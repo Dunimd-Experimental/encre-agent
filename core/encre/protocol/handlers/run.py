@@ -237,7 +237,13 @@ class RunHandlers:
 
         self._manager.touch(session.session_id)
 
-        session.agent.session.metadata["channel"] = "iwork" if self._workspace_path else "normal"
+        # Same channel-preservation rule as _h_resume: never re-tag an
+        # external-channel (iclaw, telegram, qq, ...) session as normal.
+        existing_channel = session.agent.session.metadata.get("channel", "")
+        if existing_channel in ("", "normal", "iwork"):
+            session.agent.session.metadata["channel"] = (
+                "iwork" if self._workspace_path else "normal"
+            )
 
         # Temp chat: never persist, never list in sidebar
         if msg.temp_chat:
@@ -530,12 +536,27 @@ class RunHandlers:
         else:
             session = self._get_or_create_session()
         self._current_session_id = session.session_id
-        # Tag the resumed session with the correct channel for the current mode
-        session.agent.session.metadata["channel"] = "iwork" if self._workspace_path else "normal"
+        # Tag the resumed session with the correct channel for the current
+        # mode -- but never overwrite an external channel (iclaw, telegram,
+        # qq, ...).  Those sessions belong to their platform adapter and
+        # must not leak into the normal-mode sidebar through a channel
+        # re-tag; resuming them from global search is read-only.
+        existing_channel = session.agent.session.metadata.get("channel", "")
+        if existing_channel in ("", "normal", "iwork"):
+            session.agent.session.metadata["channel"] = (
+                "iwork" if self._workspace_path else "normal"
+            )
         # Reconcile state from the actual task state -- if the
         # task is still alive, the session is definitely running even
-        # if the finally block has not fired yet.
-        if session.agent_task is not None and not session.agent_task.done():
+        # if the finally block has not fired yet.  A session parked on
+        # a permission prompt is alive but must keep its
+        # AWAITING_APPROVAL state, otherwise switching back to it would
+        # report (and render) "running" and drop the consent indicator.
+        if (
+            session.agent_task is not None
+            and not session.agent_task.done()
+            and session.state != SessionState.AWAITING_APPROVAL
+        ):
             self._manager.set_session_state(session.session_id, SessionState.RUNNING)
         sess = session.agent.session
         sess.mark_messages_dirty()
@@ -546,7 +567,8 @@ class RunHandlers:
         await self._send(ws, "session_ready", session_id=session.session_id, messages=msgs,
                          plan_items=sess.plan_items, artifacts=sess.artifacts, references=sess.references,
                          branches=branches_list, active_branch_id=sess.active_branch_id,
-                         state=state_value, request_id=msg.request_id)
+                         state=state_value, request_id=msg.request_id,
+                         channel=session.agent.session.metadata.get("channel", "normal"))
         await self._send_session_mode(ws, session)
         await self._send_session_command(ws, session)
 

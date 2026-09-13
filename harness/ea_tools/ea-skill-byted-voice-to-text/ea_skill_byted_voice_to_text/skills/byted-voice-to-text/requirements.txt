@@ -1,3 +1,0 @@
-# Voice-to-Text skill dependencies
-# Ref: https://www.volcengine.com/docs/6561/1354870
-requests>=2.28.0

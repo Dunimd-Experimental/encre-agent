@@ -369,7 +369,7 @@ export class Chat {
       card.querySelectorAll(":scope > [data-type]").forEach((el) => {
         const type = el.getAttribute("data-type") as "image" | "video" || "image";
         const src = el.getAttribute("data-src") || "";
-        if (src) new MediaViewer(el as HTMLElement, { type, src, controls: type === "video" });
+        if (src) new MediaViewer(el as HTMLElement, { type, src, controls: type === "video", openPreview: type === "image" });
       });
     };
     w.__initMediaCards = (scope?: HTMLElement) => {
@@ -480,7 +480,10 @@ export class Chat {
     onLocaleChange(() => this.render());
   }
 
-  private requestRender(): void {
+  /** RAF-throttled render — collapses bursts of stream deltas into one
+   * frame so streaming never saturates the main thread and freezes
+   * transitions/animations. */
+  public requestRender(): void {
     requestRenderImpl.call(this);
   }
 

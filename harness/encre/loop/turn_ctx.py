@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -67,6 +67,7 @@ class TurnContext:
         "tools", "backend_tools", "backend_messages", "pre_model",
         "steer_msgs", "steer_text", "injected_system_entries",
         "slot_budget", "context_window", "thinking_prefill",
+        "request_overhead_tokens",
         "text_parts", "thinking_parts", "tool_call_buffers",
         "extra_thinking", "extra_text", "extra_buffers",
         "tool_seen", "in_extra", "think_buf", "in_think",
@@ -119,6 +120,7 @@ class TurnContext:
         self.injected_system_entries: list[dict[str, str]] = []
         self.slot_budget = 0
         self.context_window = 0
+        self.request_overhead_tokens = 0
         self.thinking_prefill = ""
         self.text_parts: list[str] = []
         self.thinking_parts: list[str] = []

@@ -29,62 +29,39 @@ description = "Encre Harness — embeddable Python agent harness library"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 dependencies = [
+    # --- HTTP / networking core ---
     "httpx>=0.27",
     "httpx-ws>=0.7",
-    "pydantic>=2.5",
-    "pydantic-settings>=2.0",
+    "websockets>=12.0,<14",
+    "certifi>=2024.0",
+    # --- Config / serialization ---
+    "tomli>=2.0",
+    "pyyaml>=6.0",
+    # --- Crypto / security ---
+    "cryptography>=41.0",
+    # --- Web content extraction (web_fetch builtin + renderer) ---
     "beautifulsoup4>=4.12",
     "markdownify>=0.12",
     "lxml>=5.1",
-    "tomli>=2.0",
-    "tomli-w>=1.0",
-    "pyyaml>=6.0",
-    "cryptography>=41.0",
-    "zero-api-key-web-search>=23.0",
-    "pathspec>=0.12",
-    "websockets>=12.0,<14",
-    "Pillow>=10.0",
-    "tiktoken>=0.5",
-    "numpy>=1.24",
-    "loguru>=0.7",
-    "mss>=9.0",
-    "openpyxl>=3.1",
-    "pdfplumber>=0.10",
-    "pyautogui>=0.9",
+    # --- PDF (file_read builtin) ---
     "pypdf>=4.0",
     "PyPDF2>=3.0",
+    # --- Imaging / OCR (desktop + ocr) ---
+    "Pillow>=10.0",
     "pytesseract>=0.3",
+    # --- Desktop automation (harness computer module) ---
+    "mss>=9.0",
+    "pyautogui>=0.9",
     "uiautomation>=2.0",
-    "watchfiles>=0.21",
-    "tree-sitter>=0.21",
-    "tree-sitter-language-pack>=0.6",
-    "psutil>=6.0",
-    "openai>=1.0",
-    "requests>=2.31",
-    "certifi>=2024.0",
     "pyperclip>=1.8",
-    "python-dotenv>=1.0",
-    "markdown>=3.5",
-    "croniter>=2.0",
-    "deep-translator>=1.11",
-    "tqdm>=4.66",
-    "matplotlib>=3.8",
-    "python-docx>=1.1",
-    "python-pptx>=1.0",
-    "pyzbar>=0.1",
-    "imageio>=2.34",
-    "soundfile>=0.12",
-    "librosa>=0.10",
-    "plyer>=2.1",
-    "aiohttp-socks>=0.8",
-    "youtube-transcript-api>=0.6",
-    "opentelemetry-api>=1.25",
-    "opentelemetry-sdk>=1.25",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.25",
-    "defusedxml>=0.7",
-    "mutagen>=1.47",
-    "azure-storage-blob>=12.19",
-    "qrcode>=7.0",
+    # --- System observability ---
+    "psutil>=6.0",
+    "watchfiles>=0.21",
+    # --- Tokens / logging ---
+    "tiktoken>=0.5",
+    "loguru>=0.7",
+    # --- Cloud (bedrock backend, lazy import) ---
+    "boto3>=1.34",
 ]
 
 [tool.setuptools.packages.find]
@@ -92,7 +69,7 @@ where = ["."]
 include = ["encre*"]
 
 [tool.setuptools.package-data]
-"encre" = ["*.txt"]
+"encre" = ["*.txt", "py.typed"]
 "encre.prompts" = ["**/*.prompt"]
 "encre.skills.builtin" = ["**/*.md"]
 
@@ -103,8 +80,8 @@ include = ["encre*"]
 
 [project.entry-points."ea.plugins"]
 # User-installed third-party EA plugins register here via their own wheels.
-# The bundled ea-tool-* packages under harness/ea_tools/ do not need entries —
-# the registry scans that directory directly.
+# The bundled EA packages under core/ea_tools/ (encre-core distribution) do
+# not need entries — the registry scans that directory directly.
 
 # [tool.setuptools-rust]
 # module = "encre._native"

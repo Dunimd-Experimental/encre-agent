@@ -125,13 +125,10 @@ export function buildTimeline(msgs: Message[]): TimelineItem[] {
   if (st.branches.length > 1) {
     console.log("[buildTimeline] branches=%d active=%s msgs=%d", st.branches.length, st.activeBranchId?.slice(-8), msgs.length);
   }
-  for (let ci = 0; ci < st.compactStartingEvents.length; ci++) {
-    items.push({ kind: "compact_starting", id: `compact-starting-${ci}` });
-  }
-
-  for (let ci = 0; ci < st.compactEvents.length; ci++) {
-    items.push({ kind: "compact", id: `compact-${ci}` });
-  }
+  // NOTE: compact dividers are rendered INLINE at their compaction position
+  // (from compact_marker messages) — not stacked at the top. The
+  // "compressing" indicator is appended at the END of the timeline below,
+  // matching where the paused turn actually is.
 
   for (let si = 0; si < (st.systemMessages || []).length; si++) {
     const sm = st.systemMessages[si];
@@ -189,6 +186,11 @@ export function buildTimeline(msgs: Message[]): TimelineItem[] {
   for (let i = 0; i < msgs.length; i++) {
     const msg = msgs[i];
     if (msg.role === "user") {
+      if (msg.mode === "compact_marker") {
+        // Backend compaction boundary — inline "history compacted" divider.
+        items.push({ kind: "compact", id: `cp-${msg.id}` });
+        continue;
+      }
       items.push({
         kind: "user",
         id: `u-${msg.id}`,
@@ -339,6 +341,13 @@ export function buildTimeline(msgs: Message[]): TimelineItem[] {
     pendingStatusCards = [];
   }
 
+  // "Compressing" indicator: shown at the bottom (where the paused turn
+  // actually is) while a context compaction is in progress. Cleared when
+  // the compact event arrives and the inline divider takes over.
+  for (let ci = 0; ci < st.compactStartingEvents.length; ci++) {
+    items.push({ kind: "compact_starting", id: `compact-starting-${ci}` });
+  }
+
   // Fallback: if there are no assistant messages but a review/spec is
   // available (e.g. session just loaded), still surface the card at the end.
   if (items.every(it => it.kind !== "assistant_text" && it.kind !== "ai_header" && it.kind !== "thinking" && it.kind !== "tool")) {
@@ -395,7 +404,8 @@ export function buildRenderKey(timeline: TimelineItem[]): string {
         : [];
       return { k: "tc", id: i.id, n: i.tc.name, r: i.tc.result ? 1 : 0, d: taskDividers, sa: i.showActions ? 1 : 0, sb: i.showBranchSwitcher ? 1 : 0 };
     }
-    if (i.kind === "compact") return { k: "cp" };
+    if (i.kind === "compact") return { k: "cp", id: i.id };
+    if (i.kind === "compact_starting") return { k: "cs", id: i.id };
     if (i.kind === "workflow") {
       const wf = getState().workflowState;
       if (wf) return { k: "wf", id: wf.workflowId, n: wf.tasks.length, a: wf.active ? 1 : 0 };

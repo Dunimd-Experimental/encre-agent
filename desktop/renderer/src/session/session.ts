@@ -289,7 +289,7 @@ export class Session {
   private rowHtml(s: SessionEntryData, active: boolean): string {
     const preview = s.preview || t("general.emptySessionName");
     const displayName = s.name || preview;
-    const runningBadge = s.state !== "idle"
+    const runningBadge = s.state && s.state !== "idle"
       ? `<span class="${s.state === "awaiting_approval" ? "session-waiting" : "session-running"}"></span>`
       : "";
     const wsPathRaw = (s.metadata as any)?.workspace_path || (s.metadata as any)?.workspace || "";
@@ -496,7 +496,7 @@ export class Session {
     if (!sid) return;
     const s = getState().sessionsList.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name })))) return;
+    if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name }), { container: document.getElementById("app") ?? undefined }))) return;
     send({ type: "archive_session", session_id: sid });
     removeSessionById(sid);
     // If the archived session is currently open, clear the chat area so the
@@ -528,12 +528,13 @@ export class Session {
     Dialog.prompt(
       t("session.renameDialogTitle"),
       "",
-      currentName,
       {
         primary: t("session.rename"),
         secondary: t("session.cancel"),
         placeholder: t("session.renamePlaceholder"),
         inputClass: "encre-dialog-input--text",
+        defaultValue: currentName,
+        container: document.getElementById("app") ?? undefined,
       },
     ).then((newName) => {
       const trimmed = newName?.trim();
@@ -557,7 +558,7 @@ export class Session {
     const sessions = getState().sessionsList;
     const s = sessions.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }))) {
+    if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined })) {
       removeSessionById(sid);
       if (getState().sessionId === sid) {
         clearMessages();
@@ -598,12 +599,13 @@ export function showRenameDialog(currentName: string, onConfirm: RenameConfirmCa
   Dialog.prompt(
     t("session.renameDialogTitle"),
     "",
-    currentName,
     {
       primary: t("session.rename"),
       secondary: t("session.cancel"),
       placeholder: t("session.renamePlaceholder"),
       inputClass: "encre-dialog-input--text",
+      defaultValue: currentName,
+      container: document.getElementById("app") ?? undefined,
     },
   ).then((newName) => {
     const trimmed = newName?.trim();
@@ -658,6 +660,9 @@ export function showSessionContextMenu(
     </div>`;
   menuEl.innerHTML = items;
   showContextMenu(menuEl, x, y);
+  if (typeof (window as any).lucide !== "undefined") {
+    (window as any).lucide.createIcons({ root: menuEl });
+  }
 
   if (!noRename) {
     document.getElementById("ctx-rename-ws")?.addEventListener("click", () => {
@@ -685,7 +690,7 @@ export function showSessionContextMenu(
       menuEl.classList.add("hidden");
       const s = getState().sessionsList.find((x) => x.session_id === currentSid);
       const name = s?.name || s?.preview || currentSid.slice(0, 8);
-      if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name })))) return;
+    if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name }), { container: document.getElementById("app") ?? undefined }))) return;
       // Hide the conversation from the sidebar immediately; the backend
       // broadcast refreshes the archive manager view.
       send({ type: "archive_session", session_id: currentSid });
@@ -706,7 +711,7 @@ export function showSessionContextMenu(
     const sessions = getState().sessionsList;
     const s = sessions.find((x) => x.session_id === currentSid);
     const name = s?.name || s?.preview || currentSid.slice(0, 8);
-    if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }))) {
+    if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined })) {
       // Optimistically remove the session from the local state immediately,
       // so the UI updates even if the server response is delayed or fails.
       removeSessionById(currentSid);
@@ -738,12 +743,13 @@ export function showRenameDialogForSession(sid: string): void {
   Dialog.prompt(
     t("session.renameDialogTitle"),
     "",
-    currentName,
     {
       primary: t("session.rename"),
       secondary: t("session.cancel"),
       placeholder: t("session.renamePlaceholder"),
       inputClass: "encre-dialog-input--text",
+      defaultValue: currentName,
+      container: document.getElementById("app") ?? undefined,
     },
   ).then((newName) => {
     const trimmed = newName?.trim();

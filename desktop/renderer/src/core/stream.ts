@@ -30,7 +30,7 @@
  * resume/open responses to the right session.
  */
 
-import { ServerEvent, WorkspaceEntry, BranchUpdated, BranchSwitched, BranchRolledBack, UsageStatsEvent } from "./types.js";
+import { ServerEvent, WorkspaceEntry, BranchUpdated, BranchSwitched, BranchRolledBack, UsageStatsEvent, SessionState } from "./types.js";
 import * as state from "./state.js";
 import { send, getWorkspaceIntent } from "./ws.js";
 import { Chat } from "../chat/chat.js";
@@ -259,6 +259,46 @@ export function refreshAllData(): void {
   send({ type: "list_archived_sessions" });
 }
 
+/**
+ * How long to wait for the backend's connect push before pulling planes
+ * explicitly.  The push is the single source of truth on connect; this timer
+ * only exists because each push plane is independently try/except-guarded, so
+ * a plane that failed server-side must not leave a panel permanently empty.
+ */
+const BOOT_PUSH_FALLBACK_MS = 1200;
+let _bootFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Boot-time data pull.
+ *
+ * The backend already pushes the complete snapshot on connect
+ * (`_push_all_data`: config, sessions, sessions_all, workspaces, models plus
+ * every static plane), so the old 13-request burst fired on connect made the
+ * same payloads arrive a second time — and every duplicate re-ran the whole
+ * state→subscriber→DOM fan-out (measured: config_data ×3, sessions_list ×3,
+ * models_list ×2 before the first frame settled).  Boot therefore requests the
+ * single plane the push does not cover (archived sessions) and arms a fallback
+ * that asks for the boot-critical planes only if the push never materialised.
+ * The full `refreshAllData()` sweep is still used for mode switches, where the
+ * fan-out cost is worth paying to guarantee no panel is left stale.
+ */
+export function pullBootData(): void {
+  if (_bootFallbackTimer !== null) clearTimeout(_bootFallbackTimer);
+  send({ type: "list_archived_sessions" });
+  _bootFallbackTimer = setTimeout(() => {
+    _bootFallbackTimer = null;
+    const st = state.getState();
+    if (!st.connected) return;
+    if (!("startup_session_mode" in st.settings)) send({ type: "get_config" });
+    if (st.sessionsList.length === 0 && st.allSessions.length === 0) {
+      send({ type: "list_sessions" });
+      send({ type: "list_all_sessions" });
+    }
+    if (st.workspaces.length === 0) send({ type: "list_workspaces" });
+    if (st.availableModels.length === 0) send({ type: "list_models" });
+  }, BOOT_PUSH_FALLBACK_MS);
+}
+
 /** Initializes the stream layer with the chat/tools/permissions/settings controllers. */
 export function init(c: Chat, t: Tools, p: Permissions, s?: Settings): void {
   chat = c;
@@ -282,12 +322,81 @@ export function waitForModelValidation(): Promise<void> {
   });
 }
 
+/**
+ * Boot gate — planes that must not compete with the boot-critical ones.
+ *
+ * The backend pushes every plane in one snapshot on connect (`_push_all_data`),
+ * so these events are already queued behind config/sessions/models while the
+ * splash is still up.  Applying them immediately spreads the state→subscriber→
+ * DOM fan-out across exactly the window the splash is covering, which is what
+ * made the first painted frame arrive while side panels were still churning.
+ * Holding them back and applying them in one batch right after the reveal
+ * keeps the boot path short without changing what any panel ends up showing
+ * (the automation jobs plane is deliberately NOT deferred: the automation view
+ * is a first-class startup surface and must be populated when it is revealed).
+ */
+const BOOT_DEFERRED_EVENTS: ReadonlySet<string> = new Set([
+  "global_rules_list",
+  "memory_list",
+  "documents_list",
+  "usage_stats",
+  "project_rules_list",
+  "project_hooks_list",
+  "archived_sessions_list",
+  "index_status",
+  "profile_data",
+  "skills_list",
+  "memory_detail",
+  "gitignore_content",
+]);
+
+let _bootGateHolding = false;
+let _bootDeferredQueue: ServerEvent[] = [];
+let _bootGateSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * How long the boot gate may stay shut if the reveal never happens (e.g. the
+ * first connect fails and the splash falls back to its error/retry state). The
+ * gate must never be able to swallow a plane permanently.
+ */
+const BOOT_GATE_MAX_HOLD_MS = 5000;
+
+/** Starts holding back non-critical planes until the window is revealed. */
+export function holdNonCriticalPlanes(): void {
+  _bootGateHolding = true;
+  if (_bootGateSafetyTimer !== null) clearTimeout(_bootGateSafetyTimer);
+  _bootGateSafetyTimer = setTimeout(() => {
+    _bootGateSafetyTimer = null;
+    releaseNonCriticalPlanes();
+  }, BOOT_GATE_MAX_HOLD_MS);
+}
+
+/** Applies every plane held back during boot, in arrival order. */
+export function releaseNonCriticalPlanes(): void {
+  if (_bootGateSafetyTimer !== null) {
+    clearTimeout(_bootGateSafetyTimer);
+    _bootGateSafetyTimer = null;
+  }
+  if (!_bootGateHolding) return;
+  _bootGateHolding = false;
+  const queued = _bootDeferredQueue;
+  _bootDeferredQueue = [];
+  for (const ev of queued) {
+    handleEvent(ev);
+  }
+}
+
 /** Routes a single server event into the state store and chat view. */
 export function handleEvent(event: ServerEvent): void {
   const _perfNow = performance.now();
   const _perfType = (event as any).type;
   if (_perfType === "config_data" || _perfType === "sessions_list" || _perfType === "sessions_all" || _perfType === "models_list" || _perfType === "workspaces_list" || _perfType === "session_ready") {
     console.log("[perf] received %s at %dms", _perfType, Math.round(_perfNow - (window as any).__perfStart || _perfNow));
+  }
+  // Side-panel planes are held back while the splash is up (see BOOT_DEFERRED_EVENTS).
+  if (_bootGateHolding && BOOT_DEFERRED_EVENTS.has(_perfType)) {
+    _bootDeferredQueue.push(event);
+    return;
   }
   if (_requiresExplicitSessionId(event.type) && !_hasSessionId(event as { session_id?: string | null })) {
     return;
@@ -384,6 +493,19 @@ export function handleEvent(event: ServerEvent): void {
       // stream events can never surface it in the sidebar.
       if (state.getState().tempChat && event.session_id) {
         state.markTempChatSession(event.session_id);
+      }
+      // External-channel sessions (iclaw, telegram, qq, ...) are openable
+      // read-only from global search but must never appear in the
+      // normal/iwork sidebar. The backend reports the session's channel
+      // on session_ready; poison the id accordingly.
+      const readyChannel = (event as { channel?: string }).channel || "";
+      if (
+        event.session_id &&
+        readyChannel &&
+        readyChannel !== "normal" &&
+        readyChannel !== "iwork"
+      ) {
+        state.markExternalChannelSession(event.session_id);
       }
       state.setSessionId(event.session_id);
       // Reset persistent mode on session switch - backend will re-send mode_changed if the session has a mode
@@ -485,8 +607,11 @@ export function handleEvent(event: ServerEvent): void {
       if (_tdSid && _activeTdSid && _tdSid !== _activeTdSid) break;
       _ensureAssistantMessage(_tdSid);
       state.appendTextDelta(event.text, _tdSid);
-      chat?.render();
-      _syncSessionEntry(_activeTdSid, state.getState());
+      // Deltas arrive per-token (dozens per second). A synchronous render on
+      // every one saturates the main thread and makes every CSS transition
+      // stutter — coalesce into one render per frame instead.
+      chat?.requestRender();
+      _syncSessionEntry(_activeTdSid, state.getState(), true);
       break;
     }
 
@@ -496,8 +621,8 @@ export function handleEvent(event: ServerEvent): void {
       if (_thSid && _activeThSid && _thSid !== _activeThSid) break;
       _ensureAssistantMessage(_thSid);
       state.appendThinkingDelta(event.text, _thSid);
-      chat?.render();
-      _syncSessionEntry(_activeThSid, state.getState());
+      chat?.requestRender();
+      _syncSessionEntry(_activeThSid, state.getState(), true);
       break;
     }
 
@@ -585,9 +710,10 @@ export function handleEvent(event: ServerEvent): void {
         tc.params[key] = (tc.params[key] ?? "") + event.value;
         tc.status = "running";
         tools?.requestRender();
-        // Only render chat when name is known — without it renderToolCall
-        // falls through to a generic strip instead of the correct tool UI.
-        if (tc.name) chat?.render();
+        // Param fragments stream just like text tokens — throttle the chat
+        // re-render the same way so dense tool_call_delta bursts don't
+        // freeze transitions.
+        if (tc.name) chat?.requestRender();
       }
       break;
     }
@@ -635,7 +761,11 @@ export function handleEvent(event: ServerEvent): void {
       // call state so the in-progress timeline keeps streaming.
       _syncSubAgentView(event.id);
       tools?.requestRender();
-      chat?.renderForce?.();
+      // Progress ticks can arrive in dense bursts; a full renderForce each
+      // time is what stalled animations during tool runs. The plain render
+      // path picks up status changes incrementally and the render key
+      // forces a rebuild exactly when structure (task dividers) changes.
+      chat?.requestRender();
       break;
 
     case "tool_result":
@@ -675,16 +805,22 @@ export function handleEvent(event: ServerEvent): void {
       permissions?.show(
         event.tool_name,
         event.reason,
-        (allowed: boolean) => {
+        (decision: "allow" | "allow_session" | "deny") => {
           send({
             type: "respond_permission",
             tool_name: event.tool_name,
-            decision: allowed,
+            decision: decision !== "deny",
+            remember: decision === "allow_session",
           });
           permissionResolve = null;
           permissions?.hide();
-          state.setSessionState("idle", _eventSessionId(event));
-        }
+          // The consent gate just released the agent loop, so the session is
+          // running again -- NOT idle.  Setting "idle" here made the sidebar
+          // light disappear and the turn look finished while the agent was
+          // still working on the very tool the user just approved.
+          state.setSessionState("running", _eventSessionId(event));
+        },
+        document.getElementById("main-content") ?? undefined,
       );
       // Ensure the main chat area updates immediately so users see the
       // tool call card with a "pending" indicator rather than a frozen UI.
@@ -703,7 +839,7 @@ export function handleEvent(event: ServerEvent): void {
         body: (event as any).body,
         hint: (event as any).hint,
         options: (event as any).options,
-      });
+      }, document.getElementById("main-content") ?? undefined);
       break;
 
     case "engine_install_progress":
@@ -718,7 +854,7 @@ export function handleEvent(event: ServerEvent): void {
         message_args: (event as any).message_args,
         sub_message_code: (event as any).sub_message_code,
         sub_message_args: (event as any).sub_message_args,
-      });
+      }, document.getElementById("main-content") ?? undefined);
       break;
 
     case "finish": {
@@ -1017,11 +1153,18 @@ export function handleEvent(event: ServerEvent): void {
         isIworkMode ? freshSessions : trayCache.iwork,
       );
       if (state.getState().sessionId) {
+        const sid = state.getState().sessionId;
         const cur = (event.sessions as any[]).find(
-          (s: any) => s.session_id === state.getState().sessionId
+          (s: any) => s.session_id === sid
         );
-        if (cur && cur.state !== state.getState().running) {
-          state.setSessionState(cur.state || "idle");
+        // Adopt the server's state only when it actually differs from the
+        // local one.  The previous check compared a state *string* against
+        // the boolean `running` flag, so it was always true and clobbered the
+        // local state (e.g. "awaiting_approval" -> "running"/"idle") on every
+        // listing broadcast.
+        const localState = state.getState().sessionStore[sid]?.sessionState;
+        if (cur && cur.state && cur.state !== localState) {
+          state.setSessionState(cur.state, sid);
         }
       }
       break;
@@ -1035,6 +1178,13 @@ export function handleEvent(event: ServerEvent): void {
       // session search works in every mode (including iwork, where the
       // sidebar sessionsList is intentionally emptied).
       state.setAllSessions([...normal, ...iwork], "replace");
+      // Also refresh the sidebar for the current mode so status lights
+      // stay in sync when only sessions_all (not sessions_list) is received.
+      const currentMode = state.getState().workspaceMode === "iwork" ? "iwork" : "normal";
+      const modeSessions = currentMode === "iwork" ? iwork : normal;
+      if (modeSessions.length > 0 || state.getState().sessionsList.length === 0) {
+        state.setSessionsList(modeSessions);
+      }
       break;
     }
 
@@ -1333,8 +1483,19 @@ export function handleEvent(event: ServerEvent): void {
       state.addCompactStartingEvent(_eventSessionId(event as any));
       break;
 
+    case "compact_failed":
+      // Compaction did not produce a result (failure or no-op): dismiss
+      // the "compressing" indicator; the conversation continues with the
+      // uncompressed context.
+      if (!_hasSessionId(event as any)) break;
+      state.clearCompactStartingEvents();
+      break;
+
     case "compact":
       if (!_hasSessionId(event as any)) break;
+      // Compaction finished: drop the "compressing" indicator; the inline
+      // divider comes from the compact_marker in the refreshed messages.
+      state.clearCompactStartingEvents();
       state.addCompactEvent({
         old_count: (event as any).old_count,
         new_count: (event as any).new_count,
@@ -1592,7 +1753,10 @@ export function handleEvent(event: ServerEvent): void {
           const title = event.type === "data_export_progress"
             ? t("settings.storageExportTitle")
             : t("settings.storageImportTitle");
-          _migrationProgress = Dialog.progress(title, "", { cancellable: false });
+          _migrationProgress = Dialog.progress(title, "", {
+            cancellable: false,
+            container: document.getElementById("settings-view") ?? undefined,
+          });
         }
         _migrationProgress.update(event.percent, `${event.done} / ${event.total}`);
         const cur = (event as any).file as string | undefined;
@@ -1919,22 +2083,36 @@ function _syncSubAgentView(toolCallId: string): void {
  *  Also: derive `last_active` and `created_at` from message timestamps so
  *  the displayed time reflects the real last conversation (matching the
  *  backend's `sess.last_message_at` semantics), NOT wall-clock `Date.now()`. */
-function _syncSessionEntry(sessionId: string, st: ReturnType<typeof state.getState>): void {
+function _syncSessionEntry(sessionId: string, st: ReturnType<typeof state.getState>, light = false): void {
   if (!sessionId) return;
   if (st.tempChat) return;
   // A session that was ever a temp chat must never be (re-)added to the
   // sidebar, even after tempChat was switched off while its delete was
   // still in flight or its stream events were still arriving.
   if (state.isTempChatSession(sessionId)) return;
-  const snapshot = st.sessionStore[sessionId] || { messages: [], running: false };
+  // External-channel sessions (iclaw, telegram, qq, ...) must never be
+  // synced into the normal/iwork sidebar -- not even the "update found
+  // entry" path, since a leaked entry should be dropped, not refreshed.
+  if (state.isExternalChannelSession(sessionId)) return;
+  const snapshot = st.sessionStore[sessionId] || { messages: [], running: false, sessionState: "idle" as const };
   const snapMsgs = snapshot.messages;
   const lastContent = snapMsgs.length > 0 ? String(snapMsgs[snapMsgs.length - 1].content || "").slice(0, 20) : "";
   const key = `${sessionId}:${snapMsgs.length}:${lastContent}`;
   if (key === _lastSync) return;
+  // Light mode (per-token delta path): skip the sidebar rebuild unless the
+  // message count changed. Content-only changes carry no information the
+  // sidebar displays (preview comes from the first user message), yet each
+  // one re-renders the entire session list — that was the other half of the
+  // mid-stream animation freeze.
+  if (light && _lastSync.startsWith(`${sessionId}:${snapMsgs.length}:`)) return;
   _lastSync = key;
   const firstUser = snapMsgs.find(m => m.role === "user");
   const preview = firstUser?.content?.slice(0, 100) || "";
   const isRunning = snapshot.running ?? false;
+  // Keep the precise state so a session parked on a permission prompt stays
+  // "awaiting_approval" (yellow) instead of being flattened to "running"
+  // (green) by the coarse boolean every time messages stream in.
+  const entryState: SessionState = snapshot.sessionState ?? (isRunning ? "running" : "idle");
   // Derive sidebar ordering timestamps from the real message stream so the
   // user sees when the conversation actually happened, not when this sync
   // function happened to be called. Message.timestamp is in milliseconds
@@ -1956,11 +2134,13 @@ function _syncSessionEntry(sessionId: string, st: ReturnType<typeof state.getSta
               last_active: Math.max(e.last_active ?? 0, derivedLastActive),
               message_count: snapMsgs.length,
 preview,
-               state: isRunning ? "running" : "idle",
+               state: entryState,
              }
           : e
       )
     );
+    // Keep the tray popup's status lights in sync with the sidebar.
+    state.syncTraySessionState(sessionId, entryState);
     return;
   }
   const tray = state.getTraySessions();
@@ -1979,13 +2159,15 @@ preview,
     preview,
     created_at: derivedCreatedAt,
     last_active: derivedLastActive,
-    state: isRunning ? "running" : "idle",
+    state: entryState,
     channel,
     metadata: {
       workspace: knownWs || (channel === "iwork" ? st.activeWorkspace : undefined),
       workspace_path: knownWs || (channel === "iwork" ? st.activeWorkspace : undefined),
     },
   }]);
+  // Keep the tray popup's status lights in sync with the sidebar.
+  state.syncTraySessionState(sessionId, entryState);
 }
 
 /** Triggers a markdown file download in the browser. */

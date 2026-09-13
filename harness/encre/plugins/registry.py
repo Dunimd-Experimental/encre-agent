@@ -1,5 +1,4 @@
 ﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -32,12 +31,22 @@ from pathlib import Path
 from typing import Any
 
 from encre.logging_config import get_logger
-from encre.plugins.context import build_context as _build_context
 from encre.plugins.auto_installer import ensure_ea_tools_installed
+from encre.plugins.context import build_context as _build_context
+from encre.plugins.integrity import verify_integrity as _verify_integrity
 from encre.plugins.manifest import (
     MANIFEST_FILENAME as _MANIFEST_FILENAME,
+)
+from encre.plugins.manifest import (
     DeclarativePlugin as _DeclarativePlugin,
+)
+from encre.plugins.manifest import (
     load_manifest as _load_manifest,
+)
+from encre.plugins.transport import (
+    PluginTransport,
+    RemoteToolProxy,
+    create_transport,
 )
 from encre.plugins.types import EncrePlugin, PluginManifest, PluginSource
 
@@ -82,6 +91,20 @@ class PluginRegistry:
         # Lazy plugins: name -> (plugin_dir, source, manifest); code is
         # only imported when an activation event fires (Task 9.4)
         self._lazy: dict[str, tuple[Path, PluginSource, PluginManifest]] = {}
+        # Distributed plugin transports (name -> PluginTransport).
+        # Populated during activate() when manifest.transport != "local".
+        self._transports: dict[str, PluginTransport] = {}
+        # Tool metadata cache: avoids re-calling get_tools() / RPC on
+        # every get_all_tools() invocation.
+        self._tool_cache: list[Any] | None = None
+        self._skill_cache: list[Any] | None = None
+        self._hook_cache: dict[str, list[Any]] | None = None
+        self._backend_cache: dict[str, type[Any]] | None = None
+        # S6-S9: extension surface caches
+        self._context_cache: list[Any] | None = None
+        self._ui_cache: list[Any] | None = None
+        self._gateway_cache: list[Any] | None = None
+        self._memory_cache: list[Any] | None = None
 
     @property
     def count(self) -> int:
@@ -143,7 +166,7 @@ class PluginRegistry:
         """Return a mapping of plugin name to the error that caused load failure."""
         return dict(self._failed)
 
-    # 鈹€鈹€ Discovery 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Discovery ────────────────────────────────────────────────鈹€鈹€鈹€
 
     def discover_all(self) -> int:
         """Run all discovery mechanisms. Returns count of newly found plugins."""
@@ -212,13 +235,13 @@ class PluginRegistry:
                 for pkg, future in futures:
                     try:
                         results.append((pkg, future.result()))
-                    except Exception as e:  # noqa: BLE001 - surfaced per package below
+                    except Exception as e:
                         results.append((pkg, e))
         else:
             for pkg in packages:
                 try:
                     results.append((pkg, self._instantiate_ea_plugin(pkg)))
-                except Exception as e:  # noqa: BLE001 - surfaced per package below
+                except Exception as e:
                     results.append((pkg, e))
 
         for pkg, outcome in results:
@@ -233,6 +256,14 @@ class PluginRegistry:
             plugin.manifest.source = _tier_to_source(pkg.tier)
             # Keep the tier on the manifest for uninstall / manager decisions.
             plugin.manifest.tier = pkg.tier
+            # S5: verify code integrity for non-trusted tiers.
+            if not _verify_integrity(plugin.manifest, pkg.pkg_dir):
+                logger.warning(
+                    "Integrity check failed for '%s'; skipping",
+                    pkg.name,
+                )
+                self._failed[pkg.name] = "integrity verification failed"
+                continue
             self.register(plugin)
             logger.info(
                 f"Discovered EA plugin '{plugin.manifest.name}' (tier={pkg.tier}) "
@@ -452,7 +483,7 @@ class PluginRegistry:
             except Exception:
                 pass
 
-    # 鈹€鈹€ Lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Lifecycle ────────────────────────────────────────────────鈹€鈹€鈹€鈹€
 
     def activate(self, name: str, host: dict[str, Any] | None = None) -> bool:
         """Activate a registered plugin, invoking its ``on_activate`` hook.
@@ -463,21 +494,58 @@ class PluginRegistry:
         :class:`~encre.plugins.context.PluginContext` is built from it and
         passed to ``on_activate``.  All side effects the plugin performs
         through the context are recorded as an undo stack (Task 9.2).
+
+        Distributed plugins (``manifest.transport`` = ``process`` or
+        ``remote``) are activated through a :class:`PluginTransport`:
+        the plugin code runs in a subprocess or at a remote endpoint,
+        and tool calls are transparently proxied.
         """
         plugin = self._plugins.get(name)
         if plugin is None:
             return False
         if name in self._activated:
             return True
-        context = _build_context(name, host, undo_sink=self._record_undo)
+        manifest = plugin.manifest
+        transport_mode = getattr(manifest, "transport", "local")
+        if transport_mode != "local":
+            pkg_dir = Path(getattr(manifest, "homepage", "")) or Path(".")
+            transport = create_transport(manifest, plugin=plugin, pkg_dir=pkg_dir)
+            try:
+                if not transport.activate():
+                    logger.error("Transport activation failed for '%s'", name)
+                    self._failed[name] = "transport activation failed"
+                    return False
+                self._transports[name] = transport
+                self._activated.add(name)
+                self._invalidate_cache()
+                return True
+            except Exception as exc:
+                logger.error("Transport activation error for '%s': %s", name, exc)
+                self._failed[name] = str(exc)
+                return False
+        context = _build_context(
+            name, host, undo_sink=self._record_undo, manifest=plugin.manifest
+        )
         try:
             plugin.on_activate(context)
             self._activated.add(name)
+            self._invalidate_cache()
             return True
         except Exception as e:
             logger.error(f"Failed to activate plugin '{name}': {e}")
             self._failed[name] = str(e)
             return False
+
+    def _invalidate_cache(self) -> None:
+        """Clear aggregated caches so the next call rebuilds them."""
+        self._tool_cache = None
+        self._skill_cache = None
+        self._hook_cache = None
+        self._backend_cache = None
+        self._context_cache = None
+        self._ui_cache = None
+        self._gateway_cache = None
+        self._memory_cache = None
 
     def _record_undo(self, plugin_name: str, undo: Any) -> None:
         """Push a plugin side-effect undo onto its LIFO rollback stack."""
@@ -494,6 +562,14 @@ class PluginRegistry:
             return False
         if name not in self._activated:
             return True
+        # Close transport for distributed plugins
+        transport = self._transports.pop(name, None)
+        if transport is not None:
+            try:
+                transport.deactivate()
+                transport.close()
+            except Exception:
+                logger.warning("Transport close failed for '%s'", name, exc_info=True)
         try:
             for undo in reversed(self._undo_stack.pop(name, [])):
                 try:
@@ -503,6 +579,7 @@ class PluginRegistry:
                                    name, exc_info=True)
             plugin.on_deactivate()
             self._activated.discard(name)
+            self._invalidate_cache()
             return True
         except Exception as e:
             logger.error(f"Error deactivating plugin '{name}': {e}")
@@ -555,61 +632,183 @@ class PluginRegistry:
         for name in list(self._activated):
             self.deactivate(name)
 
-    # 鈹€鈹€ Tool/Skill/Hook aggregation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鈹€鈹€ Tool/Skill/Hook aggregation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def get_all_tools(self) -> list[Any]:
-        """Return deduplicated tools from every activated plugin."""
+        """Return deduplicated tools from every activated plugin.
+
+        For distributed plugins (``transport`` = ``process``/``remote``),
+        tool metadata is fetched over the transport and wrapped in
+        :class:`~encre.plugins.transport.RemoteToolProxy` so the agent
+        loop is unaware of transport details.
+
+        Results are cached until the activated set changes.
+        """
+        if self._tool_cache is not None:
+            return self._tool_cache
         tools: list[Any] = []
         seen: set[str] = set()
         for name in self._activated:
+            transport = self._transports.get(name)
+            if transport is not None:
+                # Distributed plugin: fetch metadata over transport
+                for meta in transport.get_tool_metas():
+                    if meta.name and meta.name not in seen:
+                        seen.add(meta.name)
+                        tools.append(RemoteToolProxy(meta, transport))
+                continue
+            # Local plugin: direct in-process call
             plugin = self._plugins[name]
             for tool in plugin.get_tools():
                 tool_name = getattr(tool, "name", "")
                 if tool_name and tool_name not in seen:
                     seen.add(tool_name)
                     tools.append(tool)
+        self._tool_cache = tools
         return tools
 
     def get_all_skills(self) -> list[Any]:
         """Return deduplicated skills from every activated plugin."""
+        if self._skill_cache is not None:
+            return self._skill_cache
         skills: list[Any] = []
         seen: set[str] = set()
         for name in self._activated:
+            transport = self._transports.get(name)
+            if transport is not None:
+                for skill_meta in transport.get_skill_metas():
+                    skill_name = skill_meta.get("name", "") if isinstance(skill_meta, dict) else ""
+                    if skill_name and skill_name not in seen:
+                        seen.add(skill_name)
+                        skills.append(skill_meta)
+                continue
             plugin = self._plugins[name]
             for skill in plugin.get_skills():
                 skill_name = getattr(skill, "name", "")
                 if skill_name and skill_name not in seen:
                     seen.add(skill_name)
                     skills.append(skill)
+        self._skill_cache = skills
         return skills
 
     def get_all_hooks(self) -> dict[str, list[Any]]:
         """Return event_type -> list of handlers across activated plugins."""
+        if self._hook_cache is not None:
+            return self._hook_cache
         hooks: dict[str, list[Any]] = {}
         for name in self._activated:
+            transport = self._transports.get(name)
+            if transport is not None:
+                for event_type, hook_meta in transport.get_hook_metas():
+                    hooks.setdefault(event_type, []).append(hook_meta)
+                continue
             plugin = self._plugins[name]
             for event_type, handler in plugin.get_hooks():
-                # Accumulate every handler registered for the same event type
                 hooks.setdefault(event_type, []).append(handler)
+        self._hook_cache = hooks
         return hooks
 
     def get_all_backends(self) -> dict[str, type[Any]]:
         """Return name -> backend class mappings from activated plugins."""
+        if self._backend_cache is not None:
+            return self._backend_cache
         backends: dict[str, type[Any]] = {}
         for name in self._activated:
+            transport = self._transports.get(name)
+            if transport is not None:
+                # Distributed plugins cannot register backend classes
+                # (they live in a separate process/remote host)
+                continue
             plugin = self._plugins[name]
             backends.update(plugin.get_backends())
+        self._backend_cache = backends
         return backends
+
+    # S6-S9: Extension surface aggregation ─────────────────────────────
+
+    def get_all_context_providers(self) -> list[Any]:
+        """Return context providers from every activated plugin (S6).
+
+        Each provider has ``name``, ``priority``, and ``provide(state)``
+        that returns a list of message dicts injected into the agent
+        context before each turn.
+        """
+        if self._context_cache is not None:
+            return self._context_cache
+        providers: list[Any] = []
+        for name in self._activated:
+            plugin = self._plugins[name]
+            providers.extend(plugin.get_context_providers())
+        self._context_cache = providers
+        return providers
+
+    def get_all_ui_providers(self) -> list[Any]:
+        """Return UI providers from every activated plugin (S7).
+
+        Each provider has ``name``, ``entry_point`` (JS module path),
+        and ``mount_point`` (sidebar/panel/settings/chat-overlay).
+        """
+        if self._ui_cache is not None:
+            return self._ui_cache
+        providers: list[Any] = []
+        for name in self._activated:
+            plugin = self._plugins[name]
+            providers.extend(plugin.get_ui_providers())
+        self._ui_cache = providers
+        return providers
+
+    def get_all_gateway_adapters(self) -> list[Any]:
+        """Return IM platform gateway adapters (S8).
+
+        Each adapter implements ``connect()`` / ``disconnect()`` /
+        ``send_message()`` / ``receive_message()``.
+        """
+        if self._gateway_cache is not None:
+            return self._gateway_cache
+        adapters: list[Any] = []
+        for name in self._activated:
+            plugin = self._plugins[name]
+            adapters.extend(plugin.get_gateway_adapters())
+        self._gateway_cache = adapters
+        return adapters
+
+    def get_all_memory_stores(self) -> list[Any]:
+        """Return alternative memory storage backends (S9).
+
+        Each store implements ``store()`` / ``retrieve()`` / ``search()``
+        / ``delete()``.
+        """
+        if self._memory_cache is not None:
+            return self._memory_cache
+        stores: list[Any] = []
+        for name in self._activated:
+            plugin = self._plugins[name]
+            stores.extend(plugin.get_memory_stores())
+        self._memory_cache = stores
+        return stores
+
+    def close_all_transports(self) -> None:
+        """Close every active distributed plugin transport."""
+        for name, transport in list(self._transports.items()):
+            try:
+                transport.deactivate()
+                transport.close()
+            except Exception:
+                logger.warning("Failed to close transport '%s'", name, exc_info=True)
+        self._transports.clear()
 
     def reset(self) -> None:
         """Deactivate everything and clear all registry state."""
         self.deactivate_all()
+        self.close_all_transports()
         self._plugins.clear()
         self._manifests.clear()
         self._activated.clear()
         self._failed.clear()
         self._undo_stack.clear()
         self._lazy.clear()
+        self._transports.clear()
+        self._invalidate_cache()
 
 
 def _event_matches(event: str, activation_events: list[str]) -> bool:

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -77,6 +77,9 @@ class EncreAutoSafetyClassifier:
     """
 
     SYSTEM_PROMPT = _loader.load("safety_classifier", category="autosafety")
+    # Intent-aware prompt used by ``classify_with_context``: it judges whether
+    # a tool call is consistent with what the user actually asked for.
+    CONTEXT_SYSTEM_PROMPT = _loader.load("safety_context_eval", category="autosafety")
 
     def __init__(
         self,
@@ -243,6 +246,105 @@ class EncreAutoSafetyClassifier:
                 decision=AutoDecision.ASK_USER,
                 confidence=0.0,
                 reasoning="Classifier unavailable -- defaulting to ask user",
+                tool_name=tool_name,
+                tool_args=tool_args,
+            )
+
+    async def classify_with_context(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        conversation_context: str,
+        tool: Any = None,
+    ) -> ClassificationResult:
+        """Classify a tool action against the user's intent.
+
+        Unlike :meth:`classify`, which judges a call in isolation, this variant
+        also reviews the recent conversation so the model can tell an expected
+        step ("user asked to fix the bug" -> editing source files) from an
+        unrelated or destructive one.  It backs the auto approval ("YOLO")
+        path, where the AI decides on the agent's behalf instead of the user.
+        """
+        self._total_classifications += 1
+
+        # Fast path: the static pre-filter always wins for clear-cut cases.
+        pattern_result = self._pattern_classify(tool_name, tool_args)
+        if pattern_result.confidence > 0.95:
+            self._cache_hits += 1
+            return pattern_result
+
+        # Cache lookup: the verdict only depends on the tool call, not on the
+        # surrounding conversation, so cached decisions stay valid.
+        cache_key = self._make_cache_key(tool_name, tool_args)
+        if cache_key in self._cache:
+            self._cache_hits += 1
+            return self._cache[cache_key]
+
+        # Read-only tools never need the model.
+        if (tool is not None and tool.is_readonly(tool_args)) or tool_name in (
+            "file_read", "grep", "glob", "web_search",
+            "task_list", "task_get", "cron_list", "task_output",
+        ):
+            result = ClassificationResult(
+                decision=AutoDecision.SAFE,
+                confidence=0.99,
+                reasoning="Read-only tool, always safe",
+                tool_name=tool_name,
+                tool_args=tool_args,
+            )
+            self._cache_result(cache_key, result)
+            return result
+
+        # Clearly malicious patterns never reach the model.
+        if pattern_result.decision == AutoDecision.BLOCK:
+            return pattern_result
+
+        args_str = json.dumps(tool_args or {}, indent=2, ensure_ascii=False)
+        if len(args_str) > 2000:
+            args_str = args_str[:2000] + "\n... truncated"
+        context_str = (conversation_context or "").strip()
+        if len(context_str) > 4000:
+            context_str = context_str[-4000:]
+
+        user_prompt = (
+            "## Recent conversation\n"
+            f"{context_str}\n\n"
+            "## Tool call awaiting authorization\n"
+            f"Tool: {tool_name}\n"
+            f"Arguments: {args_str}\n\n"
+            "Is this action consistent with the user's intent? Reply with JSON only."
+        )
+
+        start = time.time()
+        try:
+            backend = self._get_backend()
+            messages = [
+                {"role": "system", "content": self.CONTEXT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ]
+
+            full_response = ""
+            async for event in backend.chat(
+                messages=messages, max_tokens=512, temperature=0.0, enable_caching=False,
+            ):
+                if isinstance(event, BackendText):
+                    full_response += event.text
+
+            verdict = self._parse_response(full_response)
+            verdict.tool_name = tool_name
+            verdict.tool_args = tool_args
+            verdict.latency_ms = (time.time() - start) * 1000
+
+            self._cache_result(cache_key, verdict)
+            return verdict
+
+        except Exception:
+            # Fallback: an unreachable classifier must never silently grant
+            # access, so the caller is told to ask the user.
+            return ClassificationResult(
+                decision=AutoDecision.ASK_USER,
+                confidence=0.0,
+                reasoning="Context classifier unavailable -- defaulting to ask user",
                 tool_name=tool_name,
                 tool_args=tool_args,
             )

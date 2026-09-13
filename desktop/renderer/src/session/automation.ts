@@ -43,6 +43,7 @@ import {
 } from "../core/stream.js";
 import { renderMarkdown, Chat } from "../chat/chat.js";
 import { platformIconHtml } from "../ui/icons.js";
+import { attachInputExpand } from "../ui/input-expand.js";
 import type { Message } from "../core/types.js";
 
 interface TaskTemplate {
@@ -413,14 +414,13 @@ private createDropdown: HTMLElement;
     // Reuse the tape's session-crumb breadcrumb structure so the detail
     // header is identical to the sub-agent view: Automation / <name>.
     this.renderDetailBreadcrumb(data.name || "");
-    // Detail view: show the Back button. The sidebar toggle stays visible but
-    // disabled (greyed out) - the sidebar is force-collapsed in automation and
-    // the disabled state is managed by AutomationPanel. The sidebar Search
-    // button is never touched - it stays in place.
+    // Detail view: show the Back button in the sidebar-toggle's slot (toggle
+    // hidden). The sidebar is force-collapsed in automation, so the toggle has
+    // no useful action here anyway — Back is the primary header control.
     const autoBack = document.getElementById("btn-automation-back");
     const toggle = document.getElementById("btn-toggle-sidebar");
     if (autoBack) autoBack.classList.remove("hidden");
-    if (toggle) toggle.style.display = "";
+    if (toggle) toggle.style.display = "none";
   }
 
   /**
@@ -670,6 +670,7 @@ private createDropdown: HTMLElement;
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: overlay });
     }
+    attachInputExpand(overlay);
 
     // Auto-resize prompt textarea (same pattern as settings rule editor)
     const promptTa = overlay.querySelector("#auto-dlg-prompt") as HTMLTextAreaElement;
@@ -1578,7 +1579,7 @@ private createDropdown: HTMLElement;
         };
         const doDelete = () => {
           if (entryId) {
-            Dialog.confirm(t("automation.confirmDeleteRecord") || "Delete this record?", "").then((confirmed) => {
+            Dialog.confirm(t("automation.confirmDeleteRecord") || "Delete this record?", "", { container: document.getElementById("app") ?? undefined }).then((confirmed) => {
               if (confirmed) {
                 // Optimistically remove the entry from local state so the UI
                 // updates instantly, matching the session delete pattern.
@@ -1647,7 +1648,8 @@ private createDropdown: HTMLElement;
       const name = job?.name || id;
       Dialog.confirm(
         t("automation.confirmDeleteTaskTitle") || "Delete Task",
-        t("automation.confirmDeleteTask", { name }) || `Delete task "${name}"? This cannot be undone.`
+        t("automation.confirmDeleteTask", { name }) || `Delete task "${name}"? This cannot be undone.`,
+        { container: document.getElementById("app") ?? undefined },
       ).then((confirmed) => {
         if (!confirmed) return;
         send({ type: "automation_delete_job", job_id: id });

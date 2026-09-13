@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -35,8 +35,6 @@ Outer-loop ``continue`` statements of the original dispatch chain became
 
 import asyncio
 import logging
-import os
-import shutil
 import traceback
 from typing import Any
 
@@ -47,7 +45,7 @@ from encre.config import (
     _thinking_config_from_dict,
 )
 from encre.keybinds import save_keybinds
-from encre.protocol.handlers.base import _inject_context_windows
+from encre.protocol.handlers.base import _inject_context_windows, _resolve_model_context_windows
 from encre.server.protocol import (
     ClientAgentCreate,
     ClientAgentDelete,
@@ -297,6 +295,7 @@ class SettingsHandlers:
         ]
         info.agent.config.models = models
         info.agent.config.active_model_index = msg.active_model_index
+        _resolve_model_context_windows(models)
         info.agent.config.apply_active_model()
         info.agent.rebuild_backend()
         # Sync to _default_config so new sessions pick up the models
@@ -326,6 +325,7 @@ class SettingsHandlers:
                     message=f"Model '{target.name}' is disabled", code="model_disabled")
                 return
             info.agent.config.active_model_index = msg.model_index
+            _resolve_model_context_windows(info.agent.config.models)
             info.agent.config.apply_active_model()
             info.agent.rebuild_backend()
             # Sync to _default_config
@@ -356,6 +356,7 @@ class SettingsHandlers:
                 if info.agent.config.active_model_index >= len(info.agent.config.models):
                     info.agent.config.active_model_index = max(0, len(info.agent.config.models) - 1)
                 if info.agent.config.models:
+                    _resolve_model_context_windows(info.agent.config.models)
                     info.agent.config.apply_active_model()
                     info.agent.rebuild_backend()
                 # Sync to _default_config
@@ -491,6 +492,7 @@ class SettingsHandlers:
                         cfg.models.append(new_model)
                         active_idx = len(cfg.models) - 1
                 cfg.active_model_index = active_idx
+                _resolve_model_context_windows(cfg.models)
                 cfg.apply_active_model()
                 self._default_config.models = list(cfg.models)
                 self._default_config.active_model_index = active_idx
@@ -739,7 +741,6 @@ class SettingsHandlers:
             from encre.telemetry import EncreTelemetry
             stats = EncreTelemetry.get_all_sessions_usage()
             model_names: dict[str, str] = {}
-            current_model_ids: set[str] = set()
             if self._default_config:
                 for mc in self._default_config.models:
                     mid = (mc.model_id or "").strip()

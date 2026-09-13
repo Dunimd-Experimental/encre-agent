@@ -149,13 +149,20 @@ pub struct PolicyState {
 
 impl PolicyState {
     /// Resolve the effective policy for a key across all sources.
-    fn resolve_tool(&self, key: &str) -> Option<PolicyValue> {
-        resolve_policy(&self.tools_by_source, &self.tools, key)
+    ///
+    /// When `session_only` is set the user-managed configuration sources are
+    /// ignored and only a transient decision made during the current session
+    /// (`PolicySource::Session`) is honoured.  This backs the "custom mode
+    /// only" rule: per-tool settings apply exclusively in the `custom`
+    /// permission mode, while a one-off "allow for this session" answer keeps
+    /// working in the preset modes.
+    fn resolve_tool(&self, key: &str, session_only: bool) -> Option<PolicyValue> {
+        resolve_policy(&self.tools_by_source, &self.tools, key, session_only)
     }
 
     /// Resolve the effective policy for a capability across all sources.
-    fn resolve_capability(&self, key: &str) -> Option<PolicyValue> {
-        resolve_policy(&self.capabilities_by_source, &self.capabilities, key)
+    fn resolve_capability(&self, key: &str, session_only: bool) -> Option<PolicyValue> {
+        resolve_policy(&self.capabilities_by_source, &self.capabilities, key, session_only)
     }
 }
 
@@ -165,7 +172,16 @@ fn resolve_policy(
     by_source: &HashMap<PolicySource, HashMap<String, PolicyValue>>,
     legacy: &HashMap<String, PolicyValue>,
     key: &str,
+    session_only: bool,
 ) -> Option<PolicyValue> {
+    if session_only {
+        let entry = by_source.get(&PolicySource::Session)?.get(key)?;
+        return if matches!(entry, PolicyValue::Default) {
+            None
+        } else {
+            Some(entry.clone())
+        };
+    }
     for source in PolicySource::precedence() {
         if let Some(map) = by_source.get(source) {
             if let Some(policy) = map.get(key) {
@@ -304,10 +320,14 @@ struct DangerousTable {
 
 impl DangerousTable {
     fn load_from_file(path: &Path) -> Self {
+        match fs::read_to_string(path) {
+            Ok(text) => Self::load_from_text(&text),
+            Err(_) => DangerousTable { patterns: Vec::new() },
+        }
+    }
+
+    fn load_from_text(text: &str) -> Self {
         let mut patterns: Vec<(String, Regex)> = Vec::new();
-        let Ok(text) = fs::read_to_string(path) else {
-            return DangerousTable { patterns };
-        };
         let mut current: Option<String> = None;
         for raw_line in text.lines() {
             let line = raw_line.trim();
@@ -382,6 +402,10 @@ fn current_platform_tag() -> &'static str {
 struct ManagerInner {
     state: PolicyState,
     dangerous: DangerousTable,
+    /// Active session permission mode.  Only `"custom"` makes the user-managed
+    /// per-tool / per-capability policy table effective; every other mode
+    /// (manual approval, auto approval, full access) runs without it.
+    mode: String,
 }
 
 static MANAGER: OnceLock<RwLock<ManagerInner>> = OnceLock::new();
@@ -395,6 +419,7 @@ fn manager() -> &'static RwLock<ManagerInner> {
         RwLock::new(ManagerInner {
             state: PolicyState::default(),
             dangerous,
+            mode: String::from("default"),
         })
     })
 }
@@ -476,6 +501,59 @@ pub fn permission_record_decision(tool_name: &str, policy: &str) {
         .insert(tool_name.to_string(), PolicyValue::from_str(policy));
 }
 
+/// Set the active session permission mode.
+///
+/// The user-managed tool / capability policy table is only consulted when the
+/// mode is `"custom"`.  In every other mode (manual approval, auto approval,
+/// full access) those rules are inert, so the settings panel describes them as
+/// custom-mode-only and the engine matches that description.
+pub fn permission_set_mode(mode: &str) {
+    let normalized = mode.trim().to_lowercase();
+    let mut g = manager().write().expect("permission lock poisoned");
+    if g.mode != normalized {
+        g.mode = normalized;
+    }
+}
+
+/// Replace the dangerous-command pattern table with the given rule text
+/// (same format as `dangerous_commands.txt`).  Called by Python at startup
+/// so the rules always come from the package directory instead of relying
+/// on working-directory probing, and so rule updates can be hot-reloaded.
+pub fn permission_set_dangerous_patterns(text: &str) {
+    let mut g = manager().write().expect("permission lock poisoned");
+    g.dangerous = DangerousTable::load_from_text(text);
+}
+
+/// Pure dangerous-command check for the bash tool family.  Returns the
+/// matched rule string when a subcommand hits the blacklist, `None`
+/// otherwise.  Used by the auto-approval classifier as a hard floor that
+/// the classifier cannot override.
+pub fn permission_check_dangerous(tool_name: &str, args: &str) -> Option<String> {
+    let g = manager().read().expect("permission lock poisoned");
+    match_dangerous(&g, tool_name, args)
+}
+
+/// Test the bash tool family input against the dangerous-pattern table,
+/// splitting the command into subcommands first.
+fn match_dangerous(g: &ManagerInner, tool_name: &str, args: &str) -> Option<String> {
+    if !matches!(tool_name, "bash" | "bash_output") {
+        return None;
+    }
+    let command_text = extract_bash_command(args).unwrap_or_else(|| args.to_string());
+    let subcommands = split_shell_command(&command_text);
+    let effective = if subcommands.is_empty() {
+        vec![command_text]
+    } else {
+        subcommands
+    };
+    for cmd in effective {
+        if let Some(rule) = g.dangerous.match_command(&cmd, current_platform_tag()) {
+            return Some(rule);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Always-allow list — tools that bypass ALL permission checks.
 // These are non-dangerous tools (web fetch, search, memory, tasks, etc.)
@@ -494,45 +572,94 @@ const ALWAYS_ALLOW: &[&str] = &[
 ///
 /// Precedence (highest first):
 /// 0.  Always-allow list (these tools skip all checks entirely).
-/// 1.  Tool-level override from the policy table (source-aware).
-/// 2.  Capability-level override (`network`, `file`, ...).
+/// 1.  Explicit Deny/Ask tool-level override from the policy table.
+/// 2.  Explicit Deny/Ask capability-level override.
 /// 3.  Dangerous-pattern match for the `bash` tool family, per subcommand.
-/// 4.  Default: allow.
+///     Runs BEFORE any Allow/Default policy so a blanket allow entry can
+///     never silence the blacklist.
+/// 4.  Allow-level tool policy.
+/// 5.  Allow-level capability policy.
+/// 6.  Default: allow.
+///
+/// Steps 1, 2, 4 and 5 consult the user-managed policy table, which only takes
+/// effect in the `custom` permission mode.  In the preset modes the table is
+/// skipped except for a transient "allow for this session" answer, so the
+/// per-tool settings panel and the engine agree on when those rules apply.
+///
+/// The active mode also decides how a blacklisted subcommand (step 3) is
+/// reported: manual approval / custom mode asks the user, while full access
+/// (`bypass`) and auto approval (`auto`) deny it outright since neither mode
+/// prompts.
 pub fn permission_check(tool_name: &str, args: &str) -> PermissionDecision {
+    let mode = {
+        let g = manager().read().expect("permission lock poisoned");
+        g.mode.clone()
+    };
+    permission_check_mode(tool_name, args, &mode)
+}
+
+/// Authorization check with the permission mode supplied by the caller.
+///
+/// The mode travels with the call instead of being read from the process-wide
+/// slot populated by [`permission_set_mode`].  Several agent sessions with
+/// different modes share one process, so a per-call mode is the only way to
+/// guarantee the policy table is consulted exactly when the calling session is
+/// in `custom` mode -- a global slot can always be overwritten by another
+/// session between the push and the check.
+pub fn permission_check_mode(tool_name: &str, args: &str, mode: &str) -> PermissionDecision {
     // 0) Always-allow tools skip everything.
     if ALWAYS_ALLOW.contains(&tool_name) {
         return PermissionDecision::Allow;
     }
 
+    let mode = mode.trim().to_lowercase();
     let g = manager().read().expect("permission lock poisoned");
+    let session_only = mode != "custom";
 
-    // 1) Tool-level override.
-    if let Some(p) = g.state.resolve_tool(tool_name) {
-        return decision_from_policy(&p, tool_name);
-    }
-
-    // 2) Capability-level override.
-    for cap in tool_capabilities(tool_name) {
-        if let Some(p) = g.state.resolve_capability(cap) {
+    // 1) Explicit Deny/Ask tool-level override wins outright.
+    if let Some(p) = g.state.resolve_tool(tool_name, session_only) {
+        if !matches!(p, PolicyValue::Allow | PolicyValue::Default) {
             return decision_from_policy(&p, tool_name);
         }
     }
 
-    // 3) Bash dangerous patterns, evaluated per subcommand.
-    if matches!(tool_name, "bash" | "bash_output") {
-        let command_text = extract_bash_command(args).unwrap_or_else(|| args.to_string());
-        let subcommands = split_shell_command(&command_text);
-        let effective = if subcommands.is_empty() {
-            vec![command_text]
-        } else {
-            subcommands
+    // 2) Explicit Deny/Ask capability-level override wins outright.
+    for cap in tool_capabilities(tool_name) {
+        if let Some(p) = g.state.resolve_capability(cap, session_only) {
+            if !matches!(p, PolicyValue::Allow | PolicyValue::Default) {
+                return decision_from_policy(&p, tool_name);
+            }
+        }
+    }
+
+    // 3) Bash dangerous patterns, evaluated per subcommand.  Full access
+    //    ("bypass") and auto approval ("auto") never ask the user for
+    //    anything, so a blacklisted subcommand is refused outright instead
+    //    of raising a prompt.
+    if let Some(rule) = match_dangerous(&g, tool_name, args) {
+        if mode == "bypass" || mode == "auto" {
+            return PermissionDecision::Deny {
+                reason: format!("Blocked by dangerous-command rule: {rule}"),
+            };
+        }
+        return PermissionDecision::Ask {
+            reason: format!("Subcommand matches dangerous pattern: {rule}"),
+            rule,
         };
-        for cmd in effective {
-            if let Some(rule) = g.dangerous.match_command(&cmd, current_platform_tag()) {
-                return PermissionDecision::Ask {
-                    reason: format!("Subcommand matches dangerous pattern: {rule}"),
-                    rule,
-                };
+    }
+
+    // 4) Allow-level tool policy.
+    if let Some(p) = g.state.resolve_tool(tool_name, session_only) {
+        if matches!(p, PolicyValue::Allow) {
+            return decision_from_policy(&p, tool_name);
+        }
+    }
+
+    // 5) Allow-level capability policy.
+    for cap in tool_capabilities(tool_name) {
+        if let Some(p) = g.state.resolve_capability(cap, session_only) {
+            if matches!(p, PolicyValue::Allow) {
+                return decision_from_policy(&p, tool_name);
             }
         }
     }

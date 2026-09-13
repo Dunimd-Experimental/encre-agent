@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -59,7 +59,7 @@ from encre.loop_stability import (
 )
 from encre.tracing import trace_llm_call
 from encre.utils.loop_helpers import _EVOLUTION_ENABLED
-from encre.utils.tokens import count_message_tokens
+from encre.utils.tokens import count_message_tokens, estimate_request_overhead
 from encre.utils.types import (
     BackendError,
     BackendFinish,
@@ -67,6 +67,9 @@ from encre.utils.types import (
     BackendThinking,
     BackendToolCall,
     BackendToolCallDelta,
+    CompactFailed,
+    CompactNotification,
+    CompactStarting,
     create_assistant_boundary,
     create_finish,
     create_system_message,
@@ -289,13 +292,24 @@ class PhaseModelMixin:
         # pre-API pressure check and for the chat call below), instead of
         # probing an in-scope local via the fragile `dir()` hack.
         t.slot_budget = self._resolve_slot_budget()
+        # Fixed per-request overhead (system prompt + tool schemas) that the
+        # message-only estimate misses.  Without it the pressure check
+        # under-reports by tens of thousands of tokens on memory-heavy
+        # agents and compaction fires too late -- the model then degrades
+        # into long repetitive reasoning on an overfull context.
+        t.request_overhead_tokens = estimate_request_overhead(
+            t.system_prompt, t.backend_tools,
+        )
         _pressure = check_token_pressure(
             t.backend_messages, t.context_window, t.slot_budget,
+            extra_tokens=t.request_overhead_tokens,
         )
         if _pressure > 0.85:
             logger.warning(
-                "[run] token pressure %.1f%% before API call turn=%d -- compacting",
+                "[run] token pressure %.1f%% before API call turn=%d "
+                "(overhead=%dk tokens) -- compacting",
                 _pressure * 100, self.session.turn_count,
+                t.request_overhead_tokens // 1000,
             )
             try:
                 # This synchronous pass is authoritative: bump the epoch so
@@ -303,6 +317,10 @@ class PhaseModelMixin:
                 # instead of clobbering this one.
                 self._compact_epoch += 1
                 _context_msgs = self.session.get_context_messages()
+                _pre_tokens = count_message_tokens(_context_msgs)
+                # Signal the frontend: output is paused while the history
+                # is being compressed (shows the "compressing" indicator).
+                yield CompactStarting()
                 self.session.set_compact_archive(_context_msgs)
                 _compacted = await self.compact_engine.compact(
                     _context_msgs, backend=self.backend,
@@ -317,6 +335,12 @@ class PhaseModelMixin:
                         self.session.active_branch_id, _compacted
                     )
                     self._compacted_this_turn = True
+                    yield CompactNotification(
+                        old_count=len(_context_msgs),
+                        new_count=len(_compacted),
+                        old_tokens=_pre_tokens,
+                        new_tokens=count_message_tokens(_compacted),
+                    )
                     t.backend_messages = self.session.get_context_messages()
                     # Re-inject system messages that were lost during session refresh
                     if t.injected_system_entries:
@@ -342,8 +366,13 @@ class PhaseModelMixin:
                             {"role": "user", "content": t.checkpoint_text}
                         )
                     logger.info("[run] pre-API compact succeeded turn=%d", self.session.turn_count)
+                else:
+                    # Compaction was a no-op: dismiss the "compressing"
+                    # indicator so it cannot get stuck on screen.
+                    yield CompactFailed(reason="no compaction applied")
             except Exception as _pc_err:
                 logger.warning("[run] pre-API compact failed: %s", _pc_err)
+                yield CompactFailed(reason=str(_pc_err))
 
         # 5. Thinking prefill (if enabled)
         t.thinking_prefill = build_thinking_prefill(
@@ -674,6 +703,9 @@ class PhaseModelMixin:
                         self._compact_epoch += 1
                         context_msgs = self.session.get_context_messages()
                         est = count_message_tokens(context_msgs)
+                        # Signal the frontend: the failed (overflowed) attempt
+                        # stops here and compression takes over visibly.
+                        yield CompactStarting()
                         self.session.set_compact_archive(context_msgs)
                         compacted = await self.compact_engine.compact(
                             context_msgs, backend=self.backend,
@@ -687,6 +719,12 @@ class PhaseModelMixin:
                             self.session.replace_branch_messages(self.session.active_branch_id, compacted)
                             self._compacted_this_turn = True
                             self._update_user_requirements(compacted)
+                            yield CompactNotification(
+                                old_count=len(context_msgs),
+                                new_count=len(compacted),
+                                old_tokens=est,
+                                new_tokens=count_message_tokens(compacted),
+                            )
                             logger.info("[reactive] compact succeeded turn=%d, continuing without error",
                                         self.session.turn_count)
                             self._has_attempted_reactive_compact = True
@@ -702,9 +740,13 @@ class PhaseModelMixin:
                                 try: self.memory_system.refresh()
                                 except Exception: logger.warning("[reactive] memory refresh failed", exc_info=True)
                             continue
+                        else:
+                            # Compaction was a no-op: dismiss the indicator.
+                            yield CompactFailed(reason="no compaction applied")
                     except Exception as _ce:
                         logger.warning("[reactive] compact failed turn=%d: %s",
                                        self.session.turn_count, _ce)
+                        yield CompactFailed(reason=str(_ce))
 
                 if decision.action == RecoveryAction.FALLBACK_CONTINUE:
                     # Model fallback: try the indicator model, then a random
@@ -756,6 +798,10 @@ class PhaseModelMixin:
                         base_url=_next.base_url or self.config.base_url,
                         api_key=_next.api_key or self.config.api_key,
                         thinking_config=self._thinking_config,
+                        # The fallback model may have a different context
+                        # window (e.g. 1M primary -> 256K fallback); the
+                        # compaction thresholds must follow immediately.
+                        context_window=getattr(_next, "context_window", 0) or 0,
                     )
                     self.backend = fallback_backend
                     # Update active_model_index so the frontend selector reflects the switch

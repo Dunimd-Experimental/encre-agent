@@ -21,7 +21,13 @@
  */
 
 import MarkdownIt from "markdown-it";
-import hljs from "highlight.js";
+// Only the "common" language set is bundled eagerly: the full build ships ~190
+// language definitions (~1.1 MB) into the entry chunk, i.e. a third of the
+// whole boot bundle parsed before the first frame, for grammars a chat code
+// block almost never uses.  lib/common covers the 36 languages that actually
+// show up (js/ts/python/rust/go/java/c/cpp/bash/sql/json/yaml/xml/markdown/…)
+// and is API-compatible with the full instance (getLanguage/highlight).
+import hljs from "highlight.js/lib/common";
 import { t } from "../features/i18n.js";
 
 const md = new MarkdownIt({

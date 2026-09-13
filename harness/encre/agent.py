@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -29,7 +29,6 @@ import json
 import logging
 import os
 import threading
-import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +36,7 @@ import yaml
 
 if TYPE_CHECKING:
     from encre.goal import EncreGoalLoop
+    from encre.skills.types import SkillSource
     from encre.swarm.session import EncreSwarmSession
 
 from encre.slash_commands import (
@@ -101,6 +101,18 @@ def _ensure_bundled_skills_loaded(registry: EncreSkillRegistry) -> None:
         return
     create_bundled_skills(registry)
     from encre.skills.types import SkillSource
+
+    # Skills for the six inlined primitive tools (file_read/file_write/
+    # file_edit/bash/web_search/web_fetch).  They live next to this module
+    # rather than in an EA package because the tools themselves are inlined
+    # into the harness (``encre.tools.builtin``).
+    _builtin_skills_dir = os.path.join(os.path.dirname(__file__), "skills", "builtin")
+    if os.path.isdir(_builtin_skills_dir):
+        try:
+            registry.load_from_dir(_builtin_skills_dir, source=SkillSource.BUNDLED)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Failed to load builtin tool skills: {e}")
+
     # Load skills bundled inside EA packages (ea_tool_* / ea_skill_*).  Resolves
     # via the directory scan so it works both in editable installs and inside
     # PyInstaller frozen bundles (where packages live under _internal/).
@@ -619,11 +631,20 @@ class EncreAgent:
 
         Call this after changing config.backend_type, config.api_key,
         config.base_url, or config.model so the backend instance matches
-        the updated settings.
+        the updated settings.  The active model's resolved context window
+        is forwarded so compaction thresholds follow the model switch
+        immediately (e.g. 1M -> 256K must trigger compaction on the next
+        turn, not keep using the old window).
         """
         from encre.backend import create_backend as _cb
         active_model = self.config.get_active_model()
         thinking_config = active_model.thinking_config or self.config.thinking_config
+        # apply_active_model() may have injected context_window into
+        # backend_kwargs; drop it so the explicit kwarg below cannot collide.
+        _backend_kwargs = {
+            k: v for k, v in self.config.backend_kwargs.items()
+            if k != "context_window"
+        }
         self.loop.backend = _cb(
             self.config.backend_type,
             api_key=self.config.api_key,
@@ -631,7 +652,8 @@ class EncreAgent:
             model=self.config.model,
             models=self.config.models,
             thinking_config=thinking_config,
-            **self.config.backend_kwargs,
+            context_window=getattr(active_model, "context_window", 0) or 0,
+            **_backend_kwargs,
         )
 
     def load_plugins(self, discover: bool = True) -> int:
@@ -713,7 +735,11 @@ class EncreAgent:
     def _wire_tools(self) -> None:
         """Wire parent loop reference to tools that need it."""
         from encre.tools.runtime import set_parent_loop
+        from encre.tools.builtin import register_builtin_tools
 
+        # Hardcoded six-tool core set (file/shell/web primitives) is part
+        # of the harness itself, not a plugin — register it unconditionally.
+        register_builtin_tools(self.tool_registry)
         set_parent_loop(self.loop)
 
     # ------------------------------------------------------------------
@@ -854,9 +880,13 @@ class EncreAgent:
     def activate_skill(self, name: str, args: str | None = None) -> str:
         return self.skill_registry.activate(name, args)
 
-    def respond_permission(self, decision: bool) -> None:
-        """Approve or deny the pending permission request from the current turn."""
-        self.loop.resolve_permission(decision)
+    def respond_permission(self, decision: bool, remember: bool = False) -> None:
+        """Approve or deny the pending permission request from the current turn.
+
+        ``remember=True`` persists an approval into the session policy table
+        so the same tool is not asked again during this session.
+        """
+        self.loop.resolve_permission(decision, remember)
 
     def goal(
         self,

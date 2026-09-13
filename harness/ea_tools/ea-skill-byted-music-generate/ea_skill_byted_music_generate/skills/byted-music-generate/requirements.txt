@@ -1,2 +1,0 @@
-# Volcengine Music Generation skill dependencies
-requests>=2.28.0

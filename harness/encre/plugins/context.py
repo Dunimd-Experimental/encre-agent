@@ -1,5 +1,4 @@
 ﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -37,10 +36,19 @@ Surfaces (Task 9.3):
 - ``commands``   register slash commands
 - ``sub_agents`` register sub-agent definitions
 - ``templates``  register prompt templates
+
+Permission enforcement (fail-closed, Task P0.2):
+Plugins whose manifest does not declare the capability required by a
+surface have that surface *blocked*: registration attempts log a warning
+and become no-ops instead of silently succeeding.  Trusted tiers
+(``mandatory`` / ``system-default``) are exempt — they ship with the app
+and their declared permissions are informational only.  Every other
+tier (``user`` / project / user-directory plugins) must declare e.g.
+``"tools:register"`` before ``context.tools.register(...)`` works.
 """
 
-import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from encre.logging_config import get_logger
 
@@ -53,16 +61,67 @@ def _noop_undo() -> None:
     """Undo closure for registrations the host cannot reverse."""
 
 
+#: Permission token each surface requires.  A manifest that does not list
+#: the token (exactly or via the ``surface:*`` wildcard) is blocked from
+#: using that surface.  ``events`` subscriptions are always allowed (they
+#: only observe); ``events.emit`` is likewise unrestricted.
+SURFACE_PERMISSIONS: dict[str, str] = {
+    "tools": "tools:register",
+    "backends": "backends:register",
+    "loop": "loop:intercept",
+    "permissions": "permissions:register",
+    "commands": "commands:register",
+    "sub_agents": "sub_agents:register",
+    "templates": "templates:register",
+    # S6-S9: extension surfaces (v0.5+)
+    "context_providers": "context:register",
+    "ui_providers": "ui:register",
+    "gateway_adapters": "gateways:register",
+    "memory_stores": "memory:register",
+}
+
+#: Tiers exempt from permission gating: they ship with the application and
+#: their code is reviewed together with the core.
+_TRUSTED_TIERS = frozenset({"mandatory", "system-default"})
+
+
+def _permission_granted(surface: str, permissions: list[str]) -> bool:
+    """Return True when *permissions* authorises *surface*.
+
+    Accepts the exact token (``tools:register``) or the surface wildcard
+    (``tools:*``).  The universal wildcard ``*`` is also honoured so a
+    plugin can explicitly opt into full power.
+    """
+    required = SURFACE_PERMISSIONS.get(surface)
+    if required is None:
+        return True
+    wildcard = f"{surface}:*"
+    return (
+        "*" in permissions
+        or required in permissions
+        or wildcard in permissions
+    )
+
+
+class PermissionError(Exception):
+    """Raised (and logged) when a plugin uses a surface it did not declare."""
+
+
 class PluginContext:
     """Per-plugin API surface handed to ``on_activate(context)``.
 
     The context is deliberately thin: every ``register_*`` forwards to a
     *host capability object* supplied by the embedding application (the
-    loop, the tool registry, 鈥?, records the returned undo closure on the
-    context's LIFO undo list, and returns the undo to the plugin.  When a
+    loop, the tool registry, ...), records the returned undo closure on
+    the context's LIFO undo list, and returns the undo to the plugin.  When a
     capability is absent (harness-only embedding), registration becomes a
     no-op that logs at debug level, so plugins degrade gracefully instead
     of crashing lightweight hosts.
+
+    ``manifest`` (optional) enables the permission gate: when supplied and
+    the plugin's tier is not trusted, each surface checks the manifest's
+    declared ``permissions`` first.  The gate is intentionally fail-closed
+    for third-party code.
     """
 
     def __init__(
@@ -78,10 +137,24 @@ class PluginContext:
         command_registry: Any = None,
         sub_agent_registry: Any = None,
         template_registry: Any = None,
+        # S6-S9: extension surface host registries (all optional)
+        context_registry: Any = None,
+        ui_registry: Any = None,
+        gateway_registry: Any = None,
+        memory_registry: Any = None,
+        manifest: Any = None,
     ) -> None:
         self.plugin_name = plugin_name
         self._undos: list[_UNDO] = []
         self._undo_sink = undo_sink
+        # Permission gate: trusted tiers skip checks entirely.
+        self._permissions: list[str] | None = None
+        if manifest is not None:
+            tier = getattr(manifest, "tier", "user")
+            if tier not in _TRUSTED_TIERS:
+                self._permissions = list(
+                    getattr(manifest, "permissions", None) or []
+                )
         _mk = _make_api
         self.tools = _mk(_ToolsApi, tool_registry, plugin_name, self)
         self.backends = _mk(_BackendsApi, backend_registry, plugin_name, self)
@@ -91,6 +164,30 @@ class PluginContext:
         self.commands = _mk(_CommandsApi, command_registry, plugin_name, self)
         self.sub_agents = _mk(_SubAgentsApi, sub_agent_registry, plugin_name, self)
         self.templates = _mk(_TemplatesApi, template_registry, plugin_name, self)
+        # S6-S9: extension surfaces
+        self.context_providers = _mk(_ContextProvidersApi, context_registry, plugin_name, self)
+        self.ui_providers = _mk(_UIProvidersApi, ui_registry, plugin_name, self)
+        self.gateway_adapters = _mk(_GatewayAdaptersApi, gateway_registry, plugin_name, self)
+        self.memory_stores = _mk(_MemoryStoresApi, memory_registry, plugin_name, self)
+
+    def _gate(self, surface: str) -> bool:
+        """Return True when the plugin may use *surface*.
+
+        Always True when no permission list is attached (trusted tier or a
+        hand-built context without a manifest).  Otherwise the manifest
+        must declare the surface token.
+        """
+        if self._permissions is None:
+            return True
+        if _permission_granted(surface, self._permissions):
+            return True
+        required = SURFACE_PERMISSIONS.get(surface, "<unknown>")
+        logger.warning(
+            "Plugin '%s' used context.%s without declaring '%s'; "
+            "blocked (add it to manifest permissions)",
+            self.plugin_name, surface, required,
+        )
+        return False
 
     def record_undo(self, undo: _UNDO) -> _UNDO:
         """Record *undo* on the plugin's rollback stack and return it.
@@ -117,13 +214,19 @@ def build_context(
     plugin_name: str,
     host: dict[str, Any] | None = None,
     undo_sink: Callable[[str, _UNDO], None] | None = None,
+    manifest: Any = None,
 ) -> PluginContext:
     """Build a :class:`PluginContext` from a host capability mapping.
 
     ``host`` keys (all optional): ``tools``/``backends``/``loop``/
-    ``events``/``permissions``/``commands``/``sub_agents``/``templates``.
-    Missing capabilities degrade to no-op registration.  ``undo_sink``
-    receives every recorded ``(plugin_name, undo)`` pair.
+    ``events``/``permissions``/``commands``/``sub_agents``/``templates``/
+    ``context_providers``/``ui_providers``/``gateway_adapters``/
+    ``memory_stores``.  Missing capabilities degrade to no-op registration.
+    ``undo_sink`` receives every recorded ``(plugin_name, undo)`` pair.
+
+    ``manifest`` (optional) enables the permission gate — when supplied,
+    non-trusted tiers must have declared a surface's permission token in
+    the manifest before the matching context API will register anything.
     """
     host = host or {}
     return PluginContext(
@@ -137,6 +240,11 @@ def build_context(
         command_registry=host.get("commands"),
         sub_agent_registry=host.get("sub_agents"),
         template_registry=host.get("templates"),
+        context_registry=host.get("context_providers"),
+        ui_registry=host.get("ui_providers"),
+        gateway_registry=host.get("gateway_adapters"),
+        memory_registry=host.get("memory_stores"),
+        manifest=manifest,
     )
 
 
@@ -163,12 +271,14 @@ class _ApiBase:
 
 
 class _ToolsApi(_ApiBase):
-    """``encre.tools`` 鈥?register tools into the live tool registry."""
+    """``encre.tools`` — register tools into the live tool registry."""
 
     _label = "tools"
 
     def register(self, tool: Any) -> _UNDO:
         """Register *tool*; returns its undo closure."""
+        if not self._ctx._gate("tools"):
+            return _noop_undo
         if self._host is None:
             return self._absent()
         try:
@@ -178,31 +288,35 @@ class _ToolsApi(_ApiBase):
 
 
 class _BackendsApi(_ApiBase):
-    """``encre.backends`` 鈥?register model backend classes."""
+    """``encre.backends`` — register model backend classes."""
 
     _label = "backends"
 
     def register(self, name: str, backend_class: type) -> _UNDO:
         """Register backend class under *name*; returns undo."""
+        if not self._ctx._gate("backends"):
+            return _noop_undo
         if self._host is None:
             return self._absent()
         return self._ctx.record_undo(self._host.plugin_register_backend(name, backend_class))
 
 
 class _LoopApi(_ApiBase):
-    """``encre.loop`` 鈥?intercept loop phases via the phase bus."""
+    """``encre.loop`` — intercept loop phases via the phase bus."""
 
     _label = "loop"
 
     def intercept(self, phase: str, handler: Callable[..., Any]) -> _UNDO:
         """Subscribe *handler* to *phase* on the phase bus; returns undo."""
+        if not self._ctx._gate("loop"):
+            return _noop_undo
         if self._host is None:
             return self._absent()
         return self._ctx.record_undo(self._host.subscribe(phase, handler, source=self._plugin))
 
 
 class _EventsApi(_ApiBase):
-    """``encre.events`` 鈥?typed plugin event pub/sub."""
+    """``encre.events`` — typed plugin event pub/sub (always permitted)."""
 
     _label = "events"
 
@@ -230,42 +344,129 @@ class _PermissionsApi(_ApiBase):
 
     def register(self, policy: Any) -> _UNDO:
         """Register *policy*; returns undo."""
+        if not self._ctx._gate("permissions"):
+            return _noop_undo
         if self._host is None:
             return self._absent()
         return self._ctx.record_undo(self._host.plugin_register_policy(policy, source=self._plugin))
 
 
 class _CommandsApi(_ApiBase):
-    """``encre.commands`` 鈥?register slash commands."""
+    """``encre.commands`` — register slash commands."""
 
     _label = "commands"
 
     def register(self, command: dict[str, Any]) -> _UNDO:
         """Register a slash-command definition; returns undo."""
+        if not self._ctx._gate("commands"):
+            return _noop_undo
         if self._host is None:
             return self._absent()
         return self._ctx.record_undo(self._host.plugin_register_command(command, source=self._plugin))
 
 
 class _SubAgentsApi(_ApiBase):
-    """``encre.sub_agents`` 鈥?register sub-agent definitions."""
+    """``encre.sub_agents`` — register sub-agent definitions."""
 
     _label = "sub_agents"
 
     def register(self, definition: dict[str, Any]) -> _UNDO:
         """Register a sub-agent definition; returns undo."""
+        if not self._ctx._gate("sub_agents"):
+            return _noop_undo
         if self._host is None:
             return self._absent()
         return self._ctx.record_undo(self._host.plugin_register_sub_agent(definition, source=self._plugin))
 
 
 class _TemplatesApi(_ApiBase):
-    """``encre.templates`` 鈥?register prompt templates."""
+    """``encre.templates`` -- register prompt templates."""
 
     _label = "templates"
 
     def register(self, name: str, template: str) -> _UNDO:
         """Register prompt template under *name*; returns undo."""
+        if not self._ctx._gate("templates"):
+            return _noop_undo
         if self._host is None:
             return self._absent()
         return self._ctx.record_undo(self._host.plugin_register_template(name, template, source=self._plugin))
+
+
+class _ContextProvidersApi(_ApiBase):
+    """``encre.context_providers`` -- inject context messages (S6).
+
+    Plugins register providers that the agent loop calls to assemble
+    additional context messages before each turn.  Each provider has a
+    ``name``, ``priority`` (lower = earlier), and ``provide(context_state)``
+    that returns a list of message dicts.
+    """
+
+    _label = "context_providers"
+
+    def register(self, provider: Any) -> _UNDO:
+        """Register a context *provider*; returns undo."""
+        if not self._ctx._gate("context_providers"):
+            return _noop_undo
+        if self._host is None:
+            return self._absent()
+        return self._ctx.record_undo(self._host.plugin_register_context_provider(provider, source=self._plugin))
+
+
+class _UIProvidersApi(_ApiBase):
+    """``encre.ui_providers`` -- inject desktop UI components (S7).
+
+    Plugins register UI providers that the Electron renderer loads as
+    dynamic modules.  Each provider has a ``name``, ``entry_point``
+    (JS/TS module path), and ``mount_point`` (where in the UI tree it
+    attaches: sidebar / panel / settings / chat-overlay).
+    """
+
+    _label = "ui_providers"
+
+    def register(self, provider: Any) -> _UNDO:
+        """Register a UI *provider*; returns undo."""
+        if not self._ctx._gate("ui_providers"):
+            return _noop_undo
+        if self._host is None:
+            return self._absent()
+        return self._ctx.record_undo(self._host.plugin_register_ui_provider(provider, source=self._plugin))
+
+
+class _GatewayAdaptersApi(_ApiBase):
+    """``encre.gateway_adapters`` -- register IM platform adapters (S8).
+
+    Plugins register gateway adapters that connect the agent to IM
+    platforms (Telegram, WeChat, QQ Bot, Slack, Discord, etc.).  Each
+    adapter implements ``connect()`` / ``disconnect()`` / ``send_message()``
+    / ``receive_message()``.
+    """
+
+    _label = "gateway_adapters"
+
+    def register(self, adapter: Any) -> _UNDO:
+        """Register a gateway *adapter*; returns undo."""
+        if not self._ctx._gate("gateway_adapters"):
+            return _noop_undo
+        if self._host is None:
+            return self._absent()
+        return self._ctx.record_undo(self._host.plugin_register_gateway_adapter(adapter, source=self._plugin))
+
+
+class _MemoryStoresApi(_ApiBase):
+    """``encre.memory_stores`` -- register memory storage backends (S9).
+
+    Plugins register alternative memory stores (vector DB, graph DB,
+    custom backends).  Each store implements ``store()`` / ``retrieve()``
+    / ``search()`` / ``delete()``.
+    """
+
+    _label = "memory_stores"
+
+    def register(self, store: Any) -> _UNDO:
+        """Register a memory *store*; returns undo."""
+        if not self._ctx._gate("memory_stores"):
+            return _noop_undo
+        if self._host is None:
+            return self._absent()
+        return self._ctx.record_undo(self._host.plugin_register_memory_store(store, source=self._plugin))

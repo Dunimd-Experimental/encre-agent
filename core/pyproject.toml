@@ -61,6 +61,7 @@ where = ["."]
 include = ["encre*"]
 
 [project.optional-dependencies]
+# --- IM platform extras (gateway adapters) ---
 discord = ["discord.py>=2.3", "PyNaCl>=1.5"]
 slack = ["slack_bolt>=1.18", "slack_sdk>=3.27"]
 telegram = ["python-telegram-bot>=20.0"]
@@ -73,6 +74,62 @@ google_chat = ["google-api-python-client>=2.0", "google-auth-httplib2>=0.2", "go
 teams = ["microsoft-teams-apps>=2.0"]
 sms = ["twilio>=8.0"]
 
+# --- EA tool/skill extras ---
+# Third-party dependencies declared by individual EA packages under
+# core/ea_tools/.  These are NOT root deps so that a minimal
+# ``pip install encre-core`` stays light; install
+# ``encre-core[ea-tools]`` to satisfy every bundled EA package.
+ea-tools = [
+    # Document / spreadsheet / presentation
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "openpyxl>=3.1",
+    "pdfplumber>=0.10",
+    # Imaging / QR / media
+    "plyer>=2.1",
+    "pyzbar>=0.1",
+    "qrcode>=7.0",
+    "imageio>=2.34",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    # Translation / transcription / search
+    "deep-translator>=1.11",
+    "youtube-transcript-api>=0.6",
+    "playwright>=1.44",
+    # Cloud storage
+    "azure-storage-blob>=12.19",
+    "google-cloud-storage>=2.10",
+    # LLM / AI SDKs
+    "openai>=1.0",
+    "google-genai>=1.0",
+    # Common utilities used by byted skills
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    # ByteDance / Volcengine SDKs
+    "ark-sdk>=1.0",
+    "veadk>=1.0",
+    "volcengine-sdk-ark>=1.0",
+    "volcengine-sdk-core>=1.0",
+    "volcengine-tos>=1.0",
+    # Testing
+    "pytest>=8",
+    "coverage>=7.0",
+]
+ea-databases = [
+    "aiosqlite>=0.20",
+    "asyncpg>=0.29",
+    "aiomysql>=0.2",
+    "pymssql>=2.2",
+    "oracledb>=2.0",
+    "duckdb>=1.0",
+    "clickhouse-driver>=0.2",
+    "motor>=3.0",
+    "pymongo>=4.6",
+    "redis>=5.0",
+]
+ea-whisper = ["openai-whisper>=20231117"]
+
 all = [
-    "encre-core[discord,slack,telegram,dingtalk,qqbot,email,matrix,feishu,google_chat,teams,sms]",
+    "encre-core[discord,slack,telegram,dingtalk,qqbot,email,matrix,feishu,google_chat,teams,sms,ea-tools,ea-databases,ea-whisper]",
 ]

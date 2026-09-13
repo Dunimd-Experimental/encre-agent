@@ -599,6 +599,23 @@ impl Bm25Index {
 #[pyfunction]
 fn permission_check(py: Python, tool_name: &str, args: &str) -> PyResult<PyObject> {
     let d = permission::permission_check(tool_name, args);
+    decision_to_dict(py, d)
+}
+
+/// Run the unified permission check with an explicit permission mode.
+///
+/// Preferred over :func:`permission_check`: the mode is passed with every
+/// call, so the user-managed policy table is consulted exactly when the
+/// calling session is in ``custom`` mode, regardless of what other sessions
+/// pushed into the process-wide mode slot.
+#[pyfunction]
+fn permission_check_mode(py: Python, tool_name: &str, args: &str, mode: &str) -> PyResult<PyObject> {
+    let d = permission::permission_check_mode(tool_name, args, mode);
+    decision_to_dict(py, d)
+}
+
+/// Convert a Rust permission decision into the dict the Python layer expects.
+fn decision_to_dict(py: Python, d: permission::PermissionDecision) -> PyResult<PyObject> {
     let out = PyDict::new(py);
     out.set_item("behavior", d.behavior_str())?;
     match d {
@@ -639,6 +656,31 @@ fn permission_get_policies() -> PyResult<String> {
 fn permission_record_decision(tool_name: &str, policy: &str) -> PyResult<()> {
     permission::permission_record_decision(tool_name, policy);
     Ok(())
+}
+
+/// Set the active session permission mode (``default`` | ``auto`` | ``bypass``
+/// | ``custom`` | ...).  The user-managed policy table is only consulted in
+/// ``custom`` mode; the preset modes ignore it.
+#[pyfunction]
+fn permission_set_mode(mode: &str) -> PyResult<()> {
+    permission::permission_set_mode(mode);
+    Ok(())
+}
+
+/// Replace the dangerous-command pattern table with the given rule text
+/// (same format as ``dangerous_commands.txt``).  Called by Python at startup
+/// so the rules always come from the package directory.
+#[pyfunction]
+fn permission_set_dangerous_patterns(text: &str) -> PyResult<()> {
+    permission::permission_set_dangerous_patterns(text);
+    Ok(())
+}
+
+/// Pure dangerous-command check for the bash tool family.  Returns the
+/// matched rule string when a subcommand hits the blacklist, else ``None``.
+#[pyfunction]
+fn permission_check_dangerous(tool_name: &str, args: &str) -> PyResult<Option<String>> {
+    Ok(permission::permission_check_dangerous(tool_name, args))
 }
 
 // ---------------------------------------------------------------------------
@@ -707,9 +749,13 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // New: permission system
     m.add_function(wrap_pyfunction!(permission_check, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_check_mode, m)?)?;
     m.add_function(wrap_pyfunction!(permission_set_policies, m)?)?;
     m.add_function(wrap_pyfunction!(permission_get_policies, m)?)?;
     m.add_function(wrap_pyfunction!(permission_record_decision, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_set_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_set_dangerous_patterns, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_check_dangerous, m)?)?;
 
     // BM25 indexer
     m.add_class::<Bm25Index>()?;

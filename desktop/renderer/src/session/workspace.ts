@@ -614,7 +614,7 @@ export class WorkspaceManager {
         models: getState().modelConfigs || [],
         selected,
         checked: modelSelEnabled,
-        disabled: !getState().settings.model_pool_enabled,
+        disabled: getState().settings.model_pool_enabled === false,
         t,
         titleKey: "workspace.modelSelectionTitle",
         hintKey: "workspace.modelSelectionHint",
@@ -628,7 +628,6 @@ export class WorkspaceManager {
    *  unindexed workspace shows 0%. */
   private indexCard(w: WorkspaceEntry): string {
     const progress = w.index_progress ?? 0;
-    const files = w.index_files ?? 0;
     const status = w.index_status ?? "idle";
     const hasIndex = status === "ready" || status === "error" || (progress || 0) > 0;
     const isIndexing = status === "indexing";
@@ -638,18 +637,15 @@ export class WorkspaceManager {
       : (hasIndex ? "var(--color-success, #22c55e)" : "var(--accent)");
     const btnIcon = isIndexing ? "pause" : (hasIndex ? "settings" : "play");
     const btnTitle = isIndexing ? "" : (hasIndex ? t("settings.indexActions") : t("settings.startIndex"));
-    return `<div class="model-form-thinking-card" data-index-card="${this.esc(w.id)}" style="padding:8px 12px">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
-        <div style="display:flex;align-items:center;gap:6px;min-width:0">
-          <i data-lucide="file-search" style="width:14px;height:14px;flex-shrink:0;color:var(--text-secondary)"></i>
-          <span class="model-form-thinking-title" style="margin:0">${t("workspace.index")}</span>
-        </div>
-        <button class="index-mgmt-btn" title="${btnTitle}" data-has-index="${hasIndex}" data-indexing="${isIndexing}" style="background:none;border:none;cursor:pointer;padding:4px;display:flex;align-items:center;justify-content:center;color:var(--text-secondary);border-radius:4px;transition:background 0.15s">
+    return `<div class="model-form-thinking-card" data-index-card="${this.esc(w.id)}" style="display:block;padding:8px 12px">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+        <span class="model-form-thinking-title" style="margin:0;white-space:nowrap;flex-shrink:0">${t("workspace.index")}</span>
+        <span style="font-size:11px;color:var(--text-muted);white-space:nowrap;flex-shrink:0">${pct}%</span>
+        <button class="index-mgmt-btn" title="${btnTitle}" data-has-index="${hasIndex}" data-indexing="${isIndexing}" style="margin-left:auto;background:none;border:none;cursor:pointer;padding:4px;display:flex;align-items:center;justify-content:center;color:var(--text-secondary);border-radius:4px;transition:background 0.15s;flex-shrink:0">
           <i data-lucide="${btnIcon}" style="width:14px;height:14px;display:block"></i>
         </button>
       </div>
-      <div class="workflow-progress-bar" style="margin:8px 0 4px"><div class="workflow-progress-fill" style="width:${pct}%;background:${fillColor}"></div></div>
-      <div class="workflow-progress-text" style="margin:0">${pct}%${files > 0 ? ` · ${files} ${t("settings.indexFilesCount")}` : ""}</div>
+      <div class="workflow-progress-bar" style="margin:0 0 4px"><div class="workflow-progress-fill" style="width:${pct}%;background:${fillColor}"></div></div>
     </div>`;
   }
 
@@ -681,36 +677,55 @@ export class WorkspaceManager {
         document.body.appendChild(menu);
       }
       menu.innerHTML = `
-        <div class="context-menu-item" data-action="reindex">${t("settings.reindex")}</div>
-        <div class="context-menu-item" data-action="delete-index">${t("settings.deleteIndex")}</div>`;
+        <div class="context-menu-item" data-action="reindex"><i data-lucide="refresh-cw" class="lucide lucide-sm"></i>${t("settings.reindex")}</div>
+        <div class="context-menu-item" data-action="delete-index"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("settings.deleteIndex")}</div>`;
 
       btn.addEventListener("click", function _onSettingsClick(e: Event) {
         e.stopPropagation();
-        document.querySelectorAll(".context-menu").forEach(m => (m as HTMLElement).style.display = "none");
         const shown = menu!.style.display !== "none";
         if (shown) {
           menu!.style.display = "none";
-        } else {
-          menu!.style.display = "block";
-          const rect = btn.getBoundingClientRect();
-          menu!.style.left = clampElLeft(menu!, rect.right - 160) + "px";
-          menu!.style.top = (rect.bottom + 4) + "px";
-          setTimeout(() => {
-            document.addEventListener("click", function _closeMenu() {
-              menu!.style.display = "none";
-              document.removeEventListener("click", _closeMenu);
-            });
-          }, 0);
+          return;
         }
+        // Hide other context menus; show this one via showContextMenu
+        // which clears inline display:none and positions the menu.
+        document.querySelectorAll(".context-menu").forEach(m => {
+          if (m !== menu) (m as HTMLElement).style.display = "none";
+        });
+        const rect = btn.getBoundingClientRect();
+        showContextMenu(menu!, rect.right - 160, rect.bottom + 4);
+        requestAnimationFrame(() => (window as any).lucide.createIcons({ root: menu! }));
+        setTimeout(() => {
+          document.addEventListener("click", function _closeMenu() {
+            menu!.style.display = "none";
+            document.removeEventListener("click", _closeMenu);
+          });
+        }, 0);
       });
 
       menu.querySelectorAll(".context-menu-item").forEach((item) => {
-        (item as HTMLElement).onclick = (e) => {
+        item.addEventListener("click", (e) => {
           e.stopPropagation();
           menu!.style.display = "none";
           const action = (item as HTMLElement).dataset.action!;
-          send({ type: action === "reindex" ? "reindex_workspace" : "delete_index", path: ws.path });
-        };
+          const isReindex = action === "reindex";
+          const doSend = () => {
+            send({ type: isReindex ? "reindex_workspace" : "delete_index", path: ws.path });
+          };
+          if (isReindex) {
+            Dialog.confirm(
+              t("workspace.confirmReindexTitle"),
+              t("workspace.confirmReindex", { name: ws.name }),
+              { container: document.getElementById("app") ?? undefined },
+            ).then((ok) => { if (ok) doSend(); });
+          } else {
+            Dialog.confirm(
+              t("workspace.confirmDeleteIndexTitle"),
+              t("workspace.confirmDeleteIndex", { name: ws.name }),
+              { priority: "high", container: document.getElementById("app") ?? undefined },
+            ).then((ok) => { if (ok) doSend(); });
+          }
+        });
       });
     } else {
       // No index: clicking button directly starts indexing
@@ -941,7 +956,7 @@ export class WorkspaceManager {
   private async handleUnarchive(sid: string): Promise<void> {
     const s = getState().archivedSessions.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (!(await Dialog.confirm(t("workspace.confirmUnarchiveTitle"), t("workspace.confirmUnarchive", { name })))) return;
+    if (!(await Dialog.confirm(t("workspace.confirmUnarchiveTitle"), t("workspace.confirmUnarchive", { name }), { container: document.getElementById("app") ?? undefined }))) return;
     // Optimistically drop the row from the archive view; the backend
     // broadcast re-inserts the session into the workspace history list.
     removeArchivedSessionById(sid);
@@ -953,7 +968,7 @@ export class WorkspaceManager {
   private async handleArchiveDelete(sid: string): Promise<void> {
     const s = getState().archivedSessions.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (!(await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name })))) return;
+    if (!(await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined }))) return;
     // Optimistically drop the row from the archive view.
     removeArchivedSessionById(sid);
     // If the deleted session is the one currently being viewed, clear the
@@ -969,7 +984,7 @@ export class WorkspaceManager {
   private async handleDelete(path: string): Promise<void> {
     const ws = getState().workspaces.find((w) => w.path === path);
     const name = ws?.name || path;
-    const ok = await Dialog.confirm(t("workspace.confirmDeleteOneTitle"), t("workspace.confirmDeleteOne", { name }));
+    const ok = await Dialog.confirm(t("workspace.confirmDeleteOneTitle"), t("workspace.confirmDeleteOne", { name }), { container: document.getElementById("app") ?? undefined });
     if (!ok) return;
     send({ type: "remove_workspace", path });
     // Backend replies workspace_removed; the state subscription refreshes the list.

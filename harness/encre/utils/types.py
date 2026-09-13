@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -53,7 +53,7 @@ from typing import Any, Literal, Union
 # How a model turn ended.
 FinishReason = Literal["stop", "tool_calls", "error", "max_tokens", "cancelled"]
 # Frontend permission mode selected for the session.
-PermissionMode = Literal["default", "accept_edits", "bypass", "dont_ask", "plan", "spec", "auto", "blacklist"]
+PermissionMode = Literal["default", "accept_edits", "bypass", "dont_ask", "plan", "spec", "auto", "blacklist", "custom"]
 # Outcome of a single permission decision.
 PermissionBehavior = Literal["allow", "deny", "ask"]
 # Kind of sub-task dispatched to a worker.
@@ -292,6 +292,19 @@ class CompactStarting:
     The frontend should show a non-expandable compression indicator
     while the model pauses to compact the context.
     """
+
+
+@dataclass
+class CompactFailed:
+    """Signals that a compaction did NOT produce a compacted result.
+
+    Emitted when the compact engine raised, or returned ``None`` (no-op),
+    after a ``CompactStarting`` was already sent.  The frontend must dismiss
+    the "compressing" indicator so it cannot get stuck on screen; the
+    conversation simply continues with the uncompressed context.
+    """
+
+    reason: str = ""
 
 
 @dataclass

@@ -177,6 +177,28 @@ set_custom_commands_provider(load_custom_slash_commands)
 
 logger = logging.getLogger("encre.transport.ws")
 
+# How long ``handle()`` waits for the client's first frame in order to learn
+# its transport-encryption mode before the first outbound frame leaves.  A
+# desktop client sends its (encrypted) first frame within a few milliseconds
+# of the socket opening, so this is normally free; a purely passive client
+# only pays it once, at connect time.
+_ENCRYPTION_PEEK_TIMEOUT_S = 0.15
+
+
+def _detect_client_encryption(raw: str | bytes) -> bool:
+    """Return True when a client frame looks like base64 ciphertext.
+
+    Plaintext clients send JSON, which always starts with ``{``; an encrypted
+    frame is base64 (``nonce || ciphertext || tag``) and never does.  Frames
+    that are not valid UTF-8 at all count as encrypted.
+    """
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    except UnicodeDecodeError:
+        return True
+    return not text.strip().startswith("{")
+
+
 # Bridge standard logging to loguru so ws.py logs appear in desktop output
 try:
     from loguru import logger as _loguru_logger
@@ -340,8 +362,31 @@ class EncreWSHandler(
         self._current_session_id = None
         self._current_ws_id = ""
         self._index_progress_callback = None
+        # One handler instance serves every socket (see EncreServer), so the
+        # encryption mode has to be re-detected per connection instead of
+        # inheriting whatever the previous client negotiated.
+        self._client_encrypted = None
         t_conn = time.time()
         logger.info("[perf] backend ws.accept")
+
+        # Learn the client's transport-encryption mode from its first frame
+        # *before* anything is sent back.  Detection used to happen only once
+        # the read loop started, which meant the placeholder `session_ready`
+        # and the entire unified initial snapshot below always left in
+        # plaintext — even for a client that had already proven it encrypts.
+        # `websockets` keeps the underlying frame queue, so the peeked frame is
+        # replayed into the read loop (see `_replay_first`).
+        _peeked_frame: str | bytes | None = None
+        if self._client_encrypted is None:
+            try:
+                _peeked_frame = await asyncio.wait_for(ws.recv(), timeout=_ENCRYPTION_PEEK_TIMEOUT_S)
+            except Exception as _peek_err:  # timeout / already closing
+                logger.debug("[ws] encryption peek unavailable: %s", _peek_err)
+                _peeked_frame = None
+            if _peeked_frame is not None:
+                self._client_encrypted = _detect_client_encryption(_peeked_frame)
+                logger.info("[ws] client transport encryption=%s (from first frame)",
+                            self._client_encrypted)
 
         # Send a placeholder session_ready immediately so the frontend can
         # start filling sidebar/tray data without waiting for the session
@@ -424,11 +469,22 @@ class EncreWSHandler(
         except Exception as exc:
             logger.warning("[push_all_data] initial push failed: %s", exc)
 
+        async def _replay_first():
+            """Yields the peeked first frame, then the live connection."""
+            if _peeked_frame is not None:
+                yield _peeked_frame
+            async for _next_raw in ws:
+                yield _next_raw
+
         try:
-            async for raw in ws:
-                if self._client_encrypted is None:
-                    text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-                    self._client_encrypted = not text.strip().startswith("{")
+            async for raw in _replay_first():
+                # Encryption is latched *on*, never off: a client whose keyfile
+                # was not ready on its first frame may upgrade to encrypted
+                # frames later, and one later frame must never be read as a
+                # downgrade back to plaintext.
+                if self._client_encrypted is not True and _detect_client_encryption(raw):
+                    self._client_encrypted = True
+                    logger.info("[ws] client transport encryption upgraded to on")
 
                 # Protocol-version handshake: old clients never send a
                 # version and stay compatible; new clients may declare one

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -84,7 +84,14 @@ class CompactionPipeline:
         *,
         backend: Any,
         config: Any,
+        extra_tokens: int = 0,
     ) -> PipelineReport:
+        """Run the compression pipeline.
+
+        ``extra_tokens`` is the fixed per-request overhead (system prompt +
+        tool schemas) added to the autocompact trigger check so it compares
+        the REAL request size against the window, not just the messages.
+        """
         report = PipelineReport(messages=list(messages))
         window = backend.context_window_size() if backend else 128_000
         est_tokens = _count_tokens(messages)
@@ -123,7 +130,10 @@ class CompactionPipeline:
         # hard-coded 32k default so the trigger matches what the backend will
         # actually reserve for output.
         slot_budget = getattr(config, "max_tokens", None) or getattr(config, "max_output_tokens", 32_768)
-        s = self._stage_compact_check(messages, window, est_tokens, max_output_tokens=slot_budget)
+        s = self._stage_compact_check(
+            messages, window, est_tokens,
+            max_output_tokens=slot_budget, extra_tokens=extra_tokens,
+        )
         report.add_stage(s)
         if s.did_work:
             report.needs_compact = True
@@ -276,13 +286,17 @@ class CompactionPipeline:
         window: int,
         est_tokens: int,
         max_output_tokens: int = 32_768,
+        extra_tokens: int = 0,
     ) -> StageResult:
         engine = self._get_compact_engine()
-        if engine.should_compact(messages, window, max_output_tokens=max_output_tokens):
+        if engine.should_compact(
+            messages, window,
+            max_output_tokens=max_output_tokens, extra_tokens=extra_tokens,
+        ):
             return StageResult(
                 name="autocompact",
                 did_work=True,
-                detail=f"triggered tokens={est_tokens} window={window}",
+                detail=f"triggered tokens={est_tokens}+{extra_tokens} window={window}",
             )
         return StageResult(name="autocompact", did_work=False)
 

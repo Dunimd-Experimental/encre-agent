@@ -122,3 +122,20 @@ export function showContextMenu(menu: HTMLElement, x: number, y: number): void {
     menu.style.top = `${clamp(top, FLOAT_MARGIN, window.innerHeight - rect.height - FLOAT_MARGIN)}px`;
   });
 }
+
+/** Estimated row height (px) for a standard dropdown item. */
+export const DROPDOWN_ITEM_H = 34;
+
+/**
+ * Caps a dropdown layer so at most `maxVisible` rows stay visible before a
+ * scrollbar kicks in. Sets the `--dd-max-h` custom property the stylesheet
+ * reads, so the cap survives subsequent reflows. Pass `itemH` when rows use
+ * a non-standard height (e.g. two-line workspace entries).
+ */
+export function capDropdownHeight(
+  menu: HTMLElement,
+  maxVisible: number,
+  itemH: number = DROPDOWN_ITEM_H,
+): void {
+  menu.style.setProperty("--dd-max-h", `${Math.max(1, maxVisible) * itemH}px`);
+}

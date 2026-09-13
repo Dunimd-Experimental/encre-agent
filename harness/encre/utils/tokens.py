@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -24,6 +24,7 @@
 """Shared token estimation using native Rust tokenizer, tiktoken, or fallback."""
 
 import importlib
+import json
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -245,6 +246,34 @@ def estimate_tokens_simple(text: str) -> int:
     tokenization but want a single consistent import point.
     """
     return estimate_tokens(text, model="gpt-5.6")
+
+
+def estimate_request_overhead(
+    system_prompt: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    model: str = "gpt-5.6",
+) -> int:
+    """Estimate tokens consumed by the fixed parts of an API request.
+
+    Compaction triggers were previously computed from the message list alone,
+    ignoring the system prompt and tool schemas that are sent with every
+    request.  For memory-heavy agents the system prompt alone can reach tens
+    of thousands of tokens, so the compaction threshold fired far too late
+    (or never) and the model degraded on an overfull context.  Callers add
+    this overhead to their message-token estimate before comparing it
+    against the context window.
+    """
+    total = 0
+    if system_prompt:
+        total += estimate_tokens(system_prompt, model) + 8
+    if tools:
+        try:
+            total += estimate_tokens(
+                json.dumps(tools, ensure_ascii=False, default=str), model
+            )
+        except Exception:
+            total += sum(estimate_tokens(str(tool), model) for tool in tools)
+    return total
 
 
 def is_tiktoken_available() -> bool:

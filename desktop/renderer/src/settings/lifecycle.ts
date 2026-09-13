@@ -157,6 +157,11 @@ export function openImpl(this: any): void {
   // Don't highlight any nav item on initial open — only when user clicks one
   this.nav.querySelectorAll(".settings-nav-item").forEach(item => item.classList.remove("active"));
   document.getElementById("app")?.classList.add("settings-mode");
+  // Entering settings should reveal the app-level sidebar (which carries
+  // the settings nav). If it was auto-collapsed by the inner sidebar or a
+  // narrow viewport snap, undo that so the settings nav is immediately
+  // visible — unless the user collapsed it by hand.
+  (window as any).__appRestoreSidebar?.();
   const sidebarNav = document.querySelector(".sidebar-settings-nav");
   if (sidebarNav && typeof (window as any).lucide !== "undefined") {
     (window as any).lucide.createIcons({ root: sidebarNav });
@@ -201,7 +206,21 @@ export function updateSidebarNavImpl(this: any): void {
 }
 
 export function closeImpl(this: any): void {
-  document.getElementById("app")?.classList.remove("settings-mode");
+  // Suppress the #main-content margin transition while settings-mode is
+  // removed: the !important margin override (0) and the sidebar-hidden
+  // negative margin differ, and without this the container visibly slides
+  // its right edge on exit. Freezing the transition for one frame makes the
+  // margin snap instantly, so the content surface stays put.
+  const mc = document.getElementById("main-content");
+  if (mc) {
+    const prev = mc.style.transition;
+    mc.style.transition = "none";
+    document.getElementById("app")?.classList.remove("settings-mode");
+    void mc.offsetWidth;
+    mc.style.transition = prev;
+  } else {
+    document.getElementById("app")?.classList.remove("settings-mode");
+  }
   delete document.documentElement.dataset.shortcutPanelActive;
   delete document.documentElement.dataset.shortcutRecording;
   (window as any).electronAPI?.setWinKeyCapture?.(false);

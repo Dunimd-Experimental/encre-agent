@@ -46,6 +46,7 @@ import { bindVersionTapUnlockImpl, loadVersionsImpl, handleAgentTapImpl, handleD
 // Chart.js is lazy-loaded on first render of the usage panel (see
 // _renderUsageSection) so it no longer blocks startup parsing.
 import { showTooltipAt, hideTooltip } from "../ui/tooltip.js";
+import { attachInputExpand } from "../ui/input-expand.js";
 import { SEARCH_ENGINES, getDefaultSearchEngine } from "../features/browser.js";
 import { searchSettingsNavItems, SEARCH_FILTER_META, SETTINGS_NAV_ITEMS } from "../features/search.js";
 import { setSearchFilter } from "../core/state.js";
@@ -103,7 +104,7 @@ function setDevModeEnabled(enabled: boolean): void {
   }
 }
 
-const PERMISSION_OPTIONS = ["default", "accept_edits", "plan", "auto", "dont_ask", "bypass"];
+const PERMISSION_OPTIONS = ["default", "auto", "bypass", "custom"];
 
 interface DropdownOption { id: string; label: string; icon?: string }
 
@@ -245,6 +246,14 @@ export class Settings {
     datasets: any[];
   } | null = null;
   private _usageGroupBy: "model" | "channel" = "model";
+  // Reentrancy guard for the async usage render.  Because _renderUsageSection
+  // awaits `import("chart.js")`, concurrent triggers (refresh callback + tab
+  // switch + autorun on usageStats change) could otherwise stack multiple
+  // Chart.js instances onto the canvas that innerHTML just replaced — that is
+  // what produced the perpetual "刷刷刷" flicker.  Overlapping triggers are
+  // coalesced into a single re-run via _usageRenderPending.
+  private _usageRendering: boolean = false;
+  private _usageRenderPending: boolean = false;
   private _recordingShortcutId: string | null = null;
   private _captureHandler: ((ev: KeyboardEvent) => void) | null = null;
 
@@ -431,7 +440,7 @@ export class Settings {
     // ── Model selection section (reuse push-gateway card style) ──
     const models = st.modelConfigs || [];
     const selectedModels = parseTargetModelSelection(s[`adapter_${defId}_models` as keyof typeof s] as string);
-    bodyHtml += renderTargetModelSelection({ id: defId, models, selected: selectedModels, t: tFn, disabled: !st.settings.model_pool_enabled });
+    bodyHtml += renderTargetModelSelection({ id: defId, models, selected: selectedModels, t: tFn, disabled: st.settings.model_pool_enabled === false });
 
     const titleKey = `settings.adapterName${defId.charAt(0).toUpperCase() + defId.slice(1)}`;
     const title = tFn(titleKey);
@@ -479,7 +488,7 @@ export class Settings {
         okBtn.textContent = tFn("settings.wechatUnbind");
         okBtn.className = "btn";
         const unbindFn = () => {
-          Dialog.confirm(tFn("settings.wechatUnbind"), tFn("settings.wechatUnbindConfirm")).then((confirmed) => {
+          Dialog.confirm(tFn("settings.wechatUnbind"), tFn("settings.wechatUnbindConfirm"), { container: document.getElementById("settings-view") ?? undefined }).then((confirmed) => {
             if (confirmed) {
               const unbindConfig: Record<string, any> = {
                 adapter_weixin_enabled: false, adapter_weixin_app_id: "",
@@ -622,7 +631,7 @@ private _bindModelSelect(): void {
   private _renderModelCreateDialog(editIdx?: number): void {
     const isEdit = editIdx !== undefined;
     const existing = isEdit ? getState().modelConfigs[editIdx!] : null;
-    const title = isEdit ? t("settings.editModel") : t("settings.addEditModel");
+    const title = isEdit ? `${t("settings.model")} "${this.esc(existing?.name || "")}"` : t("settings.addEditModel");
     const btnLabel = isEdit ? t("settings.saveChanges") : t("settings.addModel");
     const catalog = this._getCatalog();
 
@@ -1160,6 +1169,10 @@ private _bindModelSelect(): void {
         </div>
       </div>`;
     document.body.appendChild(overlay);
+    // Single hook for every form dialog: any `.input-wrapper--dialog` holding a
+    // multi-line textarea gets the composer's expand toggle (top-right, hover-
+    // revealed).  New dialogs built on this entry get it for free.
+    attachInputExpand(overlay);
 
     overlay.querySelectorAll("textarea").forEach((ta) => {
       let raf = 0;
@@ -1252,7 +1265,7 @@ private _bindModelSelect(): void {
           const sure = await Dialog.confirm(
             t("settings.storageImportReplaceTitle"),
             t("settings.storageImportReplaceConfirm"),
-            "high",
+            { priority: "high", container: document.getElementById("settings-view") ?? undefined },
           );
           if (!sure) return;
         }
@@ -1286,7 +1299,7 @@ private _bindModelSelect(): void {
           </div>
           <div class="model-table-cell model-cell-actions">
             <button class="btn-icon" data-action="view-skill" data-name="${this.esc(sk.name)}" data-tooltip="${t("settings.view")}">
-              <i data-lucide="eye" class="lucide"></i>
+              <i data-lucide="arrow-up-right" class="lucide"></i>
             </button>
             ${isUser ? `<button class="btn-icon" data-action="edit-skill" data-name="${this.esc(sk.name)}" data-tooltip="${t("settings.edit")}">
               <i data-lucide="pencil" class="lucide"></i>
@@ -1419,7 +1432,7 @@ private _bindModelSelect(): void {
         </div>
       </div>`;
 
-    const title = isEdit ? t("settings.editCommand") : t("settings.createCommand");
+    const title = isEdit ? `${t("settings.command")} "${this.esc(existing?.name || "")}"` : t("settings.createCommand");
     const { overlay, close } = this._showFormDialog(title, bodyHtml);
 
     const okBtn = overlay.querySelector("#dialog-form-ok") as HTMLButtonElement;
@@ -1427,11 +1440,11 @@ private _bindModelSelect(): void {
     okBtn.addEventListener("click", () => {
       const name = (document.getElementById("cmd-name") as HTMLInputElement)?.value?.trim();
       if (!name) {
-        Dialog.alert(t("settings.error"), t("settings.commandNamePlaceholder"));
+        Dialog.alert(t("settings.error"), t("settings.commandNamePlaceholder"), { container: document.getElementById("settings-view") ?? undefined });
         return;
       }
       if (!/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(name)) {
-        Dialog.alert(t("settings.error"), t("settings.invalidCommandName"));
+        Dialog.alert(t("settings.error"), t("settings.invalidCommandName"), { container: document.getElementById("settings-view") ?? undefined });
         return;
       }
 
@@ -1449,7 +1462,7 @@ private _bindModelSelect(): void {
         this.saveCustomCommands(updated);
       } else {
         if (st.customCommands.some(c => c.name === name)) {
-          Dialog.alert(t("settings.error"), t("settings.invalidCommandName"));
+          Dialog.alert(t("settings.error"), t("settings.invalidCommandName"), { container: document.getElementById("settings-view") ?? undefined });
           return;
         }
         const updated = [...st.customCommands, newCmd];
@@ -1514,10 +1527,10 @@ private _bindModelSelect(): void {
     if (sk.when_to_use) extraFields += `<div class="model-form-row"><label class="model-form-label">${t("settings.whenToUse")}</label><input type="text" class="model-form-input" value="${this.esc(sk.when_to_use)}" readonly /></div>`;
 
     const bodyHtml = `
-      <div class="model-form-row">
+      ${canEdit ? `<div class="model-form-row">
         <label class="model-form-label">${t("settings.skillName")}</label>
         <input type="text" class="model-form-input" value="${this.esc(sk.name)}" readonly />
-      </div>
+      </div>` : ""}
       <div class="model-form-row">
         <label class="model-form-label">${t("settings.source")}</label>
         <input type="text" class="model-form-input" value="${sk.source}" readonly />
@@ -1530,11 +1543,11 @@ private _bindModelSelect(): void {
       <div class="model-form-row">
         <label class="model-form-label">${t("settings.skillContent")}</label>
         ${canEdit
-          ? `<textarea id="skill-content-editor" class="code-textarea" rows="16" style="min-height:300px">${this.esc(fullContent)}</textarea>`
+          ? `<div class="input-wrapper input-wrapper--dialog"><textarea id="skill-content-editor" class="setting-rich-text" style="min-height:300px">${this.esc(fullContent)}</textarea></div>`
            : `<div class="msg-text" style="max-height:60vh;overflow-y:auto;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:8px">${renderMarkdown(content)}</div>`}
       </div>`;
 
-    const title = canEdit ? `${t("settings.edit")}: ${sk.name}` : sk.name;
+    const title = canEdit ? `${t("settings.skill")} "${sk.name}"` : sk.name;
     const { overlay, close } = this._showFormDialog(title, bodyHtml, true);
 
     if (canEdit) {
@@ -1599,7 +1612,6 @@ private _bindModelSelect(): void {
           <div class="model-table-cell model-cell-name">
             <span class="model-name-text">${this.esc(srv.name)}</span>
             <span class="model-active-tag" style="margin-left:8px">${sourceLabel}</span>
-            <span class="model-active-tag">${isDisabled ? t("settings.disabled") : t("settings.enabled")}</span>
           </div>
           <div class="model-table-cell model-cell-provider">
             <span class="mcp-transport-tag">${transportTag}</span>
@@ -1728,138 +1740,155 @@ private _bindModelSelect(): void {
 
   private _renderMcpImportDialog(editIdx?: number): void {
     const isEdit = editIdx !== undefined;
-    const title = isEdit ? t("settings.editMcpServer") : t("settings.addMcpServer");
+    const servers = getState().mcpServers || [];
+    const existing = isEdit ? servers[editIdx!] : undefined;
+    const title = isEdit ? `${t("settings.mcpServer")} "${this.esc(existing?.name || "")}"` : t("settings.addMcpServer");
 
-    // Pre-fill textarea for edit mode
-    let initialJson = "";
-    if (isEdit) {
-      const existing = (getState().mcpServers || [])[editIdx!];
-      if (existing) initialJson = this._serverConfigToJson(existing);
-    }
+    const initialName = existing?.name || "";
+    const initialType: "stdio" | "http" = existing?.type === "http" ? "http" : "stdio";
+    const initialCommand = existing?.command || "";
+    const initialArgs = (existing?.args || []).join(" ");
+    const initialUrl = existing?.url || "";
+    const initialEnv = existing?.env || {};
+
+    const envRowHtml = (k: string, v: string): string => `
+      <div class="mcp-env-row">
+        <input type="text" class="model-form-input mcp-env-key" placeholder="${t("settings.mcpEnvKey")}" value="${this.esc(k)}" />
+        <input type="text" class="model-form-input mcp-env-value" placeholder="${t("settings.mcpEnvValue")}" value="${this.esc(v)}" />
+        <button type="button" class="btn-icon mcp-env-remove" data-tooltip="${t("settings.remove")}">
+          <i data-lucide="trash-2" class="lucide"></i>
+        </button>
+      </div>`;
+    const envRowsHtml = (obj: Record<string, string>): string =>
+      Object.entries(obj).map(([k, v]) => envRowHtml(k, v)).join("");
+
+    const transportOptions: DropdownOption[] = [
+      { id: "stdio", label: t("settings.transportTagStdio") },
+      { id: "http", label: t("settings.transportTagHttp") },
+    ];
 
     const bodyHtml = `
+      <div class="model-form-row">
+        <label class="model-form-label" for="mcp-name"><span class="model-form-required">*</span>${t("settings.serverName")}</label>
+        <input type="text" id="mcp-name" class="model-form-input" value="${this.esc(initialName)}" placeholder="${t("settings.mcpNamePlaceholder")}" />
+      </div>
+      <div class="model-form-row">
+        <label class="model-form-label" for="mcp-transport">${t("settings.mcpTransport")}</label>
+        <div class="model-form-dropdown-row">
+          ${this.renderDropdown("mcp-transport", transportOptions, initialType, () => {})}
+        </div>
+      </div>
+      <div id="mcp-stdio-fields" class="mcp-transport-fields" ${initialType === "http" ? 'style="display:none"' : ""}>
+        <div class="model-form-row">
+          <label class="model-form-label" for="mcp-command"><span class="model-form-required">*</span>${t("settings.mcpCommand")}</label>
+          <input type="text" id="mcp-command" class="model-form-input" value="${this.esc(initialCommand)}" placeholder="${t("settings.mcpCommandPlaceholder")}" />
+        </div>
+        <div class="model-form-row">
+          <label class="model-form-label" for="mcp-args">${t("settings.mcpArgs")}</label>
+          <input type="text" id="mcp-args" class="model-form-input" value="${this.esc(initialArgs)}" placeholder="${t("settings.mcpArgsPlaceholder")}" />
+        </div>
+      </div>
+      <div id="mcp-http-fields" class="mcp-transport-fields" ${initialType === "stdio" ? 'style="display:none"' : ""}>
+        <div class="model-form-row">
+          <label class="model-form-label" for="mcp-url"><span class="model-form-required">*</span>${t("settings.mcpUrl")}</label>
+          <input type="text" id="mcp-url" class="model-form-input" value="${this.esc(initialUrl)}" placeholder="${t("settings.mcpUrlPlaceholder")}" />
+        </div>
+      </div>
       <div class="model-form-row" style="flex-direction:column;align-items:stretch">
-        <label class="model-form-label">${t("settings.importMcpJsonDesc")}</label>
-        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;line-height:1.6">
-          ${t("settings.importMcpJsonFmt1")}<br>
-          ${t("settings.importMcpJsonFmt2")}
+        <div class="mcp-env-label-row">
+          <label class="model-form-label">${t("settings.mcpEnvVars")}</label>
+          <button type="button" class="btn-icon" id="mcp-add-env" data-tooltip="${t("settings.mcpAddEnv")}">
+            <i data-lucide="plus" class="lucide"></i>
+          </button>
         </div>
-        <div class="input-wrapper input-wrapper--dialog" style="margin-bottom:10px">
-          <textarea id="mcp-import-textarea" class="setting-rich-text"
-            placeholder="${this.esc(t("settings.importMcpJsonPlaceholder"))}">${this.esc(initialJson)}</textarea>
-        </div>
-        <div id="mcp-import-preview" style="margin-top:0"></div>
-        <div id="mcp-import-options" class="hidden" style="margin-top:10px">
-          ${isEdit ? "" : `
-          <div style="font-size:12px;font-weight:500;color:var(--text-primary);margin-bottom:6px">${t("settings.importMode")}</div>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary);cursor:pointer">
-            <input type="radio" name="mcp-import-mode" value="merge" checked />
-            ${t("settings.importMcpJsonMerge")}
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary);cursor:pointer;margin-top:4px">
-            <input type="radio" name="mcp-import-mode" value="replace" />
-            ${t("settings.importMcpJsonReplace")}
-          </label>
-          `}
-        </div>
+        <div id="mcp-env-list">${envRowsHtml(initialEnv)}</div>
       </div>`;
 
     const { overlay, close } = this._showFormDialog(title, bodyHtml, true);
     const okBtn = overlay.querySelector("#dialog-form-ok") as HTMLButtonElement;
-    okBtn.textContent = t("settings.importMcpJsonParse");
+    okBtn.textContent = isEdit ? t("common.save") : t("settings.addMcpServer");
 
-    // ── Auto-grow textarea: height = content, capped at max-height ──
-    const ta = overlay.querySelector("#mcp-import-textarea") as HTMLTextAreaElement;
-    if (ta) {
-      let raf = 0;
-      const grow = () => {
-        if (raf) return;
-        raf = requestAnimationFrame(() => {
-          raf = 0;
-          ta.style.height = "auto";
-          ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
-        });
-      };
-      ta.addEventListener("input", grow);
-      grow();
-    }
+    let currentType: "stdio" | "http" = initialType;
+    this.bindDropdown("mcp-transport", (val) => {
+      currentType = (val as "stdio" | "http") || initialType;
+      const stdioEl = overlay.querySelector("#mcp-stdio-fields") as HTMLElement | null;
+      const httpEl = overlay.querySelector("#mcp-http-fields") as HTMLElement | null;
+      if (stdioEl) stdioEl.style.display = currentType === "http" ? "none" : "";
+      if (httpEl) httpEl.style.display = currentType === "http" ? "" : "none";
+    });
 
-    let parsedServers: MCPServerConfig[] | null = null;
+    const envList = overlay.querySelector("#mcp-env-list") as HTMLElement | null;
+    overlay.querySelector("#mcp-add-env")?.addEventListener("click", () => {
+      if (!envList) return;
+      const row = document.createElement("div");
+      row.className = "mcp-env-row";
+      row.innerHTML = `
+        <input type="text" class="model-form-input mcp-env-key" placeholder="${t("settings.mcpEnvKey")}" />
+        <input type="text" class="model-form-input mcp-env-value" placeholder="${t("settings.mcpEnvValue")}" />
+        <button type="button" class="btn-icon mcp-env-remove" data-tooltip="${t("settings.remove")}">
+          <i data-lucide="trash-2" class="lucide"></i>
+        </button>`;
+      envList.appendChild(row);
+      row.querySelector<HTMLInputElement>(".mcp-env-key")?.focus();
+      // Newly inserted nodes need their lucide icons created, otherwise the
+      // remove button renders as an empty shell.
+      if (typeof (window as any).lucide !== "undefined") {
+        (window as any).lucide.createIcons({ root: row });
+      }
+    });
+    envList?.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest(".mcp-env-remove");
+      if (btn) (btn.closest(".mcp-env-row") as HTMLElement | null)?.remove();
+    });
 
     okBtn.addEventListener("click", () => {
-      if (parsedServers) {
-        // ── Import / Save mode (second click) ──
-        if (isEdit) {
-          const current = [...(getState().mcpServers || [])];
-          if (editIdx! < current.length) current.splice(editIdx!, 1);
-          current.push(...parsedServers);
-          send({ type: "update_mcp", mcp_servers: current });
-        } else {
-          const isMerge = (overlay.querySelector('input[name="mcp-import-mode"]:checked') as HTMLInputElement)?.value === "merge";
-          const current = [...(getState().mcpServers || [])];
-          if (isMerge) {
-            const existingNames = new Set(current.map((s) => s.name));
-            for (const srv of parsedServers) {
-              if (!existingNames.has(srv.name)) current.push(srv);
-            }
-          } else {
-            current.length = 0;
-            current.push(...parsedServers);
-          }
-          send({ type: "update_mcp", mcp_servers: current });
+      const name = (overlay.querySelector("#mcp-name") as HTMLInputElement)?.value?.trim();
+      if (!name) {
+        showToast(t("settings.mcpNameRequired"), "", "error", "Settings");
+        return;
+      }
+
+      const newServer: MCPServerConfig = { name, type: currentType };
+      if (currentType === "http") {
+        const url = (overlay.querySelector("#mcp-url") as HTMLInputElement)?.value?.trim() || "";
+        if (!url) {
+          showToast(t("settings.mcpUrlRequired"), "", "error", "Settings");
+          return;
         }
-        close();
-        return;
+        newServer.url = url;
+        newServer.timeout = 60;
+        if (existing?.headers) newServer.headers = existing.headers;
+      } else {
+        const command = (overlay.querySelector("#mcp-command") as HTMLInputElement)?.value?.trim() || "";
+        if (!command) {
+          showToast(t("settings.mcpCommandRequired"), "", "error", "Settings");
+          return;
+        }
+        newServer.command = command;
+        const argsRaw = (overlay.querySelector("#mcp-args") as HTMLInputElement)?.value?.trim() || "";
+        newServer.args = argsRaw ? argsRaw.split(/\s+/) : [];
+        if (existing?.cwd) newServer.cwd = existing.cwd;
       }
 
-      // ── Parse mode (first click) ──
-      const textarea = overlay.querySelector("#mcp-import-textarea") as HTMLTextAreaElement;
-      const raw = textarea?.value.trim();
-      if (!raw) {
-        showToast(t("common.pleaseFillRequired"), "", "error", "Settings");
-        return;
-      }
+      const env: Record<string, string> = {};
+      envList?.querySelectorAll(".mcp-env-row").forEach((row) => {
+        const k = (row.querySelector(".mcp-env-key") as HTMLInputElement)?.value?.trim();
+        const v = (row.querySelector(".mcp-env-value") as HTMLInputElement)?.value || "";
+        if (k) env[k] = v;
+      });
+      if (Object.keys(env).length > 0) newServer.env = env;
 
-      let parsed: any;
-      try {
-        parsed = JSON.parse(raw);
-      } catch (e) {
-        showToast(t("settings.importMcpJsonParseError"), String(e), "error", "Settings");
-        return;
+      const current = [...(getState().mcpServers || [])];
+      if (isEdit && editIdx! < current.length) {
+        if (current[editIdx!].source) newServer.source = current[editIdx!].source;
+        if (current[editIdx!].disabled) newServer.disabled = true;
+        current[editIdx!] = newServer;
+      } else {
+        newServer.source = "user";
+        current.push(newServer);
       }
-
-      const servers = this._parseMcpJsonToServers(parsed);
-      if (servers.length === 0) {
-        showToast(t("settings.importMcpJsonParseError"), t("settings.noMcpServers"), "error", "Settings");
-        return;
-      }
-
-      // Show parsed preview
-      parsedServers = servers;
-      const preview = overlay.querySelector("#mcp-import-preview") as HTMLElement;
-      let html = `<div style="font-size:12px;color:var(--text-success);margin-bottom:8px">${t("settings.importMcpJsonParsed", { count: servers.length })}</div>`;
-      html += `<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">`;
-      html += `<div style="display:grid;grid-template-columns:1fr 2fr 1fr;font-size:11px;font-weight:600;background:var(--bg-secondary);padding:6px 10px;border-bottom:1px solid var(--border)">`;
-      html += `<div>${t("settings.mcpColName")}</div><div>${t("settings.mcpColCommandUrl")}</div><div>${t("settings.mcpColType")}</div></div>`;
-      for (const srv of servers) {
-        const detail = srv.type === "http"
-          ? (srv.url || "")
-          : `${srv.command || ""} ${(srv.args || []).join(" ")}`.trim();
-        const typeLabel = srv.type === "http" ? "HTTP" : "STDIO";
-        html += `<div style="display:grid;grid-template-columns:1fr 2fr 1fr;padding:5px 10px;font-size:11px;border-bottom:1px solid var(--border);align-items:center">`;
-        html += `<div style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${this.esc(srv.name)}</div>`;
-        html += `<div style="color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 6px">${this.esc(detail)}</div>`;
-        html += `<div><span class="mcp-transport-tag" style="font-size:10px">${typeLabel}</span></div>`;
-        html += `</div>`;
-      }
-      html += `</div>`;
-      preview.innerHTML = html;
-
-      // Reveal options and switch button text
-      overlay.querySelector("#mcp-import-options")?.classList.remove("hidden");
-      okBtn.textContent = isEdit
-        ? t("common.save")
-        : t("settings.importMcpJsonConfirm", { count: servers.length });
+      send({ type: "update_mcp", mcp_servers: current });
+      close();
     });
 
     if (typeof (window as any).lucide !== "undefined") {
@@ -1929,7 +1958,7 @@ private _bindModelSelect(): void {
     this.panels.rules.querySelectorAll("[data-action='delete-rule']").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const name = (btn as HTMLElement).getAttribute("data-name") || "";
-        if (await Dialog.confirm(t("common.confirmDeleteTitle"), t("common.confirmDelete", { name: `${name}.md` }))) {
+        if (await Dialog.confirm(t("common.confirmDeleteTitle"), t("common.confirmDelete", { name: `${name}.md` }), { container: document.getElementById("settings-view") ?? undefined })) {
           send({ type: "delete_global_rule", name });
         }
       });
@@ -1947,7 +1976,7 @@ private _bindModelSelect(): void {
   }
 
   private _showRuleFormDialog(name: string, content: string, isEdit: boolean): void {
-    const title = isEdit ? t("settings.edit") : t("settings.addGlobalRule");
+    const title = isEdit ? `${t("settings.rules")} "${this.esc(name)}"` : t("settings.addGlobalRule");
     const bodyHtml = `
       <div class="model-form-row">
         <label class="model-form-label" for="rule-form-name">
@@ -2066,8 +2095,12 @@ private _bindModelSelect(): void {
 
     const toolsHtml = renderRows(toolEntries);
 
+    // The per-tool rules below are honoured only by the "custom" permission
+    // mode; the three preset modes (manual / auto / full access) ignore them
+    // entirely, both in this panel and in the Rust engine.
     this.panels.permissions.innerHTML = `
       <div class="settings-section-title"><i data-lucide="shield" class="lucide section-title-icon"></i> ${t("permissions.settings.title")}</div>
+      <div class="permission-mode-hint">${this.esc(t("permissions.settings.customOnlyNote"))}</div>
       <div class="settings-card">${toolsHtml}</div>
     `;
 
@@ -2172,7 +2205,7 @@ private _bindModelSelect(): void {
         </div>
       </div>`;
 
-    const title = isEdit ? t("settings.editSubAgent") : t("settings.addSubAgent");
+    const title = isEdit ? `${t("settings.subAgent")} "${this.esc(existing?.name || "")}"` : t("settings.addSubAgent");
     const { overlay, close } = this._showFormDialog(title, bodyHtml, true);
 
     const okBtn = overlay.querySelector("#dialog-form-ok") as HTMLButtonElement;
@@ -2226,7 +2259,7 @@ private _bindModelSelect(): void {
           </div>
           <div class="model-table-cell model-cell-actions">
             <button class="btn-icon" data-action="view-memory" data-path="${this.esc(entry.path)}" data-tooltip="${tFn("settings.view")}">
-              <i data-lucide="eye" class="lucide"></i>
+              <i data-lucide="arrow-up-right" class="lucide"></i>
             </button>
           </div>
         </div>`;
@@ -2266,14 +2299,10 @@ private _bindModelSelect(): void {
     const fileName = path.replace(/\.md$/i, "").split("/").pop() || path;
     const bodyHtml = `
       <div class="model-form-row">
-        <label class="model-form-label">${tFn("settings.memoryFileName")}</label>
-        <input type="text" class="model-form-input" value="${this.esc(fileName)}" readonly />
-      </div>
-      <div class="model-form-row">
         <label class="model-form-label">${tFn("settings.memoryContent")}</label>
         <div id="memory-detail-content" class="msg-text" style="max-height:60vh;overflow-y:auto;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:8px">${tFn("settings.loading")}</div>
       </div>`;
-    const { overlay, close } = this._showFormDialog(tFn("settings.view"), bodyHtml, true);
+    const { overlay, close } = this._showFormDialog(fileName, bodyHtml, true);
     const cancelBtn = overlay.querySelector("#dialog-form-cancel") as HTMLElement | null;
     if (cancelBtn) cancelBtn.style.display = "none";
     const okBtn = overlay.querySelector("#dialog-form-ok") as HTMLButtonElement;
@@ -2284,32 +2313,248 @@ private _bindModelSelect(): void {
   }
 
   private async _renderUsageSection(): Promise<void> {
-    const el = this.panels.usage;
-    if (!el) return;
-    const stats = getState().usageStats;
-    const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#999";
-    const muted = getComputedStyle(document.documentElement).getPropertyValue("--text-muted").trim() || "#666";
-
-    if (!stats || stats.total_sessions === 0) {
-      el.innerHTML = `
-        <div class="settings-section-title"><i data-lucide="chart-column" class="lucide section-title-icon"></i> ${t("settings.usageStats")}</div>
-        <div class="usage-empty">
-          <div class="usage-empty-icon"><i data-lucide="chart-column" class="lucide"></i></div>
-          <div class="usage-empty-text">${t("settings.noUsageData")}</div>
-          <button class="btn-secondary" id="btn-refresh-usage-empty">${t("settings.refresh")}</button>
-        </div>`;
-      document.getElementById("btn-refresh-usage-empty")?.addEventListener("click", () => {
-        refreshAllData();
-      });
-      if (typeof (window as any).lucide !== "undefined") {
-        (window as any).lucide.createIcons({ root: el });
-      }
+    // Reentrancy guard: _renderUsageSection awaits `import("chart.js")`, so
+    // overlapping triggers (refresh callback + tab switch + autorun on
+    // usageStats change) are coalesced into a single re-run.
+    if (this._usageRendering) {
+      this._usageRenderPending = true;
       return;
     }
+    this._usageRendering = true;
+    try {
+      const el = this.panels.usage;
+      if (!el) return;
+      const stats = getState().usageStats;
+      const muted = getComputedStyle(document.documentElement).getPropertyValue("--text-muted").trim() || "#666";
 
-    // ── Group sessions by (day, model|channel) for a unified chart ──
-    const sessions = stats.sessions || [];
-    const groupBy = this._usageGroupBy;
+      if (!stats || stats.total_sessions === 0) {
+        // No data — render the empty state (only when not already shown, so a
+        // refresh that returns no data doesn't flicker the whole panel).
+        if (!el.querySelector("#usage-empty")) {
+          el.innerHTML = `
+            <div class="settings-section-title"><i data-lucide="chart-column" class="lucide section-title-icon"></i> ${t("settings.usageStats")}</div>
+            <div class="usage-empty" id="usage-empty">
+              <div class="usage-empty-icon"><i data-lucide="chart-column" class="lucide"></i></div>
+              <div class="usage-empty-text">${t("settings.noUsageData")}</div>
+              <button class="btn-secondary" id="btn-refresh-usage-empty">${t("settings.refresh")}</button>
+            </div>`;
+          document.getElementById("btn-refresh-usage-empty")?.addEventListener("click", () => {
+            refreshAllData();
+          });
+          if (typeof (window as any).lucide !== "undefined") {
+            (window as any).lucide.createIcons({ root: el });
+          }
+        }
+        return;
+      }
+
+      const groupBy = this._usageGroupBy;
+      const model = this._computeUsageChartModel(stats.sessions || [], groupBy);
+
+      // Build the static shell (title + icon + metrics container + activity
+      // heatmap + chart box) ONLY when it isn't already present.  A refresh /
+      // autorun / re-entry that finds an existing shell skips this and only
+      // updates the concrete data below — so the section title, its icon and
+      // the activity heatmap never re-render on refresh.
+      const needsShell = !el.querySelector("#usage-metrics");
+
+      if (needsShell) {
+        const heatmap = this._renderUsageHeatmap(stats.sessions || [], muted);
+        const unifiedChart = this._renderUnifiedDailyBarChart(model, groupBy, muted);
+        el.innerHTML = `
+          <div class="settings-section-title">
+            <i data-lucide="chart-column" class="lucide section-title-icon"></i>
+            ${t("settings.usageStats")}
+            <button class="btn-icon" id="btn-refresh-usage-chart" data-tooltip="${t("settings.refresh")}" style="margin-left:auto">
+              <i data-lucide="refresh-cw" class="lucide"></i>
+            </button>
+          </div>
+
+          <div class="usage-metrics" id="usage-metrics">
+            ${this._metricHtml("usage-metric-sessions", stats.total_sessions, "settings.totalSessions")}
+            <div class="usage-metric-vr"></div>
+            ${this._metricHtml("usage-metric-tokens", this._formatNumber(stats.total_tokens), "settings.totalTokens")}
+            <div class="usage-metric-vr"></div>
+            ${this._metricHtml("usage-metric-input", this._formatNumber(stats.total_input_tokens), "settings.totalInputTokens")}
+            <div class="usage-metric-vr"></div>
+            ${this._metricHtml("usage-metric-output", this._formatNumber(stats.total_output_tokens), "settings.totalOutputTokens")}
+            <div class="usage-metric-vr"></div>
+            ${this._metricHtml("usage-metric-tools", stats.total_tool_calls, "settings.totalToolCalls")}
+          </div>
+
+          ${heatmap}
+
+          ${unifiedChart}`;
+
+        document.getElementById("btn-refresh-usage-chart")?.addEventListener("click", () => {
+          refreshAllData();
+        });
+        el.querySelectorAll(".usage-groupby-seg .seg-item").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const mode = (btn as HTMLElement).getAttribute("data-groupby") as "model" | "channel";
+            if (mode) this._applyUsageGrouping(mode);
+          });
+        });
+        if (typeof (window as any).lucide !== "undefined") {
+          (window as any).lucide.createIcons({ root: el });
+        }
+      }
+
+      // ---- in-place DATA update (runs on every render / refresh) ----
+      const metricsEl = el.querySelector("#usage-metrics") as HTMLElement | null;
+      const chartWrap = el.querySelector("#usage-chart-wrap") as HTMLElement | null;
+      const canvas = el.querySelector("#usage-bar-chart") as HTMLCanvasElement | null;
+
+      // Show the skeleton shimmer on the data regions while we recompute.
+      metricsEl?.classList.add("is-loading");
+      chartWrap?.classList.remove("is-ready");
+
+      // Metric numbers update synchronously.
+      this._setMetricValue(el, "usage-metric-sessions", String(stats.total_sessions));
+      this._setMetricValue(el, "usage-metric-tokens", this._formatNumber(stats.total_tokens));
+      this._setMetricValue(el, "usage-metric-input", this._formatNumber(stats.total_input_tokens));
+      this._setMetricValue(el, "usage-metric-output", this._formatNumber(stats.total_output_tokens));
+      this._setMetricValue(el, "usage-metric-tools", String(stats.total_tool_calls));
+
+      // Legend + title + segment highlight follow the grouping silently.
+      const legendEl = el.querySelector(".usage-legend") as HTMLElement | null;
+      if (legendEl) legendEl.innerHTML = model.legendHtml;
+      const titleEl = el.querySelector(".usage-chart-title-text") as HTMLElement | null;
+      if (titleEl) {
+        titleEl.textContent = t(groupBy === "model" ? "settings.dailyUsageByModel" : "settings.dailyUsageByChannel");
+      }
+      el.querySelectorAll(".usage-groupby-seg .seg-item").forEach((b) => {
+        const isActive = (b as HTMLElement).getAttribute("data-groupby") === groupBy;
+        b.classList.toggle("active", isActive);
+        (b as HTMLElement).setAttribute("aria-selected", String(isActive));
+      });
+
+      // Lazy-load Chart.js (cached after first resolve).
+      const { Chart, registerables } = await import("chart.js");
+      Chart.register(...registerables);
+
+      if (needsShell) {
+        // Fresh canvas — build a new instance.
+        if (this._usageBarChart) {
+          this._usageBarChart.destroy();
+          this._usageBarChart = null;
+        }
+        if (canvas && this._usageBarChartData) {
+          const data = this._usageBarChartData;
+          this._usageBarChart = new Chart(canvas, {
+            type: "bar",
+            data: { labels: data.labels, datasets: data.datasets },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              // The shimmer placeholder already conveys "loading"; disable the
+              // chart's own entry animation so switching/refreshing doesn't
+              // re-flicker the bars.
+              animation: false,
+              plugins: {
+                legend: { display: false },
+                // Native Chart.js tooltip disabled in favour of our global custom
+                // tooltip (see tooltip.ts) which matches the app's design system.
+                tooltip: { enabled: false },
+              },
+              onHover: (event: any, activeElements: any[]) => {
+                const d = this._usageBarChartData;
+                if (!d || !activeElements || activeElements.length === 0) {
+                  hideTooltip();
+                  return;
+                }
+                const idx = activeElements[0].index;
+                const day = d.labels[idx];
+                const lines = [`${day}`];
+                let total = 0;
+                for (const ds of d.datasets) {
+                  const v = (ds.data as any[])[idx] || 0;
+                  if (v > 0) {
+                    lines.push(`${ds.label}: ${this._formatNumber(v)}`);
+                    total += v;
+                  }
+                }
+                lines.push(`${t("settings.chartTotal")}: ${this._formatNumber(total)}`);
+                const rect = canvas!.getBoundingClientRect();
+                const x = rect.left + (event?.x ?? rect.width / 2);
+                const y = rect.top + (event?.y ?? 0);
+                showTooltipAt(lines.join("\n"), x, y);
+              },
+              scales: {
+                x: {
+                  stacked: true,
+                  grid: { color: "rgba(224,226,242,0.08)" },
+                  ticks: { color: muted, font: { size: 10 } },
+                },
+                y: {
+                  stacked: true,
+                  beginAtZero: true,
+                  grid: { color: "rgba(224,226,242,0.08)" },
+                  ticks: {
+                    color: muted,
+                    font: { size: 10 },
+                    callback: (v: any) => this._formatNumber(Number(v)),
+                  },
+                },
+              },
+            },
+          });
+          canvas.addEventListener("mouseleave", () => hideTooltip());
+        }
+      } else if (this._usageBarChart) {
+        // Same canvas — update in place, no recreate, no flicker.
+        this._usageBarChart.data.labels = this._usageBarChartData!.labels as any;
+        this._usageBarChart.data.datasets = this._usageBarChartData!.datasets as any;
+        this._usageBarChart.update();
+      }
+
+      // Reveal the data: drop the shimmer.
+      metricsEl?.classList.remove("is-loading");
+      requestAnimationFrame(() => chartWrap?.classList.add("is-ready"));
+    } finally {
+      this._usageRendering = false;
+      if (this._usageRenderPending) {
+        this._usageRenderPending = false;
+        void this._renderUsageSection();
+      }
+    }
+  }
+
+  /** Build one metric cell (value + label) with a hidden shimmer bar that is
+   *  revealed only while the metrics row is in its loading state. */
+  private _metricHtml(id: string, value: string | number, labelKey: string): string {
+    return `
+          <div class="usage-metric">
+            <span class="usage-metric-value" id="${id}">${value}</span>
+            <span class="usage-metric-shimmer" aria-hidden="true"></span>
+            <span class="usage-metric-label">${t(labelKey)}</span>
+          </div>`;
+  }
+
+  /** Update a metric cell's numeric value in place (no DOM rebuild). */
+  private _setMetricValue(root: HTMLElement, id: string, value: string): void {
+    const node = root.querySelector("#" + id) as HTMLElement | null;
+    if (node) node.textContent = value;
+  }
+
+  /** Pure data computation for the unified daily bar chart.  Shared by the
+   *  full panel render and the lightweight in-place re-grouping so the
+   *  (somewhat heavy) aggregation is defined exactly once. */
+  private _computeUsageChartModel(
+    sessions: UsageStatsSessionEntry[],
+    groupBy: "model" | "channel",
+  ): {
+    days: string[];
+    groupOrder: string[];
+    cellMap: Record<string, Record<string, { tokens: number; count: number; turns: number; tools: number }>>;
+    groupColor: Record<string, string>;
+    groupTotals: Record<string, { tokens: number; status?: string }>;
+    truncated: boolean;
+    labels: string[];
+    datasets: any[];
+    legendHtml: string;
+  } {
     // Collect every day that has any session, sorted ascending.
     const daySet = new Set<string>();
     for (const s of sessions) {
@@ -2356,141 +2601,94 @@ private _bindModelSelect(): void {
     }
 
     const truncated = allDays.length > days.length;
-    const unifiedChart = this._renderUnifiedDailyBarChart(days, groupOrder, cellMap, groupColor, muted, groupTotals, truncated, groupBy);
-    const heatmap = this._renderUsageHeatmap(sessions, muted);
+    const labels = days.map((d) => this._shortDay(d));
+    const datasets = groupOrder.map((g) => ({
+      label: g,
+      data: days.map((d) => cellMap[d]?.[g]?.tokens || 0),
+      backgroundColor: groupColor[g],
+      borderColor: groupColor[g],
+      borderWidth: 0,
+      borderRadius: 2,
+      maxBarThickness: 28,
+      stack: "usage",
+    }));
+    this._usageBarChartData = { labels, datasets };
 
-    el.innerHTML = `
-      <div class="settings-section-title">
-        <i data-lucide="chart-column" class="lucide section-title-icon"></i>
-        ${t("settings.usageStats")}
-        <button class="btn-icon" id="btn-refresh-usage-chart" data-tooltip="${t("settings.refresh")}" style="margin-left:auto">
-          <i data-lucide="refresh-cw" class="lucide"></i>
-        </button>
-      </div>
+    // Legend: every group with >0 tokens gets a swatch + name + total.
+    const legendHtml = groupOrder
+      .filter((g) => (groupTotals[g]?.tokens || 0) > 0)
+      .map((g) => {
+        const color = groupColor[g];
+        const total = groupTotals[g]?.tokens || 0;
+        const status = groupTotals[g]?.status;
+        const tag =
+          groupBy === "model" && status === "deleted"
+            ? `<span class="usage-model-tag usage-model-tag--deleted">${t("settings.deletedModel")}</span>`
+            : groupBy === "model" && status === "unknown"
+              ? `<span class="usage-model-tag usage-model-tag--unknown">${t("settings.unknownModel")}</span>`
+              : "";
+        const display = g.length > 32 ? this.esc(g.slice(0, 32) + "...") : this.esc(g);
+        return `
+          <div class="usage-legend-item">
+            <span class="usage-model-dot" style="background:${color}"></span>
+            <span class="usage-legend-name">${display}</span>
+            ${tag}
+            <span class="usage-legend-tokens">${this._formatNumber(total)}</span>
+          </div>`;
+      })
+      .join("");
 
-      <!-- Metrics row -->
-      <div class="usage-metrics">
-        <div class="usage-metric">
-          <span class="usage-metric-value">${stats.total_sessions}</span>
-          <span class="usage-metric-label">${t("settings.totalSessions")}</span>
-        </div>
-        <div class="usage-metric-vr"></div>
-        <div class="usage-metric">
-          <span class="usage-metric-value">${this._formatNumber(stats.total_tokens)}</span>
-          <span class="usage-metric-label">${t("settings.totalTokens")}</span>
-        </div>
-        <div class="usage-metric-vr"></div>
-        <div class="usage-metric">
-          <span class="usage-metric-value">${this._formatNumber(stats.total_input_tokens)}</span>
-          <span class="usage-metric-label">${t("settings.totalInputTokens")}</span>
-        </div>
-        <div class="usage-metric-vr"></div>
-        <div class="usage-metric">
-          <span class="usage-metric-value">${this._formatNumber(stats.total_output_tokens)}</span>
-          <span class="usage-metric-label">${t("settings.totalOutputTokens")}</span>
-        </div>
-        <div class="usage-metric-vr"></div>
-        <div class="usage-metric">
-          <span class="usage-metric-value">${stats.total_tool_calls}</span>
-          <span class="usage-metric-label">${t("settings.totalToolCalls")}</span>
-        </div>
-      </div>
+    return { days, groupOrder, cellMap, groupColor, groupTotals, truncated, labels, datasets, legendHtml };
+  }
 
-      <!-- Activity heatmap (per-hour, all models combined) -->
-      ${heatmap}
+  /** Switch the daily chart grouping (按模型 / 按模式) WITHOUT rebuilding the
+   *  whole panel.  Reuses the existing Chart.js instance and only swaps the
+   *  datasets + legend, then fades the shimmer out.  This is what removes the
+   *  "switching triggers the entire panel to re-render" flicker. */
+  private _applyUsageGrouping(mode: "model" | "channel"): void {
+    if (mode === this._usageGroupBy) return;
+    const el = this.panels.usage;
+    if (!el) return;
+    const stats = getState().usageStats;
+    if (!stats || stats.total_sessions === 0) return;
 
-      <!-- Unified daily bar chart, grouped by model with legend -->
-      ${unifiedChart}`;
-
-    // Build / refresh the Chart.js instance on the canvas.  We stash the
-    // data on the instance in _renderUnifiedDailyBarChart so we can
-    // attach the Chart after innerHTML has placed the canvas in the DOM.
-    if (this._usageBarChart) {
-      this._usageBarChart.destroy();
-      this._usageBarChart = null;
-    }
-    const canvas = el.querySelector("#usage-bar-chart") as HTMLCanvasElement | null;
-    if (canvas && this._usageBarChartData) {
-      const data = this._usageBarChartData;
-      // Lazy-load Chart.js on first usage-panel render.
-      const { Chart, registerables } = await import("chart.js");
-      Chart.register(...registerables);
-      this._usageBarChart = new Chart(canvas, {
-        type: "bar",
-        data: { labels: data.labels, datasets: data.datasets },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          interaction: { mode: "index", intersect: false },
-          animation: { duration: 250 },
-          plugins: {
-            legend: { display: false },
-            // Native Chart.js tooltip disabled in favour of our global custom
-            // tooltip (see tooltip.ts) which matches the app's design system.
-            tooltip: { enabled: false },
-          },
-          onHover: (event: any, activeElements: any[]) => {
-            if (!activeElements || activeElements.length === 0) {
-              hideTooltip();
-              return;
-            }
-            const idx = activeElements[0].index;
-            const day = data.labels[idx];
-            const lines = [`${day}`];
-            let total = 0;
-            for (const ds of data.datasets) {
-              const v = (ds.data as any[])[idx] || 0;
-              if (v > 0) {
-                lines.push(`${ds.label}: ${this._formatNumber(v)}`);
-                total += v;
-              }
-            }
-            lines.push(`${t("settings.chartTotal")}: ${this._formatNumber(total)}`);
-            const rect = canvas.getBoundingClientRect();
-            const x = rect.left + (event?.x ?? rect.width / 2);
-            const y = rect.top + (event?.y ?? 0);
-            showTooltipAt(lines.join("\n"), x, y);
-          },
-          scales: {
-            x: {
-              stacked: true,
-              grid: { color: "rgba(224,226,242,0.08)" },
-              ticks: { color: muted, font: { size: 10 } },
-            },
-            y: {
-              stacked: true,
-              beginAtZero: true,
-              grid: { color: "rgba(224,226,242,0.08)" },
-              ticks: {
-                color: muted,
-                font: { size: 10 },
-                callback: (v: any) => this._formatNumber(Number(v)),
-              },
-            },
-          },
-        },
-      });
-    }
-
-    canvas?.addEventListener("mouseleave", () => hideTooltip());
-
-    document.getElementById("btn-refresh-usage-chart")?.addEventListener("click", () => {
-      refreshAllData();
+    this._usageGroupBy = mode;
+    // Update the segment highlight immediately for responsiveness.
+    el.querySelectorAll(".usage-groupby-seg .seg-item").forEach((b) => {
+      const isActive = (b as HTMLElement).getAttribute("data-groupby") === mode;
+      b.classList.toggle("active", isActive);
+      (b as HTMLElement).setAttribute("aria-selected", String(isActive));
     });
 
-    // Mode toggle for chart grouping
-    el.querySelectorAll(".usage-groupby-seg .seg-item").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const mode = (btn as HTMLElement).getAttribute("data-groupby") as "model" | "channel";
-        if (mode && mode !== this._usageGroupBy) {
-          this._usageGroupBy = mode;
-          void this._renderUsageSection();
-        }
-      });
-    });
-
-    if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons({ root: el });
+    // If a full render is currently in flight, let it finish and coalesce.
+    if (this._usageRendering) {
+      this._usageRenderPending = true;
+      return;
+    }
+    this._usageRendering = true;
+    try {
+      const wrap = el.querySelector("#usage-chart-wrap") as HTMLElement | null;
+      wrap?.classList.remove("is-ready"); // show shimmer during the swap
+      const model = this._computeUsageChartModel(stats.sessions || [], mode);
+      if (this._usageBarChart) {
+        this._usageBarChart.data.labels = model.labels as any;
+        this._usageBarChart.data.datasets = model.datasets as any;
+        this._usageBarChart.update();
+      }
+      const legendEl = el.querySelector(".usage-legend") as HTMLElement | null;
+      if (legendEl) legendEl.innerHTML = model.legendHtml;
+      const titleEl = el.querySelector(".usage-chart-title-text") as HTMLElement | null;
+      if (titleEl) {
+        titleEl.textContent = t(mode === "model" ? "settings.dailyUsageByModel" : "settings.dailyUsageByChannel");
+      }
+      // Reveal the chart on the next frame so the shimmer sweep is visible.
+      requestAnimationFrame(() => wrap?.classList.add("is-ready"));
+    } finally {
+      this._usageRendering = false;
+      if (this._usageRenderPending) {
+        this._usageRenderPending = false;
+        void this._renderUsageSection();
+      }
     }
   }
 
@@ -2624,50 +2822,16 @@ private _bindModelSelect(): void {
    * "(deleted)" / "(unknown)" tag for historical-only models.
    */
   private _renderUnifiedDailyBarChart(
-    days: string[],
-    groupOrder: string[],
-    cellMap: Record<string, Record<string, { tokens: number; count: number; turns: number; tools: number }>>,
-    groupColor: Record<string, string>,
-    muted: string,
-    groupTotals: Record<string, { tokens: number; status?: string }>,
-    truncated: boolean = false,
+    model: {
+      days: string[];
+      groupOrder: string[];
+      truncated: boolean;
+      legendHtml: string;
+    },
     groupBy: "model" | "channel" = "model",
+    muted: string = "",
   ): string {
-    if (days.length === 0 || groupOrder.length === 0) return "";
-
-    // Build Chart.js datasets: one stacked bar per group, all sharing
-    // the same x-axis (one stack per day).
-    const datasets = groupOrder.map((g) => ({
-      label: g,
-      data: days.map((d) => cellMap[d]?.[g]?.tokens || 0),
-      backgroundColor: groupColor[g],
-      borderColor: groupColor[g],
-      borderWidth: 0,
-      borderRadius: 2,
-      maxBarThickness: 28,
-      stack: "usage",
-    }));
-    const labels = days.map((d) => this._shortDay(d));
-    this._usageBarChartData = { labels, datasets };
-
-    // Legend: every group gets a swatch + name + total.
-    // Skip groups with 0 tokens (e.g. tool-only automation sessions with no model).
-    const legendItems = groupOrder.filter(g => (groupTotals[g]?.tokens || 0) > 0).map((g) => {
-      const color = groupColor[g];
-      const total = groupTotals[g]?.tokens || 0;
-      const status = groupTotals[g]?.status;
-      const tag = groupBy === "model" && status === "deleted" ? `<span class="usage-model-tag usage-model-tag--deleted">${t("settings.deletedModel")}</span>`
-                 : groupBy === "model" && status === "unknown" ? `<span class="usage-model-tag usage-model-tag--unknown">${t("settings.unknownModel")}</span>`
-                 : "";
-      const display = g.length > 32 ? this.esc(g.slice(0, 32) + "...") : this.esc(g);
-      return `
-        <div class="usage-legend-item">
-          <span class="usage-model-dot" style="background:${color}"></span>
-          <span class="usage-legend-name">${display}</span>
-          ${tag}
-          <span class="usage-legend-tokens">${this._formatNumber(total)}</span>
-        </div>`;
-    }).join("");
+    if (model.days.length === 0 || model.groupOrder.length === 0) return "";
 
     const titleKey = groupBy === "model" ? "settings.dailyUsageByModel" : "settings.dailyUsageByChannel";
 
@@ -2675,19 +2839,25 @@ private _bindModelSelect(): void {
       <div class="usage-chart-box">
         <div class="usage-chart-title">
           <i data-lucide="bar-chart-3" class="lucide"></i>
-          ${t(titleKey)}
+          <span class="usage-chart-title-text">${t(titleKey)}</span>
           <div class="seg usage-groupby-seg">
             <button class="seg-item${groupBy === "model" ? " active" : ""}" data-groupby="model" aria-selected="${groupBy === "model" ? "true" : "false"}">${t("settings.usageGroupByModel")}</button>
             <button class="seg-item${groupBy === "channel" ? " active" : ""}" data-groupby="channel" aria-selected="${groupBy === "channel" ? "true" : "false"}">${t("settings.usageGroupByMode")}</button>
           </div>
         </div>
         <div class="usage-heatmap-stats">
-          ${truncated ? `<div class="usage-heatmap-stat"><span>${t("settings.olderDaysHidden")}</span></div>` : ""}
+          ${model.truncated ? `<div class="usage-heatmap-stat"><span>${t("settings.olderDaysHidden")}</span></div>` : ""}
         </div>
-        <div class="usage-chart-canvas-wrap">
+        <div class="usage-chart-canvas-wrap" id="usage-chart-wrap">
           <canvas id="usage-bar-chart"></canvas>
+          <div class="usage-chart-shimmer" aria-hidden="true">
+            <span class="usage-shimmer-bar bar-1"></span>
+            <span class="usage-shimmer-bar bar-2"></span>
+            <span class="usage-shimmer-bar bar-3"></span>
+            <span class="usage-shimmer-bar bar-4"></span>
+          </div>
         </div>
-        <div class="usage-legend">${legendItems}</div>
+        <div class="usage-legend">${model.legendHtml}</div>
       </div>`;
   }
 
@@ -2742,7 +2912,7 @@ private _bindModelSelect(): void {
     // Determine the date range.  Always show at least MIN_DAYS of
     // calendar so a user with one session doesn't see a single bar.
     const MIN_DAYS = 30;    // minimum visible days (~1 month)
-    const MAX_DAYS = 92;    // cap at the recent 3 months (this month + previous 2)
+    const MAX_DAYS = 60;    // cap at the recent ~2 months so it stays readable
     const activeTs = sessions.map(s => (s.last_active || s.first_active) * 1000).filter(t => t);
     const latestMs = Math.max(...activeTs);
     const earliestMs = Math.min(...activeTs);
@@ -2783,17 +2953,17 @@ private _bindModelSelect(): void {
     // The chart is capped at the recent 3 months (this month + the
     // previous two) and scales to fit the panel (no horizontal scroll),
     // so the cells spread out to fill the available width.
-    const cellW = 11, cellH = 11, cellGap = 5;
-    const cellRadius = 1;
-    const PL = 6, PR = 6, PT = 18, PB = 18;
-    // Stretch the day columns to fill the panel: a wider per-day stride
-    // for short histories (so it isn't a narrow strip) and a tighter one
-    // for the full 3 months (so it still fits without scrolling).
-    const MIN_DAY_STRIDE = 9; // min px per day column
-    const TARGET_TOTAL_W = 1100; // preferred full width
-    const naturalStride = cellW + cellGap;
-    const idealStride = Math.max(MIN_DAY_STRIDE, Math.min(naturalStride * 2, TARGET_TOTAL_W / numDays));
-    const stride = Math.max(MIN_DAY_STRIDE, Math.min(naturalStride * 2, idealStride));
+    // Bigger square cells with a UNIFORM gap in all four directions
+    // (left/right/top/bottom).  The day columns are no longer stretched to
+    // fill the panel width -- that stretch made the horizontal gap far
+    // larger than the vertical one and produced tiny cells with big empty
+    // space.  Now every gap equals cellGap so the grid reads as a clean
+    // checkerboard; the scroll container already has overflow-x:auto for
+    // long histories.
+    const cellW = 12, cellH = 12, cellGap = 4;
+    const cellRadius = 2;
+    const PL = 6, PR = 6, PT = 14, PB = 20;
+    const stride = cellW + cellGap; // uniform horizontal gap == cellGap
     const W = PL + numDays * stride - cellGap + PR;
     const H = PT + BLOCKS * (cellH + cellGap) - cellGap + PB;
 
@@ -2834,7 +3004,16 @@ private _bindModelSelect(): void {
     // Day labels along the bottom: ONLY month names (e.g. "7月"),
     // shown once at the first column of each month.  No day numbers, no
     // weekly ticks -- the user explicitly wants month-only axis labels.
-    const dayLabels: string[] = [];
+    // The first label is left-anchored and the last is right-anchored so
+    // the text never spills outside the SVG viewBox (which would clip it);
+    // a single month is centered.
+    // Labels live in the bottom padding band between the last cell row
+    // (cellsBottom) and the SVG bottom edge (H).  Center them vertically
+    // in that band via dominant-baseline so they never clip at the
+    // viewBox bottom (a hand-computed baseline used to overflow H by 1px).
+    const cellsBottom = PT + BLOCKS * (cellH + cellGap) - cellGap;
+    const labelY = (cellsBottom + H) / 2;
+    const labelInfos: { x: number; label: string }[] = [];
     let lastMonth = -1;
     for (let d = 0; d < numDays; d++) {
       const colDate = new Date(startDate);
@@ -2844,15 +3023,31 @@ private _bindModelSelect(): void {
         lastMonth = m;
         const x = PL + d * stride + cellW / 2;
         const label = colDate.toLocaleDateString(loc, { month: "short" });
-        dayLabels.push(
-           `<text x="${x.toFixed(1)}" y="${(PT + BLOCKS * (cellH + cellGap) + 13).toFixed(1)}" ` +
-          `text-anchor="middle" ` +
-          `fill="var(--text-text-secondary, #9599a6)" ` +
-          `style="font-size:12px;font-weight:var(--font-weight-medium,500);font-family:var(--font-family-default);">` +
-          `${label}</text>`
-        );
+        labelInfos.push({ x, label });
       }
     }
+    const dayLabels = labelInfos.map((info, i) => {
+      let anchor: string;
+      let tx: number;
+      if (labelInfos.length === 1) {
+        anchor = "middle";
+        tx = W / 2;
+      } else if (i === 0) {
+        anchor = "start";
+        tx = info.x;
+      } else if (i === labelInfos.length - 1) {
+        anchor = "end";
+        tx = info.x;
+      } else {
+        anchor = "middle";
+        tx = info.x;
+      }
+      return `<text x="${tx.toFixed(1)}" y="${labelY.toFixed(1)}" ` +
+        `text-anchor="${anchor}" dominant-baseline="central" ` +
+        `fill="var(--text-text-secondary, #9599a6)" ` +
+        `style="font-size:12px;font-weight:var(--font-weight-medium,500);font-family:var(--font-family-default);">` +
+        `${info.label}</text>`;
+    });
 
     // Cells: one per (day, 4-hour block).  Only render cells inside the
     // data range; padding cells stay empty (drawn with the empty color).
@@ -2893,7 +3088,7 @@ private _bindModelSelect(): void {
     }
 
     // Legend row at the bottom -- "Less" ... ramp swatches ... "More".
-    const legendCellSize = 11;
+    const legendCellSize = 12;
     const legendGap = 3;
     const legendW = ramp.length * legendCellSize + (ramp.length - 1) * legendGap;
     const legendRects = ramp.map((c, i) =>
@@ -3171,7 +3366,7 @@ private _bindModelSelect(): void {
     });
 
     document.getElementById("dev-reset-state")?.addEventListener("click", async () => {
-      const confirmed = await Dialog.confirm(t("settings.devRestartAppTitle"), t("settings.devRestartAppDesc"), "high");
+      const confirmed = await Dialog.confirm(t("settings.devRestartAppTitle"), t("settings.devRestartAppDesc"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
       if (!confirmed) return;
       localStorage.clear();
       location.reload();
@@ -3180,12 +3375,12 @@ private _bindModelSelect(): void {
     document.getElementById("dev-restart-server")?.addEventListener("click", async () => {
       const running = getState().running;
       if (running) {
-        const ok = await Dialog.confirm(t("settings.devRestartRunningTitle"), t("settings.devRestartRunningDesc"), "high");
+        const ok = await Dialog.confirm(t("settings.devRestartRunningTitle"), t("settings.devRestartRunningDesc"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
         if (!ok) return;
       }
-      const confirmed = await Dialog.confirm(t("settings.devRestartTitle"), t("settings.devRestartServerDesc"), "high");
+        const confirmed = await Dialog.confirm(t("settings.devRestartTitle"), t("settings.devRestartServerDesc"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
       if (!confirmed) return;
-      const prog = Dialog.progress(t("settings.devRestartProgressTitle"), "", { cancellable: false });
+        const prog = Dialog.progress(t("settings.devRestartProgressTitle"), "", { cancellable: false, container: document.getElementById("settings-view") ?? undefined });
       const cleanup = (window as any).electronAPI?.onRestartProgress?.((data: { progress: number }) => {
         const p = data.progress;
         let msg: string;
@@ -3284,7 +3479,7 @@ private _bindModelSelect(): void {
 
     // Clear sessions
     document.getElementById("storage-clear-sessions")?.addEventListener("click", async () => {
-      const ok = await Dialog.confirm(t("common.confirmClearSessionsTitle"), t("common.confirmClearSessions"), "high");
+      const ok = await Dialog.confirm(t("common.confirmClearSessionsTitle"), t("common.confirmClearSessions"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
       if (ok) {
         send({ type: "clear_all_sessions" } as any);
       }
@@ -3292,7 +3487,7 @@ private _bindModelSelect(): void {
 
     // Export all data
     document.getElementById("storage-export-data")?.addEventListener("click", async () => {
-      const ok = await Dialog.confirm(t("settings.storageExportTitle"), t("settings.storageExportConfirm"), "high");
+      const ok = await Dialog.confirm(t("settings.storageExportTitle"), t("settings.storageExportConfirm"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
       if (ok) {
         send({ type: "export_data" } as any);
       }
@@ -3311,7 +3506,7 @@ private _bindModelSelect(): void {
 
     // Clear browser data
     document.getElementById("storage-clear-browser")?.addEventListener("click", async () => {
-      const ok = await Dialog.confirm(t("settings.confirmClearBrowserDataTitle"), t("settings.confirmClearBrowserData"), "high");
+      const ok = await Dialog.confirm(t("settings.confirmClearBrowserDataTitle"), t("settings.confirmClearBrowserData"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
       if (ok) {
         window.electronAPI?.browserClearData?.();
       }
@@ -3403,7 +3598,7 @@ private _bindModelSelect(): void {
     });
 
     document.getElementById("browser-clear-data")?.addEventListener("click", async () => {
-      const ok = await Dialog.confirm(t("settings.confirmClearBrowserDataTitle"), t("settings.confirmClearBrowserData"), "high");
+      const ok = await Dialog.confirm(t("settings.confirmClearBrowserDataTitle"), t("settings.confirmClearBrowserData"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
       if (ok) {
         window.electronAPI?.browserClearData?.();
         this.renderBrowser();
@@ -3411,7 +3606,7 @@ private _bindModelSelect(): void {
     });
 
     document.getElementById("browser-clear-history")?.addEventListener("click", async () => {
-      const ok = await Dialog.confirm(t("settings.confirmClearHistoryTitle"), t("settings.confirmClearHistory"), "high");
+      const ok = await Dialog.confirm(t("settings.confirmClearHistoryTitle"), t("settings.confirmClearHistory"), { priority: "high", container: document.getElementById("settings-view") ?? undefined });
       if (ok) {
         window.electronAPI?.clearHistory?.();
         this.renderBrowser();

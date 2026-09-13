@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -168,16 +168,18 @@ class LoopControlMixin:
         """
         return await self._plan_mode.wait_for_permission_decision(tool_name)
 
-    def resolve_permission(self, decision: bool) -> None:
+    def resolve_permission(self, decision: bool, remember: bool = False) -> None:
         """Resolve a pending permission request with the given decision.
 
         Args:
             decision: ``True`` to approve the pending tool, ``False`` to deny.
+            remember: When True, persist an approval into the session policy
+                table so the same tool is not asked again this session.
 
         Returns:
             None.
         """
-        self._plan_mode.resolve_permission(decision)
+        self._plan_mode.resolve_permission(decision, remember)
 
     def resolve_question(self, answers: str) -> None:
         """Submit answers to a pending question/answer request.

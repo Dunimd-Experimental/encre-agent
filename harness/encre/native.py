@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -70,8 +70,15 @@ update_code_index = _native.update_code_index
 parse_diagnostics = _native.parse_diagnostics
 parse_lsp_message = _native.parse_lsp_message
 permission_check = _native.permission_check
+permission_check_mode = getattr(_native, "permission_check_mode", _missing_native("permission_check_mode"))
+permission_check_dangerous = getattr(_native, "permission_check_dangerous", _missing_native("permission_check_dangerous"))
 permission_get_policies = _native.permission_get_policies
 permission_record_decision = _native.permission_record_decision
+permission_set_dangerous_patterns = getattr(
+    _native, "permission_set_dangerous_patterns",
+    _missing_native("permission_set_dangerous_patterns"),
+)
+permission_set_mode = getattr(_native, "permission_set_mode", _missing_native("permission_set_mode"))
 permission_set_policies = _native.permission_set_policies
 read_file = _native.read_file
 sandbox_execute = _native.sandbox_execute
@@ -140,8 +147,12 @@ __all__ = [
     "parse_diagnostics",
     "parse_lsp_message",
     "permission_check",
+    "permission_check_dangerous",
+    "permission_check_mode",
     "permission_get_policies",
     "permission_record_decision",
+    "permission_set_dangerous_patterns",
+    "permission_set_mode",
     "permission_set_policies",
     "read_file",
     "sandbox_execute",

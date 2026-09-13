@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -388,7 +388,8 @@ class EncreLoop(
                     yield _ev
 
                 # 鈹€鈹€ Phase: post-tool compression check 鈹€鈹€
-                await self._phase_post_tool_compact(t)
+                async for _ev in self._phase_post_tool_compact(t):
+                    yield _ev
 
                 # 鈹€鈹€ Phase: end-of-turn bookkeeping (grace call, guardrail,
                 # telemetry, evolution, hooks, rollback) 鈹€鈹€

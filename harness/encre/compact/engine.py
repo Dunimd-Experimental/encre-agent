@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -239,22 +239,26 @@ class CompactEngine:
         max_output_tokens: int = 32_768,
         *,
         min_turns: int = 4,
+        extra_tokens: int = 0,
     ) -> bool:
         """Return True if the token count exceeds the compact threshold.
 
         The threshold is::
 
             effective_window = context_window - min(max_output_tokens, 32_768)
-            trigger = effective_window - AUTOMATICALLY_BUFFER_TOKENS
+            trigger = effective_window - AUTOCOMPACT_BUFFER_TOKENS
 
         This fires BEFORE context is dangerously full so the model has
-        headroom to consume the summary.
+        headroom to consume the summary.  ``extra_tokens`` accounts for the
+        fixed per-request overhead (system prompt + tool schemas) that is
+        not part of *messages*; without it the trigger under-estimates the
+        real request size and compaction starts too late.
         """
         if len(messages) < min_turns * 2:
             return False
         effective = context_window - min(max_output_tokens, 32_768)
         threshold = effective - AUTOCOMPACT_BUFFER_TOKENS
-        est = count_message_tokens(messages)
+        est = count_message_tokens(messages) + max(0, extra_tokens)
         return est > threshold
 
     def should_microcompact(

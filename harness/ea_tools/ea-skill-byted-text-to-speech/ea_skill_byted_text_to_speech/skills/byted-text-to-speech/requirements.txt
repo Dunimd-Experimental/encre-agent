@@ -1,3 +1,0 @@
-# Byted-Text-to-Speech skill dependencies
-# Ref: https://www.volcengine.com/docs/6561/1598757
-httpx>=0.25.0

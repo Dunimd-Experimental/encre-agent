@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -246,6 +246,9 @@ class ClientRespondPermission:
     type: str = "respond_permission"
     tool_name: str = ""
     decision: bool = False
+    # When True the decision is persisted into the session policy table so
+    # the same tool is not asked again during this session ("always allow").
+    remember: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ClientRespondPermission":
@@ -253,6 +256,7 @@ class ClientRespondPermission:
             type="respond_permission",
             tool_name=d.get("tool_name", ""),
             decision=d.get("decision", False),
+            remember=bool(d.get("remember", False)),
         )
 
 
@@ -1785,6 +1789,8 @@ ServerMessageType = Literal[
     "agent_updated",
     "search_results",
     "compact",
+    "compact_starting",
+    "compact_failed",
     "rollback_log",
     "rollback_checkout",
     "model_validated",

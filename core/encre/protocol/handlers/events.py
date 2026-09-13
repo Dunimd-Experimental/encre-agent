@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -39,6 +39,7 @@ from encre.utils.types import (
     Artifact,
     AssistantBoundary,
     BackendError,
+    CompactFailed,
     CompactNotification,
     CompactStarting,
     EngineInstallProgress,
@@ -175,6 +176,13 @@ class EventDispatchMixin:
 
         elif isinstance(event, CompactStarting):
             await self._send(ws, "compact_starting", session_id=sid)
+
+        elif isinstance(event, CompactFailed):
+            # The compaction did not produce a result (engine failure or
+            # no-op): tell the frontend to dismiss the "compressing"
+            # indicator so it cannot get stuck on screen.
+            await self._send(ws, "compact_failed",
+                reason=event.reason or "", session_id=sid)
 
         elif isinstance(event, CompactNotification):
             # Send the compacted message list so the frontend's state

@@ -73,6 +73,9 @@ pub struct SandboxResult {
 pub fn sandbox_execute(
     command: &str,
     timeout: u64,
+    // Unused on Windows: the Job Object sandbox does not take a workspace
+    // root, so the parameter only feeds the Landlock / Seatbelt paths.
+    #[cfg_attr(target_os = "windows", allow(unused_variables))]
     workspace: Option<&str>,
 ) -> Result<SandboxResult, String> {
     // ── Build the subprocess command ──────────────────────────

@@ -67,12 +67,22 @@ esbuild.buildSync({
 
 // Bundle the React renderer (browser target, automatic JSX runtime).
 // - format "esm" + splitting: dynamic import() of heavy on-demand libraries
-//   (xlsx/mammoth/pptx/xterm/chart.js) is split into separate chunk files
-//   that are only fetched when the feature is first used.
+//   (xlsx/mammoth/pptx/xterm/chart.js, plus the lazy locale tables and the
+//   Material file-icon set) is split into separate chunk files that are only
+//   fetched when the feature is first used.
 // - minify: shrinks the entry bundle by ~55% (6.7MB -> ~3MB before
 //   splitting; much smaller after heavy libs move to lazy chunks).
 // - define:BUILD_LOCALES — compile-time locale list; only matched locales
 //   are kept in the bundle via tree-shaking.
+// esbuild only ever *adds* hashed chunk files, so every rebuild used to leave
+// the previous build's chunks behind (62 of the 72 files on disk were dead
+// duplicates of 6 libraries). Clear the directory first so the renderer only
+// ships chunks the current entry actually references.
+const chunksDir = path.join(desktop, "renderer", "chunks");
+if (fs.existsSync(chunksDir)) {
+  fs.rmSync(chunksDir, { recursive: true, force: true });
+  console.log("chunks/ cleared.");
+}
 esbuild.buildSync({
   entryPoints: [path.join(desktop, "renderer", "src", "app.ts")],
   bundle: true,

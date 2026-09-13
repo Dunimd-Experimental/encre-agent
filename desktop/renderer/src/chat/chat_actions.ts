@@ -149,7 +149,7 @@ import { pickRandomQuote } from "./timeline.js";
       // re-render it as a chip instead of raw markup.
       const cmdTagMatch = origContent.match(/^<command>(\w[\w-]*)<\/command>$/s);
       if (origContent.includes("<terminal>") || origContent.includes("<attach ") || origContent.includes("<mode>") || cmdTagMatch) origContent = "";
-      Dialog.confirm(t("chat.rollbackEdit"), t("chat.rollbackEditDesc")).then((confirmed) => {
+      Dialog.confirm(t("chat.rollbackEdit"), t("chat.rollbackEditDesc"), { container: document.getElementById("main-content") ?? undefined }).then((confirmed) => {
         if (confirmed) {
           const sid = targetMsg.serverId;
           rememberRollbackEditTarget(targetMsg, idx);
@@ -197,7 +197,7 @@ import { pickRandomQuote } from "./timeline.js";
       const st = getState();
       const userMsgs = st.messages.filter(m => m.role === "user");
       if (isNaN(idx) || !userMsgs[idx]) return;
-      Dialog.confirm(t("chat.deleteMessage"), t("chat.deleteMessageDesc")).then((confirmed) => {
+      Dialog.confirm(t("chat.deleteMessage"), t("chat.deleteMessageDesc"), { container: document.getElementById("main-content") ?? undefined }).then((confirmed) => {
         if (confirmed) send({ type: "delete_message", message_index: idx });
       });
       return;
@@ -487,7 +487,7 @@ import { pickRandomQuote } from "./timeline.js";
     if (assistantIdx < 0) return;
     let userContent = "";
     for (let i = assistantIdx - 1; i >= 0; i--) {
-      if (st.messages[i].role === "user") {
+      if (st.messages[i].role === "user" && st.messages[i].mode !== "compact_marker") {
         userContent = st.messages[i].content;
         break;
       }
@@ -497,7 +497,7 @@ import { pickRandomQuote } from "./timeline.js";
     // Compute user message index (0-based among all user messages in the session)
     let userMsgIdx = -1;
     for (let i = 0; i < assistantIdx; i++) {
-      if (st.messages[i].role === "user") userMsgIdx++;
+      if (st.messages[i].role === "user" && st.messages[i].mode !== "compact_marker") userMsgIdx++;
     }
 
     // Remove old assistant messages after the fork point; the preceding

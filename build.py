@@ -271,9 +271,11 @@ def build_server():
     # auto-scans <bundle>/ea_tools/ (encre.plugins.ea_scan): reads each
     # ea-tool-* package's pyproject.toml, imports its plugin module from
     # the shipped source, and loads its bundled skills/.  No package is
-    # hardcoded here — dropping a new package into harness/ea_tools/ ships it
+    # hardcoded here — dropping a new package into core/ea_tools/ ships it
     # automatically.  __pycache__ / egg-info are stripped from the copy.
-    ea_src = ROOT / "harness" / "ea_tools"
+    # (EA extension packages belong to the encre-core distribution; the six
+    # mandatory primitives live in harness as encre.tools.builtin.)
+    ea_src = ROOT / "core" / "ea_tools"
     if ea_src.is_dir():
         ea_stage = ROOT / "build" / "ea_tools_stage"
         if ea_stage.exists():

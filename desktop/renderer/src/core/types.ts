@@ -51,6 +51,7 @@ export type ServerEvent =
   | ArtifactsUpdate
   | AssistantBoundaryEvent
   | CompactStartingEvent
+  | CompactFailedEvent
   | CompactEvent
   | SystemMessageEvent
   | ModelsList
@@ -187,7 +188,6 @@ export interface SearchResultEntry {
 /** Keys for the user-configurable search filter (Settings → Search Filter). */
 export type SearchFilterKey =
   | "session"
-  | "conversation"
   | "memory"
   | "global_rule"
   | "project_rule"
@@ -213,7 +213,6 @@ export type SearchFilter = Record<SearchFilterKey, boolean>;
 export function defaultSearchFilter(): SearchFilter {
   return {
     session: true,
-    conversation: true,
     memory: true,
     global_rule: true,
     project_rule: true,
@@ -1560,6 +1559,8 @@ export interface ClientRespondPermission {
   type: "respond_permission";
   tool_name: string;
   decision: boolean;
+  /** When true, persist the approval for the rest of the session ("always allow"). */
+  remember?: boolean;
 }
 
 export interface ClientRespondTakeover {
@@ -1738,6 +1739,10 @@ export interface SessionSnapshot {
   spec: SpecData | null;
   planReview: PlanReviewData | null;
   running: boolean;
+  /** Precise session state mirroring the backend ("idle" | "running" |
+   *  "awaiting_approval").  `running` is only the coarse boolean derived from
+   *  it, so it cannot distinguish a permission wait from an active run. */
+  sessionState: SessionState;
   agentState?: AgentStateSnapshot | null;
 }
 
@@ -2043,6 +2048,12 @@ export interface CompactStartingEvent {
   session_id?: string;
 }
 
+export interface CompactFailedEvent {
+  type: "compact_failed";
+  reason?: string;
+  session_id?: string;
+}
+
 export interface CompactEvent {
   type: "compact";
   old_count: number;
@@ -2165,6 +2176,7 @@ export function createEmptySessionSnapshot(): SessionSnapshot {
     spec: null,
     planReview: null,
     running: false,
+    sessionState: "idle",
     agentState: null,
   };
 }

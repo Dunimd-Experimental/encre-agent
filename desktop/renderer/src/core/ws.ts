@@ -84,8 +84,11 @@ async function drainQueue(): Promise<void> {
 export async function connect(onEvent: EventHandler): Promise<void> {
   handler = onEvent;
 
-  // Initialise crypto layer before the first connection
-  if (!_cryptoInitDone) {
+  // Initialise the crypto layer before the first connection. The keyfile is
+  // written by the backend, which may not have finished booting yet, so a
+  // failed attempt is retried on later connects instead of latching the
+  // session into permanent plaintext.
+  if (!_cryptoInitDone || !isReady()) {
     await initCrypto();
     _cryptoInitDone = true;
   }

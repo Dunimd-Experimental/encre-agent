@@ -43,6 +43,10 @@ const HKDF_SALT = new TextEncoder().encode("encre-crypto-hkdf-v1");
 
 let _masterKey: CryptoKey | null = null;
 let _ready = false;
+// Throttles init retries: the keyfile is written by the backend, so a window
+// that connects before it exists must not re-read the disk on every message.
+let _lastInitAttempt = 0;
+const INIT_RETRY_INTERVAL_MS = 2_000;
 
 // ── Machine identity for key wrapping ────────────────────────────
 
@@ -109,23 +113,28 @@ async function unwrapMasterKey(keyfileBytes: Uint8Array): Promise<CryptoKey> {
  */
 export async function initCrypto(): Promise<void> {
   if (_ready) return;
+  // A missing keyfile is a *retryable* state, not a final one: on a fresh
+  // install the backend may not have written <data_dir>/keys/keyfile yet when
+  // the window first connects. Throttle the retries so a permanently missing
+  // key cannot turn into a disk read per message.
+  const now = Date.now();
+  if (now - _lastInitAttempt < INIT_RETRY_INTERVAL_MS) return;
+  _lastInitAttempt = now;
 
   try {
     const keyfileBytes = await window.electronAPI?.readKeyfile();
     if (!keyfileBytes || keyfileBytes.byteLength === 0) {
-      // If the keyfile doesn't exist, the TS layer can't create it
-      // (that requires Python's cryptography library).
-      // In practice the server creates it before the desktop frontend starts.
-      console.warn("[encre/crypto] Keyfile not available — transport encryption disabled");
-      _ready = true;
+      // The TS layer cannot create the keyfile (that requires Python's
+      // `cryptography`); the server writes it. Stay un-ready so a later
+      // connect() retries rather than silently running in plaintext.
+      console.warn("[encre/crypto] Keyfile not available yet — transport encryption pending");
       return;
     }
 
     _masterKey = await unwrapMasterKey(new Uint8Array(keyfileBytes));
     _ready = true;
   } catch (err) {
-    console.warn("[encre/crypto] Failed to initialise crypto:", err);
-    _ready = true;  // don't block forever — fall back to plaintext
+    console.warn("[encre/crypto] Failed to initialise crypto (will retry):", err);
   }
 }
 

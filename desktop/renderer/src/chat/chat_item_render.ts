@@ -524,28 +524,11 @@ export function renderItemHTMLImpl(this: Chat, item: TimelineItem): string {
   }
 
   export function renderCompactCardImpl(this: Chat, item: TimelineItem): string {
-    const st = getState();
-    const idx = parseInt(item.id.replace("compact-", ""));
-    const evt = st.compactEvents[idx];
-    if (!evt) return "";
-    const id = item.id;
-    const expanded = this.expandedItems.has(id);
-    const reductionPct = evt.old_tokens > 0
-      ? Math.round((1 - evt.new_tokens / evt.old_tokens) * 100)
-      : 0;
-    const summary = `${evt.old_count} → ${evt.new_count} messages · ${_fmtTokens(evt.old_tokens)} → ${_fmtTokens(evt.new_tokens)} tokens (${reductionPct}% reduced)`;
-    const bodyLines = [
-      `Old messages: ${evt.old_count}  New messages: ${evt.new_count}`,
-      `Old tokens:   ${_fmtTokens(evt.old_tokens)}  New tokens:   ${_fmtTokens(evt.new_tokens)}`,
-      `Reduction:    ${reductionPct}%`,
-    ];
-    return `<div class="strip-item${expanded ? " expanded" : ""}" data-id="${id}">
-      <div class="strip" onmouseenter="window.__hoverOn(this)" onmouseleave="window.__hoverOff(this)">
-        <span class="icon-wrap"><i data-lucide="shrink" class="semantic"></i><i data-lucide="chevron-down" class="arrow"></i></span>
-        <span class="strip-name">Context compacted</span>
-        <span class="strip-summary">${escapeHtml(summary)}</span>
-      </div>
-      <div class="strip-body">${escapeHtml(bodyLines.join("\n"))}</div>
+    // Clean inline divider: the compressed context itself is NEVER shown to
+    // the user -- just a single-line separator marking where the earlier
+    // conversation was compacted (no expand/collapse, no stats).
+    return `<div class="compact-divider" data-id="${item.id}">
+      <span class="compact-divider-text">${t("chat.contextCompacted")}</span>
     </div>`;
   }
 

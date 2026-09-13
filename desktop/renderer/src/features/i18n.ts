@@ -30,7 +30,7 @@
  */
 
 import { getState, subscribe, setSettings } from "../core/state.js";
-import { LOCALE_REGISTRY } from "../locales/registry.js";
+import { LOCALE_REGISTRY, LAZY_LOCALE_LOADERS } from "../locales/registry.js";
 
 // esbuild --define:BUILD_LOCALES=["zh","en",...] — set at build time.
 // Falls back to ALL registry locales when undefined (local dev / no flag).
@@ -62,12 +62,43 @@ export function getIntlLocale(): string {
   return intlTagOf(getLocale());
 }
 
-const translations: Record<Locale, LocaleMessages> = { ...LOCALE_REGISTRY } as Record<Locale, LocaleMessages>;
+// Only the eagerly bundled tables (zh + en) start out populated.  Every other
+// locale is installed by ensureLocale() when it is selected — see
+// LAZY_LOCALE_LOADERS for why the rest are not in the entry chunk.
+const translations: Partial<Record<Locale, LocaleMessages>> = { ...LOCALE_REGISTRY };
 
 let currentLocale: Locale = "zh";
 
 type LocaleChangeCallback = (locale: Locale) => void;
 const localeChangeCallbacks: Set<LocaleChangeCallback> = new Set();
+
+const _localeLoads = new Map<Locale, Promise<void>>();
+
+/**
+ * Ensures the translation table for `locale` is loaded.
+ *
+ * zh/en are always present; every other locale is fetched from its own chunk on
+ * first use.  Resolves immediately when the table is already installed, and
+ * never rejects — a failed load leaves the English fallback in place so the UI
+ * stays readable instead of rendering raw keys.
+ */
+export async function ensureLocale(locale: Locale): Promise<void> {
+  if (Object.keys(translations[locale] ?? {}).length > 0) return;
+  const loader = (LAZY_LOCALE_LOADERS as Record<string, (() => Promise<LocaleMessages>) | undefined>)[locale];
+  if (!loader) return;
+  let pending = _localeLoads.get(locale);
+  if (!pending) {
+    pending = loader()
+      .then((messages) => {
+        translations[locale] = messages;
+        clearLocaleCache();
+      })
+      .catch(() => { /* keep the en fallback */ })
+      .finally(() => { _localeLoads.delete(locale); });
+    _localeLoads.set(locale, pending);
+  }
+  await pending;
+}
 
 /** Sets the active locale, persists it and notifies subscribers. */
 export function setLocale(locale: Locale): void {
@@ -81,6 +112,16 @@ export function setLocale(locale: Locale): void {
   document.documentElement.dir = locale === "ar" || locale === "he" ? "rtl" : "ltr";
   clearLocaleCache();
   localeChangeCallbacks.forEach((cb) => cb(locale));
+  // Lazy tables: a locale outside zh/en resolves a moment later.  Re-run the
+  // change callbacks once it lands so the UI switches to the selected language
+  // instead of staying on the English fallback of that first pass.
+  if (Object.keys(translations[locale] ?? {}).length === 0) {
+    void ensureLocale(locale).then(() => {
+      if (currentLocale !== locale) return;
+      clearLocaleCache();
+      localeChangeCallbacks.forEach((cb) => cb(locale));
+    });
+  }
 }
 
 /** Registers a callback fired whenever the locale changes; returns an unsubscribe fn. */
@@ -221,10 +262,15 @@ export function loadTranslations(locale: Locale, messages: LocaleMessages): void
   clearLocaleCache();
 }
 
-/** Loads every locale table at once and clears the cache. */
-export function loadAllTranslations(messages: Record<Locale, LocaleMessages>): void {
+/** Installs every provided locale table at once and clears the cache. */
+export function loadAllTranslations(messages: Partial<Record<Locale, LocaleMessages>>): void {
   for (const loc of LOCALES) {
-    translations[loc] = messages[loc] ?? {};
+    const table = messages[loc];
+    // Skip empty/absent tables so they cannot masquerade as "loaded" and stop
+    // ensureLocale() from fetching the real chunk later.
+    if (table && Object.keys(table).length > 0) {
+      translations[loc] = table;
+    }
   }
   clearLocaleCache();
 }
@@ -233,6 +279,3 @@ export function loadAllTranslations(messages: Record<Locale, LocaleMessages>): v
 export function createLocaleGetter(key: string): StringGetter {
   return () => t(key);
 }
-
-// Load translations eagerly so all module-level t() calls find them
-loadAllTranslations(translations);

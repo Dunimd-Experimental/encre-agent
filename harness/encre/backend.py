@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -48,11 +48,9 @@ from encre.backends.openai import OpenAIBackend
 from encre.backends.openai_compatible import OpenAICompatibleBackend
 from encre.backends.opencode import OpenCodeGoBackend, OpenCodeZenBackend
 from encre.backends.openrouter import OpenRouterBackend
-from encre.backends.retry import DEFAULT_RETRY_CONFIG, RetryConfig
 from encre.backends.router import RouterBackend
 from encre.utils.types import (
     AdaptiveThinking,
-    DisabledThinking,
     EnabledThinking,
     ThinkingConfig,
 )
@@ -82,6 +80,7 @@ def _build_failover_backends(
             bu = m.base_url or default_base_url
             md = m.model_id or default_model
             tc = getattr(m, "thinking_config", None)
+            cw = getattr(m, "context_window", 0) or 0
         elif isinstance(m, dict):  # Raw dict
             name = m.get("name") or m.get("model_id", "unknown")
             bt = m.get("backend_type", "openai")
@@ -89,6 +88,7 @@ def _build_failover_backends(
             bu = m.get("base_url", default_base_url)
             md = m.get("model_id", default_model)
             tc = m.get("thinking_config")
+            cw = m.get("context_window", 0) or 0
         else:
             continue
         be = create_backend(
@@ -97,6 +97,7 @@ def _build_failover_backends(
             base_url=bu,
             model=md,
             thinking_config=tc,
+            context_window=cw,
         )
         if be is not None:
             result.append((name, be))
@@ -249,9 +250,30 @@ def _build_thinking_kwargs(
     return {}
 
 
+def _override_context_window(backend: BaseBackend, window: int) -> None:
+    """Force ``context_window_size()`` to return an explicit per-model value.
+
+    Only a handful of backends accept a ``context_window`` constructor kwarg
+    (openai_compatible, openrouter).  This applies the override generically to
+    ANY backend instance -- including ``FailoverBackend``, whose own
+    ``context_window_size()`` delegates to the primary child -- so switching to
+    a model with a different window takes effect immediately for compaction.
+    """
+    if not window or window <= 0:
+        return
+    def _size(_b: BaseBackend = backend, _w: int = window) -> int:
+        return _w
+    backend.context_window_size = _size  # type: ignore[method-assign]
+
+
 def create_backend(type: str, **kwargs: Any) -> BaseBackend | None:
     if not type:
         return None
+
+    # The explicit per-model context window is applied generically AFTER
+    # construction (see _override_context_window) so every backend honours it
+    # without each constructor needing a context_window parameter.
+    explicit_window: int = kwargs.pop("context_window", 0) or 0
 
     # Failover requires special handling 鈥?it needs pre-built children.
     if type == "failover":
@@ -303,4 +325,6 @@ def create_backend(type: str, **kwargs: Any) -> BaseBackend | None:
     for key, value in thinking_kwargs.items():
         kwargs.setdefault(key, value)
 
-    return cls(**kwargs)
+    backend = cls(**kwargs)
+    _override_context_window(backend, explicit_window)
+    return backend

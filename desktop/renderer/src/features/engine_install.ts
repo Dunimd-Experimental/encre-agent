@@ -118,6 +118,7 @@ async function _askOne(
   body: string,
   hint: string,
   opt: EngineOption,
+  container?: HTMLElement,
 ): Promise<string> {
   const primaryLabel = _resolveField(opt.label, opt.label_code, undefined);
   const ok = await Dialog.confirmInstall(
@@ -127,8 +128,9 @@ async function _askOne(
       primary: primaryLabel,
       secondary: t("engineInstall.cancel"),
       hint,
+      priority: "high",
+      container,
     },
-    "high",
   );
   if (!ok) return "cancelled";
   return opt.id;
@@ -142,7 +144,10 @@ async function _askOne(
  *
  * @param req - The install request describing engine, options and i18n fields.
  */
-export async function handleEngineInstallRequest(req: InstallRequest): Promise<void> {
+export async function handleEngineInstallRequest(
+  req: InstallRequest,
+  container?: HTMLElement,
+): Promise<void> {
   if (!req || !req.request_id) return;
   if (_pendingChoices.has(req.request_id)) return;
   _pendingChoices.add(req.request_id);
@@ -165,7 +170,7 @@ export async function handleEngineInstallRequest(req: InstallRequest): Promise<v
       const body = remaining
         ? `${resolved.body}\n\n${t("engineInstall.fallbackHint", { remaining })}`
         : resolved.body;
-      const picked = await _askOne(resolved.title, body, resolved.hint, opt);
+      const picked = await _askOne(resolved.title, body, resolved.hint, opt, container);
       if (picked && picked !== "cancelled") {
         choice = picked;
         break;
@@ -211,7 +216,10 @@ function _progressSubMessage(evt: ProgressEvent): string {
  *
  * @param evt - Progress event carrying percent, message and status.
  */
-export function handleEngineInstallProgress(evt: ProgressEvent): void {
+export function handleEngineInstallProgress(
+  evt: ProgressEvent,
+  container?: HTMLElement,
+): void {
   if (!evt || !evt.request_id) return;
   let handle = _progressHandles.get(evt.request_id);
   const status = evt.status || "running";
@@ -232,7 +240,7 @@ export function handleEngineInstallProgress(evt: ProgressEvent): void {
     handle = Dialog.progress(
       t("engineInstall.configuring"),
       msg,
-      { cancellable: true, indeterminate: evt.indeterminate !== false },
+      { cancellable: true, indeterminate: evt.indeterminate !== false, container },
     );
     _progressHandles.set(evt.request_id, handle);
   }

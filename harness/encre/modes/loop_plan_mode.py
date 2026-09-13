@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -134,10 +134,14 @@ class PlanModeManager:
             await _drain([permission_waiter, cancel_waiter])
             raise
 
-    def resolve_permission(self, decision: bool) -> None:
-        """Called by the agent owner to approve or deny a pending permission request."""
+    def resolve_permission(self, decision: bool, remember: bool = False) -> None:
+        """Called by the agent owner to approve or deny a pending permission request.
+
+        ``remember=True`` (always-allow this session) persists the verdict
+        into the session policy table; a one-off allow is not recorded.
+        """
         self._permission_decision = decision
-        if self._pending_tool_name and self._safety is not None:
+        if remember and self._pending_tool_name and self._safety is not None:
             try:
                 self._safety.record_permission_decision(
                     self._pending_tool_name, decision

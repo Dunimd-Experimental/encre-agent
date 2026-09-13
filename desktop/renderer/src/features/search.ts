@@ -88,11 +88,6 @@ const SECTION_DEFS: Record<string, SectionTemplate> = {
     // Show the session title (user name or first-message preview), never the id.
     kindLabel: (r) => r.name || r.preview || t("search.resultSession"),
   },
-  conversation: {
-    getLabel: () => t("search.sectionConversations"),
-    icon: `<i data-lucide="message-square" class="lucide lucide-sm"></i>`,
-    kindLabel: (r) => r.name || r.preview || t("general.resultConversation"),
-  },
   memory: {
     getLabel: () => t("search.sectionMemory"),
     icon: `<i data-lucide="brain" class="lucide lucide-sm"></i>`,
@@ -349,7 +344,6 @@ function toEntry(it: LocalItem): SearchResultEntry {
 /** User-facing labels for each search-filter toggle, shared by the settings UI. */
 export const SEARCH_FILTER_META: { key: SearchFilterKey; zh: string; en: string }[] = [
   { key: "session", zh: "会话", en: "Sessions" },
-  { key: "conversation", zh: "对话内容", en: "Conversations" },
   { key: "memory", zh: "记忆", en: "Memory" },
   { key: "global_rule", zh: "全局规则", en: "Global Rules" },
   { key: "project_rule", zh: "项目规则", en: "Project Rules" },
@@ -381,7 +375,7 @@ function isKnownLucideIcon(name: string): boolean {
 }
 
 const SECTION_ORDER = [
-  "session_header", "conversation", "memory", "global_rule", "project_rule",
+  "session_header", "memory", "global_rule", "project_rule",
   "app_action", "settings_nav", "slash_command",
   "skill", "workspace", "model", "mcp_server", "sub_agent", "document",
   "notification", "custom_command", "tool", "automation", "workflow", "file",
@@ -398,9 +392,26 @@ const SECTION_ORDER = [
  */
 const KIND_TO_FILTER_KEY: Record<string, SearchFilterKey> = {
   session_header: "session",
+  conversation: "session",
   file: "workspace_file",
   settings_nav: "settings",
   app_action: "action",
+};
+
+/**
+ * App-action ids that are pure navigation shortcuts opening the same settings
+ * panel as a `settings_nav` entry (value = the panel id). Both appear in the
+ * local index independently, so without cross-kind dedup the palette shows the
+ * same settings destination twice (e.g. "模型管理" under both 设置项 and 操作).
+ */
+const ACTION_TO_NAV_PANEL: Record<string, string> = {
+  settings: "general",
+  "model-management": "model",
+  "skills-management": "skills",
+  "mcp-servers": "mcp",
+  "agent-config": "agent",
+  about: "about",
+  "keyboard-shortcuts": "shortcuts",
 };
 
 /** Resolves the search-filter key for a result kind (defaults to the kind). */
@@ -931,7 +942,7 @@ export class Search {
     const backendResults = this.searching
       ? []
       : getState().searchResults.filter((r) => {
-          if (r.kind === "conversation") return filter.conversation;
+          if (r.kind === "conversation") return filter.session;
           if (r.kind === "file") return filter.workspace_file;
           return true;
         });
@@ -998,21 +1009,45 @@ export class Search {
     return runLocalSearch(q, getState().searchFilter);
   }
 
-  /** Merges backend and local results, de-duplicated by kind+identity. */
+  /** Merges backend and local results, de-duplicated by kind+identity, session_id,
+   *  and cross-kind navigation duplicates. */
   private mergeResults(backend: SearchResultEntry[], local: SearchResultEntry[]): SearchResultEntry[] {
     const seen = new Set<string>();
+    const seenSessionIds = new Set<string>();
     const merged = [...backend];
     for (const item of backend) {
       seen.add(`${item.kind}:${item.session_id || item.path || item.name || item.snippet}`);
+      if (item.session_id) seenSessionIds.add(item.session_id);
     }
     for (const item of local) {
       const key = `${item.kind}:${item.path || item.name || item.session_id || item.snippet}`;
+      if (item.session_id && seenSessionIds.has(item.session_id)) continue;
       if (!seen.has(key)) {
         merged.push(item);
         seen.add(key);
+        if (item.session_id) seenSessionIds.add(item.session_id);
       }
     }
-    return merged;
+
+    // Cross-kind dedup: a result is redundant when it is just another route to
+    // a destination already covered by a different-kind result in the list.
+    const navPanels = new Set<string>();
+    const slashCommandNames = new Set<string>();
+    for (const r of merged) {
+      if (r.kind === "settings_nav" && r.preview) navPanels.add(r.preview);
+      if (r.kind === "slash_command" && r.name) slashCommandNames.add(r.name.replace(/^\//, "").toLowerCase());
+    }
+    return merged.filter((r) => {
+      // app_action that opens a settings panel already reachable via settings_nav.
+      if (r.kind === "app_action" && r.path) {
+        const panel = ACTION_TO_NAV_PANEL[r.path];
+        if (panel && navPanels.has(panel)) return false;
+      }
+      // Custom commands are also registered as slash commands with the same
+      // name, so a match would show each command under two sections.
+      if (r.kind === "custom_command" && r.name && slashCommandNames.has(r.name.toLowerCase())) return false;
+      return true;
+    });
   }
 
   /** Groups results into ordered, labeled sections for rendering. */
@@ -1020,7 +1055,10 @@ export class Search {
     const sections: SectionDef[] = [];
     const seenKinds = new Set<string>();
     for (const kind of SECTION_ORDER) {
-      const items = results.filter((r) => r.kind === kind);
+      const items = results.filter((r) => {
+        if (kind === "session_header") return r.kind === "session_header" || r.kind === "conversation";
+        return r.kind === kind;
+      });
       if (items.length === 0) continue;
       const def = SECTION_DEFS[kind] || SECTION_DEFS["file"];
       sections.push({
@@ -1028,6 +1066,7 @@ export class Search {
         items,
       });
       seenKinds.add(kind);
+      if (kind === "session_header") seenKinds.add("conversation");
     }
     const other = results.filter((r) => !seenKinds.has(r.kind));
     if (other.length) {

@@ -1,5 +1,4 @@
 ﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -20,6 +19,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from enum import Enum
@@ -66,6 +67,50 @@ class PluginManifest:
     engines: dict[str, str] = field(default_factory=dict)
     contributes: dict[str, Any] = field(default_factory=dict)
 
+    # Distributed plugin transport (v0.5+).  Determines where the plugin
+    # code executes and how the host communicates with it.
+    #   "local"   — in-process (default, backward compatible)
+    #   "process" — subprocess sandbox (JSON-RPC over stdio)
+    #   "remote"  — network plugin at ``endpoint`` URL (HTTP POST)
+    transport: str = "local"
+    #: Endpoint URL for ``transport="remote"`` plugins; ignored otherwise.
+    endpoint: str = ""
+    #: Resource limits for ``transport="process"`` plugins.
+    #: Keys: ``cpu`` (float, core fraction), ``memory_mb`` (int),
+    #: ``timeout_s`` (float, per-call timeout).  All optional.
+    resource_limits: dict[str, Any] = field(default_factory=dict)
+
+    # S5: integrity hash of the plugin's .py files (SHA-256).  Verified
+    # at load time for non-trusted tiers to detect tampering.
+    integrity: str = ""
+    # Factory target (``module:attr``) for process-transport plugins.
+    factory: str = ""
+
+    # S6-S9: Extension surfaces (v0.5+).  Each list names the capability
+    # the plugin provides, mirroring the existing provides_tools pattern.
+    provides_context: list[str] = field(default_factory=list)
+    provides_ui: list[str] = field(default_factory=list)
+    provides_gateways: list[str] = field(default_factory=list)
+    provides_memory: list[str] = field(default_factory=list)
+
+    @property
+    def encre_engine(self) -> str:
+        """Authoritative harness compatibility range (``engines["encre"]``).
+
+        Falls back to the legacy ``min_ea_version`` field when the
+        ``engines`` map is unset, so hand-built manifests keep working.
+        New manifests should declare ``engines = {"encre": ">=0.5"}``.
+        """
+        return self.engines.get("encre") or self.min_ea_version
+
+    @encre_engine.setter
+    def encre_engine(self, value: str) -> None:
+        """Set ``engines["encre"]`` and mirror into legacy fields (dual-write)."""
+        self.engines["encre"] = value
+        # Keep the legacy fields consistent for consumers that still read
+        # them directly (they are deprecated aliases, not authoritative).
+        self.min_ea_version = value
+
     @property
     def is_lazy(self) -> bool:
         """True when code activation must wait for an activation event."""
@@ -95,6 +140,15 @@ class PluginManifest:
             "permissions": self.permissions,
             "engines": self.engines,
             "contributes": self.contributes,
+            "transport": self.transport,
+            "endpoint": self.endpoint,
+            "resource_limits": self.resource_limits,
+            "integrity": self.integrity,
+            "factory": self.factory,
+            "provides_context": self.provides_context,
+            "provides_ui": self.provides_ui,
+            "provides_gateways": self.provides_gateways,
+            "provides_memory": self.provides_memory,
         }
 
     @classmethod
@@ -144,6 +198,25 @@ class EncrePlugin:
     def get_backends(self) -> dict[str, Any]:
         """Return {name: backend_class} provided by this plugin."""
         return {}
+
+    # S6-S9: Extension surface providers (v0.5+).  Each returns a list of
+    # capability objects; plugins that don't provide a surface return [].
+
+    def get_context_providers(self) -> list[Any]:
+        """Return context providers that inject messages into the agent context."""
+        return []
+
+    def get_ui_providers(self) -> list[Any]:
+        """Return UI providers that inject components into the desktop renderer."""
+        return []
+
+    def get_gateway_adapters(self) -> list[Any]:
+        """Return IM platform gateway adapters (Telegram, WeChat, etc.)."""
+        return []
+
+    def get_memory_stores(self) -> list[Any]:
+        """Return alternative memory storage backends."""
+        return []
 
     def on_activate(self, context: Any = None) -> None:
         """Called when the plugin is activated.

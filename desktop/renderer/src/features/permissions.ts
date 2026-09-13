@@ -55,21 +55,26 @@ export class Permissions {
    *
    * @param toolName - Name of the tool requesting access.
    * @param reason   - Human-readable justification shown to the user.
-   * @param cb       - Callback invoked with `true` when allowed, `false` otherwise.
+   * @param cb       - Callback invoked with `"allow"` (one-off), `"allow_session"`
+   *                   (remember for this session) or `"deny"`.
    *
-   * Reuses the standard install/confirm dialog shell. If a prompt is already
-   * open the new request is rejected immediately (`false`) so the agent loop is
-   * never blocked.
+   * Reuses the standard install/confirm dialog shell. When the user allows
+   * with "always allow this session", the answer is recorded in the Rust
+   * policy table so subsequent invocations of the same tool are silent.
+   *
+   * If a prompt is already open the new request is rejected immediately
+   * (`"deny"`) so the agent loop is never blocked.
    */
   show(
     toolName: string,
     reason: string,
-    cb: (allowed: boolean) => void,
+    cb: (decision: "allow" | "allow_session" | "deny") => void,
+    container?: HTMLElement,
   ): void {
     if (this.active) {
       // A previous request is still open -- fall through to its
       // resolver with "deny" so the agent loop is not blocked.
-      cb(false);
+      cb("deny");
       return;
     }
     this.active = true;
@@ -80,21 +85,28 @@ export class Permissions {
     const translatedDesc = t(descKey as any);
     const description = translatedDesc === descKey ? reason : translatedDesc;
     const body = t("permissions.body", { name: toolName, description });
-    const allow = t("permissions.allow");
-    const deny = t("permissions.deny");
 
-    // Reuse the same modal as the "Delete" / engine-install confirm:
-    // same overlay, same card, same primary/secondary buttons.
-    Dialog.confirmInstall(title, body, { primary: allow, secondary: deny }, "critical")
-      .then((allowed) => {
+    // Three-way choice: deny / always-allow-this-session / allow-once.
+    Dialog.tripleConfirm(
+      title,
+      body,
+      {
+        primary: t("permissions.allowOnce"),
+        tertiary: t("permissions.allowSession"),
+        secondary: t("permissions.deny"),
+        priority: "critical",
+        container,
+      },
+    )
+      .then((choice) => {
         this.active = false;
         setPendingPermission(null);
-        cb(allowed);
+        cb(choice === "primary" ? "allow" : choice === "tertiary" ? "allow_session" : "deny");
       })
       .catch(() => {
         this.active = false;
         setPendingPermission(null);
-        cb(false);
+        cb("deny");
       });
   }
 

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -46,6 +46,7 @@ from encre.server.protocol import (
     ClientSpecApprove,
     ClientSpecReject,
 )
+from encre.server.session_manager import SessionState
 from encre.tools.runtime import set_browser_session_id as set_session_id, set_cdp_url
 
 logger = logging.getLogger("encre.transport.ws")
@@ -62,7 +63,14 @@ class PermissionHandlers:
         if session is None:
             session = self._get_or_create_session()
         self._manager.touch(session.session_id)
-        session.agent.respond_permission(msg.decision)
+        session.agent.respond_permission(msg.decision, msg.remember)
+        # The agent loop was blocked inside this consent gate; the user just
+        # released it, so the session is active again.  Without this the state
+        # would stay AWAITING_APPROVAL for the rest of the turn, so any
+        # resume/listing refresh would keep reporting "waiting for consent"
+        # while the agent is actually working.
+        if session.state == SessionState.AWAITING_APPROVAL:
+            self._manager.set_session_state(session.session_id, SessionState.RUNNING)
 
     async def _h_respond_plan(self, ws: Any, msg: ClientRespondPlan) -> None:
         session = (

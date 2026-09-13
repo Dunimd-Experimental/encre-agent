@@ -338,6 +338,7 @@ body {
   display: flex;
   flex: 1;
   overflow: hidden;
+  position: relative;
 }
 
 /* ── Unified Icon Button System ──────────────────────────────────── */
@@ -600,7 +601,11 @@ body {
 .encre-menu-dropdown {
   position: absolute;
   z-index: 300;
-  width: 240px;
+  width: max-content;
+  min-width: 200px;
+  max-width: var(--dd-max-w, calc(100vw - 24px));
+  max-height: var(--dd-max-h, 360px);
+  overflow-y: auto;
   padding: 4px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border-light);
@@ -826,11 +831,17 @@ body {
   overflow: hidden;
 }
 
-/* Sidebar content fades quickly during collapse/expand to prevent jarring
-   content reflow. The fast opacity transition (0.12s) completes well before
-   the slow width transition (0.28s), creating a natural staggered effect. */
+/* Sidebar content is pinned to the expanded width (256px) and clipped by
+   #sidebar's overflow:hidden, so it never reflows while the sidebar's own
+   width transitions. The opacity transition is synced to the SAME slow
+   duration as the width — a fast fade made collapse (content gone, then
+   empty box shrank) and expand (content appeared cramped, then grew) read
+   as two different moves; matching durations makes the two directions a
+   perfect mirror. */
 #sidebar > * {
-  transition: opacity var(--transition-fast);
+  width: 256px;
+  min-width: 256px;
+  transition: opacity var(--transition-slow);
 }
 #app.sidebar-collapsed #sidebar > * {
   opacity: 0;
@@ -1722,10 +1733,12 @@ body:has(.context-target) .ws-tree-session-item.active {
   transform: translateX(0);
 }
 
-/* Session inner sidebar content fades quickly during slide to prevent jarring
-   reflow, matching the app sidebar's staggered fade effect. */
+/* Inner sidebar content fades synced to the same slow duration as the
+   sidebar's own transform/width move, mirroring the app sidebar so collapse
+   and expand read as a perfect mirror (a fast fade made the two directions
+   feel different). */
 #session-inner-sidebar > * {
-  transition: opacity var(--transition-fast);
+  transition: opacity var(--transition-slow);
 }
 #main-body.sidebar-hidden #session-inner-sidebar > *,
 #automation-view:not(.hidden) ~ #session-inner-sidebar > * {
@@ -1837,12 +1850,16 @@ body:has(.context-target) .ws-tree-session-item.active {
   position: absolute;
   top: 100%;
   inset-inline-end: 4px;
+  width: max-content;
+  min-width: 140px;
+  max-width: var(--dd-max-w, calc(100vw - 24px));
+  max-height: var(--dd-max-h, 320px);
+  overflow-y: auto;
   background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
   z-index: 100;
-  min-width: 140px;
   padding: 4px;
 }
 .tab-add-item {
@@ -1854,6 +1871,7 @@ body:has(.context-target) .ws-tree-session-item.active {
   color: var(--text-primary);
   cursor: pointer;
   border-radius: 6px;
+  white-space: nowrap;
   transition: background var(--transition-fast);
 }
 .tab-add-item:hover {
@@ -4410,8 +4428,10 @@ html[dir="rtl"] .welcome-title {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 4px;
+  width: max-content;
   min-width: 220px;
-  max-height: 320px;
+  max-width: var(--dd-max-w, calc(100vw - 24px));
+  max-height: var(--dd-max-h, 320px);
   overflow-y: auto;
   box-shadow: var(--shadow-lg);
   z-index: 100;
@@ -4451,6 +4471,7 @@ html[dir="rtl"] .welcome-title {
   color: var(--text-primary);
   font-size: 13px;
   cursor: pointer;
+  white-space: nowrap;
   transition: background var(--transition-fast);
   text-align: start;
 }
@@ -4796,6 +4817,60 @@ html[dir="rtl"] .welcome-title {
 .input-expand-btn .lucide {
   width: 12px;
   height: 12px;
+}
+
+/* ── Dialog textarea expand toggle (top-right, hover-revealed) ───────── */
+/* Hit area tucked into the container's top-right corner (`.input-wrapper`
+   already establishes the positioning context): only that corner reveals the
+   toggle, mirroring the composer's expand zone. */
+.dialog-expand-zone {
+  position: absolute;
+  top: 5px;
+  inset-inline-end: 5px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  width: 32px;
+  height: 26px;
+}
+
+/* Deliberately no bespoke transition here: the button is a plain `.btn-icon`,
+   so it inherits `transition: all var(--transition-fast)` and its reveal is
+   byte-for-byte the composer button's motion (no extra scale/curve). */
+.dialog-input-expand {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.dialog-expand-zone:hover .dialog-input-expand,
+.dialog-input-expand:hover,
+.dialog-input-expand:focus-visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* The glide uses the composer's own curve, and the min/max clamps are lifted
+   for its duration so `height` is free to interpolate.  Without that the
+   browser resolves the bounds in the very recalculation that arms the
+   transition: the lower bound jumps straight to the expanded height, the *used*
+   height is pinned there from frame zero, and the box snaps open while the fold
+   stutters.  Same trick the composer uses on `.prompt-input.expanded`
+   (`min-height: 0; max-height: none`).  Applied only for the duration of the
+   click so typing keeps its instant auto-grow. */
+.input-wrapper--dialog textarea.setting-rich-text.is-expand-anim {
+  transition: height var(--transition-emphasized);
+  min-height: 0 !important;
+  max-height: none !important;
+}
+
+/* Expanded: the textarea takes over most of the dialog.  `!important` beats
+   the inline height written by the dialogs' auto-grow handlers; the clamps are
+   lifted here too so the fixed height survives the animation class leaving. */
+.input-wrapper--dialog.is-expanded textarea.setting-rich-text {
+  height: min(480px, 50vh) !important;
+  min-height: 0 !important;
+  max-height: none !important;
 }
 
 .prompt-input.input-anim {
@@ -5278,6 +5353,9 @@ html[dir="rtl"] .welcome-title {
   position: fixed;
   z-index: 250;
   min-width: 180px;
+  max-width: var(--dd-max-w, calc(100vw - 24px));
+  max-height: var(--dd-max-h, 320px);
+  overflow-y: auto;
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -5295,30 +5373,19 @@ html[dir="rtl"] .welcome-title {
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--text-primary);
+  white-space: nowrap;
   cursor: pointer;
   transition: background var(--transition-fast);
 }
 
+/* Stronger hover than --bg-hover: the plain token (#222) is nearly
+   invisible against the menu surface (--bg-tertiary #1a1a1a), so every
+   context-menu row gets the same distinct highlight. Danger rows keep
+   their red tint below. */
 .context-menu-item:hover {
-  background: var(--bg-hover);
-}
-
-/* Rename & Export get a stronger hover to stand out from default items.
-   Archive / Unarchive items join the same group so their hover feedback
-   matches every other regular item (the plain --bg-hover is nearly
-   invisible on dark menus). */
-#ctx-rename:hover,
-#ctx-export:hover,
-#ctx-archive:hover,
-#ctx-archive-ws:hover,
-#wsmgr-ctx-unarchive:hover {
   background: rgba(255, 255, 255, 0.12);
 }
-[data-theme="light"] #ctx-rename:hover,
-[data-theme="light"] #ctx-export:hover,
-[data-theme="light"] #ctx-archive:hover,
-[data-theme="light"] #ctx-archive-ws:hover,
-[data-theme="light"] #wsmgr-ctx-unarchive:hover {
+[data-theme="light"] .context-menu-item:hover {
   background: rgba(0, 0, 0, 0.08);
 }
 
@@ -5327,7 +5394,12 @@ html[dir="rtl"] .welcome-title {
 }
 
 .context-menu-item-danger:hover {
-  background: rgba(239, 68, 68, 0.1);
+  background: rgba(239, 68, 68, 0.18);
+  color: #f87171;
+}
+[data-theme="light"] .context-menu-item-danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #dc2626;
 }
 
 .context-menu-divider {
@@ -5381,7 +5453,7 @@ html[dir="rtl"] .welcome-title {
 
 /* ── Dialog (reusable modal) ─────────────────────────────────────── */
 .encre-dialog-overlay {
-  position: fixed;
+  position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.45);
   backdrop-filter: blur(4px);
@@ -5389,7 +5461,6 @@ html[dir="rtl"] .welcome-title {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
   animation: fade-in var(--motion-enter);
 }
 
@@ -5397,14 +5468,6 @@ html[dir="rtl"] .welcome-title {
   animation: fade-out var(--motion-exit) forwards;
 }
 
-/* Dialog confined to a container (e.g. the session sidebar) instead of the
-   whole window: covers the container and stays inside it. */
-.encre-dialog-overlay--inline {
-  position: absolute;
-  inset: 0;
-  z-index: 60;
-  background: rgba(0, 0, 0, 0.35);
-}
 .encre-dialog-card--inline {
   min-width: 0;
   width: min(360px, calc(100% - 32px));
@@ -5624,6 +5687,7 @@ html[dir="rtl"] .welcome-title {
   flex-direction: column;
   overflow-y: auto;
   padding: 24px 32px 40px;
+  position: relative;
 }
 
 #settings-content-wrap {
@@ -5814,7 +5878,19 @@ html[dir="rtl"] .welcome-title {
 }
 
 .log-row:hover {
-  background: var(--bg-hover);
+  background: rgba(255, 255, 255, 0.08);
+}
+[data-theme="light"] .log-row:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+/* Row that the open context menu targets — stays highlighted while the
+   menu is open, even when the pointer has moved onto the menu itself. */
+.log-row.ctx-target {
+  background: rgba(255, 255, 255, 0.12);
+}
+[data-theme="light"] .log-row.ctx-target {
+  background: rgba(0, 0, 0, 0.08);
 }
 
 .log-cell {
@@ -6899,6 +6975,14 @@ body.child-mode #header-bar {
   border-bottom: none;
 }
 
+/* ── Permission mode hint ────────────────────────────────────── */
+.permission-mode-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 2px 0 12px;
+  line-height: 1.5;
+}
+
 .settings-item-control {
   flex-shrink: 0;
   display: flex;
@@ -6995,6 +7079,7 @@ body.child-mode #header-bar {
   inset-inline-end: 0;
   min-width: 100%;
   width: max-content;
+  max-width: var(--dd-max-w, calc(100vw - 24px));
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -7002,7 +7087,7 @@ body.child-mode #header-bar {
   padding: 4px;
   z-index: 200;
   display: none;
-  max-height: 280px;
+  max-height: var(--dd-max-h, 320px);
   overflow-y: auto;
 }
 
@@ -7025,6 +7110,7 @@ body.child-mode #header-bar {
   cursor: pointer;
   font-size: 13px;
   color: var(--text-primary);
+  white-space: nowrap;
   transition: background var(--transition-fast);
   margin-bottom: 2px;
 }
@@ -8038,6 +8124,9 @@ body.child-mode #header-bar {
   top: calc(100% + 4px);
   inset-inline-start: 0;
   width: 260px;
+  max-width: var(--dd-max-w, calc(100vw - 24px));
+  max-height: var(--dd-max-h, 360px);
+  overflow-y: auto;
   padding: 12px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
@@ -9141,6 +9230,36 @@ body.child-mode #header-bar {
   height: 14px;
 }
 
+/* ── MCP env vars (add / edit server form) ─────────────────── */
+.mcp-transport-fields {
+  margin-bottom: 16px;
+}
+.mcp-env-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.mcp-env-label-row .model-form-label {
+  margin-bottom: 0;
+}
+.mcp-env-label-row .btn-icon {
+  flex-shrink: 0;
+}
+.mcp-env-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.mcp-env-row .model-form-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.mcp-env-row .mcp-env-remove {
+  flex-shrink: 0;
+}
+
 .model-table {
   display: flex;
   flex-direction: column;
@@ -9271,7 +9390,7 @@ body.child-mode #header-bar {
 }
 
 .model-cell-provider {
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   color: var(--text-secondary);
 }
@@ -9279,6 +9398,7 @@ body.child-mode #header-bar {
 .model-cell-actions {
   width: 120px;
   flex-shrink: 0;
+  margin-left: auto;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -11736,6 +11856,7 @@ input.model-form-input--reveal {
   flex: 1;
   text-align: center;
   min-width: 0;
+  position: relative;
 }
 .usage-metric-value {
   display: block;
@@ -11926,6 +12047,81 @@ input.model-form-input--reveal {
   position: relative;
   width: 100%;
   height: 220px;
+}
+
+/* Skeleton shimmer placeholder shown while the daily bar chart is being
+ * built / refreshed / re-grouped.  Industry-standard "transparent -> gray ->
+ * transparent" sweep moving left -> right (reuses the project shimmerWave
+ * keyframes).  Kept light & transparent per design review: small radius and a
+ * low-opacity sweep with no solid gray block behind it. */
+.usage-chart-canvas-wrap .usage-chart-shimmer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: transparent;
+  transition: opacity var(--transition-fast);
+  z-index: 1;
+}
+.usage-chart-canvas-wrap.is-ready .usage-chart-shimmer {
+  opacity: 0;
+  pointer-events: none;
+}
+.usage-chart-canvas-wrap canvas {
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+.usage-chart-canvas-wrap.is-ready canvas {
+  opacity: 1;
+}
+.usage-shimmer-bar {
+  height: 12px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(140, 144, 156, 0.18) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmerWave 1.6s ease-in-out infinite;
+}
+.usage-shimmer-bar.bar-1 { width: 100%; }
+.usage-shimmer-bar.bar-2 { width: 78%; }
+.usage-shimmer-bar.bar-3 { width: 92%; }
+.usage-shimmer-bar.bar-4 { width: 64%; }
+
+/* Metric cells show a matching shimmer bar (instead of the number) while the
+ * metrics row is loading.  Overlaid on the value's slot (no layout shift).
+ * Same light / transparent treatment as the chart skeleton. */
+.usage-metric-shimmer {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 56px;
+  height: 14px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(140, 144, 156, 0.18) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmerWave 1.6s ease-in-out infinite;
+}
+.usage-metrics.is-loading .usage-metric-value { visibility: hidden; }
+.usage-metrics.is-loading .usage-metric-shimmer { display: block; }
+
+@media (prefers-reduced-motion: reduce) {
+  .usage-shimmer-bar { animation: none; background: rgba(140, 144, 156, 0.18); }
+  .usage-metric-shimmer { animation: none; background: rgba(140, 144, 156, 0.18); }
 }
 
 .usage-heatmap-legend {
@@ -13873,6 +14069,57 @@ input.model-form-input--reveal {
 
 .copy-flash.is-fading {
   opacity: 0;
+}
+
+/* ── Floating panels that used to snap in ───────────────────────────
+   Context menus, the tab-add dropdown, the chat action menu, legacy
+   dialogs, and the command palette all appeared with no motion. They now
+   reuse the project's existing keyframes so they read as the same motion
+   language: scale+drop for anchored menus, slide+scale for dialog cards,
+   pure fade for full-screen overlays. The entrance fires on the same
+   trigger that showed them before (`.hidden` removal, `.open`, or DOM
+   insertion) so no JS change is needed. */
+.context-menu:not(.hidden) {
+  animation: encre-menu-in var(--motion-enter);
+  transform-origin: top left;
+}
+
+.tab-add-dropdown:not(.hidden) {
+  animation: encre-menu-in var(--motion-enter);
+  transform-origin: top left;
+}
+
+/* The chat action menu explicitly disabled the inherited `fadeInUp`.
+   Same specificity (two classes), declared later in source order, so it
+   wins and restores motion. It anchors to the top-right because the menu
+   opens from a button on the right of the message bubble. */
+.action-menu.mention-dropdown {
+  animation: encre-menu-in var(--motion-enter);
+  transform-origin: top right;
+}
+
+.toast-overlay:not(.hidden),
+#rename-dialog-overlay:not(.hidden) {
+  animation: fade-in var(--motion-enter);
+}
+
+.toast-dialog:not(.hidden),
+#rename-dialog:not(.hidden) {
+  animation: yimSlideUp var(--transition-emphasized);
+}
+
+#search-overlay:not(.hidden),
+#review-commit-overlay:not(.hidden) {
+  animation: fade-in var(--motion-enter);
+}
+
+/* Context menus opened via inline `style.display = "block"` (rather than
+   the `.hidden` class) also need the entrance; the `:not(.hidden)` rule
+   above covers the class path, this covers the inline path. */
+.context-menu[style*="display: block"],
+.context-menu[style*="display:block"] {
+  animation: encre-menu-in var(--motion-enter);
+  transform-origin: top left;
 }
 
 /* While the session sidebar's resize handle is being dragged, the width

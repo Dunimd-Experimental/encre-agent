@@ -63,6 +63,7 @@ export interface TabDef {
   content?: string;      /** for markdown tabs: initial markdown content */
   title?: string;        /** for markdown tabs: preview title */
   filePath?: string;     /** for editor/markdown tabs: file path */
+  mediaType?: string;    /** for media tabs: "image" | "video" (when path has no known ext) */
   state?: string;        /** breathing light: "running" | "awaiting_approval" | "permission" | "" */
 }
 
@@ -374,6 +375,30 @@ export class SessionInner {
         this.createTab("browser", { startUrl: url });
       }
     }) as EventListener);
+
+    // Open a media file from a chat media viewer (info tool card) as a
+    // sidebar media preview tab — same primitive the file tree uses.
+    window.addEventListener("media-open-preview", ((e: CustomEvent) => {
+      const { type, src } = e.detail as { type?: string; src?: string };
+      if (!src) return;
+      const filePath = src.replace(/^local:\/\/\//, "").replace(/^local:\/\//, "").replace(/^file:\/\/\//, "").replace(/^file:\/\//, "");
+      if (/^https?:/i.test(filePath)) return;
+      const panel = document.getElementById("session-inner-sidebar");
+      const mainBody = document.getElementById("main-body");
+      if (panel && mainBody && panel.classList.contains("hidden")) {
+        panel.classList.remove("hidden");
+        mainBody.classList.remove("sidebar-hidden");
+        document.getElementById("app")?.classList.add("sidebar-collapsed");
+        this.saveSidebarVisibility();
+      }
+      const existing = this.tabs.find(t => t.type === "media" && t.filePath === filePath);
+      if (existing) {
+        this.activateTab(existing.id);
+        return;
+      }
+      const name = filePath.split(/[/\\]/).pop() || filePath;
+      this.createTab("media", { title: name, filePath, mediaType: type === "video" ? "video" : "image" });
+    }) as EventListener);
   }
 
   /** Re-renders the active tab's content (reactive to state/locale). */
@@ -676,7 +701,7 @@ export class SessionInner {
     }
   }
 
-  public async createTab(type: string, opts?: { shellPath?: string; shellArgs?: string[]; startUrl?: string; content?: string; title?: string; filePath?: string }): Promise<void> {
+  public async createTab(type: string, opts?: { shellPath?: string; shellArgs?: string[]; startUrl?: string; content?: string; title?: string; filePath?: string; mediaType?: string }): Promise<void> {
     let id: string;
     let label: string;
     if (type === "terminal") {
@@ -720,6 +745,7 @@ export class SessionInner {
     if (opts?.content !== undefined) tab.content = opts.content;
     if (opts?.title !== undefined) tab.title = opts.title;
     if (opts?.filePath !== undefined) tab.filePath = opts.filePath;
+    if (opts?.mediaType !== undefined) tab.mediaType = opts.mediaType;
     this.tabs.push(tab);
     _saveTabs(this.tabs);
     this.activeTab = id;
@@ -754,7 +780,7 @@ export class SessionInner {
       } else if (t.type === "code") {
         await this.setupCodePanel(panel, t.id, t.content || "", t.filePath || "");
       } else if (t.type === "media") {
-        this.setupMediaPanel(panel, t.id, t.filePath || "");
+        this.setupMediaPanel(panel, t.id, t.filePath || "", t.mediaType);
       } else if (t.type === "office") {
         this.setupOfficePanel(panel, t.id, t.filePath || "");
       }
@@ -985,10 +1011,10 @@ export class SessionInner {
     ctxMenu.className = "context-menu hidden";
     ctxMenu.setAttribute("id", `term-ctx-menu-${tabId}`);
     ctxMenu.innerHTML = `
-      <div class="context-menu-item" data-action="copy">${t("sessionInner.termCopy")}</div>
-      <div class="context-menu-item" data-action="paste">${t("sessionInner.termPaste")}</div>
+      <div class="context-menu-item" data-action="copy"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("sessionInner.termCopy")}</div>
+      <div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.termPaste")}</div>
       <div class="context-menu-divider"></div>
-      <div class="context-menu-item" data-action="send">${t("sessionInner.termSendToChat")}</div>`;
+      <div class="context-menu-item" data-action="send"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>`;
     document.body.appendChild(ctxMenu);
     let ctxTermTarget: any = null;
 
@@ -996,6 +1022,7 @@ export class SessionInner {
       ev.preventDefault();
       ctxTermTarget = term;
       showContextMenu(ctxMenu, ev.clientX, ev.clientY);
+      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: ctxMenu }));
     });
 
     term.onData((data: string) => {
@@ -2023,11 +2050,11 @@ export class SessionInner {
       onDialog: (type, message, _defaultPromptText, respond) => {
         this.setTabState(tabId, "awaiting_approval");
         if (type === "alert") {
-          Dialog.alert(message, "").then(() => { respond(null); this.setTabState(tabId, ""); });
+          Dialog.alert(message, "", { container: this.el }).then(() => { respond(null); this.setTabState(tabId, ""); });
         } else if (type === "confirm") {
-          Dialog.confirm(message, "").then((ok) => { respond(ok ? "true" : "false"); this.setTabState(tabId, ""); });
+          Dialog.confirm(message, "", { container: this.el }).then((ok) => { respond(ok ? "true" : "false"); this.setTabState(tabId, ""); });
         } else if (type === "prompt") {
-          Dialog.prompt(message, "", _defaultPromptText).then((val) => { respond(val); this.setTabState(tabId, ""); });
+          Dialog.prompt(message, "", { defaultValue: _defaultPromptText, container: this.el }).then((val) => { respond(val); this.setTabState(tabId, ""); });
         } else {
           respond(null);
           this.setTabState(tabId, "");
@@ -2565,36 +2592,37 @@ export class SessionInner {
       if (isDir) {
         // Folder: new file/folder, paste into it, send, delete.
         menu =
-          `<div class="context-menu-item" data-action="new-file">${t("sessionInner.newFile")}</div>` +
-          `<div class="context-menu-item" data-action="new-folder">${t("sessionInner.newFolder")}</div>` +
+          `<div class="context-menu-item" data-action="new-file"><i data-lucide="file-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFile")}</div>` +
+          `<div class="context-menu-item" data-action="new-folder"><i data-lucide="folder-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFolder")}</div>` +
           `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="paste">${t("sessionInner.pasteFile")}</div>` +
+          `<div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.pasteFile")}</div>` +
           `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="send-folder">${t("sessionInner.termSendToChat")}</div>` +
+          `<div class="context-menu-item" data-action="send-folder"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>` +
           `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item context-menu-item-danger" data-action="delete">${t("sessionInner.delete")}</div>`;
+          `<div class="context-menu-item context-menu-item-danger" data-action="delete"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("sessionInner.delete")}</div>`;
       } else if (!path) {
         // Empty area (no file/folder under the cursor): create + paste into root.
         menu =
-          `<div class="context-menu-item" data-action="new-file">${t("sessionInner.newFile")}</div>` +
-          `<div class="context-menu-item" data-action="new-folder">${t("sessionInner.newFolder")}</div>` +
+          `<div class="context-menu-item" data-action="new-file"><i data-lucide="file-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFile")}</div>` +
+          `<div class="context-menu-item" data-action="new-folder"><i data-lucide="folder-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFolder")}</div>` +
           `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="paste">${t("sessionInner.pasteFile")}</div>`;
+          `<div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.pasteFile")}</div>`;
       } else {
         // File: copy it, send to conversation, preview (.md), delete.
         menu =
-          `<div class="context-menu-item" data-action="copy">${t("sessionInner.copyFile")}</div>` +
+          `<div class="context-menu-item" data-action="copy"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("sessionInner.copyFile")}</div>` +
           `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="send-file">${t("sessionInner.termSendToChat")}</div>`;
+          `<div class="context-menu-item" data-action="send-file"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>`;
         if (isMd) {
-          menu += `<div class="context-menu-divider"></div><div class="context-menu-item" data-action="preview">${t("sessionInner.preview")}</div>`;
+          menu += `<div class="context-menu-divider"></div><div class="context-menu-item" data-action="preview"><i data-lucide="eye" class="lucide lucide-sm"></i>${t("sessionInner.preview")}</div>`;
         }
         menu +=
           `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item context-menu-item-danger" data-action="delete">${t("sessionInner.delete")}</div>`;
+          `<div class="context-menu-item context-menu-item-danger" data-action="delete"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("sessionInner.delete")}</div>`;
       }
       treeCtxMenu.innerHTML = menu;
       showContextMenu(treeCtxMenu, ev.clientX, ev.clientY);
+      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: treeCtxMenu }));
     };
 
     treeCtxMenu.addEventListener("click", async (ev) => {
@@ -2672,7 +2700,7 @@ export class SessionInner {
           if (res && res.success) {
             await renderTree();
           } else if (res && res.error) {
-            Dialog.alert(t("dialog.error"), res.error);
+            Dialog.alert(t("dialog.error"), res.error, { container: this.el });
           }
         }
       }
@@ -2937,7 +2965,7 @@ export class SessionInner {
     await this.createTab("office", { title: name, filePath });
   }
 
-  private setupMediaPanel(panel: HTMLElement, tabId: string, filePath: string): void {
+  private setupMediaPanel(panel: HTMLElement, tabId: string, filePath: string, mediaType?: string): void {
     panel.style.overflow = "hidden";
     panel.style.background = "var(--bg-primary)";
 
@@ -2954,7 +2982,9 @@ export class SessionInner {
     panel.appendChild(container);
 
     const ext = filePath.split(".").pop()?.toLowerCase() || "";
-    const isVideo = SessionInner._videoExts.has(ext);
+    const isVideo = mediaType
+      ? mediaType === "video"
+      : SessionInner._videoExts.has(ext);
 
     const mv = new MediaViewer(container, { type: isVideo ? "video" : "image", src: filePath });
     this.panelMediaViewers.set(tabId, mv);
@@ -3189,10 +3219,10 @@ export class SessionInner {
     ctxMenu.className = "context-menu hidden";
     ctxMenu.setAttribute("id", `code-ctx-menu-${tabId}`);
     ctxMenu.innerHTML = `
-      <div class="context-menu-item" data-action="copy">${t("sessionInner.termCopy")}</div>
-      <div class="context-menu-item" data-action="paste">${t("sessionInner.termPaste")}</div>
+      <div class="context-menu-item" data-action="copy"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("sessionInner.termCopy")}</div>
+      <div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.termPaste")}</div>
       <div class="context-menu-divider"></div>
-      <div class="context-menu-item" data-action="send">${t("sessionInner.termSendToChat")}</div>`;
+      <div class="context-menu-item" data-action="send"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>`;
     document.body.appendChild(ctxMenu);
     let ctxEditorTarget: any = null;
 
@@ -3200,6 +3230,7 @@ export class SessionInner {
       ev.preventDefault();
       ctxEditorTarget = view;
       showContextMenu(ctxMenu, ev.clientX, ev.clientY);
+      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: ctxMenu }));
     }, true);
 
     const outsideClick = (e: MouseEvent) => {
@@ -3683,6 +3714,9 @@ export class SessionInner {
     } else {
       panel.classList.add("hidden");
       mainBody.classList.add("sidebar-hidden");
+      // The inner sidebar's open state collapsed the app sidebar; undo that
+      // so switching to a session without the inner sidebar re-expands it.
+      (window as any).__appRestoreSidebar?.();
     }
   }
 
@@ -3781,8 +3815,8 @@ export class SessionInner {
         document.body.appendChild(menu);
       }
       menu.innerHTML = `
-        <div class="context-menu-item" data-action="reindex">${t("settings.reindex")}</div>
-        <div class="context-menu-item" data-action="delete-index">${t("settings.deleteIndex")}</div>`;
+        <div class="context-menu-item" data-action="reindex"><i data-lucide="refresh-cw" class="lucide lucide-sm"></i>${t("settings.reindex")}</div>
+        <div class="context-menu-item" data-action="delete-index"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("settings.deleteIndex")}</div>`;
 
       btn.addEventListener("click", function _onSettingsClick(e: Event) {
         e.stopPropagation();
@@ -3797,6 +3831,7 @@ export class SessionInner {
           const rect = btn.getBoundingClientRect();
           menu!.style.left = clampElLeft(menu!, rect.right - 160) + "px";
           menu!.style.top = (rect.bottom + 4) + "px";
+          requestAnimationFrame(() => (window as any).lucide.createIcons({ root: menu! }));
           setTimeout(() => {
             document.addEventListener("click", function _closeMenu() {
               menu!.style.display = "none";
@@ -4078,7 +4113,7 @@ export class SessionInner {
       </div>`;
 
     return `<div class="si-panel">
-      ${this.panelHeader("index", t("sidebar.index"), "file-search")}
+      ${this.panelHeader("index", t("sidebar.index"), "database")}
       <div class="si-panel-body${this.collapsedPanels.has("index") ? " hidden" : ""}"><div class="si-panel-inner">${html}</div></div>
     </div>`;
   }

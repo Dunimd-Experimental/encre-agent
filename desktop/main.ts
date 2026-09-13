@@ -1348,10 +1348,10 @@ const TRAY_LABELS: Record<string, { openYim: string; quit: string; tooltip: stri
 };
 
 /**
-  zh: { openYim: "\u6253\u5f00 Encre", quit: "\u9000\u51fa", tooltip: "Encre Server" },
+ * Updates the tray tooltip to reflect the backend running status.
  * @param running - Whether the backend service is currently running.
  */
-function updateTrayStatus(running: boolean): void {
+function updateTrayStatus(_running: boolean): void {
   if (!tray) return;
   const labels = TRAY_LABELS[currentTrayLocale] || TRAY_LABELS.en;
   tray.setToolTip(labels.tooltip);
@@ -1536,8 +1536,8 @@ function createTray(): void {
 
 /**
  * Creates the main application BrowserWindow: a frameless, hidden-by-default
- * window that loads the renderer, locks zoom to 100%, enables the dev tools,
- * and hides to the tray on close instead of quitting.
+ * window that loads the renderer, locks zoom to 100%, opens the dev tools only
+ * on demand (ENCRE_DEVTOOLS=1), and hides to the tray on close instead of quitting.
  */
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -1570,8 +1570,17 @@ function createWindow(): void {
   };
   mainWindow.on("maximize", pushMaxState);
   mainWindow.on("unmaximize", pushMaxState);
-  // Force developer tools on startup for debugging
-  mainWindow.webContents.openDevTools();
+  // Developer tools are opt-in (ENCRE_DEVTOOLS=1). Leaving them docked in a
+  // frameless window desyncs the OS client-area hit region from what the
+  // renderer paints, so real mouse clicks on the custom min/max/close buttons
+  // silently miss the buttons (injected/synthetic clicks still "work", which
+  // is why this only shows up with a real mouse). Docked DevTools also grabs
+  // focus right after boot, which makes the tray popup's blur handler close it
+  // again the instant it opens. Detached mode is used to avoid the same
+  // hit-region desync when the tools are actually wanted.
+  if (process.env.ENCRE_DEVTOOLS === "1") {
+    mainWindow.webContents.openDevTools({ mode: "detach" });
+  }
   // Force-reset and lock zoom to 100% to avoid accidental Ctrl+-/Ctrl+wheel shrink.
   mainWindow.webContents.setZoomFactor(1);
   mainWindow.webContents.setVisualZoomLevelLimits(1, 1).catch(() => {});
@@ -1913,17 +1922,28 @@ ipcMain.handle("getAppPath", () => {
 
 // 闂傚倸鍊风粈渚€宕崸妤€鍌ㄦ繝濠傜墕绾惧鏌熼崜褏甯涢柣鎾冲暣閺屾稖绠涢幙鍐┬︽繛?Crypto keyfile access 闂傚倸鍊风粈渚€宕崸妤€鍌ㄦ繝濠傜墕绾惧鏌熼崜褏甯涢柣鎾冲暣閺屾稖绠涢幙鍐┬︽繛瀛樼矒缁犳牕顫忓ú顏勭闁圭粯甯掓潏鍛存⒑缁嬫鍎愰柟鐟版喘瀵顓兼径濠勵槯婵犮垼娉涢敃锝嗙珶閺囥垺鈷掑ù锝囶焾閺嗛亶鏌涘Ο鑽ょ煉鐎规洘鍨块獮妯肩磼濡厧甯楅梻浣侯焾缁绘劙藝椤栨稓顩插Δ锝呭暞閳锋垿鏌涢幇顓炵祷閻㈩垬鍔戦弻娑氣偓锝庡亝瀹曞矂鏌＄仦鐣屝х€规洘顨嗗鍕節娴ｅ壊妫滈梻鍌氬€风粈渚€宕崸妤€鍌ㄦ繝濠傜墕绾惧鏌熼崜褏甯涢柣鎾冲暣閺屾稖绠涢幙鍐┬︽繛瀛樼矒缁犳牕顫忓ú顏勭闁圭粯甯掓潏鍛存⒑缁嬫鍎愰柟鐟版喘瀵顓兼径濠勵槯婵犮垼娉涢敃锝嗙珶閺囥垺鈷掑ù锝囶焾閺嗛亶鏌涘Ο鑽ょ煉鐎规洘鍨块獮妯肩磼濡厧甯楅梻浣侯焾缁绘劙藝椤栨稓顩插Δ锝呭暞閳锋垿鏌涢幇顓炵祷閻㈩垬鍔戦弻娑氣偓锝庡亝瀹曞矂鏌＄仦鐣屝х€规洘顨嗗鍕節娴ｅ壊妫滈梻鍌氬€风粈渚€宕崸妤€鍌ㄦ繝濠傜墕绾惧鏌熼崜褏甯涢柣鎾冲暣閺屾稖绠涢幙鍐┬︽繛瀛樼矒缁犳牕顫忓ú顏勭闁圭粯甯掓潏鍛存⒑缁嬫鍎愰柟鐟版喘瀵顓兼径濠勵槯婵犮垼娉涢敃锝嗙珶閺囥垺鈷掑ù锝囶焾閺嗛亶鏌涘Ο鑽ょ煉鐎规洘鍨块獮妯肩磼濡厧甯楅梻浣侯焾缁绘劙藝椤栨稓顩插Δ锝呭暞閳锋垿鏌涢幇顓炵祷閻㈩垬鍔戦弻娑氣偓锝庡亝瀹曞矂鏌＄仦鐣屝х€规洘顨嗗鍕節娴ｅ壊妫滈梻鍌氬€风粈渚€宕崸妤€鍌ㄦ繝濠傜墕绾惧鏌熼崜褏甯涢柣鎾冲暣閺屾稖绠涢幙鍐┬︽繛瀛樼矒缁犳牕顫忓ú顏勭闁圭粯甯掓潏鍛存⒑缁嬫鍎愰柟鐟版喘瀵顓兼径濠勵槯婵犮垼娉涢敃锝嗙珶閺囥垺鈷掑ù锝囶焾閺嗛亶鏌涘Ο鑽ょ煉鐎规洘鍨块獮妯肩磼濡厧甯楅梻浣侯焾缁绘劙藝椤栨稓顩插Δ锝呭暞閳锋垿鏌涢幇顓炵祷閻㈩垬鍔戦弻娑氣偓锝庡亝瀹曞矂鏌＄仦鐣屝х€规洘顨嗗鍕節娴ｅ壊妫滈梻鍌氬€风粈渚€宕崸妤€鍌ㄦ繝濠傜墕绾惧鏌熼崜褏甯涢柣鎾冲暣閺屾稖绠涢幙鍐┬︽繛瀛樼矒缁犳牕顫忓ú顏勭闁圭粯甯掓潏鍛存⒑缁嬫鍎愰柟鐟版喘瀵顓兼径濠勵槯婵犮垼娉涢敃锝嗙珶閺囥垺鈷掑ù锝囶焾閺嗛亶鏌涘Ο鑽ょ煉鐎规洘鍨块獮妯肩磼濡厧甯楅梻浣侯焾缁绘劙藝椤栨稓顩插Δ锝呭暞閳锋垿鏌涢幇顓炵祷閻㈩垬鍔戦弻娑氣偓锝庡亝瀹曞矂鏌＄仦鐣屝х€规洘顨嗗鍕節娴ｅ壊妫滈梻鍌氬€风粈渚€宕崸妤€鍌ㄦ繝濠傜墕绾惧鏌熼崜褏甯涢柣鎾冲暣閺屾稖绠涢幙鍐┬︽繛瀛樼矒缁犳牕顫忓ú顏勭闁圭粯甯掓潏鍛存⒑缁嬫鍎愰柟鐟版喘瀵顓兼径濠勵槯婵犮垼娉涢敃锝嗙珶閺囥垺鈷掑ù锝囶焾閺嗛亶鏌涘Ο鑽ょ煉鐎规洘鍨块獮妯肩磼濡厧甯楅梻浣侯焾缁绘劙藝椤栨稓顩插Δ锝呭暞閳锋垿鏌涢幇顓炵祷閻㈩垬鍔戦弻娑氣偓锝庡亝瀹曞矂鏌＄仦鐣屝х€规洘顨嗗鍕節娴ｅ壊妫?
 
-// Reads the user's transport-encryption keyfile (~/.encre/keyfile).
+// Reads the user's transport-encryption keyfile. The canonical location is
+// <data_dir>/keys/keyfile, matching the Python side's `keyfile_path()`; the
+// legacy ~/.encre/keyfile is still tried so un-migrated installs keep working.
+// Candidates are tried in that order so a stale legacy file can never shadow
+// the live key (the two would derive different master keys).
 ipcMain.handle("readKeyfile", () => {
   try {
-    const keyfilePath = path.join(
+    const legacyDir = path.join(
       process.env.HOME || process.env.USERPROFILE || ".",
-      ".encre",
-      "keyfile"
+      ".encre"
     );
-    if (!fs.existsSync(keyfilePath)) return null;
-    const buf = fs.readFileSync(keyfilePath);
-    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    const candidates = [
+      path.join(DATA_DIR, "keys", "keyfile"),
+      path.join(legacyDir, "keyfile"),
+    ];
+    for (const keyfilePath of candidates) {
+      if (!fs.existsSync(keyfilePath)) continue;
+      const buf = fs.readFileSync(keyfilePath);
+      if (buf.byteLength === 0) continue;
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    }
+    return null;
   } catch {
     return null;
   }
@@ -2208,8 +2228,6 @@ ipcMain.handle("setAutoStart", async (_event, enabled: boolean) => {
 // Updates the tray locale from the renderer.
 ipcMain.on("tray-locale", (_event, locale: string) => {
   currentTrayLocale = locale;
-  const labels = getTrayLabels();
-  if (tray) tray.setToolTip(labels.tooltip);
   updateTrayStatus(true);
   sendTrayDataToPopup();
 });

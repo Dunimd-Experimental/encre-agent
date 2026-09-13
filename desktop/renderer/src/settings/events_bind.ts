@@ -122,7 +122,7 @@ export function initSettingsDomEvents(this: any): void {
         const id = removeBtn.getAttribute("data-doc-id");
         const name = removeBtn.getAttribute("data-doc-name");
         if (id && name) {
-          Dialog.confirm(t("settings.deleteDoc"), t("settings.confirmDeleteDoc", { name })).then((ok) => {
+          Dialog.confirm(t("settings.deleteDoc"), t("settings.confirmDeleteDoc", { name }), { container: document.getElementById("settings-view") ?? undefined }).then((ok) => {
             if (ok) {
               send({ type: "remove_document", id } as any);
             }
@@ -160,7 +160,7 @@ export function initSettingsDomEvents(this: any): void {
       if (deleteBtn) {
         const name = deleteBtn.getAttribute("data-name") || "";
         if (name) {
-          Dialog.confirm(t("settings.delete"), t("settings.skillDeleteConfirm", { name })).then(async (ok) => {
+          Dialog.confirm(t("settings.delete"), t("settings.skillDeleteConfirm", { name }), { container: document.getElementById("settings-view") ?? undefined }).then(async (ok) => {
             if (ok) {
               const filtered = getState().skillsList.filter(s => s.name !== name);
               setSkillsList(filtered);
@@ -185,7 +185,7 @@ export function initSettingsDomEvents(this: any): void {
       if (deleteCmd) {
         const name = deleteCmd.getAttribute("data-name") || "";
         if (name) {
-          Dialog.confirm(t("settings.delete"), t("settings.commandRemoveConfirm", { name })).then(async (ok) => {
+          Dialog.confirm(t("settings.delete"), t("settings.commandRemoveConfirm", { name }), { container: document.getElementById("settings-view") ?? undefined }).then(async (ok) => {
             if (ok) {
               this.removeCustomCommand(name);
             }
@@ -261,7 +261,7 @@ setModelConfigs(currentModels, activeIdx);
       if (deleteBtn) {
         const idx = parseInt(deleteBtn.getAttribute("data-idx") || "0");
         const m = getState().modelConfigs[idx];
-        Dialog.confirm(t("common.confirmDeleteTitle"), t("common.confirmDelete", { name: m?.name || t("common.unnamed") })).then((ok) => {
+        Dialog.confirm(t("common.confirmDeleteTitle"), t("common.confirmDelete", { name: m?.name || t("common.unnamed") }), { container: document.getElementById("settings-view") ?? undefined }).then((ok) => {
           if (ok) {
             const currentModels = [...getState().modelConfigs];
             currentModels.splice(idx, 1);
@@ -299,7 +299,7 @@ setModelConfigs(currentModels, activeIdx);
         const current = [...(getState().mcpServers || [])];
         const srv = current[idx];
         const name = srv?.name || t("settings.mcpServer");
-        Dialog.confirm(t("settings.confirmDeleteMcpTitle"), t("settings.confirmDeleteMcp", { name })).then((ok) => {
+        Dialog.confirm(t("settings.confirmDeleteMcpTitle"), t("settings.confirmDeleteMcp", { name }), { container: document.getElementById("settings-view") ?? undefined }).then((ok) => {
           if (ok) {
             current.splice(idx, 1);
             setMcpServers(current);
@@ -361,7 +361,7 @@ setModelConfigs(currentModels, activeIdx);
         const agents = getState().subAgents || [];
         if (idx < 0 || idx >= agents.length) return;
         const name = agents[idx].name;
-        Dialog.confirm(t("settings.confirmDeleteSubAgent", { name }), t("settings.confirmDeleteSubAgentTitle")).then((confirmed) => {
+        Dialog.confirm(t("settings.confirmDeleteSubAgent", { name }), t("settings.confirmDeleteSubAgentTitle"), { container: document.getElementById("settings-view") ?? undefined }).then((confirmed) => {
           if (!confirmed) return;
           const updated = agents.filter((_, i) => i !== idx);
           setSubAgents(updated);
@@ -410,13 +410,20 @@ setModelConfigs(currentModels, activeIdx);
 
     // Auto-refresh model panel when modelConfigs or activeModelIndex change
     let lastModelIdx = getState().activeModelIndex;
+    let lastModelsRef = getState().modelConfigs;
     subscribe(() => {
       const app = document.getElementById("app");
       if (!app?.classList.contains("settings-mode")) return;
       const st = getState();
       const idxChanged = st.activeModelIndex !== lastModelIdx;
-      if (idxChanged) {
+      // modelConfigs is replaced with a new array reference by setModelConfigs,
+      // so a reference inequality detects enable/disable (and edit/delete) — not
+      // just activeModelIndex changes.  Without this, disabling the last active
+      // model (where activeModelIndex stays put) left the stale "使用中" tag.
+      const modelsChanged = st.modelConfigs !== lastModelsRef;
+      if (idxChanged || modelsChanged) {
         lastModelIdx = st.activeModelIndex;
+        lastModelsRef = st.modelConfigs;
         if (this.currentPanel === "model" && this.panels.model) this.renderModel();
       }
     });

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -47,10 +46,12 @@ Each package's ``pyproject.toml`` is the single source of truth for metadata
 
 from __future__ import annotations
 
+import os
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from encre.logging_config import get_logger
 
@@ -87,26 +88,67 @@ def _is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def _ea_tools_candidates(here: Path) -> list[Path]:
+    """Return dev-tree candidate locations of the ``ea_tools/`` directory.
+
+    Ordered by preference.  In a source checkout ``ea_scan.py`` lives at
+    ``harness/encre/plugins/ea_scan.py``, so ``parents[2]`` is the harness
+    root and ``parents[3]`` the repository root.  The packages historically
+    sat at ``harness/ea_tools/`` and now live at ``core/ea_tools/`` (the EA
+    extension set belongs to the encre-core distribution).  A bare
+    ``pip install encre-harness`` has none of them — discovery then relies
+    on entry points, which is the intended embedding behaviour.
+    """
+    harness_root = here.parents[2]          # .../harness
+    repo_root = here.parents[3]             # .../encre (repository root)
+    return [
+        repo_root / "core" / _EA_TOOLS_DIRNAME,   # current: <repo>/core/ea_tools/
+        repo_root / _EA_TOOLS_DIRNAME,            # repo-level: <repo>/ea_tools/
+        harness_root / _EA_TOOLS_DIRNAME,        # legacy: harness/ea_tools/
+    ]
+
+
 def ea_tools_root() -> Path:
-    """Return the directory that contains the bundled ``ea-tool-*`` packages."""
+    """Return the directory that contains the bundled ``ea-tool-*`` packages.
+
+    Resolution order:
+
+    1. ``ENCRE_EA_TOOLS_ROOT`` environment variable (explicit override).
+    2. ``sys._MEIPASS/ea_tools`` in frozen (PyInstaller) builds.
+    3. The first existing dev-tree candidate (see
+       :func:`_ea_tools_candidates`).
+
+    Returns a nonexistent path when nothing matches; the scanner treats a
+    missing directory as "no bundled packages" (entry-point discovery only).
+    """
+    # 1. Explicit override wins.
+    env_root = os.environ.get("ENCRE_EA_TOOLS_ROOT")
+    if env_root:
+        return Path(env_root)
     if _is_frozen():
         meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
         return meipass / _EA_TOOLS_DIRNAME
-    return Path(__file__).resolve().parents[2] / _EA_TOOLS_DIRNAME
+    here = Path(__file__).resolve()
+    for candidate in _ea_tools_candidates(here):
+        if candidate.is_dir():
+            return candidate
+    # Nothing found: return the legacy path so callers see a consistent
+    # (missing) location instead of an odd half-composed one.
+    return _ea_tools_candidates(here)[0]
 
 
 def _parse_pyproject(path: Path) -> dict[str, Any]:
-    """Parse a ``pyproject.toml`` into a plain dict, or return {} on failure."""
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
-        import tomli as tomllib  # type: ignore[no-redef]
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(f"Failed to parse pyproject.toml at {path}: {exc}")
-        return {}
+    """Parse a ``pyproject.toml`` into a plain dict, or return {} on failure.
+
+    Delegates to :mod:`encre.plugins.manifest_cache` for disk-cached
+    parsing — the first startup pays the TOML parse cost, subsequent
+    startups hit the mtime-validated cache and skip I/O entirely.
+    """
+    from encre.plugins.manifest_cache import parse_pyproject_cached
+    data = parse_pyproject_cached(path)
+    if not data:
+        logger.debug("Empty/failed pyproject.toml at %s", path)
+    return data
 
 
 def _extract_tier(data: dict[str, Any]) -> str:

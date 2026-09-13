@@ -22,7 +22,7 @@ console.log("[perf] app.js eval start epoch=" + Date.now());
  */
 
 import { connect, send, sendRetry, sendSwitchBranch, sendRollback } from "./core/ws.js";
-import { handleEvent, init as streamInit, onAutomationShowResult, setRequestedSessionId, onAutomationStreamEvent, refreshAllData } from "./core/stream.js";
+import { handleEvent, init as streamInit, onAutomationShowResult, setRequestedSessionId, onAutomationStreamEvent, refreshAllData, pullBootData, holdNonCriticalPlanes, releaseNonCriticalPlanes } from "./core/stream.js";
 import {
   addUserMessage,
   addMessage,
@@ -58,6 +58,7 @@ import {
   removeBranchMessages,
   clearAllNotifications,
   setModelConfigs,
+  setAgentConfig,
   getUnreadCount,
 } from "./core/state.js";
 import { Chat, formatAgentLabel, getAgentName } from "./chat/chat.js";
@@ -79,7 +80,7 @@ import { ModeTransitionManager, type AppMode } from "./chat/mode-transition.js";
 import { SessionInner, TabDef } from "./session/session_inner.js";
 import { renderMarkdown } from "./chat/chat.js";
 import { EALoader } from "./features/ealoader.js";
-import { t, getLocale, onLocaleChange, applyI18n, setLocale, LOCALES, getIntlLocale } from "./features/i18n.js";
+import { t, getLocale, onLocaleChange, applyI18n, setLocale, LOCALES, getIntlLocale, ensureLocale } from "./features/i18n.js";
 import { Dialog } from "./ui/dialog.js";
 import { applyTabTooltip } from "./ui/tab-tooltip.js";
 import { lookupShortcut, augmentTitle, formatShortcut, platformLabel } from "./features/shortcutDisplay.js";
@@ -294,6 +295,11 @@ class App {
     // two hooks above: returning from settings rebuilds the chat DOM, and
     // without this the content simply snaps back into place.
     (window as any).__appContentEnter = () => this.replayContentEnter();
+    // Re-expand the app-level sidebar after the session inner sidebar is
+    // hidden. Guards on userToggledSidebar so a manual collapse is respected,
+    // and on viewport width so a genuinely narrow window stays collapsed
+    // (the sidebar would only overlay content there anyway).
+    (window as any).__appRestoreSidebar = () => this.restoreAppSidebar();
     this.tools = new Tools();
 this.settings = new Settings();
     this.permissions = new Permissions();
@@ -665,12 +671,15 @@ this.settings = new Settings();
       if (!("startup_session_mode" in st.settings)) return;
       _startupModeApplied = true;
       const mode = st.settings.startup_session_mode as string;
-      if (mode === "iwork") {
-        refreshAllData();
-      } else if (mode === "automation") {
+      // No data pull here: the backend's connect push (`_push_all_data`) has
+      // already delivered every plane for this mode — `sessions_list` is
+      // channel-filtered and `sessions_all` carries both channels, and the push
+      // repeats on every mode change. The old refreshAllData() call here was a
+      // second full 12-plane sweep during boot (measured: config_data ×3,
+      // sessions_list ×3, models_list ×2). A push that never materialises is
+      // covered by pullBootData()'s fallback instead.
+      if (mode === "automation") {
         this.modeTransition.toggleAutomation();
-      } else {
-        refreshAllData();
       }
     };
     // Fire once on registration in case config_data already arrived before
@@ -696,6 +705,9 @@ this.settings = new Settings();
         panel.classList.add("hidden");
         mainBody.classList.add("sidebar-hidden");
         this.sessionInner.saveSidebarVisibility();
+        // The inner sidebar's open state collapsed the app sidebar; undo
+        // that so closing the inner sidebar re-expands the app sidebar.
+        this.restoreAppSidebar();
       }
     });
 
@@ -1211,10 +1223,15 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const entry = allEntries[idx];
       if (!entry) return;
       ctxEntry = entry;
+      // Keep the right-clicked row highlighted while the menu is open —
+      // hover alone fades out as soon as the pointer moves onto the menu.
+      container.querySelectorAll(".log-row.ctx-target").forEach((r) => r.classList.remove("ctx-target"));
+      row.classList.add("ctx-target");
       ctxMenu.innerHTML = `
-        <div class="context-menu-item" data-action="copy-row">${t("settings.aboutLogCopyRow")}</div>
-        <div class="context-menu-item" data-action="copy-all">${t("settings.aboutLogCopyAll")}</div>`;
+        <div class="context-menu-item" data-action="copy-row"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("settings.aboutLogCopyRow")}</div>
+        <div class="context-menu-item" data-action="copy-all"><i data-lucide="files" class="lucide lucide-sm"></i>${t("settings.aboutLogCopyAll")}</div>`;
       showContextMenu(ctxMenu, ev.clientX, ev.clientY);
+      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: ctxMenu }));
       ev.preventDefault();
     };
     const boundCtx = onCtx.bind(this);
@@ -1227,6 +1244,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         if (!item) return;
         const action = item.getAttribute("data-action");
         ctxMenu.classList.add("hidden");
+        container.querySelectorAll(".log-row.ctx-target").forEach((r) => r.classList.remove("ctx-target"));
         if (action === "copy-row" && ctxEntry) {
           navigator.clipboard.writeText(`[${ctxEntry.timestamp}] [${ctxEntry.level}] ${ctxEntry.source}: ${ctxEntry.message}`).catch(() => {});
         } else if (action === "copy-all") {
@@ -1236,7 +1254,10 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       });
     }
 
-    document.addEventListener("click", () => ctxMenu?.classList.add("hidden"), false);
+    document.addEventListener("click", () => {
+      ctxMenu?.classList.add("hidden");
+      container.querySelectorAll(".log-row.ctx-target").forEach((r) => r.classList.remove("ctx-target"));
+    }, false);
 
     // ── Lazy / windowed loading (scroll triggers backend batch fetch) ──
     const api = window.electronAPI;
@@ -1482,11 +1503,11 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     if (autoBackBtn && toggleBtn && searchBtn) {
       if (isAutomationDetail) {
         autoBackBtn.classList.remove("hidden");
-        toggleBtn.style.display = "";
+        toggleBtn.style.display = "none";
         searchBtn.style.display = "";
       } else if (isAutomationSubAgent) {
         autoBackBtn.classList.remove("hidden");
-        toggleBtn.style.display = "";
+        toggleBtn.style.display = "none";
         searchBtn.style.display = "none";
       } else {
         autoBackBtn.classList.add("hidden");
@@ -1711,13 +1732,23 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
     await new Promise<void>(r => requestAnimationFrame(() => r()));
 
+    // Lazy locale tables: make sure the selected language's chunk is installed
+    // before anything is painted, so a non-zh/en session never flashes the
+    // English fallback first. zh/en resolve synchronously (no await cost).
+    await ensureLocale(getLocale());
+
     const _connStart = performance.now();
+    // Hold back side-panel planes from the moment we connect: the backend
+    // pushes the whole snapshot on connect, and applying the non-critical
+    // planes during boot only steals main-thread time from the reveal.
+    holdNonCriticalPlanes();
     await connect(handleEvent);
     if (getState().connected) {
       console.log("[perf] ws open after %dms", Math.round(performance.now() - _connStart));
-      // Unified initial data pull: config+models, sessions, workspaces in one
-      // call so every panel starts from the same fresh snapshot.
-      refreshAllData();
+      // The backend pushes the full snapshot on connect (`_push_all_data`), so
+      // boot pulls only the plane that push does not cover (archived sessions)
+      // instead of re-requesting — and re-rendering — the same 12 planes.
+      pullBootData();
     }
 
     // Wait for the startup mode's priority data so the window opens already
@@ -1732,8 +1763,11 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     console.log("[perf] initial data present at %dms", Math.round(performance.now() - (window as any).__perfStart));
 
     if (getState().connected) {
-      // Reveal the (now data-filled) main UI.
+      // Reveal the (now data-filled) main UI, then let the held-back
+      // side-panel planes land in one batch — they no longer compete with the
+      // boot-critical planes for the main thread while the splash is covering.
       this.splash.hide();
+      releaseNonCriticalPlanes();
     } else {
       // Backend never came up: keep the splash showing the error + retry.
       await this.handleSplashError(t("app.splashNoConnect"));
@@ -2563,6 +2597,22 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       return lvl || "default";
     };
 
+    // Permission-mode helpers: four user-facing modes; legacy session
+    // values (accept_edits, plan, ...) collapse onto their closest card.
+    const PERMISSION_MODES: Array<{ id: string; labelKey: string; icon: string }> = [
+      { id: "default", labelKey: "permissions.modes.manual", icon: "user-check" },
+      { id: "auto", labelKey: "permissions.modes.auto", icon: "shield-check" },
+      { id: "bypass", labelKey: "permissions.modes.full", icon: "shield-off" },
+      { id: "custom", labelKey: "permissions.modes.custom", icon: "sliders-horizontal" },
+    ];
+    const permissionModeGroup = (m: string): string =>
+      m === "auto" ? "auto" : m === "bypass" ? "bypass" : m === "custom" ? "custom" : "default";
+    const getPermissionModeLabel = (m: string): string => {
+      const id = permissionModeGroup(m);
+      const found = PERMISSION_MODES.find((x) => x.id === id);
+      return found ? t(found.labelKey) : m;
+    };
+
     const renderMainPage = (mainPage: HTMLElement) => {
       const st = getState();
       const allModels = st.modelConfigs || [];
@@ -2611,6 +2661,17 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
           </button>`;
       }
 
+      // Permission mode entry -- always shown below the thinking entry.
+      const currentPermGroup = permissionModeGroup(
+        (st as any).agentConfig?.permission_mode || "default",
+      );
+      const permissionEntry = `
+        <button class="mention-dropdown-item" data-action="sub-permission">
+          <span>${t("input.permissionMode")}</span>
+          <span style="margin-inline-start:auto;color:var(--text-muted);font-size:12px">${this.esc(getPermissionModeLabel(currentPermGroup))}</span>
+          <i data-lucide="chevron-right" class="lucide"></i>
+        </button>`;
+
       // Model list — only show CONFIGURED models.  The catalog ("available
       // models") is a settings-side browsing aid for adding new models; it is
       // NOT a pickable model here, so when nothing is configured the selector
@@ -2631,7 +2692,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
       const divider = models.length > 0 ? `<div class="mention-dropdown-divider"></div>` : "";
 
-      mainPage.innerHTML = modelsHtml + divider + thinkingEntry + `
+      mainPage.innerHTML = modelsHtml + divider + thinkingEntry + permissionEntry + `
         <button class="mention-dropdown-item add-model-btn" data-action="add-model">
           <i data-lucide="plus" class="lucide"></i>
           <span>${t("settings.addModel")}</span>
@@ -2663,6 +2724,20 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
           if (thinkingPage) {
             renderThinkingPage(thinkingPage);
             thinkingPage.classList.remove("hidden");
+          }
+        });
+      }
+
+      // Permission entry -> navigate to permission page
+      const permissionBtn = mainPage.querySelector('[data-action="sub-permission"]') as HTMLElement | null;
+      if (permissionBtn) {
+        permissionBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          mainPage.classList.add("hidden");
+          const permissionPage = dropdown.querySelector('[data-page="permission"]') as HTMLElement;
+          if (permissionPage) {
+            renderPermissionPage(permissionPage);
+            permissionPage.classList.remove("hidden");
           }
         });
       }
@@ -2740,10 +2815,66 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       });
     };
 
+    const renderPermissionPage = (permissionPage: HTMLElement) => {
+      const st = getState();
+      const currentGroup = permissionModeGroup(
+        (st as any).agentConfig?.permission_mode || "default",
+      );
+
+      const backBtn = `<button class="mention-dropdown-item" data-action="back-model-main">
+        <i data-lucide="arrow-left" class="lucide"></i>
+        <span>${t("input.selectPermissionMode")}</span>
+      </button>`;
+
+      const items = PERMISSION_MODES
+        .map((m) => `
+          <button class="mention-dropdown-item${m.id === currentGroup ? " active" : ""}" data-perm-mode="${m.id}">
+            <i data-lucide="${m.icon}" class="lucide"></i>
+            <span>${this.esc(t(m.labelKey))}</span>
+          </button>`)
+        .join("");
+
+      permissionPage.innerHTML = backBtn
+        + `<div class="mention-dropdown-divider"></div>`
+        + items;
+
+      if (typeof (window as any).lucide !== "undefined") {
+        (window as any).lucide.createIcons({ root: permissionPage });
+      }
+
+      // Back button
+      const backEl = permissionPage.querySelector('[data-action="back-model-main"]') as HTMLElement | null;
+      if (backEl) {
+        backEl.addEventListener("click", (e) => {
+          e.stopPropagation();
+          permissionPage.classList.add("hidden");
+          const mainPage = dropdown.querySelector('[data-page="main"]') as HTMLElement;
+          if (mainPage) {
+            renderMainPage(mainPage);
+            mainPage.classList.remove("hidden");
+          }
+        });
+      }
+
+      // Mode selection: persists via update_agent; agent_updated refreshes
+      // the store, but re-render immediately for snappy feedback.
+      permissionPage.querySelectorAll(".mention-dropdown-item[data-perm-mode]").forEach((item) => {
+        item.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const mode = (item as HTMLElement).dataset.permMode || "default";
+          const cfg = (getState() as any).agentConfig;
+          if (cfg) setAgentConfig({ ...cfg, permission_mode: mode });
+          send({ type: "update_agent", permission_mode: mode });
+          renderPermissionPage(permissionPage);
+        });
+      });
+    };
+
     const render = () => {
       // Ensure page structure exists
       let mainPage = dropdown.querySelector('[data-page="main"]') as HTMLElement | null;
       let thinkingPage = dropdown.querySelector('[data-page="thinking"]') as HTMLElement | null;
+      let permissionPage = dropdown.querySelector('[data-page="permission"]') as HTMLElement | null;
 
       if (!mainPage) {
         mainPage = document.createElement("div");
@@ -2757,9 +2888,33 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         thinkingPage.setAttribute("data-page", "thinking");
         dropdown.appendChild(thinkingPage);
       }
+      if (!permissionPage) {
+        permissionPage = document.createElement("div");
+        permissionPage.className = "mention-page hidden";
+        permissionPage.setAttribute("data-page", "permission");
+        dropdown.appendChild(permissionPage);
+      }
 
-      // Always show main page on render, reset thinking page
+      // Preserve whichever sub-page is currently open.  Store updates
+      // (streaming stats, model list refresh, agent_updated, ...) arrive
+      // asynchronously and must never snap the dropdown back to the main
+      // page while the user is picking a reasoning level or a permission mode.
+      if (!thinkingPage.classList.contains("hidden")) {
+        renderThinkingPage(thinkingPage);
+        mainPage.classList.add("hidden");
+        permissionPage.classList.add("hidden");
+        return;
+      }
+      if (!permissionPage.classList.contains("hidden")) {
+        renderPermissionPage(permissionPage);
+        mainPage.classList.add("hidden");
+        thinkingPage.classList.add("hidden");
+        return;
+      }
+
+      // No sub-page open: show the main page.
       thinkingPage.classList.add("hidden");
+      permissionPage.classList.add("hidden");
       mainPage.classList.remove("hidden");
       renderMainPage(mainPage);
     };
@@ -2773,7 +2928,15 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
     selector.addEventListener("click", (e) => {
       e.stopPropagation();
+      // The model and workspace dropdowns must never be open at the same time.
+      const wsDropdown = document.getElementById("input-workspace-dropdown");
+      if (wsDropdown) wsDropdown.classList.add("hidden");
       if (dropdown.classList.contains("hidden")) {
+        // Reopening always starts from the main page, even if a sub-page was
+        // left open the last time the dropdown was visible.
+        dropdown
+          .querySelectorAll('.mention-page[data-page="thinking"], .mention-page[data-page="permission"]')
+          .forEach((page) => page.classList.add("hidden"));
         render();
         dropdown.classList.remove("hidden");
         // CSS anchors it with `inset-inline-end: 0`, so under rtl it grows
@@ -3412,6 +3575,17 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       panel.classList.add("hidden");
       mainBody.classList.add("sidebar-hidden");
     }
+    // The inner sidebar collapsing the app sidebar was an automatic side
+    // effect, not a user choice — undo it so the app sidebar re-expands.
+    this.restoreAppSidebar();
+  }
+
+  /** Re-expand the app-level sidebar unless the user collapsed it by hand or
+   *  the viewport is too narrow to show it inline. */
+  private restoreAppSidebar(): void {
+    if (this.userToggledSidebar) return;
+    if (window.innerWidth <= 920) return;
+    document.getElementById("app")?.classList.remove("sidebar-collapsed");
   }
 
   /**
@@ -3525,6 +3699,9 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // ── 5. Model selector dropdown (in input toolbar) ──────────────
     const modelDropdown = document.getElementById("input-model-dropdown");
     if (modelDropdown) modelDropdown.classList.add("hidden");
+    // Keep the two input dropdowns mutually exclusive here as well.
+    const wsDropdownCleanup = document.getElementById("input-workspace-dropdown");
+    if (wsDropdownCleanup) wsDropdownCleanup.classList.add("hidden");
 
     // ── 6. Chat status bar + queue card ────────────────────────────
     const statusBar = document.getElementById("chat-status-bar");
@@ -4440,7 +4617,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const sessions = getState().sessionsList;
       const s = sessions?.find(x => x.session_id === sid);
       const name = s?.name || s?.preview || sid.slice(0, 8);
-      const ok = await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }));
+      const ok = await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined });
       if (ok) {
         send({ type: "delete_session", session_id: sid });
         resetChat();
@@ -4483,7 +4660,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       if (lastAssistantIdx < 0 || msgs[lastAssistantIdx].role !== "assistant") return;
       let userMsgIdx = -1;
       for (let i = 0; i < lastAssistantIdx; i++) {
-        if (msgs[i].role === "user") userMsgIdx++;
+        if (msgs[i].role === "user" && msgs[i].mode !== "compact_marker") userMsgIdx++;
       }
       if (userMsgIdx < 0) return;
       const removed = new Set<string>();
@@ -4605,7 +4782,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     a["toggle_theme"] = () => {
       const current = getState().themePreference || "system";
       const next = current === "dark" ? "light" : current === "light" ? "system" : "dark";
-      Dialog.confirm(t("theme.switchTitle"), t("theme.switchConfirm", { label: t(`theme.${next}`) }), "low").then(ok => {
+      Dialog.confirm(t("theme.switchTitle"), t("theme.switchConfirm", { label: t(`theme.${next}`) }), { priority: "low", container: document.getElementById("app") ?? undefined }).then(ok => {
         if (!ok) return;
         setThemePreference(next);
         if (next === "system") {
@@ -4622,7 +4799,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const current = (getState().settings.language as string) || getLocale();
       const idx = Math.max(0, (LOCALES as readonly string[]).indexOf(current));
       const next = LOCALES[(idx + 1) % LOCALES.length];
-      Dialog.confirm(t("language.switchTitle"), t("language.switchConfirm", { label: t(`language.${next}`) }), "low").then(ok => {
+      Dialog.confirm(t("language.switchTitle"), t("language.switchConfirm", { label: t(`language.${next}`) }), { priority: "low", container: document.getElementById("app") ?? undefined }).then(ok => {
         if (!ok) return;
         const settings = { ...getState().settings, language: next };
         setSettings(settings);
@@ -4762,7 +4939,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     }
 
     scroll.appendChild(grid);
-    Dialog.showHtmlDialog("Keyboard Shortcuts", scroll, "low");
+    Dialog.showHtmlDialog("Keyboard Shortcuts", scroll, { priority: "low", container: document.getElementById("app") ?? undefined });
   }
 
   private bindKeyboardShortcuts(): void {

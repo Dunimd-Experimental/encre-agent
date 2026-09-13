@@ -543,7 +543,7 @@ export function renderShortcutsImpl(this: any): void {
           if (conflict) {
             const conflictName = t(`shortcuts.${conflict.id}` as any) || conflict.description || conflict.id;
             const msg = t("settings.shortcutConflict").replace("{0}", conflictName);
-            const ok = await Dialog.confirm(t("settings.shortcutConflictTitle"), msg);
+            const ok = await Dialog.confirm(t("settings.shortcutConflictTitle"), msg, { container: document.getElementById("settings-view") ?? undefined });
             if (!ok) {
 this.renderShortcuts();
     this.renderStorage();

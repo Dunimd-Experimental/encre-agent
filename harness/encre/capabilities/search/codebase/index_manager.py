@@ -146,6 +146,10 @@ class IndexManager:
     def reindex(self, ws_id: str, ws_path: str) -> None:
         """Force a full re-index: cancel any in-flight task, start fresh."""
         self.cancel_index(ws_id)
+        # Drop the on-disk cache (metadata/progress/index files) so the
+        # spawned indexer actually rebuilds instead of taking the cache-hit
+        # path and instantly reporting 100%.
+        self._remove_index_files(ws_id, ws_path)
         with self._lock:
             self._failed.discard(ws_id)
             entry = self._indices.get(ws_id)

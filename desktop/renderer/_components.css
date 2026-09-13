@@ -280,6 +280,23 @@
   user-select: none;
 }
 
+/* 模型池配置卡片展开/收起动画：grid-template-rows 0fr→1fr 平滑过渡，
+   不再直接 display:none。内容由内层 overflow:hidden 裁切。 */
+.model-selection-row {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows var(--motion-slide),
+              opacity var(--motion-slide);
+}
+.model-selection-row--open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.model-selection-row-inner {
+  overflow: hidden;
+}
+
 
 /* ── 7. 徽章 / 计数标签 ────────────────────────────────────────
    合并来源: .si-badge (L1254) / .si-status (L1321)
@@ -335,7 +352,6 @@
    ──────────────────────────────────────────────────────────────── */
 
 /* 遮罩层 */
-.encre-dialog-overlay,
 .toast-overlay,
 #rename-dialog-overlay {
   position: fixed;
@@ -343,13 +359,6 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
-}
-.encre-dialog-overlay {
-  background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  animation: yimFadeIn var(--duration-base) ease-out;
 }
 .toast-overlay {
   background: rgba(0, 0, 0, 0.4);
@@ -362,12 +371,7 @@
   z-index: 260;
 }
 
-.encre-dialog-overlay.encre-dialog-dismissing {
-  animation: yimFadeOut var(--duration-fast) ease-out forwards;
-}
-
 /* 对话框卡片 */
-.encre-dialog-card,
 .toast-dialog,
 #rename-dialog {
   background: var(--bg-secondary);
@@ -378,7 +382,6 @@
   max-width: 480px;
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
 }
-.encre-dialog-card {   animation: yimSlideUp var(--transition-emphasized); }
 
 .toast-dialog {
   background: var(--bg-primary);

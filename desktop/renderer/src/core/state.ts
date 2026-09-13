@@ -35,6 +35,7 @@ import { AppState, createEmptyState, createEmptySessionSnapshot, Message, ToolCa
 import { t } from "../features/i18n.js";
 import { findSlashCommand } from "../features/slash_commands.js";
 import { buildTraySessionData, dedupeSessions } from "../chat/session-projection.js";
+import { Dialog } from "../ui/dialog.js";
 
 type Listener = () => void;
 
@@ -134,6 +135,9 @@ export function setConnected(v: boolean): void {
 
 /** Switches the active session id, resetting scoped fields and syncing its snapshot. */
 export function setSessionId(id: string): void {
+  if (id !== state.sessionId) {
+    Dialog.swapSession(state.sessionId, id);
+  }
   state.sessionId = id;
   getOrCreateSessionSnapshot(id);
   // Reset session-scoped global fields so the sidebar canvas does not
@@ -304,6 +308,21 @@ export function restoreMessages(rawMessages: Array<{ role: string; content: stri
   let latestAssistantWithToolCalls: Message | undefined;
   for (const raw of rawMessages || []) {
     if (raw.role === "system") continue;
+    if (raw.role === "compact_marker") {
+      // Backend compaction boundary: renders as an inline "history
+      // compacted" divider, never as a user bubble.
+      messages.push({
+        id: (raw as any).id ? `m:${(raw as any).id}` : crypto.randomUUID(),
+        role: "user",
+        content: "",
+        isStreaming: false,
+        toolCalls: [],
+        segments: [],
+        timestamp: (raw as any).created_at || Date.now(),
+        mode: "compact_marker",
+      });
+      continue;
+    }
     if (raw.role === "tool") {
       const target = findRestoredToolCall(raw as any, toolCallsById, latestAssistantWithToolCalls);
       if (target) {
@@ -388,6 +407,22 @@ export function loadSessionMessages(rawMessages: Array<{ role: string; content: 
   for (const raw of rawMessages) {
     if (raw.role === "system") continue;
 
+    if (raw.role === "compact_marker") {
+      // Backend compaction boundary: renders as an inline "history
+      // compacted" divider, never as a user bubble.
+      messages.push({
+        id: (raw as any).id ? `m:${(raw as any).id}` : crypto.randomUUID(),
+        role: "user",
+        content: "",
+        isStreaming: false,
+        toolCalls: [],
+        segments: [],
+        timestamp: (raw as any).created_at || Date.now(),
+        mode: "compact_marker",
+      });
+      continue;
+    }
+
     if (raw.role === "tool") {
       const target = findRestoredToolCall(raw as any, toolCallsById, latestAssistantWithToolCalls);
       if (target) {
@@ -452,7 +487,10 @@ export function loadSessionMessages(rawMessages: Array<{ role: string; content: 
     }
     if (!rawFileRefs) {
       const sid = sessionId;
-      const idx = messages.filter(m => m.role === "user").length;
+      // Compact markers ride along as user-role messages but are not real
+      // user turns -- exclude them so the per-user-message storage index
+      // stays aligned with the backend's own user-message count.
+      const idx = messages.filter(m => m.role === "user" && m.mode !== "compact_marker").length;
       try {
         const stored = localStorage.getItem(`fr:${sid}:${idx}`);
         if (stored) rawFileRefs = JSON.parse(stored);
@@ -712,6 +750,7 @@ export function clearMessages(sessionId = state.sessionId): void {
   snapshot.branches = [];
   snapshot.activeBranchId = "";
   snapshot.running = false;
+  snapshot.sessionState = "idle";
   if (getSessionKey(sessionId) === getSessionKey(state.sessionId)) {
     state.activeToolId = null;
     state.telemetry = null;
@@ -945,10 +984,12 @@ export function updateToolCall(
   }
 }
 
-/** Sets the running/streaming flag for the (active) session. */
+/** Sets the session state ("idle" | "running" | "awaiting_approval") for the
+ *  (active) session, keeping the derived running flag in sync. */
 export function setSessionState(state_val: string, sessionId = state.sessionId): void {
   const snapshot = getOrCreateSessionSnapshot(sessionId);
   snapshot.running = state_val !== "idle";
+  snapshot.sessionState = state_val as SessionState;
   syncSessionState(sessionId);
   emit();
   const sid = sessionId;
@@ -956,7 +997,6 @@ export function setSessionState(state_val: string, sessionId = state.sessionId):
     state.sessionsList = state.sessionsList.map(e =>
       e.session_id === sid ? { ...e, state: state_val as SessionState } : e
     );
-    window.electronAPI?.traySessionsUpdate?.(state.sessionsList);
     traySessionsCache.normal = traySessionsCache.normal.map(e =>
       e.session_id === sid ? { ...e, state: state_val as SessionState } : e
     );
@@ -1561,6 +1601,11 @@ export function setSessionsList(sessions: import("./types.js").SessionEntryData[
     // Temp chat sessions are ephemeral and must never appear in the sidebar.
     if ((session.metadata as Record<string, unknown>)?.temp_chat) return false;
     if (isTempChatSession(session.session_id)) return false;
+    // External-channel sessions (iclaw, telegram, ...) never belong in the
+    // normal/iwork sidebar lists.
+    if (isExternalChannelSession(session.session_id)) return false;
+    const ch = (session as { channel?: string }).channel || "normal";
+    if (ch !== "normal" && ch !== "iwork") return false;
     return (session.message_count || 0) > 0;
   });
   update({ sessionsList: visible });
@@ -1591,6 +1636,24 @@ export function setTraySessions(normal: any[], iwork: any[]): void {
   traySessionsCache.normal = normal;
   traySessionsCache.iwork = iwork;
   publishTraySessions();
+}
+
+/** Updates a single session's `state` field in the dual-mode tray cache
+ *  (normal + iwork) and republishes to the tray popup.  Called from
+ *  `_syncSessionEntry` during streaming so the tray's status lights stay
+ *  in sync with the sidebar. */
+export function syncTraySessionState(sessionId: string, newState: SessionState): void {
+  if (!sessionId) return;
+  let changed = false;
+  traySessionsCache.normal = traySessionsCache.normal.map(e => {
+    if (e.session_id === sessionId && e.state !== newState) { changed = true; return { ...e, state: newState }; }
+    return e;
+  });
+  traySessionsCache.iwork = traySessionsCache.iwork.map(e => {
+    if (e.session_id === sessionId && e.state !== newState) { changed = true; return { ...e, state: newState }; }
+    return e;
+  });
+  if (changed) publishTraySessions();
 }
 
 export function getTraySessions(): { normal: any[]; iwork: any[] } {
@@ -1934,6 +1997,27 @@ export function markTempChatSession(sessionId: string): void {
 /** True when the id belongs to (or belonged to) a temp chat. */
 export function isTempChatSession(sessionId: string): boolean {
   return _tempChatSessionIds.has(sessionId);
+}
+
+/**
+ * Sessions owned by an external channel (iclaw, telegram, qq, ...).
+ * They are searchable and can be opened read-only from global search,
+ * but must never appear in the normal/iwork sidebar lists.
+ */
+const _externalChannelSessionIds = new Set<string>();
+
+/** Record a session id as belonging to an external channel. */
+export function markExternalChannelSession(sessionId: string): void {
+  if (!sessionId) return;
+  _externalChannelSessionIds.add(sessionId);
+  // Drop it from the sidebar lists immediately (it may have leaked in
+  // via a broadcast that predates the channel fix).
+  removeSessionById(sessionId);
+}
+
+/** True when the session belongs to an external channel (iclaw, ...). */
+export function isExternalChannelSession(sessionId: string): boolean {
+  return _externalChannelSessionIds.has(sessionId);
 }
 
 /** Switches the active branch for the (active) session. */

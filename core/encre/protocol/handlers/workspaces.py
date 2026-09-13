@@ -456,7 +456,7 @@ class WorkspacesHandlers:
                 ws_id = _make_workspace_id(target_path)
                 self._index_manager.delete_index(ws_id, target_path)
                 await self._send(ws, "index_status", files=0, status="idle",
-                                 workspace_id=ws_id)
+                                 progress=0, workspace_id=ws_id)
                 logger.info("[index] deleted index ws=%s", ws_id[:8])
             except Exception as e:
                 await self._send(ws, "index_status", files=0, status=f"error: {e}")

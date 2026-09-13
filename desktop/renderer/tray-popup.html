@@ -64,8 +64,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica N
 .session-ws-icon{width:16px;height:16px;border-radius:4px;overflow:hidden;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;user-select:none;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
 .session-ws-icon-img{width:100%;height:100%;object-fit:cover;display:block}
 .session-ws-icon-letter{font-size:9px;font-weight:700;color:#fff;line-height:1}
-.session-running,.session-waiting{display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;flex-shrink:0}
+.session-running,.session-waiting,.session-orange{display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;flex-shrink:0}
 .session-waiting{background:#f59e0b}
+.session-orange{background:#f97316}
 .e{padding:18px;text-align:center;font-size:12px;color:var(--tp-empty);display:flex;align-items:center;justify-content:center;gap:6px}
 .e svg.icon{width:14px;height:14px;opacity:.4}
 .actions{display:flex;border-top:1px solid var(--tp-border)}
@@ -188,7 +189,10 @@ function renderSessions(sessions, emptyKey) {
     for (var i = 0; i < sessions.length; i++) {
       var s = sessions[i];
       var name = esc(truncate(s.name || s.preview || (s.session_id || "").slice(0, 8) || "Untitled", 28));
-      var runningBadge = (s.awaiting_approval || s.is_running) ? '<span class="session-' + (s.awaiting_approval ? "waiting" : "running") + '"></span>' : "";
+      // Session rows carry the unified `state` field ("idle" | "running" |
+      // "awaiting_approval"); the older awaiting_approval/is_running flags no
+      // longer exist on the payload, so the breathing light never rendered.
+      var runningBadge = (s.state && s.state !== "idle") ? '<span class="session-' + (s.state === "awaiting_approval" ? "waiting" : "running") + '"></span>' : "";
       // iWork rows carry their owning-workspace icon, like the main sidebar.
       var icon = currentMode === "iwork" ? wsIconHtml(sessionWsPath(s), true) : "";
       var row = document.createElement("div");

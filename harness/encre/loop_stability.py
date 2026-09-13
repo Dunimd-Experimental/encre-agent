@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -407,11 +407,18 @@ def check_token_pressure(
     messages: list[dict[str, Any]],
     context_window: int,
     max_tokens: int,
+    extra_tokens: int = 0,
 ) -> float:
     """Return the ratio of estimated input tokens to available context.
 
     Values > 1.0 mean the request will likely overflow.
     Values > PRE_API_COMPACT_THRESHOLD_RATIO mean we should compact first.
+
+    ``extra_tokens`` accounts for the fixed per-request overhead (system
+    prompt + tool schemas) that is sent alongside *messages* but is not
+    part of the message list itself.  Ignoring it made the pressure check
+    under-estimate by tens of thousands of tokens for memory-heavy agents,
+    delaying compaction until the model degraded on an overfull context.
     """
     try:
         from encre.utils.tokens import count_message_tokens
@@ -424,6 +431,7 @@ def check_token_pressure(
             for m in messages
         )
         input_tokens = total_chars // 4
+    input_tokens += max(0, extra_tokens)
 
     available = context_window - max_tokens
     if available <= 0:
@@ -437,9 +445,12 @@ def should_post_tool_compact(
     messages: list[dict[str, Any]],
     context_window: int,
     max_tokens: int,
+    extra_tokens: int = 0,
 ) -> bool:
     """Return True if context should be compressed after tool execution."""
-    ratio = check_token_pressure(messages, context_window, max_tokens)
+    ratio = check_token_pressure(
+        messages, context_window, max_tokens, extra_tokens=extra_tokens,
+    )
     return ratio > POST_TOOL_COMPACT_THRESHOLD_RATIO
 
 

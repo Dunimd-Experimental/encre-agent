@@ -31,6 +31,10 @@ export interface MediaData {
    *  contexts (activity promo, notification center): images show no toolbar,
    *  videos show only the volume control. Default true. */
   toolbar?: boolean;
+  /** Show the "open in sidebar as file preview" button (arrow-up-right icon,
+   *  next to copy) on the image toolbar. Only enabled for media rendered by
+   *  the info tool card. Default false. */
+  openPreview?: boolean;
 }
 
 function esc(s: string): string {
@@ -132,6 +136,9 @@ export class MediaViewer {
           `<span class="media-tool-divider"></span>` +
           `<button type="button" class="media-tool" data-action="save" data-tooltip="${t("mediaViewer.save")}"><i data-lucide="download" class="lucide" style="width:14px;height:14px"></i></button>` +
           `<button type="button" class="media-tool" data-action="copy" data-tooltip="${t("mediaViewer.copy")}"><i data-lucide="copy" class="lucide" style="width:14px;height:14px"></i></button>` +
+          (this.media.openPreview
+            ? `<button type="button" class="media-tool" data-action="open-preview" data-tooltip="${t("mediaViewer.openPreview")}"><i data-lucide="arrow-up-right" class="lucide" style="width:14px;height:14px"></i></button>`
+            : "") +
         `</div>`
         : "");
     this.imgEl = this.el.querySelector(".media-viewer-img");
@@ -153,6 +160,7 @@ export class MediaViewer {
       else if (action === "rotate") this.rotation = (this.rotation + 90) % 360;
       else if (action === "save") this.saveImage();
       else if (action === "copy") this.copyImage();
+      else if (action === "open-preview") this.openInSidebar();
       this.applyImgTransform();
     });
 
@@ -249,6 +257,12 @@ export class MediaViewer {
         navigator.clipboard.writeText(src).catch(() => {});
       }
     }
+  }
+
+  private openInSidebar(): void {
+    window.dispatchEvent(new CustomEvent("media-open-preview", {
+      detail: { type: this.media.type, src: this.media.src },
+    }));
   }
 
   /* ── Video ─────────────────────────────────────────────────────── */

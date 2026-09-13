@@ -142,10 +142,12 @@ export function renderTargetModelSelection(opts: TargetModelSelectionOptions): s
             </label>
           </div>
         </div>
-        <div id="adapter-models-row-${id}" style="${on && !disabled ? "" : "display:none"}">
-          <div class="auto-push-gateways">
-            <div class="auto-push-gateways-label">${title}</div>
-            <div id="dlg-models-${id}" class="model-selection-list">${listHtml}</div>
+        <div id="adapter-models-row-${id}" class="model-selection-row${on && !disabled ? " model-selection-row--open" : ""}">
+          <div class="model-selection-row-inner">
+            <div class="auto-push-gateways">
+              <div class="auto-push-gateways-label">${title}</div>
+              <div id="dlg-models-${id}" class="model-selection-list">${listHtml}</div>
+            </div>
           </div>
         </div>
       </div>`;
@@ -171,7 +173,7 @@ export function bindTargetModelSelection(
   if (disabled) return;
   if (row) {
     toggle.addEventListener("change", () => {
-      row.style.display = toggle.checked ? "" : "none";
+      row.classList.toggle("model-selection-row--open", toggle.checked);
       emit();
     });
   }

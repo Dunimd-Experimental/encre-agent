@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -635,16 +635,27 @@ class EncreSafetyEngine:
     ) -> None:
         self.config = config
 
-        # Load dangerous command patterns from file if not already set
-        if not config.dangerous_command_patterns:
-            patterns_path = Path(__file__).parent / "dangerous_commands.txt"
-            if patterns_path.exists():
-                loaded: list[str] = []
-                for line in patterns_path.read_text(encoding="utf-8").splitlines():
-                    stripped = line.strip()
-                    if stripped and not stripped.startswith("#") and not stripped.startswith("["):
-                        loaded.append(stripped)
-                config.dangerous_command_patterns = loaded
+        # Load dangerous command patterns from file if not already set, and
+        # push the raw rule text into the Rust engine so the dangerous-
+        # command blacklist does not depend on working-directory probing.
+        patterns_path = Path(__file__).parent / "dangerous_commands.txt"
+        if not config.dangerous_command_patterns and patterns_path.exists():
+            loaded: list[str] = []
+            for line in patterns_path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and not stripped.startswith("["):
+                    loaded.append(stripped)
+            config.dangerous_command_patterns = loaded
+        try:
+            from encre import native as _native
+            if hasattr(_native, "permission_set_dangerous_patterns") and patterns_path.exists():
+                _native.permission_set_dangerous_patterns(
+                    patterns_path.read_text(encoding="utf-8")
+                )
+        except Exception:
+            # Native engine unavailable or older build without the API;
+            # its cwd-based fallback load still applies.
+            pass
 
         self._sensitive_patterns: list[re.Pattern[str]] = [
             re.compile(r"(?:api[_-]?key|apikey|secret|password|token|credential|AUTH_TOKEN|PRIVATE_KEY|AWS_SECRET|GITHUB_TOKEN)", re.IGNORECASE),
@@ -683,6 +694,11 @@ class EncreSafetyEngine:
             self.sandbox = None
         self._ssrf_guard = EncreSSRFGuard()
         self._auto_classifier = auto_classifier
+        # A classifier injected by the caller is authoritative and never
+        # replaced.  For the auto permission mode one is built lazily from the
+        # session's active model instead (see ``_get_auto_classifier``).
+        self._auto_classifier_explicit = auto_classifier is not None
+        self._auto_classifier_key: tuple[str, str, str, str] | None = None
 
     def native_sandbox_provides_fs_isolation(self) -> bool:
         """Return True when the Rust native sandbox applies real filesystem isolation.
@@ -763,7 +779,64 @@ class EncreSafetyEngine:
             return False, "Unicode homoglyph/zero-width characters detected"
         return True, ""
 
+    def _permission_mode(self) -> str:
+        """Return the active permission mode, defaulting to ``default``."""
+        return str(getattr(self.config, "permission_mode", "") or "default")
+
+    def _dangerous_rule(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        """Return the dangerous-command rule this call hits, or ``""``.
+
+        The blacklist is a hard floor that no permission mode can silence, so
+        it is consulted before the AI classifier and before the policy table.
+        """
+        try:
+            from encre import native as _native
+            if hasattr(_native, "permission_check_dangerous"):
+                payload = json.dumps(tool_input or {}, ensure_ascii=False)
+                return str(_native.permission_check_dangerous(tool_name, payload) or "")
+        except Exception:
+            # Native engine unavailable; the engine check below still runs.
+            pass
+        return ""
+
     async def check_tool_permission(self, tool_name: str, tool_input: dict[str, Any]) -> PermissionDecision:
+        """Unified permission entry point for every non-read-only tool call.
+
+        Dispatches on the active mode so that every call site agrees on the
+        same semantics:
+
+        * ``custom``  -- the user-managed per-tool / per-capability policy
+          table decides (resolved inside the Rust engine).
+        * ``default`` -- manual approval; a blacklisted subcommand comes back
+          as ``Ask`` so the frontend can prompt.
+        * ``auto``    -- handed to :meth:`check_yolo_permission`; the AI
+          classifier decides and the user is never prompted.
+        * ``bypass``  -- full access; never prompts.  Only the dangerous-
+          command blacklist still refuses a call.
+
+        The policy table is deliberately *not* applied outside ``custom``: the
+        settings panel describes those rules as custom-mode-only, and the Rust
+        engine mirrors that by ignoring them for the preset modes.
+        """
+        if self._permission_mode() == "auto":
+            return await self.check_yolo_permission(tool_name, tool_input)
+
+        decision = await self._engine_check(tool_name, tool_input)
+
+        if self._permission_mode() == "bypass" and decision.behavior == "ask":
+            # Full access never prompts.  A blacklisted subcommand is refused
+            # instead; any other ``Ask`` can only come from a preset policy
+            # that must stay inert in this mode, so it degrades to allow.
+            rule = self._dangerous_rule(tool_name, tool_input)
+            if rule:
+                return PermissionDeny(
+                    reason=f"Blocked by dangerous-command rule: {rule}"
+                )
+            return PermissionAllow(reason=getattr(decision, "reason", ""))
+
+        return decision
+
+    async def _engine_check(self, tool_name: str, tool_input: dict[str, Any]) -> PermissionDecision:
         # The Rust permission engine is the single source of truth for
         # authorization.  We forward the tool name and the JSON-serialized
         # arguments so the dangerous-command regex table can inspect the
@@ -771,10 +844,22 @@ class EncreSafetyEngine:
         # by Rust is mapped back onto the existing PermissionAllow /
         # PermissionDeny / PermissionAsk dataclasses so the rest of the
         # agent loop (and the WS protocol) continues to work unchanged.
+        self._push_permission_mode()
         try:
             from encre import native as _native
             payload = json.dumps(tool_input or {}, ensure_ascii=False)
-            decision = _native.permission_check(tool_name, payload)
+            try:
+                # Preferred: the mode travels with the call, so the policy
+                # table is consulted exactly when this session is in custom
+                # mode -- never based on a process-wide slot another session
+                # may have overwritten.
+                decision = _native.permission_check_mode(
+                    tool_name, payload, self._permission_mode()
+                )
+            except Exception:
+                # Older native build without the per-call API: fall back to
+                # the process-wide mode pushed above.
+                decision = _native.permission_check(tool_name, payload)
         except Exception:
             # Defensive fallback: never let a permission-engine failure
             # crash the agent loop.  Default to allow and let downstream
@@ -838,6 +923,24 @@ class EncreSafetyEngine:
         except Exception:
             pass
 
+    def _push_permission_mode(self) -> None:
+        """Push the session permission mode into the Rust engine.
+
+        The user-managed per-tool / per-capability policy table is honoured
+        only in the ``custom`` mode; the engine needs the active mode so it can
+        skip those rules in manual approval / auto approval / full access.
+        """
+        try:
+            from encre import native as _native
+            if hasattr(_native, "permission_set_mode"):
+                _native.permission_set_mode(
+                    str(getattr(self.config, "permission_mode", "") or "default")
+                )
+        except Exception:
+            # Native engine unavailable or older build without the API; the
+            # in-process policy table then simply stays fully active.
+            pass
+
     def set_policies(self, tools: dict[str, str], capabilities: dict[str, str]) -> None:
         """Replace the user-managed policy table inside the Rust engine.
 
@@ -898,6 +1001,40 @@ class EncreSafetyEngine:
                 tools[key] = value
         self.set_policies(tools, capabilities)
 
+    def _get_auto_classifier(self) -> EncreAutoSafetyClassifier | None:
+        """Return the classifier that reviews tool calls in auto mode.
+
+        The classifier is built lazily from the session's active model so it
+        follows the model the user selected (switching models rebuilds it) and
+        is reused between calls so the static pre-filter and the verdict cache
+        stay warm.  Returns ``None`` when no model is configured, in which case
+        auto mode falls back to the static engine.
+        """
+        if self._auto_classifier_explicit:
+            return self._auto_classifier
+        try:
+            active = self.config.get_active_model()
+        except Exception:
+            active = None
+        model_id = str(getattr(active, "model_id", "") or "")
+        if active is None or (not model_id and not self.config.model):
+            return None
+        key = (
+            model_id or str(self.config.model or ""),
+            str(getattr(active, "backend_type", "") or self.config.backend_type or ""),
+            str(getattr(active, "api_key", "") or self.config.api_key or ""),
+            str(getattr(active, "base_url", "") or self.config.base_url or ""),
+        )
+        if self._auto_classifier is None or self._auto_classifier_key != key:
+            self._auto_classifier = EncreAutoSafetyClassifier(
+                backend_type=key[1],
+                api_key=key[2],
+                base_url=key[3],
+                model=key[0],
+            )
+            self._auto_classifier_key = key
+        return self._auto_classifier
+
     async def _check_auto_mode(self, tool_name: str, tool_input: dict[str, Any]) -> PermissionDecision:
         """Auto mode: use classifier when available, fall back to pattern checks.
 
@@ -925,23 +1062,46 @@ class EncreSafetyEngine:
         conversation_context: str = "",
         tool: Any = None,
     ) -> PermissionDecision:
-        if self._auto_classifier is None or not conversation_context:
-            return await self.check_tool_permission(tool_name, tool_input)
+        """Auto approval: the AI classifier decides, the user is never asked.
+
+        The classifier reviews the tool call (plus the recent conversation
+        when it is available) and grants it unless it judges the call high
+        risk or malicious, in which case the call is denied.  The dangerous-
+        command blacklist is a hard floor the classifier cannot override, and
+        here it refuses the call outright instead of prompting, because auto
+        approval exists precisely to keep the user out of the loop.
+        """
+        rule = self._dangerous_rule(tool_name, tool_input)
+        if rule:
+            return PermissionDeny(
+                reason=f"Blocked by dangerous-command rule: {rule}"
+            )
+
+        classifier = self._get_auto_classifier()
+        if classifier is None:
+            # No model to review with -- fall back to the static engine and
+            # downgrade any residual prompt, since auto approval never asks.
+            decision = await self._engine_check(tool_name, tool_input)
+            if decision.behavior == "ask":
+                return PermissionAllow(reason=getattr(decision, "reason", ""))
+            return decision
 
         from encre.autosafety import AutoDecision
 
-        if self._auto_classifier is not None:
-            result = await self._auto_classifier.classify_with_context(
+        if conversation_context:
+            result = await classifier.classify_with_context(
                 tool_name, tool_input, conversation_context, tool=tool,
             )
-            if result.decision in (AutoDecision.SAFE, AutoDecision.LOW_RISK):
-                return PermissionAllow(reason=result.reasoning)
-            if result.decision == AutoDecision.BLOCK:
-                return PermissionDeny(reason=result.reasoning)
-            if result.decision == AutoDecision.HIGH_RISK:
-                return PermissionDeny(reason=result.reasoning)
+        else:
+            result = await classifier.classify(tool_name, tool_input, tool=tool)
 
-        return PermissionAsk(reason=result.reasoning if result else "")
+        if result.decision in (AutoDecision.HIGH_RISK, AutoDecision.BLOCK):
+            return PermissionDeny(
+                reason=result.reasoning or f"Auto classifier rejected {tool_name}."
+            )
+        # SAFE / LOW_RISK / ASK_USER: the AI has reviewed the call and grants
+        # it.  Auto approval never falls back to prompting the user.
+        return PermissionAllow(reason=result.reasoning)
 
     def _validate_url_safe(self, url: str) -> bool:
         if not url:

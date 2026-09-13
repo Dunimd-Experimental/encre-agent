@@ -173,6 +173,8 @@ def _load_agents_layer(
     candidates = ["AGENTS.override.md", "AGENTS.md", *_coerce_str_list(fallback_filenames)]
     for filename in candidates:
         path = directory / filename
+        if not path.is_file():
+            continue
         content = _read_text_file(path, max_bytes=max_bytes)
         if content:
             return (str(path), content)

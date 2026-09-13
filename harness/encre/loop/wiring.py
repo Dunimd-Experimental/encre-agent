@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -209,6 +209,13 @@ class _LoopWiringMixin:
             self._thinking_config = resolve_thinking_config(
                 None, config.model, backend_type=config.backend_type
             )
+        # apply_active_model() (called by EncreConfig.from_file) may have
+        # injected context_window into backend_kwargs; drop it so the
+        # explicit kwarg below cannot collide.
+        _backend_kwargs = {
+            k: v for k, v in config.backend_kwargs.items()
+            if k != "context_window"
+        }
         self.backend = create_backend(
             config.backend_type,
             api_key=config.api_key,
@@ -216,7 +223,12 @@ class _LoopWiringMixin:
             model=config.model,
             models=config.models,
             thinking_config=self._thinking_config,
-            **config.backend_kwargs,
+            # Honour the active model's resolved context window from the
+            # first turn -- otherwise the backend falls back to its built-in
+            # default and compaction thresholds ignore model switches made
+            # in a previous app run.
+            context_window=getattr(active_model, "context_window", 0) or 0,
+            **_backend_kwargs,
         )
         self.safety = safety or EncreSafetyEngine(config)
         self.compact_engine = CompactEngine()

@@ -82,6 +82,34 @@ def _inject_context_windows(models: list[dict[str, Any]]) -> list[dict[str, Any]
     return models
 
 
+def _resolve_model_context_windows(models: list[Any]) -> list[Any]:
+    """Write the real context-window size back into each ``ModelConfig``.
+
+    Legacy / freshly-added models carry ``context_window == 0``; without a
+    resolved value ``apply_active_model()`` cannot forward the window through
+    ``backend_kwargs``, so the backend falls back to name-based detection and
+    the effective context window never changes when the user switches models
+    (nor does compaction trigger for a smaller window).  Resolution mirrors
+    :func:`_inject_context_windows` but mutates the ``ModelConfig`` objects
+    themselves so the value persists with the config.
+    """
+    for m in models:
+        if not hasattr(m, "context_window"):
+            continue
+        if getattr(m, "context_window", 0) > 0:
+            continue
+        bt = getattr(m, "backend_type", "")
+        mid = getattr(m, "model_id", "")
+        if bt and mid:
+            try:
+                be = create_backend(bt, model=mid, base_url=getattr(m, "base_url", ""))
+                if be:
+                    m.context_window = be.context_window_size()
+            except Exception:
+                pass
+    return models
+
+
 class HandlerBase:
     """Connection state, frame send and session bootstrap for all mixins."""
 
@@ -286,12 +314,33 @@ class HandlerBase:
 
     @staticmethod
     def _renderer_session_messages(session: Any) -> list[dict[str, Any]]:
-        """Return visible history without dropping renderer-only tool IDs."""
-        return [
-            message
-            for message in session.get_renderer_messages()
-            if message.get("role") != "system"
-        ]
+        """Return visible history without dropping renderer-only tool IDs.
+
+        Model-facing compaction blocks (summary, active archive, archive
+        hint, workspace context) are stripped: the compressed context itself
+        must never be shown to the user.  The compact summary position is
+        replaced with a lightweight ``compact_marker`` entry that the
+        frontend renders as an inline "history compacted" divider.
+        """
+        result: list[dict[str, Any]] = []
+        for message in session.get_renderer_messages():
+            if message.get("role") == "system":
+                continue
+            if message.get("is_compact_summary") or message.get("is_compact_boundary"):
+                result.append({
+                    "id": message.get("id") or f"compact-marker-{len(result)}",
+                    "role": "compact_marker",
+                    "created_at": message.get("created_at") or message.get("timestamp") or 0,
+                })
+                continue
+            if (
+                message.get("is_compact_active_archive")
+                or message.get("is_compact_archive_hint")
+                or message.get("is_compact_context")
+            ):
+                continue
+            result.append(message)
+        return result
 
     def _resolve_startup_mode(self) -> str:
         """Resolve startup_session_mode: settings.json takes priority (runtime changes),
@@ -337,7 +386,6 @@ class HandlerBase:
                 if pset and hasattr(self._info.agent.config, "permission_settings"):
                     self._info.agent.config.permission_settings = pset
                     if hasattr(self._info.agent, "safety"):
-                        from encre.utils.types import PermissionAllow
                         tools_dict = {}
                         caps_dict = {}
                         for k, v in pset.items():
