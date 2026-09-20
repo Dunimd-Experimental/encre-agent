@@ -36,12 +36,46 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from encre.logging_config import get_logger
+from encre.loop.phase_api import (
+    LoopPhase,
+    PhaseContext,
+    PhaseResult,
+    PhaseScope,
+)
 from encre.loop.turn_ctx import TurnContext
 from encre.loop_stability import should_post_tool_compact
 from encre.utils.tokens import count_message_tokens, estimate_request_overhead
 from encre.utils.types import CompactFailed, CompactNotification, CompactStarting
 
 logger = get_logger(__name__)
+
+
+class PreModelCompactPhase(LoopPhase):
+    """Turn-scoped phase: pre-API-call compaction (Claude Code style).
+
+    Wraps :meth:`PhaseCompactMixin._phase_pre_model_compact` -- the exact
+    code the runner used to call first inside every turn iteration.
+    """
+
+    name = "pre_model_compact"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        await self._stream_through(ctx, self._loop._phase_pre_model_compact(ctx.turn))
+        return PhaseResult.continue_()
+
+
+class PostToolCompactPhase(LoopPhase):
+    """Turn-scoped phase: post-tool compression check.
+
+    Wraps :meth:`PhaseCompactMixin._phase_post_tool_compact` -- the exact
+    code the runner used to call after tool execution.
+    """
+
+    name = "post_tool_compact"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        await self._stream_through(ctx, self._loop._phase_post_tool_compact(ctx.turn))
+        return PhaseResult.continue_()
 
 
 class PhaseCompactMixin:

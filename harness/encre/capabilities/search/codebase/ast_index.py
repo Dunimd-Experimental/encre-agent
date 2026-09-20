@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -27,6 +27,8 @@
 # ``encre.native``.  It provides a pure-Python API for symbol lookup, reference
 # finding, outline generation, "go to definition" and relevance search, while
 # caching parsed data on disk under ``.encre/ast_index.json``.
+
+from __future__ import annotations
 
 import json
 import logging

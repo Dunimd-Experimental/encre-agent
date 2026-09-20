@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -30,7 +30,7 @@ the plugin back exactly (Task 9.2).
 Surfaces (Task 9.3):
 - ``tools``      register additional tools
 - ``backends``   register model backend classes
-- ``loop``       intercept loop phases via the phase bus
+- ``loop``       intercept loop phases via the event backbone
 - ``events``     subscribe/emit typed plugin events
 - ``permissions``register permission policies
 - ``commands``   register slash commands
@@ -131,7 +131,7 @@ class PluginContext:
         undo_sink: Callable[[str, _UNDO], None] | None = None,
         tool_registry: Any = None,
         backend_registry: Any = None,
-        phase_bus: Any = None,
+        loop_bus: Any = None,
         event_bus: Any = None,
         permission_registry: Any = None,
         command_registry: Any = None,
@@ -158,7 +158,7 @@ class PluginContext:
         _mk = _make_api
         self.tools = _mk(_ToolsApi, tool_registry, plugin_name, self)
         self.backends = _mk(_BackendsApi, backend_registry, plugin_name, self)
-        self.loop = _mk(_LoopApi, phase_bus, plugin_name, self)
+        self.loop = _mk(_LoopApi, loop_bus, plugin_name, self)
         self.events = _mk(_EventsApi, event_bus, plugin_name, self)
         self.permissions = _mk(_PermissionsApi, permission_registry, plugin_name, self)
         self.commands = _mk(_CommandsApi, command_registry, plugin_name, self)
@@ -234,7 +234,7 @@ def build_context(
         undo_sink=undo_sink,
         tool_registry=host.get("tools"),
         backend_registry=host.get("backends"),
-        phase_bus=host.get("loop"),
+        loop_bus=host.get("loop"),
         event_bus=host.get("events"),
         permission_registry=host.get("permissions"),
         command_registry=host.get("commands"),
@@ -302,17 +302,18 @@ class _BackendsApi(_ApiBase):
 
 
 class _LoopApi(_ApiBase):
-    """``encre.loop`` — intercept loop phases via the phase bus."""
+    """``encre.loop`` — intercept loop phases via the event backbone."""
 
     _label = "loop"
 
     def intercept(self, phase: str, handler: Callable[..., Any]) -> _UNDO:
-        """Subscribe *handler* to *phase* on the phase bus; returns undo."""
+        """Register *handler* as a phase hook on the backbone; returns undo."""
         if not self._ctx._gate("loop"):
             return _noop_undo
         if self._host is None:
             return self._absent()
-        return self._ctx.record_undo(self._host.subscribe(phase, handler, source=self._plugin))
+        self._host.on(phase, handler)
+        return self._ctx.record_undo(lambda: self._host.off(phase, handler))
 
 
 class _EventsApi(_ApiBase):

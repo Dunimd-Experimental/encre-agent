@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -45,6 +45,8 @@ build vision-language-model prompts.  That is the responsibility of the
 agent / tool layer above; here we just provide the action dispatcher,
 the trajectory, and a small validation layer.
 """
+
+from __future__ import annotations
 
 import base64
 import contextlib

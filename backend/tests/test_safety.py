@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -828,7 +828,7 @@ class TestUnicodeHomoglyph:
         the command intent from human readers.
         """
         # Zero-width space U+200B
-        r = _analyze("rm鈥?-rf /")
+        r = _analyze("rm\u200b -rf /")
         assert r.contains_unicode_homoglyph is True
         assert r.injection_detected is True
 
@@ -841,7 +841,7 @@ class TestUnicodeHomoglyph:
         changing the command semantics.
         """
         # Zero-width non-joiner U+200C
-        r = _analyze("鈥宭s -la")
+        r = _analyze("\u200cls -la")
         assert r.contains_unicode_homoglyph is True
         assert r.injection_detected is True
 
@@ -853,7 +853,7 @@ class TestUnicodeHomoglyph:
         are detected because BIDI overrides can reorder command text visually.
         """
         # Right-to-left override U+202E
-        r = _analyze("鈥畆m -rf /")
+        r = _analyze("\u202erm -rf /")
         assert r.contains_unicode_homoglyph is True
         assert r.injection_detected is True
 
@@ -865,7 +865,7 @@ class TestUnicodeHomoglyph:
         because the BOM is an invisible character that can alter command parsing.
         """
         # BOM U+FEFF
-        r = _analyze("锘縠cho hello")
+        r = _analyze("\ufeffecho hello")
         assert r.contains_unicode_homoglyph is True
         assert r.injection_detected is True
 
@@ -1178,7 +1178,7 @@ class TestEncreSafetyEngineBash:
         'homoglyph' or 'zero-width' because invisible characters must be
         rejected even on benign-looking commands.
         """
-        safe, reason = engine.is_bash_safe("鈥媏cho hi")
+        safe, reason = engine.is_bash_safe("\u200becho hi")
         assert safe is False
         assert "homoglyph" in reason.lower() or "zero-width" in reason.lower()
 

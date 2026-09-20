@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -36,6 +36,8 @@ Every error emitted from the agent loop (via ``BackendError``,
 The frontend SHOULD use ``category`` for icon/color selection and
 ``code`` for precise error handling, NEVER parse the ``message`` text.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum

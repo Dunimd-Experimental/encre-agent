@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -38,6 +38,7 @@ The former monolithic ``encre/loop.py`` is split into:
   model, recovery, tools, execute).
 """
 
+from encre.backend import create_backend
 from encre.loop.runner import EncreLoop
 from encre.loop.turn_ctx import TurnContext, TurnExit
 
@@ -45,4 +46,5 @@ __all__ = [
     "EncreLoop",
     "TurnContext",
     "TurnExit",
+    "create_backend",
 ]

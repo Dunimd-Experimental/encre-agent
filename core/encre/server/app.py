@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -109,8 +109,8 @@ class EncreServer:
         except Exception:
             logger.exception("Unhandled error in WebSocket handler")
 
-    async def _handle_http(self, path: str, _request_headers) -> tuple[int, str, dict[str, str]] | None:
-        result = handle_admin(path, self._manager)
+    async def _handle_http(self, path: str, request_headers) -> tuple[int, str, dict[str, str]] | None:
+        result = handle_admin(path, self._manager, request_headers=request_headers)
         if result is None:
             return None
         status, body, header_list = result
@@ -139,11 +139,22 @@ class EncreServer:
 
         logger.info(f"Starting encre server on {self.host}:{self.port}")
 
-        async def process_request(path, _request_headers):
+        async def process_request(path, request_headers):
+            # Block cross-site browser handshakes (drive-by WebSocket
+            # hijacking): the desktop renderer connects over file:///custom
+            # schemes or Node, never from an http(s) page on another host.
+            from encre.server.admin import _origin_is_local
+            if not _origin_is_local(request_headers):
+                return (403, [("Content-Type", "text/plain")], b"Forbidden")
             if path and path.startswith("/ws"):
                 return None  # Let websockets handle it
-            # Handle HTTP admin endpoints
-            result = handle_admin(path, self._manager)
+            # Handle HTTP admin endpoints.  Some of them (git status/diff/
+            # push/pull/...) shell out to git with timeouts of up to 60s;
+            # running that inline would freeze the whole event loop (and
+            # every live agent session), so it goes to a worker thread.
+            result = await asyncio.to_thread(
+                handle_admin, path, self._manager, request_headers
+            )
             if result is None:
                 return (404, [], b"Not Found")
             status, body, header_list = result

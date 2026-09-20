@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -36,23 +36,34 @@ How it works
   itself in detail; it only counts how many tools were involved.
 * When the number of distinct tool names in a single run reaches
   :attr:`TOOL_CALL_THRESHOLD`, the engine spawns a background asyncio task that
-  performs the (potentially slow) skill generation and registration off the
-  critical path.
+  performs the (potentially slow) skill generation off the critical path.
+* Generated skills are **not** activated directly. They are handed to the
+  :class:`~encre.improve.verification.SkillVerifier` as *proposed* artifacts
+  and only promoted once they pass verification; a failing artifact is rejected
+  with recorded reasons. This prevents a bad run from permanently polluting
+  long-term behaviour.
 * All in-flight crystallisation tasks are tracked so that :meth:`stop` can
   cancel them and wait for them to finish tearing down.
 
 Caveats
 -------
 The engine deliberately ignores partial failures: if a generated skill cannot
-be registered, the error is logged by the generator and the engine simply
-forgets the task. This keeps the learning side-effects from ever blocking or
-crashing the main agent loop.
+be proposed or verified, the error is logged and the engine simply forgets the
+task. This keeps the learning side-effects from ever blocking or crashing the
+main agent loop.
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import logging
+import secrets
+import time
 
 from encre.agent import EncreAgent
+
+from encre.improve.verification import SkillVerifier
 
 logger = logging.getLogger("encre.learning")
 
@@ -78,18 +89,28 @@ class LearningEngine:
     _tasks:
         Live list of :class:`asyncio.Task` objects spawned for crystallisation.
         Entries remove themselves when their task completes.
+    _verifier:
+        The :class:`SkillVerifier` gate that proposed skills must pass before
+        they become active. Created lazily from the owning agent when not
+        injected.
     """
 
     # Below this many distinct tools a run is treated as too small to learn from.
     TOOL_CALL_THRESHOLD = 5
 
-    def __init__(self, agent: EncreAgent) -> None:
-        """Initialise the engine with its owning agent.
+    def __init__(
+        self,
+        agent: EncreAgent,
+        *,
+        verifier: SkillVerifier | None = None,
+    ) -> None:
+        """Initialise the engine with its owning agent and verification gate.
 
         Args:
             agent: The agent used to build skill generators. The reference is
-                stored and later handed to :class:`SkillGenerator`; it is not
-                otherwise used here.
+                stored and later handed to :class:`SkillGenerator`.
+            verifier: Optional verification gate. When omitted one is created
+                lazily for the agent on first use.
 
         Returns:
             None.
@@ -97,14 +118,53 @@ class LearningEngine:
         self._agent = agent
         self._running = False
         self._tasks: list[asyncio.Task] = []
+        self._verifier = verifier
+
+    def _get_verifier(self) -> SkillVerifier:
+        """Return the verification gate, creating one for the agent if needed.
+
+        The gate is bound to the owning agent's loop so that promoted skills
+        are written into procedural memory (Task 7.4).  Binding is best-effort
+        and idempotent; a memory fault can never block skill promotion.
+        """
+        if self._verifier is None:
+            self._verifier = SkillVerifier(self._agent)
+        self._bind_procedural_memory(self._verifier)
+        return self._verifier
+
+    def _bind_procedural_memory(self, verifier: SkillVerifier) -> None:
+        """Bind ``verifier`` to the agent loop's procedural-memory bridge.
+
+        Resolved duck-typed (``agent.loop.attach_skill_verifier``) so this
+        module stays independent of the loop package.  The loop owns the
+        actual write into :class:`~encre.memdir.layers.MemoryLayerStore`; here
+        we only connect the gate's ``on_promoted`` seam.  Never raises.
+        """
+        attach = getattr(
+            getattr(self._agent, "loop", None), "attach_skill_verifier", None,
+        )
+        if not callable(attach):
+            return
+        try:
+            attach(verifier)
+        except Exception:
+            logger.warning(
+                "failed to bind skill verifier to procedural memory", exc_info=True,
+            )
 
     async def start(self) -> None:
-        """Mark the engine as running and ready to analyse runs.
+        """Mark the engine as running and migrate any legacy auto-generated skills.
+
+        Migration is best-effort and idempotent: pre-verification artifacts are
+        marked ``proposed`` so they cannot be injected until they pass the gate.
 
         Returns:
             None.
         """
         self._running = True
+        # Best-effort: migration must never prevent the engine from starting.
+        with contextlib.suppress(Exception):
+            self._get_verifier().migrate_legacy()
         logger.info("Learning engine started")
 
     async def stop(self) -> None:
@@ -127,7 +187,13 @@ class LearningEngine:
         self._tasks.clear()
         logger.info("Learning engine stopped")
 
-    async def analyze_run(self, tool_names: list[str], prompt: str) -> None:
+    async def analyze_run(
+        self,
+        tool_names: list[str],
+        prompt: str,
+        *,
+        run_id: str = "",
+    ) -> None:
         """Consider a finished run and perhaps queue a crystallisation task.
 
         The engine ignores runs while stopped or while the run did not involve
@@ -141,6 +207,9 @@ class LearningEngine:
                 :attr:`TOOL_CALL_THRESHOLD`.
             prompt: The original user prompt for the run, passed through to the
                 generator so the generated skill can capture intent.
+            run_id: Optional identifier for the originating run; recorded on the
+                proposed artifact for provenance. A synthetic id is minted when
+                omitted.
 
         Returns:
             None.
@@ -149,30 +218,35 @@ class LearningEngine:
             return
         if len(tool_names) < self.TOOL_CALL_THRESHOLD:
             return
-        # Offload the (potentially slow) generation/registration to the event
-        # loop so the caller's analysis path is never blocked.
-        task = asyncio.create_task(self._crystallize(tool_names, prompt))
+        if not run_id:
+            run_id = f"run-{int(time.time())}-{secrets.token_hex(3)}"
+        # Offload the (potentially slow) generation to the event loop so the
+        # caller's analysis path is never blocked.
+        task = asyncio.create_task(self._crystallize(tool_names, prompt, run_id))
         self._tasks.append(task)
         # When the task finishes, drop it from the list if still present.
         task.add_done_callback(lambda t: self._tasks.remove(t) if t in self._tasks else None)
 
-    async def _crystallize(self, tool_names: list[str], prompt: str) -> None:
-        """Generate and register a skill from the observed tool pattern.
+    async def _crystallize(self, tool_names: list[str], prompt: str, run_id: str = "") -> None:
+        """Generate, propose and verify a skill from the observed tool pattern.
 
-        Builds a :class:`SkillGenerator` for the owning agent, asks it to
-        synthesise a skill definition from the tool names and prompt, and if a
-        definition comes back, registers it. A ``None`` result from the
-        generator means nothing worth saving was found, so we silently stop.
+        Builds a :class:`SkillGenerator` wired to the verification gate, asks it
+        to synthesise a skill definition from the tool names and prompt, records
+        it as a proposed artifact, then runs verification. A passing artifact is
+        promoted to active; a failing one is rejected with recorded reasons. A
+        ``None`` result from the generator means nothing worth saving was found,
+        so we silently stop.
 
         Args:
             tool_names: Tool names that formed the pattern to learn.
             prompt: The originating prompt, preserved as skill context.
+            run_id: Identifier of the originating run, stored on the artifact.
 
         Returns:
             None.
 
         Raises:
-            Any exception raised by ``SkillGenerator.register`` is allowed to
+            Any exception raised by the generator or verifier is allowed to
             propagate to the task wrapper; the engine does not catch it here,
             so callers awaiting the task (or the done-callback pruner) should
             treat failures as non-fatal.
@@ -180,8 +254,14 @@ class LearningEngine:
         # Imported lazily to avoid a circular import at module load time.
         from encre.improve.learning.skill_generator import SkillGenerator
 
-        generator = SkillGenerator(self._agent)
+        verifier = self._get_verifier()
+        generator = SkillGenerator(self._agent, verifier=verifier)
         skill_def = generator.generate(tool_names, prompt)
         if skill_def is None:
             return
-        await generator.register(skill_def)
+        artifact = await generator.register(skill_def, run_id=run_id)
+        if artifact is None:
+            return
+        # Verification decides promote vs reject; unverified output never
+        # reaches the main prompt.
+        verifier.verify(artifact)

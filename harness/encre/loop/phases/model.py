@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Model phase: prepare the backend request and stream one model slot.
 
 Extracted verbatim from the original monolithic ``_run_impl``.  Contains the
@@ -39,8 +41,21 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from encre.backends.adaptive import (
+    apply_to_messages,
+    apply_to_tools,
+    compute_plan,
+    tool_intent_fallback,
+)
 from encre.backends.base import format_backend_error
+from encre.backends.registry import ModelInfo, resolve_model_info
 from encre.logging_config import get_logger
+from encre.loop.phase_api import (
+    LoopPhase,
+    PhaseContext,
+    PhaseResult,
+    PhaseScope,
+)
 from encre.loop.turn_ctx import TurnContext, TurnExit
 from encre.loop_error import RecoveryAction, RecoveryDecision
 from encre.compact.loop_state.transition import TurnTransition
@@ -85,6 +100,23 @@ _THINK_OPEN = re.compile(r'<(think|thought|thinking|reasoning|analysis)>|\[inter
 _THINK_CLOSE = re.compile(r'</(think|thought|thinking|reasoning|analysis)>|\[/internal\]')
 
 
+def _append_to_system_prompt(messages: list[dict[str, Any]], suffix: str) -> None:
+    """把 ``suffix`` 追加到消息列表首条 system 消息的末尾。
+
+    追加而非前置，保证 system prompt 的既有前缀完全不变，从而不破坏 prompt
+    caching 的缓存前缀语义。若列表中没有 system 消息，则插入一条新的 system
+    消息作为首元素。
+    """
+    for index, message in enumerate(messages):
+        if message.get("role") == "system":
+            existing = message.get("content")
+            if not isinstance(existing, str):
+                existing = "" if existing is None else str(existing)
+            messages[index] = {**message, "content": existing + "\n\n" + suffix}
+            return
+    messages.insert(0, {"role": "system", "content": suffix})
+
+
 class PhaseModelMixin:
     """Backend request preparation and streaming for one turn."""
 
@@ -103,10 +135,22 @@ class PhaseModelMixin:
             Streaming ``AgentEvent`` items; may raise :class:`TurnExit` to
             terminate the run (mirrors the original ``return`` statements).
         """
-        tools = None
-        if self.backend.supports_tool_calling():
-            self.discovery.tool_set_name = self._tool_set_name
-            tools = self.discovery.get_active_tools_payload(self.session.id, fmt="openai")
+        # ── 能力矩阵自适应：调用前按 ModelInfo + backend 能力算出降级方案 ──
+        # ModelInfo 以 backend 暴露的模型名为准（registry 查询，未注册时退到
+        # provider 级默认值）；连模型名都拿不到时传 None，走保守默认。
+        plan = compute_plan(
+            self._resolve_capability_model_info(),
+            backend=self.backend,
+            config=self.config,
+        )
+        if plan.degraded:
+            self._publish_capability_degraded(plan)
+
+        # tools 始终取一次活跃清单：即便原生工具调用被降级，也需要用它的
+        # 名称/描述生成纯文本工具意图指令。
+        self.discovery.tool_set_name = self._tool_set_name
+        _raw_tools = self.discovery.get_active_tools_payload(self.session.id, fmt="openai")
+        tools = apply_to_tools(_raw_tools, plan)
         t.tools = tools
 
         # Reset the streaming buffer for this turn so the cancel-persistence
@@ -115,7 +159,7 @@ class PhaseModelMixin:
         self._pending_stream_thinking = []
 
         _t_pm = time.time()
-        pre_model = await self.phase_bus.emit(
+        pre_model = await self.event_bus.emit(
             "pre_model_request", messages=self.session.messages, tools=tools,
         )
         t.pre_model = pre_model
@@ -126,6 +170,20 @@ class PhaseModelMixin:
         if pre_model and pre_model.get("modified_input"):
             mi = pre_model["modified_input"]
             t.backend_messages = mi.get("messages", t.backend_messages)
+
+        # tools 被降级关闭时，把工具清单压缩成纯文本指令追加到 system prompt
+        # 末尾（前缀保持稳定），让模型改用文本表达工具意图。同时更新
+        # t.system_prompt，使后续 request-overhead 估算反映这段新增文本。
+        if not plan.use_tools:
+            _tool_intent = tool_intent_fallback(_raw_tools)
+            if _tool_intent:
+                _append_to_system_prompt(t.backend_messages, _tool_intent)
+                if t.system_prompt:
+                    t.system_prompt = t.system_prompt + "\n\n" + _tool_intent
+
+        # 无 vision 的模型不再收到图片引用：剥离并替换为文本描述。
+        if not plan.use_vision:
+            t.backend_messages = apply_to_messages(t.backend_messages, plan)
 
         # Inject evolution guidance and feedback into backend messages only
         # (not into self.session.messages) so they don't appear as user input in the UI,
@@ -385,9 +443,10 @@ class PhaseModelMixin:
 
         # Cached microcompact: register tool_results and queue deletions
         # for the Anthropic cache_edits API layer.  Only runs when the
-        # backend is Anthropic (other backends ignore the block).
-        _cache_edits_state = self._cache_edits_state
-        if _cache_edits_state is None and self.config.enable_prompt_caching:
+        # backend is Anthropic (other backends ignore the block) and the
+        # capability plan allows prompt caching this turn.
+        _cache_edits_state = self._cache_edits_state if plan.use_caching else None
+        if _cache_edits_state is None and self.config.enable_prompt_caching and plan.use_caching:
             try:
                 from encre.cache_edits import create_state
                 self._cache_edits_state = create_state()
@@ -434,11 +493,19 @@ class PhaseModelMixin:
                 # Wrap the chat generator with a 120s timeout on the first event,
                 # so a hanging API call (wrong key, no network, etc.) surfaces an
                 # error rather than freezing the UI indefinitely.
+                # Enable caching only when the user requested it AND the backend
+                # reports it AND the capability plan allows it this turn.
+                _enable_caching = (
+                    self.config.enable_prompt_caching
+                    and self.backend.supports_prompt_caching()
+                    and plan.use_caching
+                )
                 _chat_gen = self.backend.chat(
                     messages=t.backend_messages,
                     tools=t.backend_tools,
                     max_tokens=t.slot_budget,
-                    enable_caching=self.config.enable_prompt_caching and self.backend.supports_prompt_caching(),
+                    stream=plan.use_streaming,
+                    enable_caching=_enable_caching,
                     cache_edits_state=_cache_edits_state,
                 )
                 async for event in self._chat_with_timeout(_chat_gen, timeout=120.0):
@@ -897,3 +964,66 @@ class PhaseModelMixin:
         await self.hook_system.emit_post_model_response(
             t.response_text, len(t.tool_call_buffers)
         )
+
+    def _resolve_capability_model_info(self) -> ModelInfo | None:
+        """解析当前 backend 对应的 :class:`ModelInfo`。
+
+        优先按 backend 暴露的模型名查询 registry（未注册时退回 provider 级
+        默认值）；聚合型 backend（router / failover）不暴露 ``model``，此时回退
+        到 ``config.model``。当两者都拿不到模型名、或解析过程出现任何异常时返回
+        ``None``，由 :func:`compute_plan` 走保守默认。
+        """
+        backend = getattr(self, "backend", None)
+        model_name = getattr(backend, "model", "") or getattr(self.config, "model", "") or ""
+        if not model_name:
+            return None
+        provider: str | None = None
+        provider_fn = getattr(backend, "provider_name", None)
+        if callable(provider_fn):
+            try:
+                provider = str(provider_fn() or "") or None
+            except Exception:
+                provider = None
+        try:
+            return resolve_model_info(str(model_name), provider)
+        except Exception:
+            return None
+
+    def _publish_capability_degraded(self, plan: Any) -> None:
+        """把降级决策发布到全局事件主干，供审计/排障。
+
+        ``self.event_bus`` 不可用时静默降级，绝不因观测失败中断模型调用。
+        """
+        try:
+            self.event_bus.publish(
+                "capability_degraded",
+                session_id=self.session.id or "",
+                payload={
+                    "model": getattr(self.backend, "model", "") or "",
+                    "plan": {
+                        "use_tools": plan.use_tools,
+                        "use_vision": plan.use_vision,
+                        "use_caching": plan.use_caching,
+                        "use_streaming": plan.use_streaming,
+                    },
+                    "reasons": dict(plan.reasons),
+                },
+            )
+        except Exception:
+            logger.debug("[capability] capability_degraded publish failed", exc_info=True)
+
+
+class ModelPhase(LoopPhase):
+    """Turn-scoped phase: backend request preparation and model streaming.
+
+    Wraps :meth:`PhaseModelMixin._phase_model` -- the exact code the runner
+    used to call second inside every turn iteration.  A :class:`TurnExit`
+    raised deep inside the streaming loop propagates unchanged; the pipeline
+    driver translates it into the historical immediate run exit.
+    """
+
+    name = "model"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        await self._stream_through(ctx, self._loop._phase_model(ctx.turn))
+        return PhaseResult.continue_()

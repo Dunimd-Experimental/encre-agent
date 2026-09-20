@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -21,6 +21,17 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
+from encre.memdir.layers import (
+    DecayState,
+    LinkRelation,
+    MemoryEntry,
+    MemoryLayerStore,
+    MemoryLink,
+    MemoryType,
+)
+from encre.memdir.recall import EmbeddingBackend, RecallEngine, RecallHit
 from encre.memdir.semantic import (
     ConsolidationAction,
     MemoryConsolidator,
@@ -32,10 +43,19 @@ from encre.memdir.system import EncreMemorySystem, EntrypointResult, MemoryHeade
 
 __all__ = [
     "ConsolidationAction",
+    "DecayState",
+    "EmbeddingBackend",
     "EncreMemorySystem",
     "EntrypointResult",
+    "LinkRelation",
     "MemoryConsolidator",
+    "MemoryEntry",
     "MemoryHeader",
+    "MemoryLayerStore",
+    "MemoryLink",
+    "MemoryType",
+    "RecallEngine",
+    "RecallHit",
     "SearchResult",
     "SemanticMemorySearch",
     "WorkingMemory",

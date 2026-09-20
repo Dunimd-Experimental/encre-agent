@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -28,6 +28,8 @@ Maintains running shell processes started via the bash tool with
 exposing an offset-based read protocol so the bash_output tool can stream
 new bytes since the last read without re-sending what the model already saw.
 """
+
+from __future__ import annotations
 
 import asyncio
 import os

@@ -277,9 +277,10 @@ async def test_deliver_over_cap_truncates_saves_audit_and_appends_note(tmp_path)
     # the absolute audit path, so the exact length depends on the path -- we
     # only assert it's meaningfully shorter than the original.
     assert len(sent_content) < len(content)
-    # Full output was saved to disk.
-    from pathlib import Path
-    saved = Path(results[0].saved_path).read_text(encoding="utf-8")
+    # Full output was saved to disk (encrypted at rest; read through the
+    # transparent secure_io helper).
+    from encre.secure_io import read_text
+    saved = read_text(results[0].saved_path)
     assert saved == content
 
 

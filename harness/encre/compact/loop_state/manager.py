@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -70,6 +70,36 @@ META_MILESTONE_SUMMARIES = "milestone_summaries"
 # Sentinel for change detection
 _UNSET: dict[str, Any] = {}
 
+# Change-log snapshots cap.  Accumulator values such as ``turn_summaries``
+# grow on every turn, so snapshotting them in full per change would make
+# the change log (and its ``state_changed`` mirror on the event backbone)
+# retain O(n^2) state over a long run.  Oversized containers are recorded
+# as a bounded tail instead, which keeps the audit trail usable.
+_SNAPSHOT_MAX_ITEMS = 32
+
+
+def _snapshot(value: Any) -> Any:
+    """Return a deepcopied snapshot of *value*, bounded for large containers.
+
+    Args:
+        value: The value to snapshot for the change log.
+
+    Returns:
+        A deep copy for small values; for oversized lists a bounded tail
+        summary, and for oversized dicts a size-only summary.
+    """
+    if isinstance(value, list):
+        if len(value) > _SNAPSHOT_MAX_ITEMS:
+            return {
+                "_snapshot": "list_tail",
+                "len": len(value),
+                "tail": copy.deepcopy(value[-_SNAPSHOT_MAX_ITEMS:]),
+            }
+        return copy.deepcopy(value)
+    if isinstance(value, dict) and len(value) > _SNAPSHOT_MAX_ITEMS:
+        return {"_snapshot": "dict", "len": len(value)}
+    return copy.deepcopy(value)
+
 
 class StateManager:
     """Unified typed state manager for EncreLoop.
@@ -119,19 +149,48 @@ class StateManager:
         self._change_seq += 1
         rec = {
             "key": key,
-            "old": copy.deepcopy(old),
-            "new": copy.deepcopy(new),
+            "old": _snapshot(old),
+            "new": _snapshot(new),
             "timestamp": time.time(),
             "seq": self._change_seq,
         }
         self._changes.append(rec)
         if len(self._changes) > 10000:
             self._changes.pop(0)
+        self._publish_change(rec)
         if self._on_change:
             try:
                 self._on_change(key, old, new)
             except Exception:
                 logger.exception("StateManager.on_change callback failed for key=%s", key)
+
+    def _publish_change(self, rec: dict[str, Any]) -> None:
+        """Mirror a recorded change onto the session's event backbone.
+
+        The local change log remains the authoritative audit trail (see
+        :meth:`change_log` / :meth:`replay`); when the session has no backbone
+        attached (lightweight embeddings, unit tests) this degrades to a
+        no-op instead of raising.
+        """
+        bus = getattr(self._session, "event_bus", None)
+        if bus is None:
+            return
+        try:
+            bus.publish(
+                "state_changed",
+                session_id=getattr(self._session, "id", "") or "",
+                payload={
+                    "key": rec["key"],
+                    "old": rec["old"],
+                    "new": rec["new"],
+                    "seq": rec["seq"],
+                },
+            )
+        except Exception:
+            logger.warning(
+                "StateManager failed to publish change for key=%s", rec["key"],
+                exc_info=True,
+            )
 
     # 鈹€鈹€ Typed accessors 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 

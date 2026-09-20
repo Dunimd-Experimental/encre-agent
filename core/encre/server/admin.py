@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -28,8 +28,9 @@ from __future__ import annotations
 These endpoints are served alongside the WebSocket upgrade by
 :func:`encre.server.app.EncreServer.start` via the ``process_request`` hook.
 They expose read-only operational data (health, config, session counts, stats)
-and a single control action (cancel a running session).  All responses are JSON
-with permissive CORS headers so local tooling can consume them.
+and a single control action (cancel a running session).  All responses are JSON;
+cross-site browser requests (non-local ``Origin``) are rejected to prevent
+drive-by CSRF and CORS-based secret reads.
 """
 
 import json
@@ -42,14 +43,72 @@ from encre.server.session_manager import SessionManager, SessionState
 
 _start_time = time.time()
 
+#: Hosts considered local.  Requests whose ``Origin`` header names any other
+#: host come from a browser page (drive-by CSRF / CORS reading) and are
+#: rejected.  The desktop app calls these endpoints from the Node main
+#: process, which never sends an ``Origin`` header.
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+#: Substrings (lowercase) of config keys whose values must never leave the
+#: process in plaintext via the admin API.
+_SECRET_MARKERS = ("api_key", "token", "secret", "password")
+
+
+def _redact_secrets(data: Any) -> Any:
+    """Recursively mask secret-looking values in a config dict."""
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            lk = str(k).lower()
+            if any(m in lk for m in _SECRET_MARKERS):
+                if isinstance(v, str) and v:
+                    out[k] = "***"
+                elif isinstance(v, list):
+                    out[k] = ["***" if isinstance(i, str) and i else i for i in v]
+                else:
+                    out[k] = v
+            else:
+                out[k] = _redact_secrets(v)
+        return out
+    if isinstance(data, list):
+        return [_redact_secrets(i) for i in data]
+    return data
+
+
+def _origin_is_local(request_headers: Any) -> bool:
+    """Return True when the request is not a cross-site browser request.
+
+    Node (Electron main) requests carry no ``Origin`` header at all; browser
+    pages always do.  Any ``Origin`` that is not one of the loopback hosts is
+    treated as a drive-by attempt and rejected.
+    """
+    if request_headers is None:
+        return True
+    try:
+        origin = request_headers.get("Origin")
+    except Exception:
+        return True
+    if not origin or origin == "null":
+        return True
+    parsed = urlparse(origin)
+    if parsed.scheme not in ("http", "https"):
+        return True  # custom/desktop-app schemes
+    return (parsed.hostname or "").lower() in _LOCAL_HOSTS
+
 
 def _json_response(data: dict[str, Any], status: int = 200) -> tuple[int, str, list[tuple[str, str]]]:
     body = json.dumps(data, ensure_ascii=False, indent=2)
-    headers = [("Content-Type", "application/json"), ("Access-Control-Allow-Origin", "*")]
+    # No Access-Control-Allow-Origin: cross-origin browser reads are never
+    # legitimate for these local admin endpoints (and are blocked upstream
+    # by the Origin check in handle_admin).
+    headers = [("Content-Type", "application/json")]
     return status, body, headers
 
 
-def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tuple[str, str]]] | None:
+def handle_admin(path: str, manager: SessionManager, request_headers: Any = None) -> tuple[int, str, list[tuple[str, str]]] | None:
+    if not _origin_is_local(request_headers):
+        return (403, json.dumps({"error": "cross-origin requests are not allowed"}), [("Content-Type", "application/json")])
+
     parsed = urlparse(path)
     base_path = parsed.path
     query = parse_qs(parsed.query)
@@ -68,7 +127,7 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
         # used to ``tomllib.load`` the monolithic encrypted blob, which
         # always raised and returned "{}" no matter what was configured.
         from encre import config_store
-        return _json_response(config_store.load_config())
+        return _json_response(_redact_secrets(config_store.load_config()))
 
     if base_path == "/sessions":
         return _json_response({
@@ -93,14 +152,23 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
         if info is None:
             return _json_response({"error": "Session not found"}, 404)
         if info.agent_task and not info.agent_task.done():
-            info.agent_task.cancel()
+            # handle_admin may run in a worker thread (offloaded from the
+            # event loop by server.app); Task.cancel is not thread-safe, so
+            # marshal it back onto the task's own loop.
+            task = info.agent_task
+            loop = task.get_loop()
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                task.cancel()
         manager.set_session_state(session_id, SessionState.IDLE)
         return _json_response({"ok": True, "session_id": session_id})
 
     if base_path == "/git/status":
         workspace = query.get("workspace", [""])[0]
-        if not workspace:
-            return _json_response({"error": "workspace required"}, 400)
+        _ws_err = _workspace_error(workspace)
+        if _ws_err:
+            return _json_response({"error": _ws_err}, 400)
         try:
             from encre.git.repo import EncreGitRepo
             repo = EncreGitRepo(workspace=workspace)
@@ -111,8 +179,9 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
 
     if base_path == "/git/diff":
         workspace = query.get("workspace", [""])[0]
-        if not workspace:
-            return _json_response({"error": "workspace required"}, 400)
+        _ws_err = _workspace_error(workspace)
+        if _ws_err:
+            return _json_response({"error": _ws_err}, 400)
         filter_type = query.get("filter", ["all"])[0]
         file_path = query.get("file", [None])[0]
         try:
@@ -126,9 +195,12 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
     if base_path == "/git/commit":
         import subprocess
         workspace = query.get("workspace", [""])[0]
+        _ws_err = _workspace_error(workspace)
+        if _ws_err:
+            return _json_response({"error": _ws_err}, 400)
         message = query.get("message", [""])[0]
-        if not workspace or not message:
-            return _json_response({"error": "workspace and message required"}, 400)
+        if not message:
+            return _json_response({"error": "message required"}, 400)
         try:
             result = subprocess.run(
                 ["git", "commit", "-m", message],
@@ -144,8 +216,9 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
     if base_path == "/git/push":
         import subprocess
         workspace = query.get("workspace", [""])[0]
-        if not workspace:
-            return _json_response({"error": "workspace required"}, 400)
+        _ws_err = _workspace_error(workspace)
+        if _ws_err:
+            return _json_response({"error": _ws_err}, 400)
         try:
             # If no upstream tracking is set, auto-configure origin/HEAD.
             check = subprocess.run(
@@ -178,8 +251,9 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
     if base_path == "/git/pull":
         import subprocess
         workspace = query.get("workspace", [""])[0]
-        if not workspace:
-            return _json_response({"error": "workspace required"}, 400)
+        _ws_err = _workspace_error(workspace)
+        if _ws_err:
+            return _json_response({"error": _ws_err}, 400)
         try:
             # If no upstream tracking is set, auto-configure origin/HEAD.
             check = subprocess.run(
@@ -213,8 +287,9 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
     if base_path == "/git/behind":
         import subprocess
         workspace = query.get("workspace", [""])[0]
-        if not workspace:
-            return _json_response({"error": "workspace required"}, 400)
+        _ws_err = _workspace_error(workspace)
+        if _ws_err:
+            return _json_response({"error": _ws_err}, 400)
         try:
             branch_res = subprocess.run(
                 ["git", "branch", "--show-current"],
@@ -249,8 +324,9 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
     if base_path == "/git/pr":
         import subprocess
         workspace = query.get("workspace", [""])[0]
-        if not workspace:
-            return _json_response({"error": "workspace required"}, 400)
+        _ws_err = _workspace_error(workspace)
+        if _ws_err:
+            return _json_response({"error": _ws_err}, 400)
         try:
             # Push first so the remote branch exists.
             push_res = subprocess.run(
@@ -285,6 +361,15 @@ def handle_admin(path: str, manager: SessionManager) -> tuple[int, str, list[tup
         except Exception as e:
             return _json_response({"error": str(e)})
 
+    return None
+
+
+def _workspace_error(workspace: str | None) -> str | None:
+    """Basic sanity checks for the user-supplied workspace path."""
+    if not workspace or not workspace.strip():
+        return "workspace required"
+    if "\x00" in workspace:
+        return "invalid workspace"
     return None
 
 

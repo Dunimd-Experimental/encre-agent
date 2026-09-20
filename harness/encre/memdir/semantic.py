@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import math
 import os
 import re
@@ -28,6 +30,8 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
+
+from encre.memdir.judgment import _fingerprint
 
 """Local, dependency-free semantic memory retrieval and consolidation.
 
@@ -458,6 +462,80 @@ class MemoryConsolidator:
                         file_b=names[j],
                         reason=f"Jaccard similarity {score:.2f} >= {self.SIMILARITY_THRESHOLD}",
                         merged_content=self._merge_pair(files[names[i]], files[names[j]]),
+                    ))
+        return actions
+
+    # ---- entry-level duplication (layered memory) ------------------------
+
+    @staticmethod
+    def entry_similarity(a: Any, b: Any) -> float:
+        """Similarity of two memory entries in ``[0.0, 1.0]``.
+
+        Identical normalised content short-circuits to ``1.0`` so that entries
+        whose tokens are too short for Jaccard still deduplicate; otherwise the
+        Jaccard token similarity is returned.  This is the *same* similarity
+        core the file-level path uses, exposed for entry-based callers.
+
+        Args:
+            a: First entry (any object exposing a ``content`` attribute).
+            b: Second entry (any object exposing a ``content`` attribute).
+
+        Returns:
+            Similarity in ``[0.0, 1.0]``.
+        """
+        text_a = str(getattr(a, "content", "") or "")
+        text_b = str(getattr(b, "content", "") or "")
+        if not text_a or not text_b:
+            return 0.0
+        if _fingerprint(text_a) == _fingerprint(text_b):
+            return 1.0
+        return _jaccard_similarity(text_a, text_b)
+
+    def find_entry_match(self, entry: Any, pool: list[Any]) -> Any | None:
+        """Return the first entry in ``pool`` that duplicates ``entry``.
+
+        Entry-level counterpart of :meth:`find_duplicates`, reusing exactly the
+        same similarity core and :attr:`SIMILARITY_THRESHOLD`.
+
+        Args:
+            entry: The candidate entry.
+            pool: Existing entries to compare against.
+
+        Returns:
+            The first duplicate found, or ``None``.
+        """
+        for other in pool:
+            if self.entry_similarity(entry, other) >= self.SIMILARITY_THRESHOLD:
+                return other
+        return None
+
+    def find_entry_duplicates(self, entries: list[Any]) -> list[ConsolidationAction]:
+        """Find near-duplicate entry pairs and propose merging them.
+
+        Args:
+            entries: Entries (any objects exposing ``id`` and ``content``).
+
+        Returns:
+            List of ``merge`` :class:`ConsolidationAction` objects whose
+            ``file_a`` / ``file_b`` carry the entry ids.
+        """
+        actions: list[ConsolidationAction] = []
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                score = self.entry_similarity(entries[i], entries[j])
+                if score >= self.SIMILARITY_THRESHOLD:
+                    actions.append(ConsolidationAction(
+                        action="merge",
+                        file_a=str(getattr(entries[i], "id", i)),
+                        file_b=str(getattr(entries[j], "id", j)),
+                        reason=(
+                            f"entry similarity {score:.2f} >= "
+                            f"{self.SIMILARITY_THRESHOLD}"
+                        ),
+                        merged_content=self._merge_pair(
+                            str(getattr(entries[i], "content", "")),
+                            str(getattr(entries[j], "content", "")),
+                        ),
                     ))
         return actions
 

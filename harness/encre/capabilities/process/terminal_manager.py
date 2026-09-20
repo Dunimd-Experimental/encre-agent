@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -31,6 +31,8 @@ preserving working directory, environment variables, and shell state.
 Commands are piped through stdin; the output is collected until a unique
 delimiter marker is seen in the stdout stream.
 """
+
+from __future__ import annotations
 
 import asyncio
 import os

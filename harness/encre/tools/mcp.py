@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -31,6 +31,8 @@ Implements the standard JSON-RPC 2.0 based MCP protocol with support for:
 - MCP prompts (prompts/list, prompts/get)
 - Proper JSON-RPC 2.0 error codes
 """
+
+from __future__ import annotations
 
 import asyncio
 import contextlib

@@ -450,7 +450,13 @@ class EncreWSHandler(
             except Exception as exc:
                 logger.warning("[resume] background resume failed: %s", exc)
 
-        self._tasks.add(asyncio.create_task(_background_resume()))
+        _resume_task = asyncio.create_task(_background_resume())
+        # Prune finished tasks from the set: this handler instance is shared
+        # by every connection for the whole server lifetime, so an unpruned
+        # set would accumulate done task objects (and their frames) over a
+        # long-running session.
+        _resume_task.add_done_callback(self._tasks.discard)
+        self._tasks.add(_resume_task)
 
         # Track connection for gateway status broadcasting
         self._connections.append(ws)

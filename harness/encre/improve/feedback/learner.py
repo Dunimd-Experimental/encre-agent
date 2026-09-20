@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -269,6 +269,15 @@ class EncreFeedbackLearner:
     def record_count(self) -> int:
         """Total number of stored records (incl. stale)."""
         return len(self._records)
+
+    def iter_records(self) -> list[CorrectionRecord]:
+        """Return a snapshot of every stored correction record.
+
+        The returned list is a shallow copy: mutating it does not affect the
+        learner's internal store.  Used by the safety-policy reflow to compile
+        correction preferences into permission policies.
+        """
+        return list(self._records)
 
     @property
     def active_count(self) -> int:

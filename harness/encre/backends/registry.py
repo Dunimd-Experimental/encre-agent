@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -705,6 +705,17 @@ def resolve_model_info(model_name: str, provider: str | None = None) -> ModelInf
     info = REGISTRY.resolve(model_name)
     if info is not None:
         return info
+
+    # Adapter enrichment (P1.2): a registered backend adapter may describe
+    # custom models the static registry does not know.  Built-in adapters
+    # decline (return None), so this is a no-op unless an embedder opted in
+    # via register_backend_adapter.  Deferred import keeps the module graph
+    # acyclic (adapter_registry composes the backend classes).
+    from encre.backends.adapter_registry import default_registry
+
+    adapter_info = default_registry.model_info(model_name)
+    if adapter_info is not None:
+        return adapter_info
 
     # Infer provider from model name if not given.
     if provider is None:

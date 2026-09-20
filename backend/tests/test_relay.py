@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -234,7 +234,7 @@ def test_verify_delivery_signature_replay_window():
     and asserts False because the replay-window check prevents replay
     of old delivery signatures.
     """
-    ts = int(time.time) - 9999  # outside the 300s window
+    ts = int(time.time()) - 9999  # outside the 300s window
     body = '{"event":"inbound"}'
     sig = sign(f"{ts}.{body}", "delivery-key")
     assert verify_delivery_signature(body, str(ts), sig, ["delivery-key"]) is False

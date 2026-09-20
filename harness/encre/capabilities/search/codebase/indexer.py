@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -110,7 +110,7 @@ class EncreCodeIndex:
         self._query_ready = False
         self._indexed = True
 
-    def scan(self, progress_cb: callable | None = None) -> None:
+    def scan(self, progress_cb=None) -> None:
         """Build the code index from scratch for the whole workspace."""
         ws = Path(self.workspace).resolve()
         if not ws.exists():
@@ -125,7 +125,7 @@ class EncreCodeIndex:
             total = len(self._modules)
             progress_cb("_done", total, max(total, 1))
 
-    def scan_incremental(self, progress_cb: callable | None = None) -> None:
+    def scan_incremental(self, progress_cb=None) -> None:
         """Update the index re-using prior state (full scan on first run)."""
         ws = Path(self.workspace).resolve()
         if not ws.exists():

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -42,6 +42,8 @@ the same JSON shape Claude Desktop / Claude Code uses for ``mcpServers``::
         }
     }
 """
+
+from __future__ import annotations
 
 import asyncio
 import contextlib

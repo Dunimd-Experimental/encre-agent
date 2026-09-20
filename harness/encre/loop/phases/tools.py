@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -44,6 +44,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from encre.logging_config import get_logger
+from encre.loop.phase_api import LoopPhase, PhaseContext, PhaseResult
 from encre.loop.turn_ctx import TurnContext
 from encre.recovery import ErrorRecoveryEngine, RetryableExecutor
 from encre.utils.loop_helpers import (
@@ -807,3 +808,39 @@ class PhaseToolsMixin:
                     if plan_items:
                         yield PlanUpdate(plan_items=plan_items)
                         self.session.plan_items = plan_items
+
+
+class PrepareToolsPhase(LoopPhase):
+    """Turn-scoped phase: prepare + gate the primary tool calls.
+
+    Wraps :meth:`PhaseToolsMixin._phase_prepare_tools` -- the exact code the
+    runner used to call fourth inside every turn iteration.  This is the
+    phase that owns the historical ``t.do_break`` checkpoint after tool
+    gating (plan-mode approval flow): when it completes with that flag set,
+    the pipeline skips the remaining phases and leaves the turn loop --
+    expressed here as :attr:`PhaseAction.END_RUN`.
+    """
+
+    name = "prepare_tools"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        t = ctx.turn
+        await self._stream_through(ctx, self._loop._phase_prepare_tools(t))
+        if t.do_break:
+            t.do_break = False
+            return PhaseResult.end_run("tool gating ended the turn")
+        return PhaseResult.continue_()
+
+
+class SecondaryToolsPhase(LoopPhase):
+    """Turn-scoped phase: secondary tool calls requested by executed tools.
+
+    Wraps :meth:`PhaseToolsMixin._phase_secondary_tools` -- the exact code
+    the runner used to call sixth inside every turn iteration.
+    """
+
+    name = "secondary_tools"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        await self._stream_through(ctx, self._loop._phase_secondary_tools(ctx.turn))
+        return PhaseResult.continue_()

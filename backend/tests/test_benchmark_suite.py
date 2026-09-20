@@ -29,7 +29,7 @@ These tests validate how raw benchmark task results are scored against required
 tokens, classified into failure buckets, and aggregated into summaries/analyses.
 """
 
-from encre.eval.benchmark_suite import (
+from encre.improve.eval.benchmark_suite import (
     analyze_benchmark_results,
     classify_benchmark_result,
     normalize_task,

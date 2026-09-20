@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -37,6 +37,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from encre.logging_config import get_logger
+from encre.loop.phase_api import LoopPhase, PhaseContext, PhaseResult
 from encre.loop.turn_ctx import TurnContext
 from encre.recovery import ErrorRecoveryEngine, RetryableExecutor
 from encre.tracing import trace_tool_call
@@ -679,3 +680,17 @@ class PhaseExecuteMixin:
                 plan_items = _ensure_plan_items(p["name"], p["args"])
                 if plan_items:
                     yield PlanUpdate(plan_items=plan_items)
+
+
+class ExecuteToolsPhase(LoopPhase):
+    """Turn-scoped phase: execute the prepared tool calls.
+
+    Wraps :meth:`PhaseExecuteMixin._phase_execute_tools` -- the exact code
+    the runner used to call fifth inside every turn iteration.
+    """
+
+    name = "execute_tools"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        await self._stream_through(ctx, self._loop._phase_execute_tools(ctx.turn))
+        return PhaseResult.continue_()

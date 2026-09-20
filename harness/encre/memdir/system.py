@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -21,16 +21,15 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from encre.memdir.age import memory_age_days, memory_age_text, memory_freshness_text
+from encre.memdir.age import memory_age_text, memory_freshness_text
 from encre.memdir.entrypoint import load_entrypoint_raw, write_entrypoint
-from encre.memdir.manifest import format_memory_manifest
-from encre.memdir.semantic import MemoryConsolidator, SemanticMemorySearch, WorkingMemory
-from encre.prompts.loader import PromptLoader
 
 FRONTMATTER_MAX_LINES = 30
 MAX_MEMORY_FILES = 200
@@ -61,29 +60,38 @@ class EntrypointResult:
     was_byte_truncated: bool
 
 
-_loader = PromptLoader()
-
-
 class EncreMemorySystem:
-    """Fa莽ade orchestrating all memory-directory operations for an agent.
+    """File-I/O facade over the memory directory (no retrieval of its own).
 
-    Wraps the entrypoint loader, manifest formatter, :class:`SemanticMemorySearch`,
-    :class:`WorkingMemory`, and :class:`MemoryConsolidator`. Callers typically
-    construct it with the agent's ``auto_memory_path`` and then use
-    :meth:`build_prompt` / :meth:`build_prompt_with_context` to inject memory
-    into a model prompt.
+    This class is deliberately **file I/O only**: it knows how to scan the
+    encrypted ``.md`` memory files, read/write the ``MEMORY.md`` entrypoint,
+    and parse front matter.  It does **not** search, recall, or assemble any
+    prompt.
+
+    Division of labour (do not conflate the two):
+
+    * :class:`~encre.memdir.layers.MemoryLayerStore` is the **single store**
+      of memories; retrieval flows only through
+      :class:`~encre.memdir.recall.RecallEngine`.
+    * This facade feeds that store via :meth:`~MemoryLayerStore.ingest_memory_dir`
+      (which reuses :meth:`scan` and the front-matter parser owned here), and
+      :meth:`refresh` provides the *ingestion trigger* the production loop
+      already calls.
     """
+
     MAX_ENTRYPOINT_LINES = MAX_ENTRYPOINT_LINES
     MAX_ENTRYPOINT_BYTES = MAX_ENTRYPOINT_BYTES
     FRONTMATTER_MAX_LINES = FRONTMATTER_MAX_LINES
     ENTRYPOINT_NAME = ENTRYPOINT_NAME
 
-    def __init__(self, auto_memory_path: str):
+    def __init__(self, auto_memory_path: str, layer_store: Any = None):
         self.auto_memory_path = auto_memory_path
         self._ensure_dir()
-        self._semantic = SemanticMemorySearch(auto_memory_path)
-        self._consolidator = MemoryConsolidator(auto_memory_path)
-        self._working: WorkingMemory = WorkingMemory()
+        # Optional collaborator: when attached, :meth:`refresh` ingests the
+        # memory directory into the layer store.  When unattached, ``refresh``
+        # degrades to a harmless no-op so call sites that only construct the
+        # facade stay safe.
+        self.layer_store = layer_store
 
     def _ensure_dir(self) -> None:
         """Create the memory directory if it does not already exist."""
@@ -223,12 +231,6 @@ class EncreMemorySystem:
 
         return result
 
-    def format_manifest(self, memories: list[MemoryHeader] | None = None) -> str:
-        """Render the Markdown manifest, scanning if no list is supplied."""
-        if memories is None:
-            memories = self.scan()
-        return format_memory_manifest(memories)
-
     def load_entrypoint(self) -> EntrypointResult:
         """Load and size-limit the MEMORY.md entrypoint for prompts."""
         raw = load_entrypoint_raw(self.auto_memory_path)
@@ -239,59 +241,6 @@ class EncreMemorySystem:
             was_line_truncated=raw["was_line_truncated"],
             was_byte_truncated=raw["was_byte_truncated"],
         )
-
-    def build_prompt(self) -> str:
-        """Assemble the full memory prompt shown to the model.
-
-        Combines the base memory-system template, the MEMORY.md entrypoint,
-        the Markdown manifest of available memories, and usage hints into a
-        single string ready to be injected into a system prompt.
-
-        Returns:
-            The assembled memory prompt text.
-        """
-        entrypoint = self.load_entrypoint()
-        memories = self.scan()
-
-        # Load the base memory-system template shared across all agents
-        base = _loader.load("memory_system", category="memdir")
-
-        parts = [base, ""]
-
-        if entrypoint.content:
-            parts.append("=== MEMORY.md Entrypoint ===")
-            parts.append(entrypoint.content)
-            if entrypoint.was_line_truncated or entrypoint.was_byte_truncated:
-                parts.append("")
-                parts.append(
-                    "[Note: MEMORY.md was truncated due to size limits. "
-                    "The full file is available at the memory directory path.]"
-                )
-        else:
-            parts.append("=== MEMORY.md Entrypoint ===")
-            parts.append(
-                "(No entrypoint content yet. "
-                "Create MEMORY.md to establish core project memory.)"
-            )
-
-        parts.append("")
-
-        if memories:
-            manifest = self.format_manifest(memories)
-            parts.append(manifest)
-        else:
-            parts.append("# Memory Manifest")
-            parts.append("")
-            parts.append("(No memory files found.)")
-
-        parts.append("")
-        parts.append(
-            "Use `memory_search` or `memory_read` to access memory files. "
-            "Use `memory_create` to save new memories. "
-            "Do NOT use file_read / file_write for memory files 鈥?they are encrypted."
-        )
-
-        return "\n".join(parts)
 
     def write_entrypoint(self, content: str) -> None:
         """Encrypt and persist the MEMORY.md entrypoint, with plaintext fallback."""
@@ -317,74 +266,23 @@ class EncreMemorySystem:
         """Return the underlying memory directory path."""
         return self.auto_memory_path
 
-    # ---- semantic search -------------------------------------------------
+    # ---- ingestion trigger ------------------------------------------------
 
-    def search(self, query: str, top_k: int = 5) -> list:
-        """Semantic search over memory files. Returns SearchResult list."""
-        return self._semantic.search(query, top_k=top_k)
+    def refresh(self) -> None:
+        """Trigger ingestion of the memory directory into the layer store.
 
-    def search_relevant(self, query: str, top_k: int = 5) -> list:
-        """Semantic search with higher relevance threshold."""
-        return self._semantic.search_relevant(query, top_k=top_k)
+        The layer store is the single store and :class:`RecallEngine` reads its
+        entries live on every recall, so this method is the *ingestion trigger*
+        the production loop already calls after a successful compaction: it
+        ingests every ``.md`` memory file into the store and re-reads the layer
+        files so the recall pool matches disk exactly.
 
-    def refresh_index(self) -> None:
-        """Force re-index of all memory files."""
-        self._semantic._rebuild_from_disk()
+        When no store is attached (a facade-only construction, e.g. pure file
+        tooling or a test) this degrades to a harmless no-op -- never raises.
+        """
+        store = self.layer_store
+        if store is None:
+            return
+        store.ingest_memory_dir(self.auto_memory_path)
+        store.reload()
 
-    # ---- working memory --------------------------------------------------
-
-    @property
-    def working(self) -> WorkingMemory:
-        return self._working
-
-    def reset_working(self) -> None:
-        self._working = WorkingMemory()
-
-    def inject_working_memory_prompt(self) -> str:
-        summary = self._working.summarize()
-        if summary.startswith("(empty"):
-            return ""
-        return f"Working memory:\n{summary}"
-
-    # ---- consolidation ---------------------------------------------------
-
-    def consolidate(self) -> list:
-        """Run duplicate/conflict/staleness checks and return actions."""
-        from encre.crypto import decrypt
-
-        files: dict[str, str] = {}
-        age_days: dict[str, int] = {}
-        for m in self.scan():
-            try:
-                with open(m.file_path, encoding="utf-8") as f:
-                    raw = f.read().strip()
-            except (OSError, UnicodeDecodeError):
-                continue
-            if not raw:
-                continue
-            if raw.startswith("---"):
-                files[m.filename] = raw
-            else:
-                try:
-                    files[m.filename] = decrypt(raw)
-                except Exception:
-                    files[m.filename] = raw
-            age_days[m.filename] = memory_age_days(m.mtime_ms)
-        return self._consolidator.consolidate(files, age_days)
-
-    # ---- build prompt with semantic context -------------------------------
-
-    def build_prompt_with_context(self, query: str = "", top_k: int = 5) -> str:
-        """Like build_prompt() but prepends semantically-relevant memories."""
-        parts: list[str] = []
-        if query:
-            results = self.search(query, top_k=top_k)
-            if results:
-                parts.append("## Semantically Relevant Memories")
-                parts.append("")
-                for r in results:
-                    parts.append(f"### {r.file_name} (score: {r.score:.2f})")
-                    parts.append(r.snippet)
-                    parts.append("")
-        parts.append(self.build_prompt())
-        return "\n".join(parts)

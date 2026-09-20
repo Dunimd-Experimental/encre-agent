@@ -26,11 +26,11 @@ from __future__ import annotations
 """Tests for evolution subsystem: learner, optimizer, reflex, meta-cognition."""
 
 
-from encre.evolution.config import EvolutionConfig
-from encre.evolution.learner import EncreEvolutionLearner, ErrorRecord, SuccessRecord
-from encre.evolution.meta import CapabilityProfile, EncreMetaCognition
-from encre.evolution.optimizer import EncreStrategyOptimizer
-from encre.evolution.reflex import EncreReflexLoop, ReflexResult
+from encre.improve.evolution.config import EvolutionConfig
+from encre.improve.evolution.learner import EncreEvolutionLearner, ErrorRecord, SuccessRecord
+from encre.improve.evolution.meta import CapabilityProfile, EncreMetaCognition
+from encre.improve.evolution.optimizer import EncreStrategyOptimizer
+from encre.improve.evolution.reflex import EncreReflexLoop, ReflexResult
 
 
 class TestEvolutionConfig:
@@ -628,7 +628,7 @@ class TestMetaCognition:
         the proficiency estimate.
         """
         profile = CapabilityProfile(domain="python")
-        profile.update(success=True, _difficulty=0.5)
+        profile.update(success=True, difficulty=0.5)
         assert profile.sample_count == 1, "Sample count must increment after one update."
         assert profile.score > 0.5, "Score must increase above the neutral baseline after a success."
 

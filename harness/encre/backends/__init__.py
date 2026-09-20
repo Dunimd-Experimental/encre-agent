@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -123,7 +123,23 @@ from encre.backends.tencent import TencentBackend
 from encre.backends.volcengine import VolcengineArkBackend
 from encre.backends.xiaomi import XiaomiBackend
 
+# P1.2 model-adapter drop-in surface: third-party packages register their
+# backend with one call and zero core changes.
+from encre.backends.adapter_api import BackendAdapter, BackendConfig
+from encre.backends.adapter_registry import (
+    AdapterRegistry,
+    default_registry,
+    register_backend_adapter,
+    unregister_backend_adapter,
+)
+
 __all__ = [
+    "AdapterRegistry",
+    "BackendAdapter",
+    "BackendConfig",
+    "default_registry",
+    "register_backend_adapter",
+    "unregister_backend_adapter",
     "DEFAULT_MAX_OUTPUT_TOKENS",
     "DEFAULT_RETRY_CONFIG",
     "ErrorClass",

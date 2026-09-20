@@ -27,8 +27,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from encre.feedback import CorrectionRecord, EncreFeedbackLearner
-from encre.feedback.learner import cut_str
+from encre.improve.feedback import CorrectionRecord, EncreFeedbackLearner
+from encre.improve.feedback.learner import cut_str
 
 # ---- CorrectionRecord ---------------------------------------------------
 

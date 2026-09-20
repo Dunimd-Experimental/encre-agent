@@ -31,9 +31,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from encre.config import EncreConfig
-from encre.evolution.plan_do_review import StepStatus
+from encre.improve.evolution.plan_do_review import StepStatus
 from encre.loop import EncreLoop
-from encre.mode_profiles import AgentMode, get_mode_profile
+from encre.modes.mode_profiles import AgentMode, get_mode_profile
 from encre.session import EncreSession
 
 
@@ -71,7 +71,7 @@ async def test_verify_workspace_mode_activates_pdr_and_delegation():
 
 
 @pytest.mark.asyncio
-async def test_verify_general_mode_keeps_pdr_inactive_and_no_delegation(self):
+async def test_verify_general_mode_keeps_pdr_inactive_and_no_delegation():
     """Validate that GENERAL mode leaves the PDR engine inactive and disables
     workspace delegation, confirming the historical behaviour path is preserved.
 
@@ -89,7 +89,7 @@ async def test_verify_general_mode_keeps_pdr_inactive_and_no_delegation(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_automation_mode_has_no_verify_budget_and_no_pdr(self):
+async def test_verify_automation_mode_has_no_verify_budget_and_no_pdr():
     """Validate that AUTOMATION mode has zero verify budget, no workspace
     delegation, and PDR inactive, confirming the lightweight automation
     profile is correctly isolated.
@@ -105,7 +105,7 @@ async def test_verify_automation_mode_has_no_verify_budget_and_no_pdr(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_unknown_mode_falls_back_to_general_profile(self):
+async def test_verify_unknown_mode_falls_back_to_general_profile():
     """Validate that get_mode_profile returns the GENERAL profile for both
     unknown string values and None, confirming the fallback path is safe.
 
@@ -118,7 +118,7 @@ async def test_verify_unknown_mode_falls_back_to_general_profile(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_pdr_advances_only_on_completed_step(self):
+async def test_verify_pdr_advances_only_on_completed_step():
     """Validate that start_next_step skips IN_PROGRESS steps (even after
     failure) and only advances when a step has been marked complete.
 
@@ -150,7 +150,7 @@ async def test_verify_pdr_advances_only_on_completed_step(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_workspace_mode_always_includes_coding_tool_base(self):
+async def test_verify_workspace_mode_always_includes_coding_tool_base():
     """Validate that WORKSPACE mode always includes 'coding' in its resolved
     tool set regardless of the declared intents, confirming the profile
     tool_sets field is applied on top of intent expansion.
@@ -165,7 +165,7 @@ async def test_verify_workspace_mode_always_includes_coding_tool_base(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_automation_mode_uses_bare_tool_base_with_intent_expansion(self):
+async def test_verify_automation_mode_uses_bare_tool_base_with_intent_expansion():
     """Validate that AUTOMATION mode has no fixed profile tool_sets but
     still expands by intent, confirming the distinction from WORKSPACE.
 
@@ -184,7 +184,7 @@ async def test_verify_automation_mode_uses_bare_tool_base_with_intent_expansion(
 
 
 @pytest.mark.asyncio
-async def test_verify_general_mode_expands_only_by_intent_not_by_profile(self):
+async def test_verify_general_mode_expands_only_by_intent_not_by_profile():
     """Validate that GENERAL mode resolves tool sets solely from intents
     without any fixed profile tool_sets, confirming it has no bias.
 
@@ -198,7 +198,7 @@ async def test_verify_general_mode_expands_only_by_intent_not_by_profile(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_each_mode_profile_has_distinct_nonempty_prompt_gain(self):
+async def test_verify_each_mode_profile_has_distinct_nonempty_prompt_gain():
     """Validate that GENERAL, WORKSPACE, and AUTOMATION each carry a unique,
     non-empty system-prompt gain string, confirming the profiles are
     distinguishable by the model.
@@ -219,7 +219,7 @@ async def test_verify_each_mode_profile_has_distinct_nonempty_prompt_gain(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_lightweight_review_fails_and_rolls_back_on_all_error_step(self):
+async def test_verify_lightweight_review_fails_and_rolls_back_on_all_error_step():
     """Validate that lightweight_review returns ReviewGrade.FAIL when a step
     has only error outcomes, and that the loop-level wiring converts that
     grade into mark_step_failed, keeping the step IN_PROGRESS for retry.
@@ -229,7 +229,7 @@ async def test_verify_lightweight_review_fails_and_rolls_back_on_all_error_step(
     IN_PROGRESS because the rollback path must prevent the plan from
     advancing past a verified-failed step.
     """
-    from encre.evolution.plan_do_review import ReviewGrade
+    from encre.improve.evolution.plan_do_review import ReviewGrade
 
     loop = _make_loop(AgentMode.WORKSPACE)
     loop._pdr.initialize("Step one: run the migration and verify it.")

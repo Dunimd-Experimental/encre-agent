@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -35,10 +35,10 @@ Design notes
 * The consolidator owns its own :mod:`asyncio` task and is fully decoupled
   from the agent loop: it never blocks normal execution because all work
   happens on a timer in a separate task.
-* Consolidation is best-effort. If the agent has no ``memory_system``, or that
-  object has no ``consolidate`` coroutine, the consolidator simply does nothing
-  rather than raising. Failures during a consolidation pass are logged and
-  swallowed so a misbehaving memory backend cannot crash the host loop.
+* Consolidation is best-effort. If the agent's loop has no ``memory_layers``
+  store, the consolidator simply does nothing rather than raising. Failures
+  during a consolidation pass are logged and swallowed so a misbehaving memory
+  backend cannot crash the host loop.
 
 Public surface
 --------------
@@ -60,16 +60,16 @@ class MemoryConsolidator:
     """Drives periodic, best-effort memory consolidation on a background timer.
 
     The consolidator is a self-contained async driver. It holds a reference to
-    the owning agent purely so it can reach that agent's ``memory_system``; it
+    the owning agent purely so it can reach that agent's loop memory store; it
     holds no other state. Lifecycle is explicit: call :meth:`start` to spin up
     the timer task and :meth:`stop` to cancel it cleanly.
 
     Attributes
     ----------
     _agent:
-        The agent whose memory system will be consolidated. Accessed lazily via
-        ``getattr`` so that an agent lacking a memory system is handled
-        gracefully.
+        The agent whose layered memory store will be consolidated. Accessed
+        lazily via ``getattr`` so that an agent lacking a loop or a store is
+        handled gracefully.
     _interval:
         Seconds to wait between consolidation passes. Defaults to 3600 (one
         hour).
@@ -85,12 +85,12 @@ class MemoryConsolidator:
         """Initialise the consolidator with its agent and timer interval.
 
         Args:
-            agent: The agent instance whose ``memory_system`` will be
+            agent: The agent instance whose loop memory store will be
                 consolidated. The reference is stored but not touched until a
                 consolidation pass actually runs.
             interval: Seconds to sleep between automatic consolidation passes.
                 Defaults to 3600. A smaller value consolidates more often at
-                the cost of more memory-system calls.
+                the cost of more store calls.
 
         Returns:
             None.
@@ -166,28 +166,29 @@ class MemoryConsolidator:
         await self._consolidate()
 
     async def _consolidate(self) -> None:
-        """Run one consolidation pass against the agent's memory system.
+        """Run one consolidation pass against the layered memory store.
 
-        Resolves the agent's ``memory_system`` defensively and, if it exposes a
-        callable ``consolidate`` coroutine, awaits it. The method is
-        intentionally permissive: a missing memory system or a memory system
-        without a ``consolidate`` method is treated as "nothing to do", and any
-        exception thrown by the underlying backend is logged and swallowed so a
-        failing consolidation never disrupts the host loop.
+        Retrieval and consolidation now live on the **single store**,
+        :class:`~encre.memdir.layers.MemoryLayerStore` (whose
+        :meth:`~MemoryLayerStore.consolidate` sweeps the short-term buffer).
+        The consolidator reaches it through the owning agent's loop
+        (``agent.loop.memory_layers``); a missing store -- an agent built
+        without a loop or with the memory subsystem unavailable -- is treated
+        as "nothing to do".  Any exception from the underlying store is logged
+        and swallowed so a failing consolidation never disrupts the host loop.
 
         Returns:
             None.
         """
-        # Reach the memory system without assuming it exists on every agent.
-        memory_system = getattr(self._agent, "memory_system", None)
-        if memory_system is None:
+        layer_store = getattr(getattr(self._agent, "loop", None), "memory_layers", None)
+        if layer_store is None:
             return
 
         try:
-            # Only call consolidate when the backend actually offers it; some
-            # memory implementations may not support proactive consolidation.
-            if hasattr(memory_system, "consolidate") and callable(memory_system.consolidate):
-                result = await memory_system.consolidate()
+            # The store's consolidate is synchronous; only call it when the
+            # backend actually offers the maintenance pass.
+            if hasattr(layer_store, "consolidate") and callable(layer_store.consolidate):
+                result = layer_store.consolidate()
                 logger.info("Memory consolidation completed: %s", result)
         except Exception as e:
             logger.warning("Memory consolidation failed: %s", e)

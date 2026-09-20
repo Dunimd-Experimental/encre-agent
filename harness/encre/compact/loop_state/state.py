@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -44,6 +44,8 @@ Usage::
     # For diagnostics at any point:
     snapshot = state.snapshot()
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -125,12 +127,27 @@ class LoopState:
     # 鈹€鈹€ Factory / reset 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     @classmethod
-    def create(cls, turn_count: int = 0, chain_id: str = "") -> LoopState:
-        """Create a fresh LoopState for a new ``_run_impl()`` invocation."""
-        return cls(
+    def create(
+        cls,
+        turn_count: int = 0,
+        chain_id: str = "",
+        *,
+        event_bus: Any = None,
+        session_id: str = "",
+    ) -> LoopState:
+        """Create a fresh LoopState for a new ``_run_impl()`` invocation.
+
+        ``event_bus`` (the session's event backbone) and ``session_id`` are
+        forwarded to the embedded :class:`TransitionHistory` so recorded
+        transitions are mirrored onto the backbone.
+        """
+        state = cls(
             turn_count=turn_count,
             chain_id=chain_id,
         )
+        state.transitions.event_bus = event_bus
+        state.transitions.session_id = session_id
+        return state
 
     def reset_for_new_turn(self) -> None:
         """Reset per-turn counters.  Called at the start of each turn.

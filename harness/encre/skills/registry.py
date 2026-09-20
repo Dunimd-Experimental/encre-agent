@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -82,6 +82,26 @@ class EncreSkillRegistry:
                     if new_priority >= old_priority:
                         continue
             self._aliases[alias] = skill.name
+
+    def unregister(self, name: str) -> BundledSkillDefinition | None:
+        """Remove a skill by name, cleaning up its aliases.
+
+        Used by the verification gate to roll back an auto-generated skill and
+        by legacy migration to stop injecting unverified artifacts.
+
+        Args:
+            name: The exact skill name to remove.
+
+        Returns:
+            The removed definition, or ``None`` when no such skill exists.
+        """
+        skill = self._skills.pop(name, None)
+        if skill is None:
+            return None
+        for alias in list(skill.aliases):
+            if self._aliases.get(alias) == name:
+                self._aliases.pop(alias, None)
+        return skill
 
     def lookup(self, name: str) -> BundledSkillDefinition | None:
         """Resolve a skill by exact name or by alias."""
@@ -172,6 +192,14 @@ class EncreSkillRegistry:
         metadata, body = _parse_yaml_frontmatter(content)
         name = metadata.get("name", "").strip()
         if not name:
+            return
+
+        # Lifecycle gate: auto-generated skills carry an explicit ``status``
+        # and only ``active`` ones may be loaded.  Anything else (proposed,
+        # rejected, disabled) is kept on disk for auditing but must never be
+        # injected into the prompt.  Skills without a status are unchanged.
+        status = str(metadata.get("status", "")).strip().lower()
+        if status and status != "active":
             return
 
         # Validate name per spec: lowercase, hyphens, no underscores

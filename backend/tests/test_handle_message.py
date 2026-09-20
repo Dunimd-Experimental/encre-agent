@@ -71,7 +71,7 @@ def _dm_event(text="hi", chat_id="123", user_id="42", platform="stub"):
 
 
 @pytest.mark.asyncio
-async def test_verify_handle_message_dispatches_event_even_when_source_is_missing(self):
+async def test_verify_handle_message_dispatches_event_even_when_source_is_missing():
     """Validate that handle_message dispatches the event to the registered
     handler even when the event has no source, confirming source is optional.
 
@@ -98,7 +98,7 @@ async def test_verify_handle_message_dispatches_event_even_when_source_is_missin
 
 
 @pytest.mark.asyncio
-async def test_verify_handle_message_awaits_registered_handler_with_event(self):
+async def test_verify_handle_message_awaits_registered_handler_with_event():
     """Validate that handle_message awaits the registered handler and passes
     the event object through, confirming the dispatch contract.
 
@@ -119,7 +119,7 @@ async def test_verify_handle_message_awaits_registered_handler_with_event(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_handle_message_logs_warning_and_drops_when_no_handler(self):
+async def test_verify_handle_message_logs_warning_and_drops_when_no_handler():
     """Validate that handle_message does not raise when no handler is
     registered, instead logging a warning and dropping the message.
 
@@ -137,7 +137,7 @@ async def test_verify_handle_message_logs_warning_and_drops_when_no_handler(self
 
 
 @pytest.mark.asyncio
-async def test_verify_concurrent_message_on_same_session_is_queued_not_dispatched(self):
+async def test_verify_concurrent_message_on_same_session_is_queued_not_dispatched():
     """Validate that a second message arriving on the same session_key while
     the first is active is queued, not dispatched concurrently.
 
@@ -183,7 +183,7 @@ async def test_verify_concurrent_message_on_same_session_is_queued_not_dispatche
 
 
 @pytest.mark.asyncio
-async def test_verify_messages_from_different_chats_run_concurrently(self):
+async def test_verify_messages_from_different_chats_run_concurrently():
     """Validate that messages from different chats (different session keys)
     run concurrently without queueing, confirming the guard is scoped per-session.
 
@@ -215,7 +215,7 @@ async def test_verify_messages_from_different_chats_run_concurrently(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_bypass_command_runs_after_drain_not_immediately(self):
+async def test_verify_bypass_command_runs_after_drain_not_immediately():
     """Validate that a bypass command like /stop arriving while a session is
     active is queued by the guard and processed only after the active
     session completes and drains the queue.
@@ -267,7 +267,7 @@ async def test_verify_bypass_command_runs_after_drain_not_immediately(self):
 
 
 @pytest.mark.asyncio
-async def test_verify_pending_messages_are_drained_in_order_after_completion(self):
+async def test_verify_pending_messages_are_drained_in_order_after_completion():
     """Validate that queued messages are re-dispatched in FIFO order after
     the active session completes, confirming the drain loop preserves
     message ordering.

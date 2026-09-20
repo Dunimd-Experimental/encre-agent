@@ -148,18 +148,19 @@ class TestEncreBrowserSessionConstruction:
         assert session.timeout == 60000
 
     def test_verify_initial_internal_browser_handles_are_none(self):
-        """Validate that all internal Playwright handles start as None before launch.
+        """Validate that all internal CDP handles start as None/disconnected before launch.
 
-        The test asserts _pw, _browser, _context, and _page are all None because
-        the session uses lazy initialization — these handles are created on
-        first navigate() call and must not be pre-allocated.
+        The test asserts _transport, _session, and _page_ws_url are None and
+        _connected is False because the session uses lazy initialization —
+        these handles are created on first navigate() call and must not be
+        pre-allocated.
         """
         from encre.computer.browser import EncreBrowserSession
         session = EncreBrowserSession()
-        assert session._pw is None
-        assert session._browser is None
-        assert session._context is None
-        assert session._page is None
+        assert session._transport is None
+        assert session._session is None
+        assert session._page_ws_url is None
+        assert session._connected is False
 
     def test_verify_initial_browser_state_is_empty(self):
         """Validate that the internal BrowserState starts with all empty fields.
@@ -264,18 +265,19 @@ class TestEncreBrowserSessionState:
     def test_verify_close_before_launch_is_safe(self):
         """Validate that close() on a pre-launch session does not raise and leaves handles as None.
 
-        The test calls close() on a fresh session and asserts _browser, _pw,
-        and _page remain None because close must be a no-op when no browser
-        has been launched, preventing AttributeError on teardown.
+        The test calls close() on a fresh session and asserts _transport,
+        _session, and _page_ws_url remain None because close must be a no-op
+        when no browser has been launched, preventing AttributeError on
+        teardown.
         """
         from encre.computer.browser import EncreBrowserSession
 
         async def _test():
             session = EncreBrowserSession()
             await session.close()
-            assert session._browser is None
-            assert session._pw is None
-            assert session._page is None
+            assert session._transport is None
+            assert session._session is None
+            assert session._page_ws_url is None
 
         import asyncio
         asyncio.run(_test())

@@ -21,7 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-"""The agent loop runner: assembles the loop from mixins and orchestrates phases.
+"""The agent loop runner: assembles the loop from mixins and drives the
+pluggable phase pipeline.
 
 ``EncreLoop`` is the heart of the Encre backend: it drives a single
 conversational agent turn-by-turn, streaming model output and tool calls to the
@@ -45,17 +46,21 @@ addition to calling the model backend it orchestrates:
   and milestone summaries.
 
 The loop is intentionally a thin coordinator; fine-grained behaviour lives in
-the phase mixins (``encre.loop.phases.*``), the collaborator wiring
+the phase implementations (``encre.loop.phases.*``), the collaborator wiring
 (``encre.loop.wiring``), the control surface (``encre.loop.control``), the
 cross-phase helpers (``encre.loop.support``) and the manager objects those
 modules construct (``StateManager``, ``CommandManager``, ``PlanModeManager``,
 ``SkillManager``, ``WorkingSetManager``, ``SubAgentRunner`` and the
 ``loop_stability`` helpers).  This module keeps only the run orchestration:
-the per-turn phase sequence, the control-flow translation (``do_continue`` /
-``do_break`` / :class:`~encre.loop.turn_ctx.TurnExit`) and the post-loop
-finalisation.
+the pluggable phase pipeline driver -- the loop iterates the
+:class:`~encre.loop.phase_registry.PhaseRegistry` built by the wiring and
+dispatches on the :class:`~encre.loop.phase_api.PhaseResult` each phase
+returns -- plus the turn-lifecycle bookkeeping (turn start events,
+checkpoints) and the post-loop finalisation.
 """
 
+import asyncio
+import contextlib
 import os
 import time
 from collections.abc import AsyncGenerator
@@ -64,11 +69,17 @@ from typing import Any
 from encre.events.lifecycle import (
     CheckpointCreated,
     SessionEnded,
-    SessionStarted,
     TurnStarted,
 )
 from encre.logging_config import get_logger
 from encre.loop.control import LoopControlMixin
+from encre.loop.phase_api import (
+    PhaseAction,
+    PhaseContext,
+    PhaseOutcome,
+    PhaseResult,
+    PhaseScope,
+)
 from encre.loop.phases.compact import PhaseCompactMixin
 from encre.loop.phases.end_of_turn import PhaseEndOfTurnMixin
 from encre.loop.phases.execute import PhaseExecuteMixin
@@ -76,12 +87,12 @@ from encre.loop.phases.model import PhaseModelMixin
 from encre.loop.phases.prompt import PhasePromptMixin
 from encre.loop.phases.recovery import PhaseRecoveryMixin
 from encre.loop.phases.tools import PhaseToolsMixin
+from encre.loop.phase_registry import PhaseRegistry
 from encre.loop.support import LoopSupportMixin
 from encre.loop.turn_ctx import TurnContext, TurnExit
 from encre.loop.wiring import _LoopWiringMixin
 from encre.compact.loop_state.state import LoopState
 from encre.compact.loop_state.transition import TurnTransition
-from encre.loop_stability import build_standing_orders_reminder
 from encre.utils.types import AgentEvent, create_finish
 
 logger = get_logger(__name__)
@@ -233,24 +244,33 @@ class EncreLoop(
         slash_command_mode: str = "",
         slash_commands: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
-        """Execute one agent turn; the phase-orchestration driver.
+        """Execute one agent turn; the pluggable phase-pipeline driver.
 
         For a single user prompt it resets the per-run recovery/loop state,
-        builds the system prompt (prompt phase), then iterates the main turn
-        loop through the fixed phase sequence::
+        then runs the phases registered on ``self.phase_registry``:
 
-            pre-model compact -> model streaming -> post-stream recovery
-            -> tool preparation -> tool execution -> secondary tools
-            -> post-tool compact -> end-of-turn bookkeeping
+        * the **run-scoped** phases execute once, before the turn loop
+          (``system_prompt`` -> ``session_start``);
+        * every turn iteration then executes the **turn-scoped** pipeline in
+          registration order (``pre_model_compact`` -> ``model`` ->
+          ``post_stream`` -> ``prepare_tools`` -> ``execute_tools`` ->
+          ``secondary_tools`` -> ``post_tool_compact`` -> ``end_of_turn``).
 
         Phases share state through the :class:`~encre.loop.turn_ctx.TurnContext`
-        and signal control flow the same way the original monolith did:
+        and return a :class:`~encre.loop.phase_api.PhaseResult` the runner
+        dispatches on.  The actions encode the exact control-flow branches
+        the original monolith expressed inline:
 
-        * ``t.do_continue`` -- skip the rest of the turn (mirrors ``continue``);
-        * ``t.do_break`` -- leave the turn loop (mirrors ``break``);
-        * :class:`TurnExit` -- terminate the whole run immediately (mirrors
-          ``return`` from inside the monolithic loop, skipping the post-loop
-          finalisation).
+        * ``END_TURN`` -- skip the remaining phases, start the next turn
+          iteration (mirrors ``continue``);
+        * ``END_RUN`` -- skip the remaining phases and leave the turn loop
+          (mirrors ``break``);
+        * ``EXIT`` -- terminate the whole run immediately (mirrors
+          :class:`~encre.loop.turn_ctx.TurnExit`: ``return`` from inside the
+          monolithic loop, skipping the post-loop finalisation).
+
+        The pipeline is snapshotted when the run starts, so registry
+        mutations take effect on the next ``run()``.
 
         Args:
             prompt: The user prompt for this turn.
@@ -271,7 +291,11 @@ class EncreLoop(
         # Reset per-run recovery state via the unified orchestrator.
         self._error_orch.reset_for_new_turn()
         # Initialize per-run loop state with transition history tracking.
-        self._state = LoopState.create(turn_count=self.session.turn_count)
+        self._state = LoopState.create(
+            turn_count=self.session.turn_count,
+            event_bus=self.event_bus,
+            session_id=self.session.id or "",
+        )
         # Log effective max_turns so we can diagnose unexpected session stops
         logger.info("[run] _run_impl start turn=%s max_turns=%s backend=%s model=%s",
                     self.session.turn_count, self.config.max_turns,
@@ -287,45 +311,19 @@ class EncreLoop(
         self._recent_tool_names.clear()
         self._error_tool_names.clear()
 
-        # 鈹€鈹€ Prompt phase: classify intent, build/cache the system prompt,
-        # assemble every enrichment block and update the session's system +
-        # user messages. 鈹€鈹€
-        await self._build_turn_system_prompt(t)
+        # Snapshot the pipeline once per run: registry mutations made while a
+        # run is in flight take effect on the next run, never mid-turn.
+        registry = self.phase_registry or PhaseRegistry()
+        pipeline = registry.pipeline(self.mode)
+        run_phases = [p for p in pipeline if p.scope is PhaseScope.RUN]
+        turn_phases = [p for p in pipeline if p.scope is PhaseScope.TURN]
 
-        _t_hook = time.time()
-        await self.hook_system.emit_session_start()
-        self.event_stream.publish(SessionStarted(session_id=self.session.id or ""))
-        logger.info("[run] emit_session_start done (%.2fs)", time.time() - _t_hook)
-
-        # Standing-orders reminder: loaded once per ``run()`` and merged into
-        # the LAST user message before the first model call of a fresh user
-        # turn (main agent only).  Re-arms the binding pre-action constraints
-        # (recall-first, clarify, checkpoint) right where the model begins
-        # responding; the full gates still live in the system prompt.
-        t.standing_orders_text = (
-            build_standing_orders_reminder() if not t.skip_enrichment else ""
-        )
-        t.standing_orders_injected = False
-
-        # Checkpoint hard-gate state: injected once per run() when the number
-        # of consecutive tool-call steps (since the last user message) crosses
-        # the threshold AND the user has not explicitly authorised a hands-off
-        # run.  The injected message hands control back to the user -- the
-        # code-level mirror of Gate 4 in mandatory_constraints.prompt.
-        t.checkpoint_injected_this_run = False
-        t.checkpoint_text = ""
-
-        # Sanitize session messages on every run -- old sessions loaded from disk
-        # may contain broken tool_call groups (from crashes) that cause 400 errors.
-        # Only sanitize active branch context; other branches remain untouched.
-        active_branch_id = self.session.active_branch_id
-        if active_branch_id not in self._sanitized_branches:
-            self.session.replace_branch_messages(
-                active_branch_id, self.compact_engine.sanitize(t.context_msgs),
-            )
-            self._sanitized_branches.add(active_branch_id)
-            t.context_msgs = self.session.get_context_messages()
-        t.active_branch_id = active_branch_id
+        # ── Run-scoped phases: prompt build, session start ──
+        _outcome = PhaseOutcome()
+        async for _ev in self._drive_phases(run_phases, t, _outcome):
+            yield _ev
+        if _outcome.action is PhaseAction.EXIT:
+            return
 
         while (not self.session.is_max_turns_reached()
                and not self._cancelled()
@@ -356,49 +354,21 @@ class EncreLoop(
             # the initial user message, causing repeated tool invocations.
             t.context_msgs = self.session.get_context_messages()
 
-            try:
-                # 鈹€鈹€ Phase: pre-API-call compaction (Claude Code style) 鈹€鈹€
-                async for _ev in self._phase_pre_model_compact(t):
-                    yield _ev
-
-                # 鈹€鈹€ Phase: model streaming + fallback/retry recovery 鈹€鈹€
-                async for _ev in self._phase_model(t):
-                    yield _ev
-
-                # 鈹€鈹€ Phase: post-stream recovery + assistant materialisation 鈹€鈹€
-                async for _ev in self._phase_post_stream(t):
-                    yield _ev
-                if t.do_continue:
-                    t.do_continue = False
-                    continue
-
-                # 鈹€鈹€ Phase: prepare + gate the primary tool calls 鈹€鈹€
-                async for _ev in self._phase_prepare_tools(t):
-                    yield _ev
-                if t.do_break:
-                    t.do_break = False
-                    break
-
-                # 鈹€鈹€ Phase: execute tools (safe parallel / unsafe sequential) 鈹€鈹€
-                async for _ev in self._phase_execute_tools(t):
-                    yield _ev
-
-                # 鈹€鈹€ Phase: secondary tool calls requested by executed tools 鈹€鈹€
-                async for _ev in self._phase_secondary_tools(t):
-                    yield _ev
-
-                # 鈹€鈹€ Phase: post-tool compression check 鈹€鈹€
-                async for _ev in self._phase_post_tool_compact(t):
-                    yield _ev
-
-                # 鈹€鈹€ Phase: end-of-turn bookkeeping (grace call, guardrail,
-                # telemetry, evolution, hooks, rollback) 鈹€鈹€
-                await self._phase_end_of_turn(t)
-                if t.do_break:
-                    t.do_break = False
-                    break
-            except TurnExit:
-                # A phase requested the historical ``return``: terminate the
+            # ── Turn-scoped pipeline: compact -> model -> recovery -> tools
+            # -> execute -> secondary tools -> compact -> end-of-turn ──
+            _outcome = PhaseOutcome()
+            async for _ev in self._drive_phases(turn_phases, t, _outcome):
+                yield _ev
+            if _outcome.action is PhaseAction.END_TURN:
+                # A phase requested the historical ``continue``: skip the
+                # remaining phases and start the next turn iteration.
+                continue
+            if _outcome.action is PhaseAction.END_RUN:
+                # A phase requested the historical ``break``: leave the turn
+                # loop and run the post-loop finalisation below.
+                break
+            if _outcome.action is PhaseAction.EXIT:
+                # A phase raised the historical ``TurnExit``: terminate the
                 # whole run immediately, skipping the post-loop finalisation
                 # exactly like the original monolithic method returning from
                 # inside its main loop.
@@ -435,6 +405,87 @@ class EncreLoop(
             usage=t.last_backend_usage,
             compacted=self._compacted_this_turn,
         )
+
+    async def _drive_phases(
+        self,
+        phases: list[Any],
+        t: TurnContext,
+        outcome: PhaseOutcome,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Run ``phases`` sequentially while streaming their events.
+
+        Each phase runs to completion inside a worker task while this
+        generator streams the events the phase emits to the caller.  The
+        rendezvous queue (``maxsize=1``) keeps the pull semantics of the
+        original inline ``async for ... yield`` sequence: the pipeline runs
+        at most one event ahead of the consumer, so a slow or paused
+        consumer (plan approval, backpressured websocket) suspends the
+        pipeline exactly as the old generator-based phases did.
+
+        Control flow: the first phase that returns a non-``CONTINUE``
+        :class:`~encre.loop.phase_api.PhaseResult` ends the pipeline and its
+        action is recorded in ``outcome``.  A phase raising
+        :class:`~encre.loop.turn_ctx.TurnExit` is translated into
+        :attr:`PhaseAction.EXIT`; any other exception is re-raised to the
+        caller **after** the events already emitted have been drained, so
+        the consumer never loses events that were produced before the
+        failure (identical to the old inline sequence).  When the consumer
+        abandons or is cancelled mid-stream, the worker task is cancelled
+        and reaped -- no orphan task outlives the pipeline.
+
+        Args:
+            phases: The snapshot of the pipeline to execute, in order.
+            t: The shared turn context handed to every phase.
+            outcome: Mutable accumulator receiving the final action/reason.
+
+        Yields:
+            The :class:`~encre.utils.types.AgentEvent` items the phases emit.
+        """
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+        errors: list[BaseException] = []
+
+        async def _worker() -> None:
+            try:
+                for phase in phases:
+                    ctx = PhaseContext(loop=self, turn=t, sink=queue.put)
+                    result: PhaseResult = await phase.run(ctx)
+                    if result.action is not PhaseAction.CONTINUE:
+                        outcome.action = result.action
+                        outcome.reason = result.reason
+                        return
+            except TurnExit:
+                # Historical monolith ``return``: stop everything, skip the
+                # post-loop finalisation -- expressed as the EXIT action.
+                outcome.action = PhaseAction.EXIT
+            except BaseException as exc:
+                # Re-raised on the caller side after the queue is drained.
+                errors.append(exc)
+
+        worker = asyncio.create_task(_worker())
+        get_op: asyncio.Future[Any] | None = None
+        try:
+            while True:
+                if queue.empty() and worker.done():
+                    break
+                if get_op is None:
+                    get_op = asyncio.ensure_future(queue.get())
+                _done, _ = await asyncio.wait(
+                    {get_op, worker}, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if get_op in _done:
+                    yield get_op.result()
+                    get_op = None
+        finally:
+            if get_op is not None and not get_op.done():
+                get_op.cancel()
+            if not worker.done():
+                worker.cancel()
+            # Reap the worker so nothing outlives the pipeline; its exception
+            # (if any) is re-raised below on the normal completion path.
+            with contextlib.suppress(BaseException):
+                await worker
+        if errors:
+            raise errors[0]
 
     async def _run_sub_agent(self, prompt: str,
                               system_prompt: str = "", max_turns: int = 0,

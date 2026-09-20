@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -36,10 +36,16 @@ import contextlib
 import time
 from typing import Any
 
-from encre.events.lifecycle import UserMessagePersisted
+from encre.events.lifecycle import SessionStarted, UserMessagePersisted
 from encre.logging_config import get_logger
+from encre.loop.phase_api import (
+    LoopPhase,
+    PhaseContext,
+    PhaseResult,
+    PhaseScope,
+)
 from encre.loop.turn_ctx import TurnContext
-from encre.loop_stability import _detect_requirement_change
+from encre.loop_stability import _detect_requirement_change, build_standing_orders_reminder
 from encre.prompts.classifier import classify_intents
 
 logger = get_logger(__name__)
@@ -299,15 +305,16 @@ class PhasePromptMixin:
             if _behavioral_parts:
                 system_prompt = system_prompt + "\n\n" + "\n\n".join(_behavioral_parts)
         else:
-            # Inject persistent memory context (encrypted memories from disk)
-            if self.memory_system is not None:
-                try:
-                    memory_prompt = self._ctx_bldr.build_memory_prompt()
-                    if memory_prompt:
-                        self._ctx_renderer.record("Memory", memory_prompt)
-                        system_prompt = system_prompt + "\n\n" + memory_prompt
-                except Exception:
-                    pass
+            # Inject recalled memory context: memories associated with this
+            # turn's user prompt, retrieved through the single recall path
+            # (associative recall over the layered memory store).
+            try:
+                memory_prompt = self._ctx_bldr.build_recall_prompt(prompt)
+                if memory_prompt:
+                    self._ctx_renderer.record("Memory", memory_prompt)
+                    system_prompt = system_prompt + "\n\n" + memory_prompt
+            except Exception:
+                pass
 
             # Inject relevant profile context -- only fields matching the user's query
             if self.profile_system is not None:
@@ -517,9 +524,82 @@ class PhasePromptMixin:
             logger.info("[perf] prompt build %.1fs", time.time() - _t0)
 
         t.system_prompt = system_prompt
-        t.context_msgs = ctx_msgs
+        # Re-snapshot AFTER the user prompt has been persisted above: the
+        # earlier ``ctx_msgs`` snapshot was taken before the dedup check, so
+        # assigning it directly would send the first model request of the run
+        # to the backend without the user's message.  For sub-agents (which
+        # pre-add the prompt) this re-fetch returns the identical cached list.
+        t.context_msgs = self.session.get_context_messages()
 
 
 # ``build_delegation_guidance`` is imported lazily at call time in the
 # original monolith module scope; import it here for the enrichment block.
 from encre.loop_stability import build_delegation_guidance  # noqa: E402
+
+
+class SystemPromptPhase(LoopPhase):
+    """Run-scoped phase: classify intent and build the system prompt.
+
+    Wraps :meth:`PhasePromptMixin._build_turn_system_prompt` -- the exact
+    code the runner used to call inline before the turn loop.
+    """
+
+    name = "system_prompt"
+    scope = PhaseScope.RUN
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        await self._loop._build_turn_system_prompt(ctx.turn)
+        return PhaseResult.continue_()
+
+
+class SessionStartPhase(LoopPhase):
+    """Run-scoped phase: session-start lifecycle and context sanitisation.
+
+    Wraps the block the runner used to execute directly after the prompt
+    phase: the ``session_start`` hook + event, the standing-orders /
+    checkpoint-gate initialisation, and the one-time branch sanitisation of
+    a freshly loaded session.
+    """
+
+    name = "session_start"
+    scope = PhaseScope.RUN
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        loop = self._loop
+        t = ctx.turn
+        _t_hook = time.time()
+        await loop.hook_system.emit_session_start()
+        loop.event_stream.publish(SessionStarted(session_id=loop.session.id or ""))
+        logger.info("[run] emit_session_start done (%.2fs)", time.time() - _t_hook)
+
+        # Standing-orders reminder: loaded once per ``run()`` and merged into
+        # the LAST user message before the first model call of a fresh user
+        # turn (main agent only).  Re-arms the binding pre-action constraints
+        # (recall-first, clarify, checkpoint) right where the model begins
+        # responding; the full gates still live in the system prompt.
+        t.standing_orders_text = (
+            build_standing_orders_reminder() if not t.skip_enrichment else ""
+        )
+        t.standing_orders_injected = False
+
+        # Checkpoint hard-gate state: injected once per run() when the number
+        # of consecutive tool-call steps (since the last user message) crosses
+        # the threshold AND the user has not explicitly authorised a hands-off
+        # run.  The injected message hands control back to the user -- the
+        # code-level mirror of Gate 4 in mandatory_constraints.prompt.
+        t.checkpoint_injected_this_run = False
+        t.checkpoint_text = ""
+
+        # Sanitize session messages on every run -- old sessions loaded from
+        # disk may contain broken tool_call groups (from crashes) that cause
+        # 400 errors.  Only sanitize active branch context; other branches
+        # remain untouched.
+        active_branch_id = loop.session.active_branch_id
+        if active_branch_id not in loop._sanitized_branches:
+            loop.session.replace_branch_messages(
+                active_branch_id, loop.compact_engine.sanitize(t.context_msgs),
+            )
+            loop._sanitized_branches.add(active_branch_id)
+            t.context_msgs = loop.session.get_context_messages()
+        t.active_branch_id = active_branch_id
+        return PhaseResult.continue_()

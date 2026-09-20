@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -42,6 +42,8 @@ Usage::
     results = suite.run_all()
     # results.passed, results.failed, results.errors
 """
+
+from __future__ import annotations
 
 import hashlib
 import time

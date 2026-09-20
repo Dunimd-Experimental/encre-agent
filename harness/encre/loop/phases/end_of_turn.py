@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -36,7 +36,9 @@ from typing import Any
 
 from encre.events.lifecycle import TurnEnded
 from encre.logging_config import get_logger
+from encre.loop.phase_api import LoopPhase, PhaseContext, PhaseResult
 from encre.loop.turn_ctx import TurnContext
+from encre.memdir.judgment import Experience, SignificanceJudge
 from encre.compact.loop_state.transition import TurnTransition
 from encre.loop_stability import BudgetState, build_grace_message
 from encre.capabilities.process import TerminalSessionManager
@@ -290,6 +292,16 @@ class PhaseEndOfTurnMixin:
         # Trigger background review every N turns (fire-and-forget)
         if self.reviewer is not None:
             asyncio.create_task(self.reviewer.on_turn_end(self))
+        # Significance judgment -- the ONLY path into memory.  This phase
+        # never writes memory itself: it collects this turn's experiences,
+        # hands them to the judge as a background task, and lets the judge
+        # publish `memory_candidate` events on the event backbone.  Anything
+        # below the threshold is dropped silently (no event, no write).
+        self._dispatch_significance_judgment(t)
+        # Behaviour -> safety-policy reflow.  Corrections are recorded at three
+        # call sites (execute / tools / tool executor); this single turn-tail
+        # hook covers all of them without touching any of those sites.
+        self._dispatch_safety_reflow()
         self.rollback.commit(self.session, f"turn_{self.session.turn_count}")
 
         # Clean up persistent terminal sessions from this turn.
@@ -301,3 +313,171 @@ class PhaseEndOfTurnMixin:
                 TurnTransition.NEXT_TURN,
                 turn=self.session.turn_count,
             )
+
+    # -- Significance judgment (the only memory entry point) ----------------
+
+    def _resolve_event_bus(self) -> Any:
+        """Return the event backbone, if one is wired into the loop.
+
+        The append-only :class:`~encre.events.ledger.EventSourcedBus` is
+        being introduced into the loop wiring; different call sites name the
+        attribute differently, so probe the known names.  Returns ``None``
+        when no backbone is available, in which case judgment is skipped
+        entirely (memory is never written through any other path).
+        """
+        for name in ("event_bus", "ledger_bus", "events_bus"):
+            bus = getattr(self, name, None)
+            if bus is not None:
+                return bus
+        return None
+
+    def _collect_turn_experiences(self, t: TurnContext) -> list[Experience]:
+        """Collect this turn's judgeable experiences.
+
+        Covers the user's message for the turn (where corrections and
+        emphasis live) and every tool result (where errors, surprises and
+        key outcomes live).  Raw stream noise is not collected.
+
+        Args:
+            t: The shared turn context.
+
+        Returns:
+            The experiences to hand to the significance judge.
+        """
+        session_id = getattr(self.session, "id", "") or ""
+        experiences: list[Experience] = []
+        # ``t.prompt`` is run-scoped and therefore re-seen on every turn of
+        # the same run.  Judge it only once per distinct prompt: otherwise a
+        # neutral prompt would be mistaken for a "repeated pattern" on the
+        # second turn and falsely clear the significance threshold.
+        if t.prompt and t.prompt != getattr(self, "_last_judged_prompt", None):
+            self._last_judged_prompt = t.prompt
+            experiences.append(Experience(
+                kind="user_message",
+                content=t.prompt,
+                session_id=session_id,
+                metadata={"source": "turn_prompt"},
+                ts=t.turn_start or time.time(),
+            ))
+        for p in t.prepared:
+            result = str(p.get("result", "") or "")
+            if not result:
+                continue
+            refs = [
+                str(r) for r in (
+                    p.get("tool_call_id") or p.get("id") or ""
+                ) if r
+            ]
+            experiences.append(Experience(
+                kind="tool_result",
+                content=result,
+                session_id=session_id,
+                refs=refs,
+                metadata={
+                    "tool_name": str(p.get("name", "") or ""),
+                    "is_error": bool(p.get("is_error", False)),
+                    "source": "tool_result",
+                },
+            ))
+        return experiences
+
+    def _dispatch_significance_judgment(self, t: TurnContext) -> None:
+        """Send this turn's experiences to the judge without blocking.
+
+        Judgment runs as a background task (``asyncio.create_task`` inside
+        the judge), so the turn tail never waits on it.  Candidates that
+        clear the threshold are published by the judge as ``memory_candidate``
+        events on the backbone; nothing is persisted here.
+
+        Args:
+            t: The shared turn context.
+
+        Returns:
+            None.
+        """
+        bus = self._resolve_event_bus()
+        if bus is None:
+            return
+        judge = getattr(self, "_significance_judge", None)
+        if judge is None:
+            # The ``strong_association`` signal reads existing memory through
+            # the single retrieval path (associative recall over the layer
+            # store).  When the memory subsystem is unavailable the engine is
+            # ``None`` and the signal stays inactive.
+            judge = SignificanceJudge(
+                recall_engine=getattr(self, "recall_engine", None),
+            )
+            self._significance_judge = judge
+        experiences = self._collect_turn_experiences(t)
+        if not experiences:
+            return
+        try:
+            judge.schedule_judgment(experiences, bus)
+        except Exception:
+            logger.debug(
+                "[end_of_turn] significance judgment dispatch failed",
+                exc_info=True,
+            )
+
+    def _dispatch_safety_reflow(self) -> None:
+        """Compile newly learned corrections into permission policies.
+
+        The feedback learner records user corrections at three call sites
+        (``loop/phases/execute.py``, ``loop/phases/tools.py`` and
+        ``tools/executor.py``); this single turn-tail hook deliberately covers
+        all of them.  It runs the learned-policy reflow only when the learner's
+        record count changed since the previous run, so an unchanged turn costs
+        one integer comparison and never rewrites the policy document -- i.e.
+        at most one reflow per turn.  On a change the reflow compiles the
+        records, persists the encrypted policy document and pushes the entries
+        into the Rust permission engine
+        (``apply`` = compile -> persist -> sync), which is what turns a
+        correction into a real authorization decision.
+
+        A failure here must never affect turn teardown, so everything is caught
+        and logged.  The record count is advanced only after a successful
+        reflow, so a transient fault is retried on the next turn.
+
+        Returns:
+            None.
+        """
+        reflow = getattr(self, "_policy_reflow", None)
+        if reflow is None:
+            return
+        learner = getattr(self, "feedback", None)
+        count = getattr(learner, "record_count", None)
+        if not isinstance(count, int):
+            return
+        if count == getattr(self, "_last_reflow_record_count", -1):
+            return
+        try:
+            reflow.apply(session_id=getattr(self.session, "id", "") or "")
+        except Exception:
+            logger.debug(
+                "[end_of_turn] safety-policy reflow failed", exc_info=True,
+            )
+            return
+        self._last_reflow_record_count = count
+
+
+class EndOfTurnPhase(LoopPhase):
+    """Turn-scoped phase: end-of-turn bookkeeping.
+
+    Wraps :meth:`PhaseEndOfTurnMixin._phase_end_of_turn` -- the exact code
+    the runner used to call last inside every turn iteration (grace call,
+    guardrail ladder, telemetry, evolution, hooks, rollback).  This is the
+    phase that owns the historical ``t.do_break`` checkpoint after the turn
+    tail (guardrail halt): when it completes with that flag set, the
+    pipeline leaves the turn loop -- expressed here as
+    :attr:`PhaseAction.END_RUN`.
+    """
+
+    name = "end_of_turn"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        t = ctx.turn
+        await self._loop._phase_end_of_turn(t)
+        if t.do_break:
+            t.do_break = False
+            return PhaseResult.end_run("end-of-turn guardrail halted the session")
+        return PhaseResult.continue_()

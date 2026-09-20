@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -35,6 +35,8 @@ Usage
     # Resolve "coding" 鈫?{"file_read", "file_write", "bash", ...}
     tools = resolve_toolset("coding")
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any

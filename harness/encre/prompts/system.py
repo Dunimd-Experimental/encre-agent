@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -32,6 +32,8 @@ filters them by the active intents, sorts by priority, and concatenates them.
 A ``__PROMPT_CACHE_BOUNDARY__`` marker is appended so callers can split the
 static (cacheable) prefix from the dynamic (session-specific) suffix.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any

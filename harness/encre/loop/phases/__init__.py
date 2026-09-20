@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -37,20 +37,52 @@ Each mixin extracts one section of the former monolithic ``_run_impl``:
 Phases share state via :class:`~encre.loop.turn_ctx.TurnContext` and signal
 control flow with ``t.do_continue`` / ``t.do_break`` /
 :class:`~encre.loop.turn_ctx.TurnExit`.
+
+The registry-facing phase classes (:class:`.SystemPromptPhase`,
+:class:`.SessionStartPhase`, :class:`.PreModelCompactPhase`,
+:class:`.ModelPhase`, :class:`.PostStreamPhase`, :class:`.PrepareToolsPhase`,
+:class:`.ExecuteToolsPhase`, :class:`.SecondaryToolsPhase`,
+:class:`.PostToolCompactPhase`, :class:`.EndOfTurnPhase`) wrap those mixins
+for the pluggable pipeline (P1.1) and are registered on the loop's
+:class:`~encre.loop.phase_registry.PhaseRegistry` by the wiring.
 """
 
-from encre.loop.phases.compact import PhaseCompactMixin
-from encre.loop.phases.execute import PhaseExecuteMixin
-from encre.loop.phases.model import PhaseModelMixin
-from encre.loop.phases.prompt import PhasePromptMixin
-from encre.loop.phases.recovery import PhaseRecoveryMixin
-from encre.loop.phases.tools import PhaseToolsMixin
+from encre.loop.phases.compact import (
+    PhaseCompactMixin,
+    PostToolCompactPhase,
+    PreModelCompactPhase,
+)
+from encre.loop.phases.end_of_turn import EndOfTurnPhase, PhaseEndOfTurnMixin
+from encre.loop.phases.execute import ExecuteToolsPhase, PhaseExecuteMixin
+from encre.loop.phases.model import ModelPhase, PhaseModelMixin
+from encre.loop.phases.prompt import (
+    PhasePromptMixin,
+    SessionStartPhase,
+    SystemPromptPhase,
+)
+from encre.loop.phases.recovery import PhaseRecoveryMixin, PostStreamPhase
+from encre.loop.phases.tools import (
+    PhaseToolsMixin,
+    PrepareToolsPhase,
+    SecondaryToolsPhase,
+)
 
 __all__ = [
+    "EndOfTurnPhase",
+    "ExecuteToolsPhase",
+    "ModelPhase",
     "PhaseCompactMixin",
+    "PhaseEndOfTurnMixin",
     "PhaseExecuteMixin",
     "PhaseModelMixin",
     "PhasePromptMixin",
     "PhaseRecoveryMixin",
     "PhaseToolsMixin",
+    "PostStreamPhase",
+    "PostToolCompactPhase",
+    "PreModelCompactPhase",
+    "PrepareToolsPhase",
+    "SecondaryToolsPhase",
+    "SessionStartPhase",
+    "SystemPromptPhase",
 ]

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -28,6 +28,8 @@
 # produced by an OpenAI-compatible embedding model.  At query time it asks the
 # native index (Rust) for the nearest slices.  When no embedding backend is
 # configured the index degrades to storing zero vectors.
+
+from __future__ import annotations
 
 import json
 import logging

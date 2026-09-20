@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -40,6 +40,7 @@ from typing import Any
 
 from encre.improve.evolution.plan_do_review import ReviewGrade, StepStatus
 from encre.logging_config import get_logger
+from encre.loop.phase_api import LoopPhase, PhaseContext, PhaseResult
 from encre.loop.phases.end_of_turn import _cleanup_terminal_sessions
 from encre.loop.turn_ctx import TurnContext, TurnExit
 from encre.loop_error import PostStreamAction
@@ -600,3 +601,26 @@ class PhaseRecoveryMixin:
         if segs:
             msg_kwargs["segments"] = segs
         self.session.add_message("assistant", t.assistant_content or None, **msg_kwargs)
+
+
+class PostStreamPhase(LoopPhase):
+    """Turn-scoped phase: post-stream recovery + assistant materialisation.
+
+    Wraps :meth:`PhaseRecoveryMixin._phase_post_stream` -- the exact code the
+    runner used to call third inside every turn iteration.  This is the
+    phase that owns the historical ``t.do_continue`` checkpoints (slot
+    escalation, empty/stub retry, auto-continue, verify nudges, PDR step
+    advancement): when it completes with that flag set, the pipeline skips
+    the remaining phases and starts the next turn iteration -- expressed
+    here as :attr:`PhaseAction.END_TURN`.
+    """
+
+    name = "post_stream"
+
+    async def run(self, ctx: PhaseContext) -> PhaseResult:
+        t = ctx.turn
+        await self._stream_through(ctx, self._loop._phase_post_stream(t))
+        if t.do_continue:
+            t.do_continue = False
+            return PhaseResult.end_turn("post_stream recovery requested a fresh turn")
+        return PhaseResult.continue_()

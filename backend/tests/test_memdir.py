@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -436,14 +436,13 @@ precede conflict flags when both are applicable.
 # ===========================================================================
 
 class TestEncreMemorySystem:
-    """Engineered to validate the top-level EncreMemorySystem integration.
+    """Engineered to validate the top-level EncreMemorySystem file facade.
 
-This class exercises the full stack: directory scanning with YAML
-frontmatter parsing, MEMORY.md entrypoint write/load, semantic
-search delegation, working-memory injection into prompts, and
-consolidation orchestration -- ensuring the system presents a unified
-interface over the underlying search, memory, and consolidation
-components.
+This class exercises the facade's file-I/O surface: directory scanning with
+YAML frontmatter parsing, MEMORY.md entrypoint write/load, and the
+ingestion trigger (``refresh``).  Retrieval is no longer part of this
+facade -- it goes only through RecallEngine over the layer store, so the
+old search / prompt-building / consolidation assertions are gone.
 """
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -475,65 +474,12 @@ components.
         assert "MEMORY.md" not in names
         assert "real.md" in names
 
-    def test_verify_memory_system_format_manifest_empty(self):
-        """Validate that format_manifest returns empty string for empty input."""
-        manifest = self.ms.format_manifest([])
-        assert manifest == ""
-
-    def test_verify_memory_system_build_prompt(self):
-        """Validate that build_prompt includes the MEMORY.md Entrypoint section."""
+    def test_verify_memory_system_refresh_without_store_is_noop(self):
+        """Validate that refresh degrades to a harmless no-op when unattached."""
+        assert self.ms.layer_store is None
         self._write("test.md", "---\ndescription: A test\n---\nTest content.")
-        prompt = self.ms.build_prompt()
-        assert "MEMORY.md Entrypoint" in prompt
-
-    def test_verify_memory_system_search_delegates_to_semantic(self):
-        """Validate that search delegates to the semantic search component."""
-        self._write("auth.md", "OAuth2 JWT token authentication system.")
-        self._write("ui.md", "CSS grid layout with responsive breakpoints.")
-        results = self.ms.search("authentication login")
-        assert len(results) >= 1
-        assert results[0].file_name == "auth.md"
-
-    def test_verify_memory_system_search_relevant(self):
-        """Validate that search_relevant returns a list (threshold-dependent)."""
-        self._write("db.md", "Database connection pooling with postgresql and asyncpg for performance.")  # noqa: E501
-        results = self.ms.search_relevant("database postgres")
-        # search_relevant has higher threshold -- may or may not match, depends on corpus
-        assert isinstance(results, list)
-
-    def test_verify_memory_system_working_memory_accessible(self):
-        """Validate that working memory is accessible and mutable through the system."""
-        wm = self.ms.working
-        wm.set_goal("Test goal")
-        assert self.ms.working.current_goal == "Test goal"
-
-    def test_verify_memory_system_reset_working(self):
-        """Validate that reset_working clears the current goal."""
-        self.ms.working.set_goal("Old")
-        self.ms.reset_working()
-        assert self.ms.working.current_goal == ""
-
-    def test_verify_memory_system_inject_working_empty(self):
-        """Validate that inject_working_memory_prompt returns empty string when working memory is empty."""
-        assert self.ms.inject_working_memory_prompt() == ""
-
-    def test_verify_memory_system_inject_working_with_content(self):
-        """Validate that inject_working_memory_prompt includes the current goal in the output."""
-        self.ms.working.set_goal("Fix login bug")
-        prompt = self.ms.inject_working_memory_prompt()
-        assert "Fix login bug" in prompt
-
-    def test_verify_memory_system_build_prompt_with_context(self):
-        """Validate that build_prompt_with_context includes semantically relevant content."""
-        self._write("auth.md", "OAuth2 JWT token authentication.")
-        self._write("css.md", "Tailwind CSS utility classes.")
-        prompt = self.ms.build_prompt_with_context("authentication")
-        assert "Semantically Relevant" in prompt
-        assert "auth.md" in prompt
-
-    def test_verify_memory_system_consolidate_empty(self):
-        """Validate that consolidate returns an empty list when there is no content."""
-        assert self.ms.consolidate() == []
+        # No store attached: the ingestion trigger must not raise.
+        self.ms.refresh()
 
     def test_verify_memory_system_write_entrypoint(self):
         """Validate that write_entrypoint and load_entrypoint round-trip content correctly."""

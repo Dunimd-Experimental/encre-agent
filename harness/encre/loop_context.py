@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -21,10 +21,13 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -34,17 +37,115 @@ from encre.config import EncreConfig
 from encre.git.repo import EncreGitRepo
 
 
+class _CacheMiss:
+    """Sentinel returned by :meth:`PromptCache.get` on a miss.
+
+    A dedicated object (not ``None``) because several builders legitimately
+    cache falsy values such as ``""``.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "PromptCache.MISS"
+
+
+class PromptCache:
+    """The single prompt cache behind every :class:`ContextBuilder` builder.
+
+    One implementation replaces the former per-builder
+    ``(cache_key, built_at, value)`` tuples: entries live in one dict keyed by
+    a hashable ``("namespace", ...)`` key, freshness is delegated to the
+    ``cache_fresh`` callback wired from the loop (identical TTL semantics --
+    the callback carries its own default TTL), and invalidation is per-key,
+    per-namespace or whole-cache.
+
+    Memory profile matches the old single-slot idiom: a stale entry is
+    evicted on read, and ``set`` sweeps expired entries once the map grows
+    past :attr:`_MAX_ENTRIES_BEFORE_SWEEP`, so high-cardinality keys (e.g.
+    recall queries) cannot accumulate unboundedly.
+
+    Thread-safety: the builders are normally driven by the loop task, but a
+    ``ContextBuilder`` can also be reached from worker threads (tool
+    executors, sub-agents); a lock guards the entry map.  It is uncontended
+    on the common path, so the cost is negligible.
+    """
+
+    MISS: Any = _CacheMiss()
+    # Above this many entries a set() sweeps expired ones (bounds memory for
+    # high-cardinality keys while keeping the common path O(1)).
+    _MAX_ENTRIES_BEFORE_SWEEP = 128
+
+    def __init__(self, cache_fresh: Any) -> None:
+        self._cache_fresh = cache_fresh
+        self._entries: dict[Any, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: Any) -> Any:
+        """Return the cached value for ``key``, or :attr:`MISS`.
+
+        A hit requires an entry stored under exactly ``key`` whose build
+        timestamp still passes the ``cache_fresh`` check.  A stale entry is
+        evicted on read (the old single-slot tuples were overwritten in
+        place; a keyed map needs explicit eviction to stay bounded).
+        """
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return self.MISS
+            built_at, value = entry
+        if not self._cache_fresh(built_at):
+            with self._lock:
+                self._entries.pop(key, None)
+            return self.MISS
+        return value
+
+    def set(self, key: Any, value: Any) -> None:
+        """Store ``value`` under ``key``, stamped with the current time."""
+        with self._lock:
+            self._entries[key] = (time.time(), value)
+            if len(self._entries) > self._MAX_ENTRIES_BEFORE_SWEEP:
+                self._entries = {
+                    k: v for k, v in self._entries.items()
+                    if self._cache_fresh(v[0])
+                }
+
+    def invalidate(self, key: Any) -> None:
+        """Drop the entry stored under ``key`` (no-op when absent)."""
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def invalidate_namespace(self, namespace: str) -> None:
+        """Drop every entry whose key is a tuple starting with ``namespace``.
+
+        Used where the old single-slot caches were cleared without a key
+        available (a freshly injected code index invalidates every
+        codebase-context entry regardless of its exact key).
+        """
+        with self._lock:
+            stale = [k for k in self._entries
+                     if isinstance(k, tuple) and k and k[0] == namespace]
+            for key in stale:
+                del self._entries[key]
+
+    def invalidate_all(self) -> None:
+        """Drop every entry."""
+        with self._lock:
+            self._entries.clear()
+
+
 class ContextBuilder:
     """Builds all context / prompt blocks injected into the system message.
 
-    Owns all ``_*_prompt_cache`` variables and related state
-    (``_document_manager``, ``_code_index``, etc.) so EncreLoop no longer
-    carries them directly.
+    Owns the unified :class:`PromptCache` (one keyed cache behind every
+    prompt builder) and related state (``_document_manager``, ``_code_index``,
+    etc.) so EncreLoop no longer carries them directly.
     """
 
     def __init__(self, config: EncreConfig, session: Any, *,
                  cache_fresh: Any,
                  memory_system: Any = None,
+                 recall_engine: Any = None,
                  soul_system: Any = None,
                  profile_system: Any = None,
                  git: Any = None,
@@ -52,9 +153,16 @@ class ContextBuilder:
                  device_context_manager: Any = None) -> None:
         self._config = config
         self._session = session
-        self._cache_fresh = cache_fresh
+        # The freshness callback (TTL semantics live on the wired callable);
+        # the shared PromptCache owns the entries.
+        self._prompt_cache = PromptCache(cache_fresh)
 
         self.memory_system = memory_system
+        # The single retrieval path: associative recall over the layer store.
+        # May be attached after construction (the loop builds its memory
+        # subsystem later than this builder) or stay ``None`` when the memory
+        # subsystem is unavailable -- the prompt path then degrades to "".
+        self.recall_engine = recall_engine
         self.soul_system = soul_system
         self.profile_system = profile_system
         self._git = git
@@ -64,16 +172,6 @@ class ContextBuilder:
         self._document_manager_data_dir: str | None = None
         self._code_index: EncreCodeIndex | None = None
         self._device_context_manager = device_context_manager
-
-        # Prompt caches
-        self._workspace_info_cache: tuple[str, float, tuple[str, str, str]] | None = None
-        self._memory_prompt_cache: tuple[str, float, str] | None = None
-        self._soul_prompt_cache: tuple[str, float, str] | None = None
-        self._document_prompt_cache: tuple[str, float, str] | None = None
-        self._codebase_context_cache: tuple[tuple[str, int, int], float, str] | None = None
-        self._profile_prompt_cache: tuple[str, str, float, str] | None = None
-        self._rules_prompt_cache: tuple[tuple[str, bool, bool], float, str] | None = None
-        self._contract_prompt_cache: tuple[str, float, str] | None = None
 
     # 鈹€鈹€ Directory tree (static helper) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
@@ -138,7 +236,7 @@ class ContextBuilder:
         """
         ws_path = getattr(self._config, "workspace", "") or ""
         if not ws_path or not os.path.isdir(ws_path):
-            self._workspace_info_cache = None
+            self._prompt_cache.invalidate(("workspace", ws_path))
             return "", "", ""
         cache_key = ws_path
         try:
@@ -149,12 +247,9 @@ class ContextBuilder:
                     cache_key = f"{ws_path}@{branch}"
         except Exception:
             pass
-        if (
-            self._workspace_info_cache is not None
-            and self._workspace_info_cache[0] == cache_key
-            and self._cache_fresh(self._workspace_info_cache[1])
-        ):
-            return self._workspace_info_cache[2]
+        cached = self._prompt_cache.get(("workspace", cache_key))
+        if cached is not PromptCache.MISS:
+            return cached
 
         ws_name = os.path.basename(ws_path)
 
@@ -231,7 +326,7 @@ class ContextBuilder:
                 summary_lines.append(f"  {_line}")
 
         result = (ws_path, ws_name, "\n".join(summary_lines))
-        self._workspace_info_cache = (cache_key, time.time(), result)
+        self._prompt_cache.set(("workspace", cache_key), result)
         return result
 
     def _detect_project_profile(self, ws_path: str) -> list[str]:
@@ -321,7 +416,9 @@ class ContextBuilder:
     def inject_code_index(self, idx: Any) -> None:
         """Inject a fully-built code index from the background IndexManager."""
         self._code_index = idx
-        self._codebase_context_cache = None
+        # The index changed: drop every cached codebase-context entry (the
+        # exact key is not reconstructible here -- it carries index stats).
+        self._prompt_cache.invalidate_namespace("codebase")
         ws_path = getattr(idx, "workspace", "")
         if ws_path and self._session.messages:
             new_ctx = self._build_codebase_context_sync(ws_path, idx)
@@ -392,13 +489,11 @@ class ContextBuilder:
             lang = mod.language or "other"
             by_lang[lang] = by_lang.get(lang, 0) + 1
         lang_summary_items = tuple(sorted(by_lang.items(), key=lambda x: (-x[1], x[0])))
-        cache_key = (ws_path, total, int(self._code_index._indexed), lang_summary_items)
-        if (
-            self._codebase_context_cache is not None
-            and self._codebase_context_cache[0] == cache_key
-            and self._cache_fresh(self._codebase_context_cache[1])
-        ):
-            return self._codebase_context_cache[2]
+        cache_key = ("codebase", ws_path, total, int(self._code_index._indexed),
+                     lang_summary_items)
+        cached = self._prompt_cache.get(cache_key)
+        if cached is not PromptCache.MISS:
+            return cached
 
         lines: list[str] = []
         lines.append("## Codebase Index")
@@ -410,7 +505,7 @@ class ContextBuilder:
             lines.append(f"Language breakdown: {lang_summary}")
 
         result = "\n".join(lines)
-        self._codebase_context_cache = (cache_key, time.time(), result)
+        self._prompt_cache.set(cache_key, result)
         return result
 
     # 鈹€鈹€ Architecture contract 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -427,18 +522,15 @@ class ContextBuilder:
 
         ws_path = getattr(self._config, "workspace", "") or ""
         if not ws_path or not os.path.isdir(ws_path):
-            self._contract_prompt_cache = None
+            self._prompt_cache.invalidate(("contract", ""))
             return ""
         mtime = latest_contract_mtime(ws_path)
-        cache_key = f"{ws_path}:{mtime}"
-        if (
-            self._contract_prompt_cache is not None
-            and self._contract_prompt_cache[0] == cache_key
-            and self._cache_fresh(self._contract_prompt_cache[1])
-        ):
-            return self._contract_prompt_cache[2]
+        cache_key = ("contract", f"{ws_path}:{mtime}")
+        cached = self._prompt_cache.get(cache_key)
+        if cached is not PromptCache.MISS:
+            return cached
         prompt = load_architecture_contract(ws_path)
-        self._contract_prompt_cache = (cache_key, time.time(), prompt)
+        self._prompt_cache.set(cache_key, prompt)
         return prompt
 
     # 鈹€鈹€ Document context 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -454,12 +546,10 @@ class ContextBuilder:
                 cache_key = f"{data_dir}:{st.st_mtime_ns}:{st.st_size}"
             except OSError:
                 cache_key = data_dir
-            if (
-                self._document_prompt_cache is not None
-                and self._document_prompt_cache[0] == cache_key
-                and self._cache_fresh(self._document_prompt_cache[1])
-            ):
-                return self._document_prompt_cache[2]
+            cache_key = ("document", cache_key)
+            cached = self._prompt_cache.get(cache_key)
+            if cached is not PromptCache.MISS:
+                return cached
 
             if self._document_manager is None or self._document_manager_data_dir != data_dir:
                 self._document_manager = EncreDocumentManager(data_dir)
@@ -467,29 +557,89 @@ class ContextBuilder:
             else:
                 self._document_manager._load()
             prompt = self._document_manager.build_context()
-            self._document_prompt_cache = (cache_key, time.time(), prompt)
+            self._prompt_cache.set(cache_key, prompt)
             return prompt
         except Exception:
             return ""
 
-    # 鈹€鈹€ Memory prompt 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鈹€鈹€ Memory recall prompt 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-    def build_memory_prompt(self) -> str:
-        if self.memory_system is None:
-            return ""
+    def build_recall_prompt(self, query: str) -> str:
+        """Recall memories associated with ``query`` and render them as a block.
 
-        memory_dir = self.memory_system.get_memory_path()
-        cache_key = memory_dir
-        if (
-            self._memory_prompt_cache is not None
-            and self._memory_prompt_cache[0] == cache_key
-            and self._cache_fresh(self._memory_prompt_cache[1])
-        ):
-            return self._memory_prompt_cache[2]
+        Retrieval goes through the single path
+        (:class:`~encre.memdir.recall.RecallEngine`): similarity seeds plus
+        spreading activation over explicit links.  Each rendered hit carries its
+        memory type, its content, and -- when it was reached by spreading rather
+        than by direct similarity -- the link path it was reached through.
 
-        prompt = self.memory_system.build_prompt()
-        self._memory_prompt_cache = (cache_key, time.time(), prompt)
+        The human-curated ``MEMORY.md`` entrypoint is rendered ahead of the
+        hits.  It is an *index* the user maintains by hand, not a second
+        retrieval path: it is loaded verbatim (never searched), so the single
+        retrieval path stays :class:`RecallEngine`.  Without it the curated
+        entrypoint would reach no prompt at all, since ``MEMORY.md`` is
+        deliberately excluded from ingestion.
+
+        Returns ``""`` when no recall engine is attached, the query is blank, and
+        no curated entrypoint exists.
+        """
+        engine = self.recall_engine
+        cache_key = ("recall", query)
+        if engine is not None and query:
+            cached = self._prompt_cache.get(cache_key)
+            if cached is not PromptCache.MISS:
+                return cached
+
+        lines: list[str] = []
+        entrypoint = self._load_memory_entrypoint()
+        if entrypoint:
+            lines.append("## Curated Memory Index")
+            lines.append("")
+            lines.append(entrypoint)
+            lines.append("")
+
+        # The curated index is rendered even when the recall engine is
+        # unavailable (degraded memory subsystem), so a hand-maintained
+        # entrypoint never silently stops reaching the model.
+        hits = engine.recall(query) if (engine is not None and query) else []
+        if not hits:
+            # An empty result is never cached: a memory ingested after this
+            # call (the ``refresh`` ingestion trigger) must be visible on the
+            # next identical query, not hidden behind a stale empty entry.
+            # The curated index is cheap to re-read, so it is not cached either.
+            return "\n".join(lines).rstrip() if lines else ""
+
+        lines.append("## Relevant Memories")
+        lines.append("")
+        for hit in hits:
+            entry = hit.entry
+            lines.append(f"### [{entry.type}] (score: {hit.score:.2f})")
+            lines.append(entry.content)
+            if hit.via_links:
+                path = " -> ".join(
+                    f"{link.get('relation', '')}:{link.get('target_id', '')}"
+                    for link in hit.via_links
+                )
+                lines.append(f"(recalled via {path})")
+            lines.append("")
+
+        prompt = "\n".join(lines).rstrip()
+        # Only reached with non-empty hits: an empty result is never cached
+        # (see the early return above), so a memory ingested after this call
+        # stays visible on the next identical query.
+        self._prompt_cache.set(cache_key, prompt)
         return prompt
+
+    def _load_memory_entrypoint(self) -> str:
+        """Return the curated ``MEMORY.md`` content, or ``""`` when unavailable."""
+        system = self.memory_system
+        loader = getattr(system, "load_entrypoint", None)
+        if loader is None:
+            return ""
+        try:
+            return (loader().content or "").strip()
+        except Exception:
+            return ""
 
     # 鈹€鈹€ Soul prompt 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
@@ -498,16 +648,13 @@ class ContextBuilder:
             return ""
 
         soul_dir = self.soul_system.get_soul_dir()
-        cache_key = soul_dir
-        if (
-            self._soul_prompt_cache is not None
-            and self._soul_prompt_cache[0] == cache_key
-            and self._cache_fresh(self._soul_prompt_cache[1])
-        ):
-            return self._soul_prompt_cache[2]
+        cache_key = ("soul", soul_dir)
+        cached = self._prompt_cache.get(cache_key)
+        if cached is not PromptCache.MISS:
+            return cached
 
         prompt = self.soul_system.build_prompt()
-        self._soul_prompt_cache = (cache_key, time.time(), prompt)
+        self._prompt_cache.set(cache_key, prompt)
         return prompt
 
     # 鈹€鈹€ Device context prompt 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -564,16 +711,12 @@ class ContextBuilder:
     def build_profile_prompt(self, query: str) -> str:
         if self.profile_system is None:
             return ""
-        cache_key = (getattr(self.profile_system, "_profile_path", ""), query)
-        if (
-            self._profile_prompt_cache is not None
-            and self._profile_prompt_cache[0] == cache_key[0]
-            and self._profile_prompt_cache[1] == cache_key[1]
-            and self._cache_fresh(self._profile_prompt_cache[2])
-        ):
-            return self._profile_prompt_cache[3]
+        cache_key = ("profile", getattr(self.profile_system, "_profile_path", ""), query)
+        cached = self._prompt_cache.get(cache_key)
+        if cached is not PromptCache.MISS:
+            return cached
         prompt = self.profile_system.build_relevant_prompt(query=query, threshold=0.0)
-        self._profile_prompt_cache = (cache_key[0], cache_key[1], time.time(), prompt)
+        self._prompt_cache.set(cache_key, prompt)
         return prompt
 
     # 鈹€鈹€ Rules prompt 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -582,22 +725,20 @@ class ContextBuilder:
         ws_root = getattr(self._config, "workspace", "") or ""
         disabled = set(getattr(self._config, "disabled_context_files", None) or [])
         cache_key = (
+            "rules",
             ws_root,
             bool(self._config.enable_project_rules),
             bool(self._config.enable_global_rules),
             tuple(sorted(disabled)),
         )
-        if (
-            self._rules_prompt_cache is not None
-            and self._rules_prompt_cache[0] == cache_key
-            and self._cache_fresh(self._rules_prompt_cache[1])
-        ):
-            return self._rules_prompt_cache[2]
+        cached = self._prompt_cache.get(cache_key)
+        if cached is not PromptCache.MISS:
+            return cached
         prompt = self._rules_loader.build_rules_prompt(
             ws_root,
             enable_project=self._config.enable_project_rules,
             enable_global=self._config.enable_global_rules,
             disabled_files=disabled,
         )
-        self._rules_prompt_cache = (cache_key, time.time(), prompt)
+        self._prompt_cache.set(cache_key, prompt)
         return prompt

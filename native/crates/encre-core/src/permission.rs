@@ -124,6 +124,47 @@ impl PolicySource {
     }
 }
 
+/// A permission policy learned from an explicit user correction.
+///
+/// Learned entries form a **tightening-only** layer: only `deny` and `ask` are
+/// ever honoured, and the layer is evaluated as a hard floor alongside the
+/// dangerous-command blacklist, so a learned entry can never loosen a
+/// decision.  An `allow`-style entry is dropped outright by
+/// [`permission_set_learned_policies`], which makes "the user wanted to widen
+/// access" impossible to express here -- the Python compiler maps such a
+/// preference to `ask` before it ever reaches Rust.
+///
+/// An entry may target a tool or a capability, and may additionally be scoped
+/// by a path fragment and/or a shell-command fragment so a correction such as
+/// "never read ~/.secrets" or "don't run `npm publish`" denies only the
+/// intended target instead of the whole tool.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnedPolicy {
+    /// Target tool name (empty when only `capability` is set).
+    #[serde(default)]
+    pub tool: String,
+    /// Target capability name (empty when only `tool` is set).
+    #[serde(default)]
+    pub capability: String,
+    /// Optional path fragment; when set the entry applies only if a path
+    /// extracted from the tool arguments contains it.
+    #[serde(default)]
+    pub path_scope: String,
+    /// Optional shell-command fragment; when set the entry applies only to the
+    /// `bash` family when the extracted command contains it.
+    #[serde(default)]
+    pub command_scope: String,
+    /// `deny` or `ask`.  Any other value (notably `allow`) is ignored, so the
+    /// learned layer can only ever restrict access.
+    pub policy: String,
+    /// Human-readable justification surfaced to the user / model.
+    #[serde(default)]
+    pub reason: String,
+    /// Rule identifier surfaced alongside `ask` decisions.
+    #[serde(default)]
+    pub rule: String,
+}
+
 /// State holder for the active policy set.  Persists through Python.
 ///
 /// Policies are grouped by source so that a project-level deny can override a
@@ -145,6 +186,12 @@ pub struct PolicyState {
     /// Legacy flat capability map; treated as `User` source.
     #[serde(default)]
     pub capabilities: HashMap<String, PolicyValue>,
+    /// Tightening-only policies learned from user corrections.  `None` means
+    /// "not supplied by this payload": [`permission_set_policies`] then keeps
+    /// the existing learned set instead of clearing it, so a settings-panel
+    /// update of the tool/capability table cannot silently drop learned rules.
+    #[serde(default)]
+    pub learned: Option<Vec<LearnedPolicy>>,
 }
 
 impl PolicyState {
@@ -476,10 +523,35 @@ fn find_dangerous_file() -> Option<std::path::PathBuf> {
 // Public API — called by the Python bindings
 // ---------------------------------------------------------------------------
 
+/// Drop any learned entry that is not an explicit tightening (`deny` / `ask`)
+/// and normalise the surviving policy string.  `allow` -- or anything
+/// unrecognised -- is discarded so the learned layer can never grant access.
+fn sanitize_learned(entries: Vec<LearnedPolicy>) -> Vec<LearnedPolicy> {
+    let mut kept: Vec<LearnedPolicy> = Vec::with_capacity(entries.len());
+    for mut entry in entries {
+        let policy = entry.policy.trim().to_lowercase();
+        if policy != "deny" && policy != "ask" {
+            continue;
+        }
+        entry.policy = policy;
+        kept.push(entry);
+    }
+    kept
+}
+
 /// Replace the active policy table.  Used by the WS handler when the user
 /// updates their permission settings.
-pub fn permission_set_policies(state: PolicyState) {
+///
+/// A payload that does not carry the `learned` field (`None`) keeps the
+/// existing learned-policy layer, so updating the tool/capability table never
+/// silently discards rules learned from corrections.  A payload that does
+/// carry it has its entries sanitised the same way the dedicated setter does.
+pub fn permission_set_policies(mut state: PolicyState) {
     let mut g = manager().write().expect("permission lock poisoned");
+    match state.learned.take() {
+        None => state.learned = g.state.learned.clone(),
+        Some(entries) => state.learned = Some(sanitize_learned(entries)),
+    }
     g.state = state;
 }
 
@@ -487,6 +559,23 @@ pub fn permission_set_policies(state: PolicyState) {
 pub fn permission_get_policies() -> PolicyState {
     let g = manager().read().expect("permission lock poisoned");
     g.state.clone()
+}
+
+/// Replace the tightening-only learned-policy layer.
+///
+/// Only `deny` / `ask` entries are stored; `allow`-style entries are dropped
+/// (see [`sanitize_learned`]).  This is the only way learned policies enter the
+/// engine, and they are evaluated as a hard floor together with the
+/// dangerous-command blacklist.
+pub fn permission_set_learned_policies(entries: Vec<LearnedPolicy>) {
+    let mut g = manager().write().expect("permission lock poisoned");
+    g.state.learned = Some(sanitize_learned(entries));
+}
+
+/// Return a clone of the learned-policy layer.
+pub fn permission_get_learned_policies() -> Vec<LearnedPolicy> {
+    let g = manager().read().expect("permission lock poisoned");
+    g.state.learned.clone().unwrap_or_default()
 }
 
 /// Record the user's answer to a previous `Ask` decision so we don't have to
@@ -555,6 +644,148 @@ fn match_dangerous(g: &ManagerInner, tool_name: &str, args: &str) -> Option<Stri
 }
 
 // ---------------------------------------------------------------------------
+// Learned policies — tightening-only floor
+// ---------------------------------------------------------------------------
+
+/// Normalise a scope/candidate string for substring matching: strip wrapping
+/// quotes, forward-slash-normalise, lowercase and collapse whitespace runs.
+fn normalize_scope(raw: &str) -> String {
+    let unquoted = raw.trim().trim_matches(|c| c == '\'' || c == '"');
+    let mut out = String::with_capacity(unquoted.len());
+    let mut prev_space = false;
+    for ch in unquoted.replace('\\', "/").to_lowercase().chars() {
+        if ch.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Pull path-like / command-like strings out of the JSON tool arguments so a
+/// path-scoped learned entry can be matched.  Not exhaustive: a miss simply
+/// means the scoped entry does not fire (never a false allow).
+fn extract_input_paths(args: &str) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_str::<Value>(args) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    if let Some(obj) = parsed.as_object() {
+        for key in [
+            "path", "file_path", "filename", "filepath", "target", "dest", "destination",
+        ] {
+            if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                if !s.trim().is_empty() {
+                    out.push(s.to_string());
+                }
+            }
+        }
+        for key in ["command", "cmd", "patch", "diff"] {
+            if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                if !s.trim().is_empty() {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Evaluate the tightening-only learned-policy layer against a call.
+///
+/// Returns `None` when nothing matches.  Only `deny` / `ask` entries are ever
+/// considered (an `allow` entry is skipped here as well as at insertion time),
+/// and when several entries match the strictest decision wins -- a `deny` is
+/// returned immediately, otherwise the first `ask` is kept.
+fn match_learned(g: &ManagerInner, tool_name: &str, args: &str) -> Option<PermissionDecision> {
+    let learned = g.state.learned.as_deref().unwrap_or(&[]);
+    if learned.is_empty() {
+        return None;
+    }
+    let caps = tool_capabilities(tool_name);
+    // Candidate strings are extracted lazily, only once a scoped entry needs them.
+    let mut path_candidates: Option<Vec<String>> = None;
+    let mut command_text: Option<Option<String>> = None;
+    let mut best: Option<PermissionDecision> = None;
+
+    for entry in learned {
+        let policy = entry.policy.as_str();
+        if policy != "deny" && policy != "ask" {
+            continue;
+        }
+        let target_ok = (!entry.tool.is_empty() && entry.tool == tool_name)
+            || (!entry.capability.is_empty() && caps.contains(&entry.capability.as_str()));
+        if !target_ok {
+            continue;
+        }
+        if !entry.path_scope.is_empty() {
+            let candidates = path_candidates.get_or_insert_with(|| extract_input_paths(args));
+            let scope = normalize_scope(&entry.path_scope);
+            if scope.is_empty() || !candidates.iter().any(|p| normalize_scope(p).contains(&scope)) {
+                continue;
+            }
+        }
+        if !entry.command_scope.is_empty() {
+            let command = command_text.get_or_insert_with(|| extract_bash_command(args));
+            let scope = normalize_scope(&entry.command_scope);
+            let matched = command
+                .as_deref()
+                .map(|c| normalize_scope(c).contains(&scope))
+                .unwrap_or(false);
+            if scope.is_empty() || !matched {
+                continue;
+            }
+        }
+        if policy == "deny" {
+            let reason = if entry.reason.is_empty() {
+                format!("Tool {tool_name} is denied by a learned policy.")
+            } else {
+                entry.reason.clone()
+            };
+            return Some(PermissionDecision::Deny { reason });
+        }
+        if best.is_none() {
+            let reason = if entry.reason.is_empty() {
+                format!("Tool {tool_name} requires confirmation (learned policy).")
+            } else {
+                entry.reason.clone()
+            };
+            let rule = if entry.rule.is_empty() {
+                "learned_policy".to_string()
+            } else {
+                entry.rule.clone()
+            };
+            best = Some(PermissionDecision::Ask { reason, rule });
+        }
+    }
+    best
+}
+
+/// Combine two optional decisions, returning the stricter one.  `Deny` beats
+/// `Ask`, so a learned entry can only ever tighten the dangerous-command
+/// verdict -- never weaken it.
+fn strictest(
+    a: Option<PermissionDecision>,
+    b: Option<PermissionDecision>,
+) -> Option<PermissionDecision> {
+    if matches!(a, Some(PermissionDecision::Deny { .. })) {
+        return a;
+    }
+    if matches!(b, Some(PermissionDecision::Deny { .. })) {
+        return b;
+    }
+    a.or(b)
+}
+
+// ---------------------------------------------------------------------------
 // Always-allow list — tools that bypass ALL permission checks.
 // These are non-dangerous tools (web fetch, search, memory, tasks, etc.)
 // that should never prompt the user or be gated by a capability policy.
@@ -574,9 +805,11 @@ const ALWAYS_ALLOW: &[&str] = &[
 /// 0.  Always-allow list (these tools skip all checks entirely).
 /// 1.  Explicit Deny/Ask tool-level override from the policy table.
 /// 2.  Explicit Deny/Ask capability-level override.
-/// 3.  Dangerous-pattern match for the `bash` tool family, per subcommand.
+/// 3.  Hard floor: dangerous-pattern match for the `bash` tool family, per
+///     subcommand, combined with the tightening-only learned-policy layer.
 ///     Runs BEFORE any Allow/Default policy so a blanket allow entry can
-///     never silence the blacklist.
+///     never silence the blacklist.  A learned entry can only tighten the
+///     verdict (`deny` beats `ask`), never weaken it.
 /// 4.  Allow-level tool policy.
 /// 5.  Allow-level capability policy.
 /// 6.  Default: allow.
@@ -632,20 +865,28 @@ pub fn permission_check_mode(tool_name: &str, args: &str, mode: &str) -> Permiss
         }
     }
 
-    // 3) Bash dangerous patterns, evaluated per subcommand.  Full access
-    //    ("bypass") and auto approval ("auto") never ask the user for
-    //    anything, so a blacklisted subcommand is refused outright instead
-    //    of raising a prompt.
-    if let Some(rule) = match_dangerous(&g, tool_name, args) {
+    // 3) Hard floor: the bash dangerous-pattern blacklist and the
+    //    tightening-only learned-policy layer.  The two are combined so the
+    //    strictest verdict wins: a learned entry can tighten the outcome
+    //    (e.g. deny a path the blacklist only asks about) but can never
+    //    weaken a dangerous-command refusal, because a `deny` always beats an
+    //    `ask`.  Full access ("bypass") and auto approval ("auto") never ask
+    //    the user, so a blacklisted subcommand is refused outright there.
+    let danger = match_dangerous(&g, tool_name, args).map(|rule| {
         if mode == "bypass" || mode == "auto" {
-            return PermissionDecision::Deny {
+            PermissionDecision::Deny {
                 reason: format!("Blocked by dangerous-command rule: {rule}"),
-            };
+            }
+        } else {
+            PermissionDecision::Ask {
+                reason: format!("Subcommand matches dangerous pattern: {rule}"),
+                rule,
+            }
         }
-        return PermissionDecision::Ask {
-            reason: format!("Subcommand matches dangerous pattern: {rule}"),
-            rule,
-        };
+    });
+    let learned = match_learned(&g, tool_name, args);
+    if let Some(decision) = strictest(danger, learned) {
+        return decision;
     }
 
     // 4) Allow-level tool policy.

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -40,6 +40,8 @@ Usage::
     for t in history:      # iterate newest first
         ...
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -172,9 +174,20 @@ class TransitionHistory:
 
     Index 0 is the first transition (oldest).  Callers can iterate to
     produce a post-mortem of the agent's execution path.
+
+    When ``event_bus`` is set (the loop injects the session's
+    :class:`~encre.events.ledger.EventSourcedBus`), every recorded transition
+    is also published to the backbone as a ``"state_transition"`` event; the
+    in-memory ``records`` list stays the authoritative per-run history.
     """
 
     records: list[TransitionRecord] = field(default_factory=list)
+
+    event_bus: Any = None
+    """Optional event backbone; transitions are mirrored onto it."""
+
+    session_id: str = ""
+    """Session id stamped on published transition events."""
 
     # 鈹€鈹€ properties 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
@@ -225,7 +238,27 @@ class TransitionHistory:
             metadata=metadata,
         )
         self.records.append(rec)
+        self._publish(rec)
         return rec
+
+    def _publish(self, rec: TransitionRecord) -> None:
+        """Mirror a transition onto the event backbone (no-op without one)."""
+        bus = self.event_bus
+        if bus is None:
+            return
+        try:
+            bus.publish(
+                "state_transition",
+                session_id=self.session_id,
+                payload={
+                    "transition": rec.transition.value,
+                    "turn": rec.turn,
+                    "detail": rec.detail,
+                    "metadata": dict(rec.metadata),
+                },
+            )
+        except Exception:
+            pass
 
     def clear(self) -> None:
         """Clear the history (called at start of a new ``_run_impl``)."""

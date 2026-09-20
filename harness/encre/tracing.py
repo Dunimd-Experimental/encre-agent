@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
@@ -63,7 +63,7 @@ _OTEL_AVAILABLE = True
 class _NoOpSpan:
     """Context manager that does nothing -- drops all attributes and events."""
 
-    def __enter__(self) -> _NoOpSpan:
+    def __enter__(self) -> "_NoOpSpan":
         return self
 
     def __exit__(self, *args: Any) -> None:

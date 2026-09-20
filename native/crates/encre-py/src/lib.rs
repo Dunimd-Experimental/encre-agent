@@ -650,6 +650,27 @@ fn permission_get_policies() -> PyResult<String> {
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
 }
 
+/// Replace the tightening-only learned-policy layer.  ``policies_json`` is a
+/// JSON array of learned entries; only ``deny`` / ``ask`` entries are kept
+/// (anything else, notably ``allow``, is dropped so the layer can never grant
+/// access).  Learned entries are combined with the dangerous-command blacklist
+/// as a hard floor and can only tighten a decision.
+#[pyfunction]
+fn permission_set_learned_policies(policies_json: &str) -> PyResult<()> {
+    let entries: Vec<permission::LearnedPolicy> = serde_json::from_str(policies_json)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    permission::permission_set_learned_policies(entries);
+    Ok(())
+}
+
+/// Return the learned-policy layer as a JSON array.
+#[pyfunction]
+fn permission_get_learned_policies() -> PyResult<String> {
+    let entries = permission::permission_get_learned_policies();
+    serde_json::to_string(&entries)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+}
+
 /// Persist the user's answer to a previous ``Ask`` decision so it doesn't
 /// have to be asked again for the same tool.
 #[pyfunction]
@@ -752,6 +773,8 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(permission_check_mode, m)?)?;
     m.add_function(wrap_pyfunction!(permission_set_policies, m)?)?;
     m.add_function(wrap_pyfunction!(permission_get_policies, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_set_learned_policies, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_get_learned_policies, m)?)?;
     m.add_function(wrap_pyfunction!(permission_record_decision, m)?)?;
     m.add_function(wrap_pyfunction!(permission_set_mode, m)?)?;
     m.add_function(wrap_pyfunction!(permission_set_dangerous_patterns, m)?)?;
