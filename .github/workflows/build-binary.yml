@@ -13,60 +13,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── All locales (default full build) ──────────────────────────────
+          # One installer per platform -- every build bundles ALL locales
+          # (build.py defaults to --locales all); no per-language variants.
           - os: ubuntu-latest
             target: linux-x64
             arch: x64
-            locale: all
           - os: ubuntu-24.04-arm
             target: linux-arm64
             arch: arm64
-            locale: all
           - os: windows-latest
             target: windows-x64
             arch: x64
-            locale: all
           - os: macos-15-intel
             target: macos-x64
             arch: x64
-            locale: all
           - os: macos-latest
             target: macos-arm64
             arch: arm64
-            locale: all
-          # ── Simplified locales per platform ───────────────────────────────
-          - os: ubuntu-latest
-            target: linux-x64-cn
-            arch: x64
-            locale: cn
-          - os: ubuntu-24.04-arm
-            target: linux-arm64-cn
-            arch: arm64
-            locale: cn
-          - os: windows-latest
-            target: windows-x64-cn
-            arch: x64
-            locale: cn
-          - os: macos-15-intel
-            target: macos-x64-cn
-            arch: x64
-            locale: cn
-          - os: macos-latest
-            target: macos-arm64-cn
-            arch: arm64
-            locale: cn
-          - os: ubuntu-latest
-            target: linux-x64-en
-            arch: x64
-            locale: en
-          - os: windows-latest
-            target: windows-x64-en
-            arch: x64
-            locale: en
-          - os: macos-15-intel
-            target: macos-x64-en
-            arch: x64
-            locale: en
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -89,7 +52,7 @@ jobs:
           toolchain: stable
 
       - name: Build
-        run: python build.py --locales ${{ matrix.locale }}
+        run: python build.py
         env:
           TARGET_ARCH: ${{ matrix.arch }}
           # Vendor application secret, baked into the native extension at
@@ -118,3 +81,9 @@ jobs:
         with:
           name: encre-server-${{ matrix.target }}
           path: build/server/encre-server/
+
+      - name: Upload plugin CLI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: encre-cli-${{ matrix.target }}
+          path: build/cli/encre-plugin*

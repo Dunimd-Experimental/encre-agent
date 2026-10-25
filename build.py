@@ -205,8 +205,18 @@ def install_deps():
     print(f"  [pip] using index: {index}")
 
     run(f'{base} {idx} -U pip "setuptools>=68" wheel')
-    # Editable installs of the three source trees (pure setuptools backend).
-    run(f'{base} {idx} --no-build-isolation -e ./harness -e ./core -e ./ea-cwh')
+    # Editable installs of the source trees (pure setuptools backend).
+    # ea-cwh is an independent sub-repo (own .git, never committed here), so a
+    # fresh CI checkout has no ./ea-cwh tree: fall back to the released PyPI
+    # package, which carries the same catalog data that the PyInstaller
+    # --collect-data step in build_server() needs.  Local dev checkouts with
+    # the sub-repo present keep the editable install.
+    ea_req = " -e ./ea-cwh" if (ROOT / "ea-cwh").is_dir() else " ea-cwh"
+    # cli/ is also an independent sub-repo (own .git, never committed here):
+    # fall back to the released ea-plugin-cli package the same way ea-cwh
+    # does -- build_cli() compiles the frozen exe from the installed source.
+    cli_req = "" if (ROOT / "cli").is_dir() else " ea-plugin-cli"
+    run(f'{base} {idx} --no-build-isolation -e ./harness -e ./core{ea_req}{cli_req}')
     # Build tooling ships binary wheels; keep the isolated build env for them.
     run(f'{base} {idx} build pyinstaller')
 
@@ -486,6 +496,8 @@ def build(locale_list: list[str] | None = None, publish_vendor: bool = False) ->
     build_server()
 
     # 4b. Compile the standalone encre-plugin CLI executable for this OS.
+    # With no ./cli sub-repo checkout (fresh CI) the source comes from the
+    # PyPI-released ea-plugin-cli package instead (see build_cli).
     build_cli()
 
     # 4c. Compile the official tools/skills into wheels + catalog.d entries.
@@ -668,9 +680,12 @@ def build_server():
     # pkgutil-extended "encre" package resolves harness and core subpackages.
     # EA packages need no --paths/--hidden-import: they ship as raw source
     # data and the runtime scanner inserts their dirs into sys.path itself.
+    # ea-cwh may be absent (fresh CI checkout): its PyPI package installed by
+    # install_deps() satisfies the hidden import from site-packages instead.
     path_args = []
     for p in [ROOT / "harness", ROOT / "core", ROOT / "ea-cwh"]:
-        path_args.extend(["--paths", str(p)])
+        if p.is_dir():
+            path_args.extend(["--paths", str(p)])
 
     # Run PyInstaller
     cmd_parts = [
@@ -737,11 +752,33 @@ def build_cli():
     The exe still shells out to a host Python for build/verify/twine work, so
     nothing has to be pip-installed for the CLI itself.
 
+    Source of truth: the local ``cli/`` sub-repo checkout when present.
+    ``cli/`` is an independent sub-repo (own .git, never committed here), so a
+    fresh CI checkout has no local tree -- in that case the CLI source comes
+    from the PyPI-released ``ea-plugin-cli`` package (pip-installed by
+    :func:`install_deps`), and the thin ``pyi_entry.py`` launcher is
+    regenerated into ``build/``: when ``ea_plugin_cli/__main__.py`` runs as
+    ``__main__`` inside a frozen executable its relative imports break, so the
+    entry must stay a top-level module that imports ``main()`` by package path.
+
     Output: ``build/cli/encre-plugin[.exe]``.
     """
     print("\n=== Building encre-plugin CLI (PyInstaller) ===")
 
-    build_plugin_sdk()
+    cli_tree = CLI_SRC.is_dir()
+    if cli_tree:
+        build_plugin_sdk()
+        cli_pkg_dir = CLI_SRC / "ea_plugin_cli"
+    else:
+        try:
+            import ea_plugin_cli as _cli
+        except ImportError:
+            print("  [!!] no ./cli tree and ea_plugin_cli is not installed -- "
+                  "install_deps() should have pip-installed ea-plugin-cli")
+            sys.exit(1)
+        cli_pkg_dir = Path(_cli.__file__).resolve().parent
+        print(f"  [i] no ./cli sub-repo checkout; using released "
+              f"ea_plugin_cli from {cli_pkg_dir}")
 
     try:
         import PyInstaller  # noqa: F401
@@ -753,6 +790,31 @@ def build_cli():
         shutil.rmtree(CLI_DIST)
     CLI_DIST.mkdir(parents=True, exist_ok=True)
 
+    # PyInstaller entry: the local cli/pyi_entry.py when the sub-repo is
+    # checked out; otherwise regenerate the identical thin launcher under
+    # build/ (never point PyInstaller at __main__.py directly).
+    if cli_tree:
+        entry_script = CLI_SRC / "pyi_entry.py"
+    else:
+        entry_script = ROOT / "build" / "pyi_entry.py"
+        entry_script.parent.mkdir(parents=True, exist_ok=True)
+        entry_script.write_text(
+            "from ea_plugin_cli.__main__ import main\n"
+            "\n"
+            'if __name__ == "__main__":\n'
+            "    main()\n",
+            encoding="utf-8",
+        )
+
+    # Plugin UI SDK ships as data so `encre-plugin init/sdk` works in the
+    # downloaded onefile executable without a network fetch.  The local tree
+    # embeds it via build_plugin_sdk(); the released wheel carries its own
+    # copy.  Neither present -> omit rather than fail PyInstaller.
+    sdk_args = []
+    if (cli_pkg_dir / "sdk_dist").is_dir():
+        sdk_args = ["--add-data",
+                    f"{cli_pkg_dir / 'sdk_dist'}{os.pathsep}ea_plugin_cli/sdk_dist"]
+
     cmd_parts = [
         f'"{sys.executable}"', "-m", "PyInstaller",
         "--noconfirm",
@@ -762,15 +824,15 @@ def build_cli():
         "--distpath", str(CLI_DIST),
         "--workpath", str(ROOT / "build" / "pyinstaller-work-cli"),
         "--specpath", str(ROOT / "build"),
-        "--paths", str(CLI_SRC),
+        *(["--paths", str(CLI_SRC)] if cli_tree else []),
         # ea_cwh rides along so `encre-plugin catalog regen|check` works in
-        # the downloaded exe too (registry-side index validation).
-        "--paths", str(ROOT / "ea-cwh"),
+        # the downloaded exe too (registry-side index validation).  With no
+        # local ea-cwh tree (fresh CI checkout) the PyPI package installed by
+        # install_deps() satisfies the hidden import from site-packages.
+        *(["--paths", str(ROOT / "ea-cwh")] if (ROOT / "ea-cwh").is_dir() else []),
         "--hidden-import", "ea_cwh",
-        # Plugin UI SDK ships as data so `encre-plugin init/sdk` works in the
-        # downloaded onefile executable without a network fetch.
-        "--add-data", f"{CLI_SRC / 'ea_plugin_cli' / 'sdk_dist'}{os.pathsep}ea_plugin_cli/sdk_dist",
-        str(CLI_SRC / "pyi_entry.py"),
+        *sdk_args,
+        str(entry_script),
     ]
     run(" ".join(cmd_parts))
 
