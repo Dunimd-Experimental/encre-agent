@@ -50,15 +50,18 @@ dependencies = [
     "Pillow>=10.0",
     "pytesseract>=0.3",
     # --- Windows OCR (winrt 3.x splits each namespace into its own
-    #     package; all three projections are required by ocr.py) ---
-    "winrt-runtime>=3.0",
-    "winrt-Windows.Media.Ocr>=1.0",
-    "winrt-Windows.Graphics.Imaging>=1.0",
-    "winrt-Windows.Storage.Streams>=1.0",
+    #     package; all three projections are required by ocr.py).
+    #     Windows Runtime builds (C++/MSVC) cannot compile on macOS/Linux,
+    #     so every winrt projection is gated to win32 or pip tries to build
+    #     them there and dies with "Unsupported compiler: unix". ---
+    "winrt-runtime>=3.0; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr>=1.0; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging>=1.0; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams>=1.0; sys_platform == 'win32'",
     # --- Desktop automation (harness computer module) ---
     "mss>=9.0",
     "pyautogui>=0.9",
-    "uiautomation>=2.0",
+    "uiautomation>=2.0; sys_platform == 'win32'",  # UIA is a Windows-only API
     "pyperclip>=1.8",
     # --- System observability ---
     "psutil>=6.0",
@@ -114,9 +117,9 @@ windows = [
     # Core OCR winrt projections moved to the main dependency list so any
     # install path (not only the [windows] extra) gets them.  This extra
     # now carries the remaining Windows-only niceties.
-    "winrt-Windows.Devices.Geolocation>=1.0",  # Native GPS location
-    "winrt-Windows.Devices.Sensors>=1.0",      # Accelerometer/gyro/light sensors
-    "pywin32>=306",                        # GPU/sensor/display info via WMI
+    "winrt-Windows.Devices.Geolocation>=1.0; sys_platform == 'win32'",  # Native GPS location
+    "winrt-Windows.Devices.Sensors>=1.0; sys_platform == 'win32'",      # Accelerometer/gyro/light sensors
+    "pywin32>=306; sys_platform == 'win32'",   # GPU/sensor/display info via WMI
 ]
 macos = [
     "pyobjc-framework-Cocoa>=10",         # Foundation/NSData for Vision OCR
