@@ -74,7 +74,11 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # Encre Agent requires Python 3.14+ — core/harness declare
+          # requires-python >= 3.14 and build.py hard-fails on older
+          # interpreters before packaging (the same interpreter is later
+          # bundled by PyInstaller).
+          python-version: '3.14'
 
       - uses: actions/setup-node@v4
         with:
