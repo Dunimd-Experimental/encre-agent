@@ -1,0 +1,57 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * You may not use this file except in compliance with the License.
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Single import point for every colour skin. The main window (styles.css)
+ * and the tray popup (tray-popup.html) both load this file, so a skin's
+ * palette exists in exactly one place and cannot drift between surfaces.
+ * Add a new skin here, in src/core/state.ts and in index.html's pre-paint
+ * list; nothing else should need to know the file names. */
+
+@import "ink.css";
+@import "spring.css";
+@import "autumn.css";
+@import "winter.css";
+@import "honey.css";
+@import "grass.css";
+@import "sky.css";
+@import "sunset.css";
+
+/* ── Mode-level interaction surfaces (NOT skin-dependent) ───────────
+   Hover and selection plates are neutral ink/paper overlays. They are
+   shared by the main window and the tray popup and never carry a skin
+   tint: a tinted plate over the universal neutral paper is what made
+   hovering a control look like a coloured blob, in every skin and in
+   both modes. Skin identity stays on accents, text and borders.
+
+   Ladder (hover < right-click target < selected). */
+html:root[data-theme="light"] {
+  /* Light plates sit on a near-white paper, so the overlay steps are
+     deliberately deeper than the dark-mode ones: at 4.5% they were
+     indistinguishable from the paper in the ink skin. */
+  --bg-hover: rgba(0, 0, 0, 0.07);
+  --bg-modifier-hover: rgba(0, 0, 0, 0.10);
+  --item-target-bg: rgba(0, 0, 0, 0.09);
+  --item-selected-bg: rgba(0, 0, 0, 0.12);
+}
+
+html:root[data-theme="dark"] {
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-modifier-hover: rgba(255, 255, 255, 0.09);
+  --item-target-bg: rgba(255, 255, 255, 0.08);
+  --item-selected-bg: rgba(255, 255, 255, 0.11);
+}

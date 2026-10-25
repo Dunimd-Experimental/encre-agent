@@ -1,7 +1,6 @@
 ---
 name: autonomous_authorization_patterns
-version: 1
-name: autonomous_authorization_patterns
+version: 2
 priority: 100
 condition: ~
 patterns:
@@ -22,9 +21,40 @@ patterns:
   - work autonomously
   - work in the background
   - run in the background
+  - 别问我
+  - 不用问我
+  - 不要问我
+  - 无需确认
+  - 不用确认
+  - 不要确认
+  - 别确认
+  - 自己决定
+  - 你自己决定
+  - 你看着办
+  - 你自己办
+  - 一口气做完
+  - 一次做完
+  - 一次做完它
+  - 全部做完
+  - 直接做完
+  - 自己跑完
+  - 跑完它
+  - 独立完成
+  - 不用管我
+  - 不要中断
+  - 别打断
+  - 中途不用汇报
+  - 不用汇报进度
 ---
 
 Phrase patterns that signal explicit user authorization for hands-off,
-long-chain autonomous execution. When the latest user instruction matches
-any of these, the checkpoint hard-gate auto-relaxes its threshold. Matching
-is case-insensitive and substring-based.
+long-chain autonomous execution. When the user's instruction matches any of
+these, the checkpoint gate is disabled for the run: the user asked the agent
+to work unattended, so pausing mid-chain would fight their explicit intent.
+
+Matching is case-insensitive and substring-based, and is applied to the
+current user message plus the most recent user turns (see
+`checkpoint_gate_relaxed` and `recent_user_texts` in `encre.loop_stability`),
+so an authorisation given once -- "你自己跑完，我要出门了" -- keeps covering the
+task it was given for. The list stays deliberately specific so ordinary
+instructions do not accidentally disable the gate.

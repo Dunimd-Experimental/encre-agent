@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -69,6 +69,32 @@ from encre.backends.base import BaseBackend
 from encre.backends.bedrock import BedrockBackend
 from encre.backends.deepseek import DeepSeekBackend
 from encre.backends.failover import FailoverBackend
+from encre.backends.gateway_providers import (
+    AtomicChatBackend,
+    AzureCognitiveBackend,
+    AzureOpenAIBackend,
+    BasetenBackend,
+    CerebrasBackend,
+    CortecsBackend,
+    DeepInfraBackend,
+    FireworksBackend,
+    FrogBotBackend,
+    HeliconeBackend,
+    IONetBackend,
+    LlamaCppBackend,
+    NebiusBackend,
+    OVHCloudBackend,
+    OllamaCloudBackend,
+    OpenAI302Backend,
+    ScalewayBackend,
+    STACKITBackend,
+    TogetherBackend,
+    VeniceBackend,
+    VercelAIGatewayBackend,
+    XAIBackend,
+    ZAIBackend,
+    ZenMuxBackend,
+)
 from encre.backends.github_copilot import GitHubCopilotBackend
 from encre.backends.glm import GLMBackend
 from encre.backends.gmi import GMIBackend
@@ -93,8 +119,10 @@ from encre.backends.volcengine import VolcengineArkBackend
 from encre.backends.xiaomi import XiaomiBackend
 from encre.utils.types import BackendFinish, BackendText
 
-# The exact names (sorted) the former hard-coded backend_map contained --
+# The exact names (sorted) the default adapter registry carries --
 # the unknown-type error message lists them, so this set is contract.
+# (Gateway providers verified against official docs live in
+# encre.backends.gateway_providers.)
 _HISTORICAL_TYPES = sorted([
     "openai", "anthropic", "ollama", "deepseek", "google", "groq",
     "local", "bedrock", "openai_compatible", "failover", "router",
@@ -102,6 +130,11 @@ _HISTORICAL_TYPES = sorted([
     "minimax", "alibaba", "kilocode", "xiaomi", "tencent", "huggingface",
     "opencode-zen", "opencode-go", "lmstudio", "github-copilot",
     "volcengine-ark",
+    "302ai", "atomic-chat", "azure-openai", "azure-cognitive", "baseten",
+    "cerebras", "cortecs", "deep-infra", "fireworks", "frogbot",
+    "helicone", "ionet", "llamacpp", "nebius", "ollama-cloud", "ovhcloud",
+    "scaleway", "stackit", "together", "venice", "vercel", "xai", "zai",
+    "zenmux",
 ])
 
 _API_KEY = "sk-adapter-test"
@@ -168,6 +201,30 @@ _EXPECTED_CLASSES = {
     "lmstudio": LMStudioBackend,
     "github-copilot": GitHubCopilotBackend,
     "volcengine-ark": VolcengineArkBackend,
+    "302ai": OpenAI302Backend,
+    "atomic-chat": AtomicChatBackend,
+    "azure-openai": AzureOpenAIBackend,
+    "azure-cognitive": AzureCognitiveBackend,
+    "baseten": BasetenBackend,
+    "cerebras": CerebrasBackend,
+    "cortecs": CortecsBackend,
+    "deep-infra": DeepInfraBackend,
+    "fireworks": FireworksBackend,
+    "frogbot": FrogBotBackend,
+    "helicone": HeliconeBackend,
+    "ionet": IONetBackend,
+    "llamacpp": LlamaCppBackend,
+    "nebius": NebiusBackend,
+    "ollama-cloud": OllamaCloudBackend,
+    "ovhcloud": OVHCloudBackend,
+    "scaleway": ScalewayBackend,
+    "stackit": STACKITBackend,
+    "together": TogetherBackend,
+    "venice": VeniceBackend,
+    "vercel": VercelAIGatewayBackend,
+    "xai": XAIBackend,
+    "zai": ZAIBackend,
+    "zenmux": ZenMuxBackend,
 }
 
 
@@ -210,20 +267,28 @@ def test_unknown_backend_type_raises_same_valueerror():
 # ----------------------------------------------------------------------
 
 class _ReplaceFirstAdapter:
+    """First of two adapters sharing a name; creates a backend tagged "first"."""
+
     name = "swap-type"
 
     def matches(self, config: BackendConfig) -> bool:
+        """Claim requests whose backend_type equals this adapter's name."""
         return config.backend_type == self.name
 
     def create(self, config: BackendConfig) -> BaseBackend:
+        """Build an OpenAIBackend whose api_key and model are tagged "first"."""
         return OpenAIBackend(api_key="first", model="first-model")
 
     def model_info(self, model_name, config=None):
+        """Decline to describe any model, letting the static registry answer."""
         return None
 
 
 class _ReplaceSecondAdapter(_ReplaceFirstAdapter):
+    """Same-named replacement whose created backend is tagged "second"."""
+
     def create(self, config: BackendConfig) -> BaseBackend:
+        """Build an OpenAIBackend whose api_key and model are tagged "second"."""
         return OpenAIBackend(api_key="second", model="second-model")
 
 
@@ -256,36 +321,46 @@ class _EchoBackend(BaseBackend):
     """
 
     def __init__(self, model: str = "echo") -> None:
+        """Store the model name and reset the chat-call counter."""
         self.model = model
         self.chat_calls = 0
 
     async def chat(self, messages, tools=None, tool_choice="auto",
                    temperature=0.0, max_tokens=4096, stream=True,
                    enable_caching=False, cache_edits_state=None):
+        """Yield one echo text event followed by a stop finish event."""
         self.chat_calls += 1
         yield BackendText(text=f"echo:{self.model}")
         yield BackendFinish(reason="stop", usage=None)
 
     def supports_tool_calling(self) -> bool:
+        """Report that the echo backend cannot call tools."""
         return False
 
     def context_window_size(self) -> int:
+        """Report the small fixed window this test backend claims."""
         return 4096
 
     def supports_prompt_caching(self) -> bool:
+        """Report that the echo backend offers no prompt caching."""
         return False
 
 
 class _EchoAdapter:
+    """Adapter routing ``test-echo`` requests to the canned echo backend."""
+
     name = "test-echo"
 
     def matches(self, config: BackendConfig) -> bool:
+        """Claim requests whose backend_type is the echo adapter's name."""
         return config.backend_type == self.name
 
     def create(self, config: BackendConfig) -> BaseBackend:
+        """Create an echo backend carrying the requested model name."""
         return _EchoBackend(model=config.model)
 
     def model_info(self, model_name, config=None):
+        """Decline to describe models; the static registry must handle them."""
         return None
 
 
@@ -300,6 +375,7 @@ def test_custom_adapter_dropin_via_public_api():
         assert be.model == "third-party-model", "factory kwargs must reach the backend"
 
         async def _drain():
+            """Consume the streaming chat response and collect every event."""
             chunks = []
             async for event in be.chat(messages=[{"role": "user", "content": "hi"}]):
                 chunks.append(event)
@@ -327,16 +403,20 @@ class _MatchAllAdapter:
     """Matches every request -- isolates pure registration-order semantics."""
 
     def __init__(self, tag: str) -> None:
+        """Bind the adapter name and tag from the given label."""
         self.name = f"precedence-{tag}"
         self.tag = tag
 
     def matches(self, config: BackendConfig) -> bool:
+        """Accept every config so only registration order can decide."""
         return True
 
     def create(self, config: BackendConfig) -> BaseBackend:
+        """Create an OpenAIBackend tagged with this adapter's label."""
         return OpenAIBackend(api_key=self.tag, model=self.tag)
 
     def model_info(self, model_name, config=None):
+        """Decline to describe models."""
         return None
 
 
@@ -360,15 +440,20 @@ def test_first_registered_match_wins():
 # ----------------------------------------------------------------------
 
 class _DescribeAdapter:
+    """Adapter that supplies metadata for unknown ``custom-*`` models."""
+
     name = "test-describe"
 
     def matches(self, config: BackendConfig) -> bool:
+        """Claim requests whose backend_type is the describe adapter's name."""
         return config.backend_type == self.name
 
     def create(self, config: BackendConfig) -> BaseBackend:
+        """Forward the config kwargs straight into an OpenAIBackend."""
         return OpenAIBackend(**config.kwargs)
 
     def model_info(self, model_name, config=None):
+        """Describe ``custom-*`` models; decline everything else."""
         if model_name.startswith("custom-"):
             return ModelInfo(
                 name=model_name, provider="custom-vendor",

@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Single source of truth for the Encre on-disk data root.
 

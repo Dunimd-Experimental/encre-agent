@@ -2,25 +2,6 @@
 
 ### Tool Use Discipline
 
-- **Absolute paths:** Always construct and use absolute file paths for all file system operations. Combine the project root with relative paths. Never assume a relative path resolves correctly.
-- **Verify first:** Use file_read / search to check file contents and project structure before making changes. Never guess at file contents — always read the actual file.
-- **Dependency checks:** Never assume a library is available. Check package.json, requirements.txt, Cargo.toml, pyproject.toml, etc. before importing or using it.
-- **Act, don't narrate:** Every "I will..." must be immediately followed by the tool call.
-- **Keep going:** Work autonomously until the task is fully resolved. Don't stop with a plan — execute it.
-
-### Grounding
-
-- **Verify first:** Use file_read / search to check file contents and project structure before making changes. Never guess at file contents — always read the actual file.
-- **Dependency checks:** Never assume a library is available. Check package.json, requirements.txt, Cargo.toml, pyproject.toml, etc. before importing or using it.
-
-### Conciseness
-
-- Keep explanatory text brief — focus on actions and results over narration.
-
-### Non-Interactive Commands
-
-- Use flags like `-y`, `--yes`, `--non-interactive` to prevent CLI tools from hanging.
-
-### Parallel Tool Calls
-
-- Batch independent reads, searches, and web fetches into a single response.
+- **Confident first-guess paths.** Confirm a path exists before using it; this family will produce one that looks right.
+- **Assumed library availability.** Read the manifest, then import.
+- **Re-sent instructions.** A repeated system-style block is the runtime's copy, not a new request from the user — do not restart the task because of it.

@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 OpenTelemetry integration for Encre.
@@ -82,7 +84,7 @@ class _NoOpSpan:
         pass
 
     def record_exception(self, exc: Exception) -> None:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
 
     def end(self) -> None:
         pass
@@ -259,4 +261,22 @@ def trace_llm_call(tracer: Any, model: str, prompt_preview: str) -> Any:
 
 
 def _truncate(text: str, max_len: int) -> str:
+    """Truncate *text* to at most *max_len* characters for span attributes.
+
+    OTLP providers may reject spans whose attributes exceed size limits.
+    Truncating long prompts, tool arguments, and error messages before
+    export prevents rejected spans and keeps telemetry payloads small.
+    The ``"..."`` suffix makes it obvious to consumers that the value
+    was cut off rather than ending naturally.
+
+    Args:
+        text: The string to truncate.
+        max_len: Maximum allowed length. The suffix ``"..."`` is
+            appended to the truncated result, so the total length may
+            be up to ``max_len + 3`` characters.
+
+    Returns:
+        The original string if it is already within the limit,
+        otherwise the first *max_len* characters plus ``"..."``.
+    """
     return text if len(text) <= max_len else text[:max_len] + "..."

@@ -23,7 +23,7 @@
 /**
  * Hover tooltip content for tabs.
  *
- * Shared by the session sidebar tabs and the ESD sub-app tab bar so both
+ * Shared by the session sidebar tabs and the Encre Agent Desktop Subwindow (ESD) sub-app tab bar so both
  * surface exactly the same information, in exactly the same order, with
  * exactly the same layout: header row (icon + title), then one field per
  * line with a muted label column — all flush left — and over-long values
@@ -175,14 +175,64 @@ export function baseName(p: string): string {
   return idx >= 0 ? clean.slice(idx + 1) : clean;
 }
 
+/**
+ * Address-bar style URL for display.
+ *
+ * The raw `location.href` percent-encodes every non-ASCII character, so a
+ * Chinese query rendered verbatim is a wall of `%E8%87%AA…` gibberish that
+ * looks nothing like what the page's own address bar shows.  Decode the
+ * pieces the way a browser address bar does: path, query values and hash
+ * arrive human-readable while the URL structure (`?`, `#`, `&`, reserved
+ * characters) stays intact.  `decodeURI` deliberately leaves `%23` encoded
+ * so an encoded `#` cannot be mistaken for the real fragment separator.
+ * Anything unparseable falls back to a best-effort decode of the raw string.
+ */
+export function formatUrlForDisplay(raw: string): string {
+  const url = (raw || "").trim();
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    let pathname = u.pathname;
+    let hash = u.hash;
+    try { pathname = decodeURI(pathname); } catch { /* keep encoded */ }
+    try { hash = decodeURI(hash); } catch { /* keep encoded */ }
+    // URLSearchParams values are already percent-decoded on iteration.
+    const params: string[] = [];
+    for (const [k, v] of u.searchParams) params.push(`${k}=${v}`);
+    const search = params.length ? `?${params.join("&")}` : "";
+    return `${u.origin}${pathname}${search}${hash}`;
+  } catch {
+    try { return decodeURI(url); } catch { return url; }
+  }
+}
+
+/**
+ * Hard ceiling for the tooltip header title.
+ *
+ * The CSS ellipsis on `.tt-title` is the primary cut, but it leans on the
+ * whole flex shrink chain holding up; when any link in that chain fails the
+ * CJK title smears past the fixed-width panel instead of stopping.  The cap
+ * makes the truncation deterministic: 64 code points, then an ellipsis.
+ */
+const MAX_TOOLTIP_TITLE = 64;
+function capTitle(text: string): string {
+  const s = (text || "").trim();
+  if (s.length <= MAX_TOOLTIP_TITLE) return s;
+  return `${Array.from(s).slice(0, MAX_TOOLTIP_TITLE).join("")}…`;
+}
+
 /** Turn raw tab data into the tooltip model both tab bars render. */
 export function buildTabTooltip(data: TabTooltipData, intlLocale?: string): TooltipModel {
   const rows: TooltipModel["rows"] = [];
   const location = (data.location || "").trim();
-  if (location && location !== "about:blank" && !location.startsWith("chrome-error://")) {
+  // URLs render address-bar style (percent-decoded); the CSS ellipsis on the
+  // row is the truncation mechanism, so over-long URLs cut cleanly at the
+  // panel edge instead of ballooning it.
+  const locationText = data.isUrl ? formatUrlForDisplay(location) : location;
+  if (locationText && location !== "about:blank" && !location.startsWith("chrome-error://")) {
     // No label: an https:// URL is plainly a URL and an absolute path is
     // plainly a path — captioning either one adds nothing.
-    rows.push({ value: location });
+    rows.push({ value: locationText });
   }
   if (typeof data.size === "number" && data.size >= 0) {
     const sizeText = formatFileSize(data.size);
@@ -192,8 +242,13 @@ export function buildTabTooltip(data: TabTooltipData, intlLocale?: string): Tool
     const timeText = formatTimestamp(data.mtime, intlLocale);
     if (timeText) rows.push({ label: t("tabTooltip.modified"), value: timeText });
   }
+  // The header title can fall back to the URL when a page ships no title —
+  // decode it there too, so the fallback never prints encoded gibberish.
+  const titleText = data.isUrl && data.title === location
+    ? formatUrlForDisplay(data.title)
+    : data.title;
   return {
-    title: (data.title || location || "").trim(),
+    title: capTitle(titleText || locationText || ""),
     icon: data.icon,
     rows,
     permissions: buildPermissions(data.permissions),

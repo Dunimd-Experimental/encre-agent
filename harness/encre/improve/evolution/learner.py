@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Experience-learning component of the evolution subsystem.
 
@@ -155,7 +157,7 @@ class EncreEvolutionLearner:
         self._tool_success_index: dict[str, list[int]] = {}
         self._tool_error_index: dict[str, list[int]] = {}
 
-    # 鈹€鈹€ Recording 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Recording ──────────────────────────────────────────────
 
     def record_success(
         self,
@@ -239,7 +241,7 @@ class EncreEvolutionLearner:
             rec.resolved = True
             rec.timestamp = time.time()
 
-    # 鈹€鈹€ Retrieval 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Retrieval ──────────────────────────────────────────────
 
     def get_guidance(self, tool_name: str, context: str) -> str:
         """Build a guidance string of past mistakes and proven approaches."""
@@ -287,7 +289,7 @@ class EncreEvolutionLearner:
             "top_tools_by_error": self._top_tools(self._tool_error_index, 5),
         }
 
-    # 鈹€鈹€ Internal 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Internal ───────────────────────────────────────────────
 
     def _get_relevant_errors(self, tool_name: str, context: str) -> list[str]:
         """Return the most relevant open errors for this tool/context."""
@@ -386,7 +388,7 @@ class EncreEvolutionLearner:
         counts.sort(key=lambda x: x[1], reverse=True)
         return [{"tool_name": name, "count": c} for name, c in counts[:n]]
 
-    # 鈹€鈹€ Persistence 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Persistence ────────────────────────────────────────────
 
     def save(self) -> None:
         """Persist successes and errors (encrypted when available)."""
@@ -395,8 +397,11 @@ class EncreEvolutionLearner:
             "errors": [r.to_dict() for r in self._errors],
         }
         payload = json.dumps(data, ensure_ascii=False, indent=2)
-        with contextlib.suppress(Exception):
+        try:
             payload = encrypt(payload)
+        except Exception:
+            # Fail-closed: never persist experience records as plaintext.
+            raise
         os.makedirs(os.path.dirname(self._storage_path), exist_ok=True)
         with open(self._storage_path, "w", encoding="utf-8") as f:
             f.write(payload)
@@ -428,7 +433,7 @@ class EncreEvolutionLearner:
         self._tool_error_index.clear()
 
 
-# 鈹€鈹€ Helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Helpers ─────────────────────────────────────────────────────
 
 def _extract_signature(text: str) -> str:
     """Normalise text into a whitespace-joined token signature."""

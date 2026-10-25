@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,14 +21,17 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import json
+import logging
 import re
 import shlex
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 from encre.autosafety import EncreAutoSafetyClassifier
 from encre.config import EncreConfig
@@ -52,6 +55,8 @@ from encre.utils.types import (
     PermissionDecision,
     PermissionDeny,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DangerLevel(Enum):
@@ -83,196 +88,148 @@ class BashAnalysis:
     network_targets: list[str] = field(default_factory=list)
     subcommands: list[str] = field(default_factory=list)
     shlex_error_type: str = ""  # "", "unbalanced_quote", "injection_detected"
+    #: Blacklist verdicts from the Rust engine: ``{severity, category, pattern}``.
+    #: Populated by :func:`_dangerous_matches`; the source of the danger level.
+    danger_hits: list[dict[str, str]] = field(default_factory=list)
 
 
-# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
-# Immune paths -- always-deny for destructive ops even in bypass mode
-# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+#: Engine ``category`` -> the ``BashAnalysis`` flags it implies. The blacklist
+#: itself lives in ``dangerous_commands.txt``; this map only translates a
+#: verdict into the shape callers of this module already read.
+_DANGER_CATEGORY_FLAGS: dict[str, tuple[str, ...]] = {
+    "fs": ("contains_file_write",),
+    "priv-esc": ("contains_privilege_escalation", "contains_system_modification"),
+    "shell": ("contains_network_access",),
+    "remote-exec": ("contains_network_access",),
+    "exfil": ("contains_network_access",),
+    "network": ("contains_network_access", "contains_system_modification"),
+    "obfuscation": ("contains_encoded_content",),
+    "system": ("contains_system_modification",),
+    "package": ("contains_system_modification",),
+    "persistence": ("contains_system_modification",),
+    "power": ("contains_system_modification",),
+    "resource": (),
+    "disclosure": (),
+}
 
-# Path fragments (normalized forward-slash, lowercased) that must never be
-# touched by a destructive tool call, regardless of permission mode.  These
-# cover agent/runtime config (``.git/``, ``.claude/``), shell init files
-# (``~/.bashrc`` etc., hijackable on next shell spawn), and SSH credentials
-# (``~/.ssh/``, exfiltration / forgery risk).  Read access to these is left
-# to the Rust engine; this layer only guards writes/deletes.
-IMMUNE_PATH_FRAGMENTS: tuple[str, ...] = (
-    "/.git/",          # git internal dir (HEAD/refs/objects/config)
-    "/.claude/",       # agent config dir
-    "/.ssh/",          # SSH keys / known_hosts
-    "/.bashrc",
-    "/.zshrc",
-    "/.bash_profile",
-    "/.zprofile",
-    "/.gitconfig",
-)
+#: Readable name for a verdict, so a blocked command explains itself to the
+#: model and the user instead of surfacing a raw regex.
+_DANGER_CATEGORY_LABEL: dict[str, str] = {
+    "fs": "filesystem destruction",
+    "priv-esc": "privilege escalation",
+    "shell": "reverse shell / interactive shell",
+    "remote-exec": "remote code piped into an interpreter",
+    "exfil": "data exfiltration",
+    "network": "network or firewall change",
+    "obfuscation": "encoded or obfuscated execution",
+    "system": "system service or kernel change",
+    "package": "destructive package operation",
+    "persistence": "persistence or boot modification",
+    "power": "power state change",
+    "resource": "resource exhaustion",
+    "disclosure": "sensitive file read",
+}
 
-# Bare filenames (no slash) matched at the path tail, for home-relative files
-# when the path is exactly ``~/.bashrc`` etc.
-IMMUNE_PATH_BASENAMES: tuple[str, ...] = (
-    ".bashrc",
-    ".zshrc",
-    ".bash_profile",
-    ".zprofile",
-    ".gitconfig",
-)
-
-# Tool names whose primary effect is mutating the filesystem; used as a
-# fallback when the tool object is unavailable and ``is_destructive`` cannot
-# be probed directly.
-_WRITE_TOOL_NAMES: frozenset[str] = frozenset({
-    "file_write", "write_file", "file_edit", "edit_file", "file_delete",
-    "delete_file", "apply_patch", "patch", "bash", "shell", "execute",
-    "git_tool", "git", "mv", "cp", "rm", "sed", "tee",
-})
+#: ``severity`` strings used by ``dangerous_commands.txt`` -> DangerLevel, plus
+#: the ordering the worst-of-N comparison walks.
+_DANGER_SEVERITY_LEVEL: dict[str, DangerLevel] = {
+    "critical": DangerLevel.CRITICAL,
+    "high": DangerLevel.HIGH,
+    "medium": DangerLevel.MEDIUM,
+    "low": DangerLevel.LOW,
+    "safe": DangerLevel.SAFE,
+}
+_DANGER_SEVERITY_ORDER: dict[str, int] = {
+    "safe": 0, "low": 1, "medium": 2, "high": 3, "critical": 4,
+}
 
 
-def _normalize_path_for_immune_check(raw: str) -> str:
-    """Expand ``~`` / strip quotes / forward-slash-normalize a path fragment."""
-    import os
+def _dangerous_matches(command: str) -> list[dict[str, str]]:
+    """Every blacklist rule the command hits, as decided by the Rust engine.
 
-    norm = os.path.expanduser(raw.strip().strip("'\""))
-    return norm.replace("\\", "/").lower()
-
-
-def _extract_tool_target_paths(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
-    """Pull path-like strings out of a tool call for immune-path matching.
-
-    Covers direct path fields used by the file family, ``+++ b/...`` markers
-    from unified diffs (``apply_patch``), and bash redirect / mv / cp / rm /
-    tee targets.  Not exhaustive -- false negatives simply fall through to the
-    normal permission path, never a false allow.
+    ``all_sections`` widens the pattern set past the host's own shell families:
+    a review happens before the interpreter is settled, so a Linux shape seen on
+    a Windows host must still be classified. Enforcement is unaffected -- it
+    keeps going through ``permission_check_mode``, which stays host-scoped.
     """
-    out: list[str] = []
-    for key in ("path", "file_path", "filename", "filepath", "target", "dest", "destination"):
-        val = tool_input.get(key)
-        if isinstance(val, str) and val.strip():
-            out.append(val)
+    import json
 
-    patch = tool_input.get("patch") or tool_input.get("diff")
-    if isinstance(patch, str):
-        for m in re.finditer(r"^\+\+\+\s+b/(.+)$", patch, re.MULTILINE):
-            out.append(m.group(1).strip())
-        for m in re.finditer(r"^---\s+a/(.+)$", patch, re.MULTILINE):
-            out.append(m.group(1).strip())
+    from encre import native as _native
+    _ensure_danger_table()
+    try:
+        return list(_native.permission_dangerous_matches(
+            "bash", json.dumps({"command": command}, ensure_ascii=False), True,
+        ))
+    except Exception as exc:  # pragma: no cover - native is mandatory
+        logger.warning("dangerous-match unavailable: %s", exc)
+        return []
 
-    cmd = tool_input.get("command") or tool_input.get("cmd")
-    if isinstance(cmd, str) and cmd.strip():
-        # Redirect targets:  >foo  >>foo  (write/append)
-        for m in re.finditer(r"(?:>>?|tee(?:\s+-a)?)\s*([^\s|;&<>]+)", cmd):
-            out.append(m.group(1))
-        # mv / cp destination (second path argument).
-        for m in re.finditer(r"\b(?:mv|cp)\s+(?:-[rRfv]+\s+)?(\S+)\s+(\S+)", cmd):
-            out.append(m.group(2))
-        # rm / rmdir target.
-        for m in re.finditer(r"\b(?:rm|rmdir)\s+(?:-[rRfv]+\s+)?(\S+)", cmd):
-            out.append(m.group(1))
-        # sed -i edits its target argument.
-        for m in re.finditer(r"\bsed\s+.*?-i\b\s*\S*\s+(\S+)", cmd):
-            out.append(m.group(1))
-        # Raw tokens that visibly reference an immune dir (defensive catch-all).
-        for tok in re.split(r"\s+", cmd):
-            if any(frag in tok for frag in (".git/", ".ssh/", ".claude/", ".bashrc", ".zshrc", ".gitconfig")):
-                out.append(tok)
-    return out
+
+#: The shipped blacklist is loaded once per process. ``analyze_bash_command`` is
+#: a module function that callers reach without constructing an
+#: :class:`EncreSafetyEngine`, so it cannot assume the engine already holds the
+#: table -- an empty table would silently classify everything as safe.
+_DANGER_TABLE_LOADED = False
+
+
+def _ensure_danger_table() -> None:
+    """Push ``dangerous_commands.txt`` into the engine if nothing has yet."""
+    global _DANGER_TABLE_LOADED
+    if _DANGER_TABLE_LOADED:
+        return
+    _DANGER_TABLE_LOADED = True
+    from pathlib import Path
+
+    from encre import native as _native
+    path = Path(__file__).parent / "dangerous_commands.txt"
+    if path.exists():
+        try:
+            _native.permission_set_dangerous_patterns(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - native is mandatory
+            logger.warning("dangerous-command table unavailable: %s", exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Immune paths -- always-deny for destructive ops even in bypass mode
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Immune-path enforcement lives entirely in the Rust permission engine
+# (``IMMUNE_PATH_FRAGMENTS`` / ``WRITE_TOOLS`` in permission.rs): the table,
+# the target-path extraction and the matching are all native, and the floor
+# is evaluated inside the engine's decision pipeline.  Python performs no
+# permission logic of its own -- the compiled extension is a mandatory
+# runtime component and every helper below is a direct native call.
 
 
 def matches_immune_path(raw_path: str) -> str | None:
-    """Return the matched immune fragment, or ``None`` if the path is clean."""
-    if not raw_path or not raw_path.strip():
-        return None
-    norm = _normalize_path_for_immune_check(raw_path)
-    if not norm:
-        return None
-    # Ensure a leading slash so fragment matching is unambiguous when the
-    # caller passes a bare relative path like ".git/config".
-    probe = norm if norm.startswith("/") else "/" + norm
-    for frag in IMMUNE_PATH_FRAGMENTS:
-        if frag in probe:
-            return frag.strip("/")
-    # Basename match at tail (e.g. "~/x/.bashrc" or "~/.bashrc").
-    tail = norm.rsplit("/", 1)[-1]
-    if tail in IMMUNE_PATH_BASENAMES:
-        return tail
-    return None
+    """Return the matched immune fragment, or ``None`` if the path is clean.
+
+    Direct native call into the Rust permission engine -- no Python fallback;
+    the compiled extension is a mandatory runtime component.
+    """
+    from encre import native as _native
+    hit = _native.permission_check_immune_path(raw_path or "")
+    return str(hit) if hit else None
 
 
-# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+# ═══════════════════════════════════════════════════════════════════════════
 # Injection detection patterns -- 30+ categories
-# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+# ═══════════════════════════════════════════════════════════════════════════
 
 # Command substitution (primary injection vector)
 _RE_COMMAND_SUBSTITUTION_DOLLAR = re.compile(r'\$\(.+\)', re.DOTALL)
 _RE_COMMAND_SUBSTITUTION_BACKTICK = re.compile(r'`[^`]+`')
 _RE_PROCESS_SUBSTITUTION = re.compile(r'[<(]\([^)]+\)')
 
-# Destructive file operations
-_RE_RM_RF_ROOT = re.compile(r'\brm\s+.*-(?:[a-z]*r[a-z]*f|rf).*/(?:\s|$)', re.IGNORECASE)
-_RE_RM_RF_HOME = re.compile(r'\brm\s+.*-(?:[a-z]*r[a-z]*f|rf)\s+~', re.IGNORECASE)
-_RE_RM_STAR = re.compile(r'\brm\s+.*-(?:[a-z]*r[a-z]*f|rf)\s+\*', re.IGNORECASE)
-_RE_MKFS = re.compile(r'\bmkfs\.?\w*\s', re.IGNORECASE)
-_RE_DD_WRITE = re.compile(r'\bdd\s+if=.*\s+of=', re.IGNORECASE)
-_RE_REDIRECT_DEV = re.compile(r'>\s*/dev/(?:sd[a-z]+|nvme\d+n\d+|mmcblk\d+)', re.IGNORECASE)
-_RE_REDIRECT_DISK = re.compile(r'>\s*/dev/(?:disk|block|mapper)/', re.IGNORECASE)
-_RE_REDIRECT_ETC = re.compile(r'>\s*/etc/(?:passwd|shadow|sudoers|hosts|resolv\.conf)', re.IGNORECASE)
-_RE_REDIRECT_SYSTEM = re.compile(r'>\s*/(?:etc|boot|sys|proc|dev)/', re.IGNORECASE)
-
-# Privilege escalation
-_RE_SUDO = re.compile(r'\bsudo\b', re.IGNORECASE)
-_RE_CHMOD_777_ROOT = re.compile(r'\bchmod\s+.*777\s+/', re.IGNORECASE)
-_RE_CHMOD_777 = re.compile(r'\bchmod\s+.*777\b', re.IGNORECASE)
-_RE_CHOWN_ROOT = re.compile(r'\bchown\s+.*root', re.IGNORECASE)
-_RE_SU = re.compile(r'\bsu\s+-', re.IGNORECASE)
-_RE_SETUID = re.compile(r'\bchmod\s+[0-7]*[456][0-7]{2}\b', re.IGNORECASE)
 
 # Fork bombs
 _RE_FORK_BOMB = re.compile(r':\(\)\s*\{[^}]*:\|[^}]*:[^}]*\}', re.IGNORECASE)
-_RE_FORK_BOMB_VAR = re.compile(r'(\w+)\s*\(\s*\)\s*\{\s*[^}]*\1\s*\|', re.IGNORECASE)
 
-# Reverse shells and network exploitation
-_RE_REVERSE_SHELL_BASH = re.compile(r'\bbash\s+-i\s*>&.*0>&1', re.IGNORECASE)
-_RE_REVERSE_SHELL_NC = re.compile(r'\bnc\s+.*-(?:e|(?:l|n)vp?)\s', re.IGNORECASE)
-_RE_REVERSE_SHELL_PYTHON = re.compile(
-    r'python[23]?\s+-c\s+.*socket\.(?:socket|connect)', re.IGNORECASE
-)
-_RE_REVERSE_SHELL_SOCAT = re.compile(r'\bsocat\s+.*exec:', re.IGNORECASE)
-_RE_REVERSE_SHELL_TELNET = re.compile(r'\btelnet\s+.*(?:/bin/sh|/bin/bash|cmd)', re.IGNORECASE)
-_RE_BIND_SHELL = re.compile(r'\bnc\s+-[lL].*-p\s+\d+\s+-e', re.IGNORECASE)
-_RE_CURL_PIPE_SHELL = re.compile(r'\bcurl\s+\S+.*\|\s*(?:ba)?sh\b', re.IGNORECASE)
-_RE_WGET_PIPE_SHELL = re.compile(r'\bwget\s+\S+.*-O\s*-\s*\|\s*(?:ba)?sh\b', re.IGNORECASE)
-
-# Encoded/obfuscated content (evasion techniques)
-_RE_BASE64_EVAL = re.compile(r'\bbase64\s+.*\|.*(?:ba)?sh\b', re.IGNORECASE)
-_RE_BASE64_DECODE = re.compile(r'\bbase64\s+(?:-d|--decode)', re.IGNORECASE)
-_RE_HEX_EVAL = re.compile(r'\bxxd\s+.*-r.*(?:ba)?sh\b', re.IGNORECASE)
-_RE_EVAL = re.compile(r'\beval\s', re.IGNORECASE)
-_RE_EXEC = re.compile(r'\bexec\s+\d*>&\d*', re.IGNORECASE)
-
-# System modification
-_RE_SYSTEMCTL = re.compile(r'\bsystemctl\s+(?:stop|disable|mask)\s', re.IGNORECASE)
-_RE_SERVICE = re.compile(r'\bservice\s+\S+\s+stop\b', re.IGNORECASE)
-_RE_MODPROBE = re.compile(r'\bmodprobe\s+-r\s', re.IGNORECASE)
-_RE_KILL = re.compile(r'\bkill\s+-9\s', re.IGNORECASE)
-_RE_PKILL = re.compile(r'\bpkill\s', re.IGNORECASE)
-_RE_MOUNT = re.compile(r'\bmount\s', re.IGNORECASE)
-_RE_UMOUNT = re.compile(r'\bumount\s', re.IGNORECASE)
-_RE_CRONTAB_MODIFY = re.compile(r'\bcrontab\s+-', re.IGNORECASE)
-_RE_AT_CMD = re.compile(r'\bat\s+\d', re.IGNORECASE)
-_RE_IPTABLES = re.compile(r'\biptables\s+-[ADIF]', re.IGNORECASE)
-
-# Information disclosure
-_RE_CAT_SHADOW = re.compile(r'\bcat\s+/etc/(?:shadow|passwd)\b', re.IGNORECASE)
-_RE_CAT_SSH_KEY = re.compile(r'\bcat\s+.*\.ssh/', re.IGNORECASE)
-_RE_READ_ENV = re.compile(r'\bcat\s+.*\.env\b', re.IGNORECASE)
 
 # Variable expansion trickery (PATH manipulation, etc.)
 _RE_PATH_VAR_MANIP = re.compile(r'\$\{(?:PATH|HOME|SHELL|IFS)[:#%/]', re.IGNORECASE)
 _RE_IFS_MANIP = re.compile(r'\bIFS\s*=', re.IGNORECASE)
 
-# Network: data exfiltration
-_RE_NETCAT_SEND = re.compile(r'\bnc\s+\S+\s+\d+\s*<', re.IGNORECASE)
-_RE_CURL_UPLOAD = re.compile(r'\bcurl\s+.*-F\s+\S+@\S+', re.IGNORECASE)
-_RE_SCP = re.compile(r'\bscp\s+\S+@', re.IGNORECASE)
-_RE_SSH_TUNNEL = re.compile(r'\bssh\s+-[DRL]\s', re.IGNORECASE)
 
 # Brace expansion (bash) -- {a,b} expands to multiple tokens, letting an
 # attacker construct filenames/patterns that evade single-token regex
@@ -286,9 +243,6 @@ _RE_BRACE_EXPANSION = re.compile(r'\{[^{}]*,[^{}]*\}')
 # negative lookahead avoids matching unrelated vars like $IFSHOME.
 _RE_IFS_REFERENCE = re.compile(r'\$\{?IFS\}?(?![A-Za-z0-9_])', re.IGNORECASE)
 
-# /proc/<pid>/(environ|cmdline|maps|smaps) -- environment-variable and
-# memory-map disclosure via procfs (leaks secrets, ASLR base addresses).
-_RE_PROC_ENVIRON = re.compile(r'/proc/\S*/(?:environ|cmdline|maps|smaps|auxv)\b', re.IGNORECASE)
 
 # Backslash command-name fragmentation -- escapes inside a command word
 # to evade token-anchored regex (c\at -> cat).  shlex de-escapes these at
@@ -335,7 +289,7 @@ def analyze_bash_command(command: str) -> BashAnalysis:
     """
     analysis = BashAnalysis(command=command)
 
-    # 鈹€鈹€ Layer 1: Tokenization 鈹€鈹€
+    # ── Layer 1: Tokenization ──
     try:
         tokens = shlex.split(command)
         analysis.subcommands = []
@@ -361,7 +315,7 @@ def analyze_bash_command(command: str) -> BashAnalysis:
             )
         analysis.injection_detected = True
 
-    # 鈹€鈹€ Layer 2: Unicode homoglyph detection 鈹€鈹€
+    # ── Layer 2: Unicode homoglyph detection ──
     for i, ch in enumerate(command):
         cat = unicodedata.category(ch)
         # Cf = format characters (zero-width spaces, BOM, etc.)
@@ -397,7 +351,7 @@ def analyze_bash_command(command: str) -> BashAnalysis:
             " -- log/display differential"
         )
 
-    # 鈹€鈹€ Layer 3: Pattern matching 鈹€鈹€
+    # ── Layer 3: Pattern matching ──
 
     # Command substitution
     if _RE_COMMAND_SUBSTITUTION_DOLLAR.search(command):
@@ -415,110 +369,32 @@ def analyze_bash_command(command: str) -> BashAnalysis:
     if re.search(r'[;&](?:\s*\n?\s*)(?:rm|dd|mkfs|chmod|chown|kill|reboot|shutdown)', command, re.IGNORECASE):
         analysis.contains_chained_command = True
 
-    # Destructive file ops
-    for pattern, desc in [
-        (_RE_RM_RF_ROOT, "rm -rf on root path"),
-        (_RE_RM_RF_HOME, "rm -rf on home directory"),
-        (_RE_RM_STAR, "rm -rf * (recursive delete all)"),
-        (_RE_MKFS, "mkfs (filesystem format)"),
-        (_RE_DD_WRITE, "dd write to block device"),
-        (_RE_REDIRECT_DEV, "redirect to device"),
-        (_RE_REDIRECT_DISK, "redirect to disk"),
-        (_RE_REDIRECT_ETC, "redirect overwrite system config"),
-        (_RE_REDIRECT_SYSTEM, "redirect overwrite system path"),
-    ]:
-        if pattern.search(command):
-            analysis.contains_file_write = True
-            analysis.injection_details.append(desc)
+    # ── Blacklist: answered by the Rust engine, never re-implemented here.
+    #
+    # ``dangerous_commands.txt`` is the single definition of what counts as a
+    # dangerous command; it now carries ``severity`` and ``category`` per block,
+    # so the flags and the danger level below are derived from engine verdicts
+    # rather than from a second, drifting copy of the patterns in Python.
+    # ``all_sections`` is used because an inspection happens before the shell is
+    # settled: a Linux shape reviewed on a Windows host must still be recognised.
+    # Enforcement (``permission_check_mode``) stays host-scoped and is unaffected.
+    for hit in _dangerous_matches(command):
+        severity = str(hit.get("severity") or "high")
+        category = str(hit.get("category") or "")
+        pattern = str(hit.get("pattern") or "")
+        analysis.danger_hits.append({
+            "severity": severity,
+            "category": category,
+            "pattern": pattern,
+        })
+        for flag in _DANGER_CATEGORY_FLAGS.get(category, ()):
+            setattr(analysis, flag, True)
+        if severity in ("critical", "high"):
             analysis.injection_detected = True
-
-    # Privilege escalation
-    if _RE_SUDO.search(command):
-        analysis.contains_privilege_escalation = True
-        analysis.injection_details.append("sudo detected")
-    for pattern, desc in [
-        (_RE_CHMOD_777_ROOT, "chmod 777 on root path"),
-        (_RE_CHMOD_777, "chmod 777 (world-writable)"),
-        (_RE_CHOWN_ROOT, "chown to root"),
-        (_RE_SU, "su - (switch user)"),
-        (_RE_SETUID, "setuid/setgid bit set"),
-    ]:
-        if pattern.search(command):
-            analysis.contains_privilege_escalation = True
-            analysis.contains_system_modification = True
-            analysis.injection_details.append(desc)
-            analysis.injection_detected = True
-
-    # Fork bombs
-    if _RE_FORK_BOMB.search(command):
-        analysis.injection_details.append("fork bomb detected")
-        analysis.injection_detected = True
-
-    # Reverse shells
-    for pattern, desc in [
-        (_RE_REVERSE_SHELL_BASH, "bash reverse shell"),
-        (_RE_REVERSE_SHELL_NC, "netcat reverse shell"),
-        (_RE_REVERSE_SHELL_PYTHON, "Python reverse shell"),
-        (_RE_REVERSE_SHELL_SOCAT, "socat reverse shell"),
-        (_RE_REVERSE_SHELL_TELNET, "telnet reverse shell"),
-        (_RE_BIND_SHELL, "netcat bind shell"),
-    ]:
-        if pattern.search(command):
-            analysis.contains_network_access = True
-            analysis.injection_details.append(desc)
-            analysis.injection_detected = True
-
-    # Pipe to shell (curl/wget | bash)
-    if _RE_CURL_PIPE_SHELL.search(command):
-        analysis.contains_network_access = True
-        analysis.injection_details.append("curl piped to shell -- code execution from network")
-        analysis.injection_detected = True
-    if _RE_WGET_PIPE_SHELL.search(command):
-        analysis.contains_network_access = True
-        analysis.injection_details.append("wget piped to shell -- code execution from network")
-        analysis.injection_detected = True
-
-    # Encoded/obfuscated content
-    for pattern, desc in [
-        (_RE_BASE64_EVAL, "base64 piped to shell"),
-        (_RE_BASE64_DECODE, "base64 decode"),
-        (_RE_HEX_EVAL, "hex decode piped to shell"),
-        (_RE_EVAL, "eval command"),
-        (_RE_EXEC, "exec with redirection"),
-    ]:
-        if pattern.search(command):
-            analysis.contains_encoded_content = True
-            analysis.injection_details.append(desc)
-            analysis.injection_detected = True
-
-    # System modification
-    for pattern, desc in [
-        (_RE_SYSTEMCTL, "systemctl stop/disable"),
-        (_RE_SERVICE, "service stop"),
-        (_RE_MODPROBE, "modprobe -r (remove kernel module)"),
-        (_RE_KILL, "kill -9 (force kill)"),
-        (_RE_PKILL, "pkill"),
-        (_RE_MOUNT, "mount"),
-        (_RE_UMOUNT, "umount"),
-        (_RE_CRONTAB_MODIFY, "crontab modification"),
-        (_RE_AT_CMD, "at command (scheduled execution)"),
-        (_RE_IPTABLES, "iptables modification"),
-    ]:
-        if pattern.search(command):
-            analysis.contains_system_modification = True
-            analysis.injection_details.append(desc)
-            analysis.injection_detected = True
-
-    # Information disclosure (read-only -- does not affect contains_file_write)
-    for pattern, desc in [
-        (_RE_CAT_SHADOW, "read /etc/shadow or /etc/passwd"),
-        (_RE_CAT_SSH_KEY, "read SSH private keys"),
-        (_RE_READ_ENV, "read .env secrets"),
-        (_RE_PROC_ENVIRON, "read /proc/<pid>/(environ|cmdline|maps) -- secret/address disclosure"),
-    ]:
-        if pattern.search(command):
-            analysis.injection_details.append(desc)
-            analysis.injection_detected = True
+        analysis.injection_details.append(
+            f"{_DANGER_CATEGORY_LABEL.get(category, category or 'dangerous command')} "
+            f"[{severity}]"
+        )
 
     # Variable manipulation tricks
     if _RE_PATH_VAR_MANIP.search(command):
@@ -549,31 +425,24 @@ def analyze_bash_command(command: str) -> BashAnalysis:
             "brace expansion {a,b} -- may evade single-token pattern checks"
         )
 
-    # Data exfiltration
-    for pattern, desc in [
-        (_RE_NETCAT_SEND, "netcat data exfiltration"),
-        (_RE_CURL_UPLOAD, "curl file upload"),
-        (_RE_SCP, "scp to remote host"),
-        (_RE_SSH_TUNNEL, "SSH tunnel"),
-    ]:
-        if pattern.search(command):
-            analysis.contains_network_access = True
-            analysis.injection_details.append(desc)
-
     # Network detection (broad, lower priority)
     if re.search(r'\b(curl|wget|nc|ncat|socat)\s', command, re.IGNORECASE):
         analysis.contains_network_access = True
 
-    # 鈹€鈹€ Layer 4: Danger level classification 鈹€鈹€
-    if analysis.injection_details:
-        critical_patterns = [
-            "reverse shell", "bind shell", "fork bomb", "rm -rf on root",
-            "mkfs", "dd write", "curl piped to shell", "wget piped to shell",
-            "redirect to device", "redirect to disk", "modprobe -r",
-        ]
-        if any(p in " ".join(analysis.injection_details).lower() for p in critical_patterns):
-            analysis.danger_level = DangerLevel.CRITICAL
-        elif analysis.contains_privilege_escalation or analysis.contains_system_modification:
+    # ── Layer 4: Danger level classification ──
+    # The engine's worst verdict leads; the structural layers can only escalate.
+    if analysis.danger_hits:
+        worst = max(
+            (str(h.get("severity") or "high") for h in analysis.danger_hits),
+            key=lambda s: _DANGER_SEVERITY_ORDER.get(s, 1),
+        )
+        analysis.danger_level = _DANGER_SEVERITY_LEVEL.get(worst, DangerLevel.HIGH)
+        if not analysis.injection_detected:
+            analysis.injection_detected = True
+    elif analysis.injection_details:
+        # No blacklist hit: the structural signals still escalate, exactly as
+        # before, so evasion shapes cannot be downgraded by this refactor.
+        if analysis.contains_privilege_escalation or analysis.contains_system_modification:
             analysis.danger_level = DangerLevel.HIGH
         elif analysis.contains_file_write or analysis.contains_network_access:
             analysis.danger_level = DangerLevel.MEDIUM
@@ -628,41 +497,48 @@ class EncreSafetyEngine:
     def __init__(
         self,
         config: EncreConfig,
-        sandbox_enabled: bool = False,
+        sandbox_enabled: bool | None = None,
         sandbox_config: SandboxConfig | None = None,
         workspace: str = "",
         auto_classifier: EncreAutoSafetyClassifier | None = None,
     ) -> None:
         self.config = config
 
-        # Load dangerous command patterns from file if not already set, and
-        # push the raw rule text into the Rust engine so the dangerous-
-        # command blacklist does not depend on working-directory probing.
+        # Push the blacklist into the Rust engine so it is defined in exactly
+        # one place, with its section tags intact.  The engine is a mandatory
+        # runtime component, so this is a direct native call.
+        #
+        # ``dangerous_command_patterns`` is the documented way for an operator
+        # to extend the list (docs/SECURITY.md); those extras are appended as
+        # [universal] rules so they apply under every shell, and the whole
+        # table still reaches the engine in a single push.
         patterns_path = Path(__file__).parent / "dangerous_commands.txt"
-        if not config.dangerous_command_patterns and patterns_path.exists():
-            loaded: list[str] = []
-            for line in patterns_path.read_text(encoding="utf-8").splitlines():
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#") and not stripped.startswith("["):
-                    loaded.append(stripped)
-            config.dangerous_command_patterns = loaded
-        try:
-            from encre import native as _native
-            if hasattr(_native, "permission_set_dangerous_patterns") and patterns_path.exists():
-                _native.permission_set_dangerous_patterns(
-                    patterns_path.read_text(encoding="utf-8")
-                )
-        except Exception:
-            # Native engine unavailable or older build without the API;
-            # its cwd-based fallback load still applies.
-            pass
-
-        self._sensitive_patterns: list[re.Pattern[str]] = [
-            re.compile(r"(?:api[_-]?key|apikey|secret|password|token|credential|AUTH_TOKEN|PRIVATE_KEY|AWS_SECRET|GITHUB_TOKEN)", re.IGNORECASE),
+        table_text = patterns_path.read_text(encoding="utf-8") if patterns_path.exists() else ""
+        extra = [
+            str(pattern).strip()
+            for pattern in (getattr(config, "dangerous_command_patterns", None) or [])
+            if str(pattern).strip()
         ]
+        if extra:
+            table_text = f"{table_text}\n[universal]\n" + "\n".join(extra)
+        if table_text.strip():
+            from encre import native as _native
+            _native.permission_set_dangerous_patterns(table_text)
+        # The engine push is authoritative (it folds the operator extras in), so
+        # the lazy default load in _ensure_danger_table must not run after it.
+        global _DANGER_TABLE_LOADED
+        _DANGER_TABLE_LOADED = True
 
-        self.sandbox_enabled = sandbox_enabled
-        if sandbox_enabled and workspace:
+        # Honor the config-level sandbox switch when the caller does not
+        # pass an explicit override.  Note the sandbox instance itself is
+        # inert until ``mode`` is CONTAINER/HYBRID (see
+        # ``require_container_sandbox``), so a plain default config keeps
+        # host execution.
+        self.sandbox_enabled = (
+            bool(sandbox_enabled) if sandbox_enabled is not None
+            else bool(getattr(config, "sandbox_enabled", False))
+        )
+        if self.sandbox_enabled and workspace:
             # Build a comprehensive sandbox config from the EncreConfig
             sc = sandbox_config or SandboxConfig()
 
@@ -786,18 +662,13 @@ class EncreSafetyEngine:
     def _dangerous_rule(self, tool_name: str, tool_input: dict[str, Any]) -> str:
         """Return the dangerous-command rule this call hits, or ``""``.
 
-        The blacklist is a hard floor that no permission mode can silence, so
-        it is consulted before the AI classifier and before the policy table.
+        Direct native call -- the blacklist is a hard floor that no permission
+        mode can silence, so it is consulted before the AI classifier and
+        before the policy table.
         """
-        try:
-            from encre import native as _native
-            if hasattr(_native, "permission_check_dangerous"):
-                payload = json.dumps(tool_input or {}, ensure_ascii=False)
-                return str(_native.permission_check_dangerous(tool_name, payload) or "")
-        except Exception:
-            # Native engine unavailable; the engine check below still runs.
-            pass
-        return ""
+        from encre import native as _native
+        payload = json.dumps(tool_input or {}, ensure_ascii=False)
+        return str(_native.permission_check_dangerous(tool_name, payload) or "")
 
     async def check_tool_permission(self, tool_name: str, tool_input: dict[str, Any]) -> PermissionDecision:
         """Unified permission entry point for every non-read-only tool call.
@@ -812,7 +683,7 @@ class EncreSafetyEngine:
         * ``auto``    -- handed to :meth:`check_yolo_permission`; the AI
           classifier decides and the user is never prompted.
         * ``bypass``  -- full access; never prompts.  Only the dangerous-
-          command blacklist still refuses a call.
+          command blacklist and the immune-path floor still refuse a call.
 
         The policy table is deliberately *not* applied outside ``custom``: the
         settings panel describes those rules as custom-mode-only, and the Rust
@@ -838,57 +709,27 @@ class EncreSafetyEngine:
 
     async def _engine_check(self, tool_name: str, tool_input: dict[str, Any]) -> PermissionDecision:
         # The Rust permission engine is the single source of truth for
-        # authorization.  We forward the tool name and the JSON-serialized
-        # arguments so the dangerous-command regex table can inspect the
-        # command string for the bash family.  The decision dict returned
-        # by Rust is mapped back onto the existing PermissionAllow /
-        # PermissionDeny / PermissionAsk dataclasses so the rest of the
-        # agent loop (and the WS protocol) continues to work unchanged.
-        self._push_permission_mode()
-        try:
-            from encre import native as _native
-            payload = json.dumps(tool_input or {}, ensure_ascii=False)
-            try:
-                # Preferred: the mode travels with the call, so the policy
-                # table is consulted exactly when this session is in custom
-                # mode -- never based on a process-wide slot another session
-                # may have overwritten.
-                decision = _native.permission_check_mode(
-                    tool_name, payload, self._permission_mode()
-                )
-            except Exception:
-                # Older native build without the per-call API: fall back to
-                # the process-wide mode pushed above.
-                decision = _native.permission_check(tool_name, payload)
-        except Exception:
-            # Defensive fallback: never let a permission-engine failure
-            # crash the agent loop.  Default to allow and let downstream
-            # OS-level sandboxes (Landlock / Job Object) take over -- but
-            # still run the immune-path guard below before returning.
-            decision = None
+        # authorization.  Direct native call -- the mode travels with the
+        # call so the policy table is consulted exactly when this session is
+        # in custom mode, never based on a process-wide slot another session
+        # may have overwritten.  No Python fallback exists: the compiled
+        # extension is a mandatory runtime component.  The decision dict
+        # returned by Rust is mapped onto the PermissionAllow / PermissionDeny
+        # / PermissionAsk dataclasses so the agent loop and the WS protocol
+        # keep working unchanged.
+        from encre import native as _native
+        payload = json.dumps(tool_input or {}, ensure_ascii=False)
+        decision = _native.permission_check_mode(
+            tool_name, payload, self._permission_mode()
+        )
+        behavior = decision.get("behavior")
+        reason = str(decision.get("reason") or "")
+        rule = str(decision.get("rule") or "")
 
-        if isinstance(decision, dict):
-            behavior = decision.get("behavior")
-            reason = str(decision.get("reason") or "")
-            rule = str(decision.get("rule") or "")
-        else:
-            behavior, reason, rule = None, "", ""
-
-        # Immune-path hard deny (always-on, even in bypass mode).  The Rust
-        # engine has an ALWAYS_ALLOW list but no symmetric always-deny, so a
-        # bypass-mode session would auto-allow writes to ``.git/config``,
-        # ``~/.ssh/authorized_keys``, ``~/.bashrc`` etc.  We block write-
-        # capable tools whose target touches an immune path.  Read access is
-        # left untouched (file_read of ``.git/HEAD`` stays allowed).
-        immune_hit = self.check_immune_path(tool_name, tool_input)
-        if immune_hit and tool_name in _WRITE_TOOL_NAMES and behavior != "deny":
-            return PermissionDeny(
-                reason=(
-                    f"Refused: target path '{immune_hit}' is immune "
-                    f"(system-sensitive: .git/.claude/.ssh/shell-init). "
-                    f"Cannot be modified by the agent, even in bypass mode."
-                )
-            )
+        # NOTE: immune-path enforcement (.git/.claude/.ssh/shell-init) lives
+        # inside the Rust decision pipeline as an always-on hard floor (step
+        # 0b), so a Deny for a protected path arrives here directly.  Python
+        # no longer post-filters; the engine is the single source of truth.
 
         if behavior == "deny":
             return PermissionDeny(reason=reason)
@@ -896,50 +737,42 @@ class EncreSafetyEngine:
             return PermissionAsk(reason=reason, rule=rule)
         return PermissionAllow()
 
+    async def check_readonly_permission(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> PermissionDecision:
+        """Permission check for tools that declare themselves read-only.
+
+        Read-only tools never trigger a user prompt, but an explicit deny
+        policy, an immune-path target, or a dangerous command smuggled into a
+        ``command`` argument must still be enforced.  Engine asks degrade to
+        allow here (a read-only operation is not worth prompting for); only a
+        hard deny survives.
+        """
+        decision = await self._engine_check(tool_name, tool_input)
+        if isinstance(decision, PermissionDeny):
+            return decision
+        return PermissionAllow()
+
     def check_immune_path(self, tool_name: str, tool_input: dict[str, Any]) -> str | None:
         """Return an immune-path fragment the tool call would mutate, or None.
 
-        Extracts candidate target paths from the tool input and checks each
-        against the immune set.  Pure path matching -- the caller (the
-        executor gate or ``check_tool_permission``) decides whether an immune
-        hit warrants a hard deny based on whether the operation is destructive.
+        Direct native call -- extraction and matching live in the Rust
+        permission engine.  Pure path matching: the caller (the executor gate
+        or ``check_tool_permission``) decides whether an immune hit warrants
+        a hard deny based on whether the operation is destructive.
         """
-        candidates = _extract_tool_target_paths(tool_name, tool_input or {})
-        for cand in candidates:
-            hit = matches_immune_path(cand)
-            if hit:
-                return hit
-        return None
+        from encre import native as _native
+        payload = json.dumps(tool_input or {}, ensure_ascii=False)
+        hit = _native.permission_check_immune(tool_name, payload)
+        return str(hit) if hit else None
 
     def record_permission_decision(self, tool_name: str, allowed: bool) -> None:
         """Persist the user's answer to a previous ``Ask`` decision.
 
-        Once the user has allowed or denied a tool, subsequent calls for
-        the same tool should follow the same verdict without re-prompting.
+        Direct native call -- the decision table lives in the Rust engine.
         """
-        try:
-            from encre import native as _native
-            _native.permission_record_decision(tool_name, "allow" if allowed else "deny")
-        except Exception:
-            pass
-
-    def _push_permission_mode(self) -> None:
-        """Push the session permission mode into the Rust engine.
-
-        The user-managed per-tool / per-capability policy table is honoured
-        only in the ``custom`` mode; the engine needs the active mode so it can
-        skip those rules in manual approval / auto approval / full access.
-        """
-        try:
-            from encre import native as _native
-            if hasattr(_native, "permission_set_mode"):
-                _native.permission_set_mode(
-                    str(getattr(self.config, "permission_mode", "") or "default")
-                )
-        except Exception:
-            # Native engine unavailable or older build without the API; the
-            # in-process policy table then simply stays fully active.
-            pass
+        from encre import native as _native
+        _native.permission_record_decision(tool_name, "allow" if allowed else "deny")
 
     def set_policies(self, tools: dict[str, str], capabilities: dict[str, str]) -> None:
         """Replace the user-managed policy table inside the Rust engine.
@@ -949,27 +782,21 @@ class EncreSafetyEngine:
         ``"file"``, ``"docker"``, ...).  Values are one of
         ``"allow" | "deny" | "ask" | "default"``.
         """
-        try:
-            from encre import native as _native
-            payload = json.dumps(
-                {"tools": tools, "capabilities": capabilities},
-                ensure_ascii=False,
-            )
-            _native.permission_set_policies(payload)
-        except Exception:
-            pass
+        from encre import native as _native
+        payload = json.dumps(
+            {"tools": tools, "capabilities": capabilities},
+            ensure_ascii=False,
+        )
+        _native.permission_set_policies(payload)
 
     def get_policies(self) -> dict[str, dict[str, str]]:
         """Return the current policy table as ``{"tools": {...}, "capabilities": {...}}``."""
-        try:
-            from encre import native as _native
-            raw = _native.permission_get_policies()
-            parsed = json.loads(raw) if raw else {}
-            tools = parsed.get("tools", {}) if isinstance(parsed, dict) else {}
-            capabilities = parsed.get("capabilities", {}) if isinstance(parsed, dict) else {}
-            return {"tools": tools, "capabilities": capabilities}
-        except Exception:
-            return {"tools": {}, "capabilities": {}}
+        from encre import native as _native
+        raw = _native.permission_get_policies()
+        parsed = json.loads(raw) if raw else {}
+        tools = parsed.get("tools", {}) if isinstance(parsed, dict) else {}
+        capabilities = parsed.get("capabilities", {}) if isinstance(parsed, dict) else {}
+        return {"tools": tools, "capabilities": capabilities}
 
     def _sync_policies_to_native(self) -> None:
         """Push the current ``EncreConfig.permission_settings`` map into Rust.
@@ -979,14 +806,14 @@ class EncreSafetyEngine:
         Everything else is treated as a per-tool override.
 
         **Important**: we skip pushing when ``permission_settings`` is empty
-        to avoid overwriting the Rust global state 鈥?which may have been
-        set by the frontend via ``set_permission_policies`` 鈥?with an empty
+        to avoid overwriting the Rust global state — which may have been
+        set by the frontend via ``set_permission_policies`` — with an empty
         policy table during ``EncreSafetyEngine`` initialization.  Only when
         the config actually carries permission settings (e.g. loaded from a
         persisted config file) do we synchronise them into Rust.
         """
         if not self.config.permission_settings:
-            return  # Nothing to sync 鈥?preserve any existing Rust state.
+            return  # Nothing to sync — preserve any existing Rust state.
 
         capability_keys = {
             "network", "file", "bash_io", "docker", "browser",
@@ -1012,19 +839,30 @@ class EncreSafetyEngine:
         """
         if self._auto_classifier_explicit:
             return self._auto_classifier
-        try:
-            active = self.config.get_active_model()
-        except Exception:
-            active = None
-        model_id = str(getattr(active, "model_id", "") or "")
-        if active is None or (not model_id and not self.config.model):
-            return None
-        key = (
-            model_id or str(self.config.model or ""),
-            str(getattr(active, "backend_type", "") or self.config.backend_type or ""),
-            str(getattr(active, "api_key", "") or self.config.api_key or ""),
-            str(getattr(active, "base_url", "") or self.config.base_url or ""),
-        )
+        # Use classifier_model if configured; otherwise fall back to the
+        # session's active model so the classifier follows model switches.
+        classifier_model = getattr(self.config, "classifier_model", "") or ""
+        if classifier_model:
+            key = (
+                classifier_model,
+                str(self.config.backend_type or ""),
+                str(self.config.api_key or ""),
+                str(self.config.base_url or ""),
+            )
+        else:
+            try:
+                active = self.config.get_active_model()
+            except Exception:
+                active = None
+            model_id = str(getattr(active, "model_id", "") or "")
+            if active is None or (not model_id and not self.config.model):
+                return None
+            key = (
+                model_id or str(self.config.model or ""),
+                str(getattr(active, "backend_type", "") or self.config.backend_type or ""),
+                str(getattr(active, "api_key", "") or self.config.api_key or ""),
+                str(getattr(active, "base_url", "") or self.config.base_url or ""),
+            )
         if self._auto_classifier is None or self._auto_classifier_key != key:
             self._auto_classifier = EncreAutoSafetyClassifier(
                 backend_type=key[1],
@@ -1034,26 +872,6 @@ class EncreSafetyEngine:
             )
             self._auto_classifier_key = key
         return self._auto_classifier
-
-    async def _check_auto_mode(self, tool_name: str, tool_input: dict[str, Any]) -> PermissionDecision:
-        """Auto mode: use classifier when available, fall back to pattern checks.
-
-        Kept for compatibility with callers that still expect it; the
-        unified path goes through :meth:`check_tool_permission`.
-        """
-        if self._auto_classifier is not None:
-            from encre.autosafety import AutoDecision
-            result = await self._auto_classifier.classify(tool_name, tool_input)
-            if result.decision in (AutoDecision.SAFE, AutoDecision.LOW_RISK):
-                return PermissionAllow()
-            return PermissionAsk()
-
-        # Fallback: pattern-based checks when no classifier configured
-        if self._is_dangerous(tool_name, tool_input):
-            return PermissionAsk()
-        if self._is_sensitive(tool_input):
-            return PermissionAsk()
-        return PermissionAllow()
 
     async def check_yolo_permission(
         self,
@@ -1070,11 +888,27 @@ class EncreSafetyEngine:
         command blacklist is a hard floor the classifier cannot override, and
         here it refuses the call outright instead of prompting, because auto
         approval exists precisely to keep the user out of the loop.
+
+        Two hard floors are enforced before the classifier runs and can never
+        be overridden by it, both resolved inside the Rust permission engine:
+        the dangerous-command blacklist and the immune-path floor
+        (.git/.claude/.ssh/shell-init writes are refused in every mode,
+        including auto).
         """
         rule = self._dangerous_rule(tool_name, tool_input)
         if rule:
             return PermissionDeny(
                 reason=f"Blocked by dangerous-command rule: {rule}"
+            )
+
+        immune = self.check_immune_path(tool_name, tool_input)
+        if immune:
+            return PermissionDeny(
+                reason=(
+                    f"Refused: target path '{immune}' is immune "
+                    f"(system-sensitive: .git/.claude/.ssh/shell-init). "
+                    f"Cannot be modified by the agent, even in auto mode."
+                )
             )
 
         classifier = self._get_auto_classifier()
@@ -1099,6 +933,29 @@ class EncreSafetyEngine:
             return PermissionDeny(
                 reason=result.reasoning or f"Auto classifier rejected {tool_name}."
             )
+        if result.decision == AutoDecision.ASK_USER and result.confidence <= 0.0:
+            # Sentinel from the classifier's exception fallback: the AI
+            # reviewer was unreachable and static analysis could not clear
+            # the call.  Fall back to the native engine and prefer Deny for
+            # anything dangerous-looking; auto approval never asks the user.
+            decision = await self._engine_check(tool_name, tool_input)
+            if self._is_dangerous(tool_name, tool_input):
+                return PermissionDeny(
+                    reason=(
+                        "Auto classifier unavailable and the call matches "
+                        "dangerous patterns; refusing (fail-closed)."
+                    )
+                )
+            if decision.behavior == "deny":
+                return decision
+            if decision.behavior == "allow":
+                return PermissionAllow(reason=getattr(decision, "reason", ""))
+            return PermissionDeny(
+                reason=(
+                    "Auto classifier unavailable and the native engine "
+                    "requires approval for this call; refusing (fail-closed)."
+                )
+            )
         # SAFE / LOW_RISK / ASK_USER: the AI has reviewed the call and grants
         # it.  Auto approval never falls back to prompting the user.
         return PermissionAllow(reason=result.reasoning)
@@ -1110,19 +967,6 @@ class EncreSafetyEngine:
             return self._ssrf_guard.validate_url(url)
         return False
 
-    _DANGEROUS_PATTERNS: ClassVar[list[re.Pattern[str]]] = [
-        re.compile(r"rm\s+-rf\s+/", re.IGNORECASE),
-        re.compile(r"mkfs\s", re.IGNORECASE),
-        re.compile(r"dd\s+if=.*\s+of=", re.IGNORECASE),
-        re.compile(r":\(\)\s*\{.*:\(\)\s*\{.*\}", re.IGNORECASE),
-        re.compile(r"chmod\s+777\s+/", re.IGNORECASE),
-        re.compile(r">\s*/dev/sda", re.IGNORECASE),
-    ]
-
-    _DANGEROUS_SUBSTRINGS: ClassVar[list[str]] = [
-        "rm -rf /", "mkfs", "dd if=", "chmod 777 /", "sudo ", ":(){ :|:& };:",
-    ]
-
     def _is_dangerous(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
         if tool_name == "bash":
             command = tool_input.get("command", "")
@@ -1130,17 +974,10 @@ class EncreSafetyEngine:
                 return False
             safe, _ = self.is_bash_safe(command)
             return not safe
-
-        input_str = str(tool_input)
-        for pattern in self._DANGEROUS_PATTERNS:
-            if pattern.search(input_str):
-                return True
-
-        return any(cmd.lower() in input_str.lower() for cmd in self._DANGEROUS_SUBSTRINGS)
-
-    def _is_sensitive(self, tool_input: dict[str, Any]) -> bool:
-        input_str = str(tool_input)
-        return any(pattern.search(input_str) for pattern in self._sensitive_patterns)
+        # Non-bash tools carry no shell payload here; the native engine's
+        # dangerous-pattern table (which covers any tool with a command/cmd
+        # argument) is the single source of truth for command screening.
+        return False
 
     def validate_tool_output(self, _tool_name: str, output: str) -> str:
         if len(output) > self.config.tool_result_max_chars:

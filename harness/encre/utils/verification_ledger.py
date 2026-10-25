@@ -1,7 +1,7 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright 漏 2025-2026 Wenze Wei. All Rights Reserved.
+# Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
 # This file is part of Encre.
 # The Encre project belongs to the Dunimd Team.
@@ -18,10 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
-from __future__ import annotations
-
 """Verification evidence ledger (port of Hermes verification_evidence.py).
 
 Tracks which code files were edited this session and what verification evidence
@@ -32,8 +28,12 @@ after their most recent edit.  Pure state, no loop coupling; independently
 testable.
 """
 
+from __future__ import annotations
+
+import json
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 # Tools that count as verification evidence.  `bash`/`powershell` are included
 # because the model may verify through a shell command (pytest, mypy, ...).
@@ -58,6 +58,95 @@ class VerificationEvent:
     passed: bool
     summary: str
     timestamp: float = field(default_factory=time.time)
+    exit_code: int | None = None
+    detail: str = ""
+
+
+def classify_verification_outcome(tool: str, result: str) -> tuple[bool, str] | None:
+    """Classify a verification tool result from its *real* pass/fail signal.
+
+    The tool result envelope carries authoritative outcome data and this is
+    the single place that reads it:
+
+    * ``test_run``    -> ``{"passed": N, "failed": M, ...}``: passed iff
+      ``failed == 0``.
+    * ``lint_format`` -> ``{"ok": bool, ...}``: passed iff ``ok is True``.
+    * ``bash``/``powershell`` -> ``{"exit_code": int, ...}``: the shell's own
+      success channel; passed iff ``exit_code == 0``.  A command that ran but
+      exited nonzero is a *failed* check, never a pass.
+    * ``lsp``         -> ``{"diagnostics": [...]}``: passed iff no error-level
+      diagnostics remain.
+
+    Returns ``(passed, detail)`` where ``detail`` names the decisive field,
+    or ``None`` when no real outcome signal could be extracted (unparseable
+    envelope, missing decisive field).  ``None`` MUST be treated as *not
+    passed* by callers: a fail-open here is exactly how an unexecuted check
+    masquerades as a green one.
+
+    Args:
+        tool: The verification tool name (see ``_VERIFY_EVIDENCE_TOOLS``).
+        result: The serialized tool result envelope.
+
+    Returns:
+        ``(passed, detail)`` on a decisive signal, else ``None``.
+    """
+    text = (result or "").strip()
+    try:
+        data: Any = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if tool == "test_run":
+        if "failed" in data or "failed_count" in data:
+            failed = int(data.get("failed", data.get("failed_count", 0)) or 0)
+            return (failed == 0, f"failed={failed}")
+        return None
+    if tool == "lint_format":
+        if "ok" in data:
+            ok = bool(data.get("ok"))
+            return (ok, f"ok={ok}")
+        return None
+    if tool in ("bash", "powershell"):
+        code = data.get("exit_code")
+        if code is None and "success" in data:
+            # Envelope without an explicit exit code: fall back to the
+            # manager's own success flag (it is derived from the exit code).
+            ok = bool(data.get("success"))
+            return (ok, f"success={ok}")
+        if isinstance(code, int):
+            return (code == 0, f"exit_code={code}")
+        return None
+    if tool == "lsp":
+        if "diagnostics" in data:
+            diags = data.get("diagnostics")
+            n = len(diags) if isinstance(diags, list) else 0
+            return (n == 0, f"diagnostics={n}")
+        return None
+    return None
+
+
+def _extract_exit_code(result: str) -> int | None:
+    """Best-effort extraction of the process exit code from a tool envelope.
+
+    Purely for audit trails on :class:`VerificationEvent`; returns ``None``
+    when the envelope does not carry one.
+
+    Args:
+        result: The serialized tool result envelope.
+
+    Returns:
+        The exit code, or ``None``.
+    """
+    try:
+        data: Any = json.loads((result or "").strip())
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        code = data.get("exit_code")
+        if isinstance(code, int):
+            return code
+    return None
 
 
 class VerificationLedger:
@@ -74,7 +163,7 @@ class VerificationLedger:
         self._passing_after_edit: set[str] = set()
         self._stale_seconds = stale_seconds
 
-    # 鈹€鈹€ Recording 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Recording ───────────────────────────────────────────────────
 
     def mark_edited(self, path: str) -> None:
         """Record that ``path`` was modified, invalidating prior evidence."""
@@ -89,6 +178,8 @@ class VerificationLedger:
         passed: bool,
         summary: str = "",
         paths: list[str] | None = None,
+        exit_code: int | None = None,
+        detail: str = "",
     ) -> None:
         """Record a verification attempt.
 
@@ -96,10 +187,25 @@ class VerificationLedger:
         treated as verified (the common case: the model ran a suite that
         covered its changes).  If ``paths`` is given, only those that were
         edited are marked verified on success.
+
+        Args:
+            tool: The verification tool name.
+            passed: Whether the check actually passed (from the real outcome
+                signal, e.g. exit code or failure count -- never from mere
+                "the command executed").
+            summary: Short human-readable result summary.
+            paths: Optional explicit file targets the evidence applies to.
+            exit_code: The process exit code when the evidence came from a
+                shell command, for auditability.
+            detail: The decisive-field trace from
+                :func:`classify_verification_outcome`.
         """
         if tool not in _VERIFY_EVIDENCE_TOOLS:
             return
-        self._events.append(VerificationEvent(tool=tool, passed=passed, summary=summary))
+        self._events.append(VerificationEvent(
+            tool=tool, passed=passed, summary=summary,
+            exit_code=exit_code, detail=detail,
+        ))
         if not passed:
             return
         targets = paths if paths is not None else list(self._edited)
@@ -107,7 +213,7 @@ class VerificationLedger:
             if p in self._edited:
                 self._passing_after_edit.add(p)
 
-    # 鈹€鈹€ Queries 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Queries ─────────────────────────────────────────────────────
 
     def edited_files(self) -> list[str]:
         return list(self._edited)
@@ -129,6 +235,39 @@ class VerificationLedger:
     def verify_events(self) -> list[VerificationEvent]:
         return list(self._events)
 
+    def preservation_notes(self, max_notes: int = 8) -> list[str]:
+        """Compact-preservation notes for this session's verification state.
+
+        Used by the compaction phase to build core-internal
+        ``preserve_points`` so the summariser cannot drop verification
+        evidence that the verify-on-stop gates still need.  Only facts are
+        reported: unverified files and failed verification attempts.
+
+        Args:
+            max_notes: Upper bound on returned notes.
+
+        Returns:
+            Human-readable evidence notes (possibly empty).
+        """
+        notes: list[str] = []
+        unverified = self.unverified_files()
+        if unverified:
+            shown = ", ".join(f"`{p}`" for p in unverified[:5])
+            extra = len(unverified) - 5
+            notes.append(
+                f"Unverified edited files (still require passing verification): "
+                f"{shown}" + (f" (+{extra} more)" if extra > 0 else "")
+            )
+        for ev in reversed(self._events):
+            if ev.passed:
+                continue
+            notes.append(
+                f"Failed verification via `{ev.tool}`: {ev.detail or ev.summary or 'no detail'}"
+            )
+            if len(notes) >= max_notes:
+                break
+        return notes[:max_notes]
+
     def has_failed_evidence(self) -> bool:
         """True if any recorded verification attempt failed since the last edit."""
         return any(not e.passed for e in self._events)
@@ -139,9 +278,7 @@ class VerificationLedger:
         if any(lower.endswith(s) for s in _NON_CODE_SUFFIXES):
             return False
         name = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        if any(name == n for n in _NON_CODE_NAMES):
-            return False
-        return True
+        return not any(name == n for n in _NON_CODE_NAMES)
 
     def build_nudge_message(self, failed: bool = False) -> str:
         """Evidence-driven nudge for verify-on-stop."""

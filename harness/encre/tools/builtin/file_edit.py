@@ -1,5 +1,27 @@
-﻿"""EA File Edit Tool 鈥?mandatory builtin package."""
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+#
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# DISCLAIMER: Users must comply with applicable AI regulations.
+# Non-compliance may result in service termination or legal liability.
+
+"""EA File Edit Tool - mandatory builtin package."""
 
 import re
 from typing import Any
@@ -8,7 +30,8 @@ from encre.native import compute_diff as _native_diff
 from encre.native import read_file as _native_read
 from encre.native import write_file as _native_write
 from encre.tools.base import build_tool
-from encre.capabilities.process import remap_tool_path
+from encre.tools.path_guard import guard_tool_path
+from encre.tools.tool_ui import ui_dict
 
 _WS_RE = re.compile(r"[ \t]+")
 _DIFF_ADD_RE = re.compile(r"^\+(?!\+\+)", re.MULTILINE)
@@ -30,10 +53,15 @@ def _map_norm_to_orig(orig: str, norm_pos: int) -> int | None:
             j = i
             while j < len(orig) and orig[j] in (" ", "\t"):
                 j += 1
-            cur_norm += 1; i = j; continue
+            cur_norm += 1
+            i = j
+            continue
         if ch == "\n":
-            cur_norm += 1; i += 1; continue
-        cur_norm += 1; i += 1
+            cur_norm += 1
+            i += 1
+            continue
+        cur_norm += 1
+        i += 1
     return len(orig) if cur_norm == norm_pos else None
 
 
@@ -62,9 +90,13 @@ def _apply_one_edit(content: str, old_str: str, new_str: str, replace_all: bool)
             while cursor < len(content):
                 hit = _find_with_fallback(content[cursor:], old_str)
                 if hit is None:
-                    buf.append(content[cursor:]); break
+                    buf.append(content[cursor:])
+                    break
                 s, e, _ = hit
-                buf.append(content[cursor:cursor + s]); buf.append(new_str); cursor += e; count += 1
+                buf.append(content[cursor:cursor + s])
+                buf.append(new_str)
+                cursor += e
+                count += 1
             if count == 0:
                 raise ValueError("old_str not found (replace_all)")
             return "".join(buf), count, "replace_all+ws"
@@ -87,9 +119,10 @@ async def _file_edit_execute(**kwargs: Any) -> str:
     file_path = kwargs.get("file_path", "")
     if not file_path:
         return "Error: file_path is required"
-    file_path = remap_tool_path(file_path)
-    if not file_path:
-        return "Error: Path rejected by sandbox"
+    guard = guard_tool_path(file_path, tool="file_edit", for_write=True)
+    if not guard.allowed:
+        return f"Error: {guard.reason}"
+    file_path = guard.resolved
     dry_run = bool(kwargs.get("dry_run", False))
     tool_call_id = str(kwargs.get("tool_call_id", ""))
 
@@ -139,7 +172,7 @@ async def _file_edit_execute(**kwargs: Any) -> str:
         delta = len(new_lines) - len(orig_lines)
         add_count, del_count = max(delta, 0), max(-delta, 0)
         if delta == 0 and original != content:
-            changed = sum(1 for a, b in zip(orig_lines, new_lines) if a != b)
+            changed = sum(1 for a, b in zip(orig_lines, new_lines, strict=False) if a != b)
             add_count = del_count = changed
 
     if dry_run:
@@ -160,7 +193,7 @@ async def _file_edit_execute(**kwargs: Any) -> str:
     if compute_full_diff:
         out += f"\n```diff\n{diff_text}\n```"
     else:
-        out += "\n(large file 鈥?diff omitted)"
+        out += "\n(large file \u2014 diff omitted)"
     return out
 
 
@@ -186,8 +219,9 @@ file_edit_tool = build_tool(
         "required": ["file_path"],
     },
     execute=_file_edit_execute,
+    ui=ui_dict(icon="pencil-line", label="Edit File", body="diff", result="file").as_dict(),
     intents=["general", "coding", "data"], category="filesystem",
     triggers=["edit file", "replace text", "search replace"],
     semantic_type="write", is_destructive=True, cost_level="high", retryability="guarded",
-    get_effective_path=lambda self, args: args.get("file_path") or None,
+    get_effective_path=lambda self, args: args.get("file_path") or None,  # noqa: ARG005
 )

@@ -14,4 +14,5 @@ Output a JSON object with:
 - "entry_tasks": list of task ids with no dependencies
 - "exit_tasks": list of task ids that are final
 
-Output ONLY the JSON object, no other text.
+Output ONLY the JSON object, no other text. Do NOT wrap it in markdown
+code fences -- your answer must start with `{` and end with `}`.

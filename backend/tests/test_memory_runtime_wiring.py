@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,30 +23,26 @@
 
 from __future__ import annotations
 
-"""Runtime wiring of the layered memory subsystem (Tasks 4.5 / 7.4).
+"""Runtime wiring tests for the layered memory subsystem.
 
-These tests exercise the **real** wiring built by
-:class:`~encre.loop.wiring._LoopWiringMixin`: the real
+These tests exercise the real wiring built by
+:class:`~encre.loop.wiring._LoopWiringMixin` with the real
 :class:`~encre.events.ledger.EventSourcedBus` backbone, the real
-:class:`~encre.memdir.layers.MemoryLayerStore` (encrypted
-:mod:`encre.secure_io` file I/O), the real
+:class:`~encre.memdir.layers.MemoryLayerStore` using encrypted
+:mod:`encre.secure_io` file I/O, the real
 :class:`~encre.memdir.recall.RecallEngine`, and the real
 :class:`~encre.improve.verification.SkillVerifier`.  No mock store, bus or
-recall engine is used.
+recall engine is substituted.
 
-Covered invariants:
+They pin down that a ``memory_candidate`` published on the loop's backbone is
+intaken by ``loop.memory_layers`` and encrypted at rest, that the same memory is
+retrievable through ``loop.recall_engine.recall``, that re-wiring never
+subscribes the same backbone twice, and that the skill-to-memory bridge writes
+one provenance-carrying ``procedural`` entry per promoted skill while rejected
+or re-promoted skills never produce a duplicate.
 
-1. a ``memory_candidate`` published on the loop's backbone is intaken by
-   ``loop.memory_layers`` and is encrypted at rest;
-2. the same memory is retrievable through ``loop.recall_engine.recall``;
-3. re-wiring never subscribes the same backbone twice (single intake);
-4. a promoted skill becomes one ``procedural`` memory entry carrying the
-   skill name, description, version and rollback id;
-5. a rejected skill is never written to procedural memory;
-6. re-promoting the same skill does not create a duplicate entry.
-
-The data root is redirected to ``tmp_path`` via ``ENCRE_DATA_DIR`` so the real
-user data directory is never touched.
+The data root is redirected to ``tmp_path`` through ``ENCRE_DATA_DIR`` so the
+real user data directory is never touched.
 """
 
 from unittest.mock import MagicMock, patch
@@ -85,6 +81,7 @@ class _FakeAgent:
     """Minimal agent exposing the loop plus the registries the verifier reads."""
 
     def __init__(self, loop: EncreLoop, tool_names: tuple[str, ...]) -> None:
+        """Attach the loop, register real tools, and create an empty skill registry."""
         self.loop = loop
         self.tool_registry = ToolRegistry()
         for name in tool_names:
@@ -116,13 +113,13 @@ def loop(tmp_path, monkeypatch) -> EncreLoop:
 
 
 def _candidate(content: str) -> MemoryCandidate:
-    """Build a judged candidate (the shape the significance judge publishes)."""
+    """Build a judged candidate in the shape the significance judge publishes."""
     return MemoryCandidate(
         content=content,
         significance=0.7,
         reasons=["user_correction (w=0.85, s=1.00)"],
         source_refs=["msg-1"],
-        suggested_type="semantic",
+        suggested_type="fact",
         session_id="sess-wiring",
     )
 
@@ -166,7 +163,7 @@ def test_memory_candidate_becomes_persistent_and_recallable(loop, tmp_path):
     """A backbone candidate really lands in memory_layers and is recallable."""
     assert isinstance(loop.memory_layers, MemoryLayerStore)
     assert loop.recall_engine is not None
-    # The store and recall engine are reachable from the session too.
+    # The store and recall engine are reachable from the session as well.
     assert loop.session.memory_layers is loop.memory_layers
     assert loop.session.recall_engine is loop.recall_engine
     # The data root is the isolated temp tree, never the real user data dir.
@@ -224,7 +221,7 @@ def test_promoted_skill_is_written_to_procedural_memory(loop):
     assert result.passed is True
     assert artifact.status is SkillStatus.ACTIVE
 
-    entries = loop.memory_layers.by_type(MemoryType.PROCEDURAL)
+    entries = loop.memory_layers.by_type(MemoryType.LESSON)
     assert len(entries) == 1
     entry = entries[0]
     assert entry.metadata["skill_name"] == artifact.name
@@ -251,7 +248,7 @@ def test_rejected_skill_is_not_written_to_procedural_memory(loop):
     result = verifier.verify(artifact)
     assert result.passed is False
     assert artifact.status is SkillStatus.REJECTED
-    assert loop.memory_layers.by_type(MemoryType.PROCEDURAL) == []
+    assert loop.memory_layers.by_type(MemoryType.LESSON) == []
 
 
 def test_repeated_promotion_does_not_duplicate_procedural_memory(loop):
@@ -259,16 +256,16 @@ def test_repeated_promotion_does_not_duplicate_procedural_memory(loop):
     verifier = _bound_verifier(loop)
     artifact = verifier.propose(_skill_def(name="auto-mem-dup-33333333"))
     verifier.verify(artifact)
-    assert len(loop.memory_layers.by_type(MemoryType.PROCEDURAL)) == 1
+    assert len(loop.memory_layers.by_type(MemoryType.LESSON)) == 1
 
     # Promoting the very same artifact again must not mint a second memory.
     assert verifier.promote(artifact) is True
-    assert len(loop.memory_layers.by_type(MemoryType.PROCEDURAL)) == 1
+    assert len(loop.memory_layers.by_type(MemoryType.LESSON)) == 1
 
-    # A second, independent binding is idempotent as well.
+    # A second, independent verifier binding is idempotent as well.
     loop.attach_skill_verifier(verifier)
     assert verifier.promote(artifact) is True
-    assert len(loop.memory_layers.by_type(MemoryType.PROCEDURAL)) == 1
+    assert len(loop.memory_layers.by_type(MemoryType.LESSON)) == 1
 
 
 if __name__ == "__main__":

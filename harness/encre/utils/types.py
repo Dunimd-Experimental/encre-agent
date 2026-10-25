@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Shared dataclass and type definitions for the Encre agent/backend.
 
@@ -45,7 +47,7 @@ constructing the dataclasses directly so call sites stay terse.
 from dataclasses import dataclass, field
 from typing import Any, Literal, Union
 
-# 鈹€鈹€ String-literal enumerations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── String-literal enumerations ────────────────────────────────────────
 # Why Literal unions instead of Enum: these values are (de)serialised to/from
 # JSON across the agent<->backend<->UI boundary, so plain strings avoid any
 # encoding/decoding ceremony.
@@ -102,6 +104,7 @@ class ToolProgress:
     tool_name: str
     status: str
     sub_agent_messages: list[dict[str, Any]] | None = None
+    content: str | None = None
 
 
 @dataclass
@@ -177,6 +180,7 @@ AgentEvent = Union[
     "ToolProgress", "ToolResult",
     "PermissionRequest", "QuestionRequest",
     "EngineInstallRequest", "EngineInstallProgress",
+    "RetryNotice",
     "Finish",
 ]
 
@@ -197,6 +201,9 @@ class Finish:
     error_code: str = ""
     error_category: str = ""
     compacted: bool = False
+    context_usage: dict[str, Any] | None = None
+    """Per-request context composition breakdown (system prompt /
+    messages / tools by connector kind / skills), from the prompt phase."""
 
 
 @dataclass
@@ -275,14 +282,27 @@ class PlanResolved:
 
 @dataclass
 class PlanReviewData:
-    """A plan/spec document submitted for user review (saved as 3 markdown files)."""
+    """A plan/spec document submitted for user review.
+
+    ``files`` carries the artifact list the model submitted (each entry
+    ``{"path": str, "label": str}``); ``content`` is the model's summary.
+    ``file_path``/``dir_path`` point at the review directory the record
+    was stored under.  ``call_id`` is the renderer-side id of the
+    ``submit_review`` call that produced it -- the card anchors on it so it
+    renders in the turn that asked for the decision, not at the transcript
+    tail.  ``status`` gains ``"cancelled"`` when the turn dies with the
+    review unresolved.
+    """
 
     review_id: str
     content: str
-    file_path: str  # path to plan.md
-    dir_path: str   # directory containing plan.md, steps.md, checklist.md
+    file_path: str  # primary artifact path
+    dir_path: str   # review storage directory
     mode: str  # "plan" | "spec"
-    status: str  # "review" | "approved" | "rejected"
+    status: str  # "review" | "approved" | "rejected" | "cancelled"
+    files: list = field(default_factory=list)
+    feedback: str = ""
+    call_id: str = ""
 
 
 @dataclass
@@ -291,7 +311,20 @@ class CompactStarting:
 
     The frontend should show a non-expandable compression indicator
     while the model pauses to compact the context.
+
+    Attributes:
+        notice_id: Stable id shared with the completion event and the
+            persisted session notice, so the client can flip the SAME
+            timeline line from "compressing" to "compacted" instead of
+            rendering two unrelated entries.
+        anchor_id: Server id of the last message the compaction consumed.
+            The indicator is anchored right after it, which is where the
+            completed notice lands too -- the line therefore does not
+            jump when the compaction finishes.
     """
+
+    notice_id: str = ""
+    anchor_id: str = ""
 
 
 @dataclass
@@ -302,18 +335,68 @@ class CompactFailed:
     after a ``CompactStarting`` was already sent.  The frontend must dismiss
     the "compressing" indicator so it cannot get stuck on screen; the
     conversation simply continues with the uncompressed context.
+
+    Attributes:
+        notice_id: Id of the ``CompactStarting`` indicator to dismiss.
     """
 
     reason: str = ""
+    notice_id: str = ""
 
 
 @dataclass
 class CompactNotification:
-    """Reports the before/after message and token counts of a compaction."""
+    """Reports the before/after message and token counts of a compaction.
+
+    Attributes:
+        notice_id: Id of the persisted session notice (and of the
+            ``CompactStarting`` indicator it replaces).
+    """
+
     old_count: int
     new_count: int
     old_tokens: int
     new_tokens: int
+    notice_id: str = ""
+    # Server id of the compaction watermark message (where the divider
+    # belongs), so the live line lands at the real compaction position.
+    anchor_id: str = ""
+
+
+@dataclass
+class RetryNotice:
+    """Announces that a failed model call is being retried, before the wait.
+
+    The single event every retry source funnels into, so the client has one
+    frame to render regardless of which layer decided to retry: the request
+    engine's transient-error backoff (429/5xx/connection), the loop's
+    transient-error retry, or a fallback-model switch.
+
+    Emitted *before* the delay is slept, which is the point: the user must see
+    why the turn is stalled while it is stalled. The notice is transient by
+    design -- it describes an attempt in flight, not history -- so the client
+    drops it as soon as the retried attempt produces output, and a turn that
+    exhausts its retries ends on the ordinary error line instead.
+
+    Attributes:
+        scope: Which layer is retrying -- ``"request"`` (transient HTTP error
+            inside one request), ``"network"`` (the loop re-issuing the call),
+            ``"model"`` (switching to the fallback model), or ``"unknown"``.
+        attempt: Which attempt is about to run (1-indexed).
+        max_attempts: Total attempts allowed, or 0 when unbounded.
+        delay_ms: How long the caller waits before the attempt (milliseconds).
+        message: Human-readable trigger, e.g. ``HTTP 429: rate limit``.
+        status_code: HTTP status that triggered the retry, or 0.
+        error_class: The retry engine's :class:`ErrorClass` value, or "".
+    """
+
+    scope: str = "request"
+    attempt: int = 1
+    max_attempts: int = 0
+    delay_ms: int = 0
+    message: str = ""
+    status_code: int = 0
+    error_class: str = ""
 
 
 @dataclass
@@ -327,6 +410,35 @@ class SystemMessage:
     """
     content: str
     kind: str = "info"  # "info" | "warning" | "recovery"
+
+
+@dataclass
+class ModelSwitch:
+    """Records that the active model changed mid-session.
+
+    Emitted for BOTH switch sources so the desktop can render one
+    persistent "Model switched from A to B" notice, exactly like a tool call:
+    the record lives in the session and survives reload.
+
+    Attributes:
+        from_model: Model id that was active before the switch.
+        to_model: Model id that is active after the switch.
+        reason: Human-readable trigger (provider error text for a pool
+            fallback, empty for a manual switch).
+        source: ``"manual"`` (user picked the model) or ``"pool"``
+            (model-pool cycling after a failure).
+        notice_id: Stable id shared with the persisted session notice so
+            a reload does not duplicate the line.
+    """
+
+    from_model: str = ""
+    to_model: str = ""
+    reason: str = ""
+    source: str = "manual"
+    notice_id: str = ""
+    # Server id of the message the switch happened AFTER.  The renderer
+    # inserts the notice there instead of at the tail of a growing reply.
+    anchor_id: str = ""
 
 
 @dataclass
@@ -421,10 +533,10 @@ class WorkflowCompletedEvent:
     total_duration: float = 0.0
 
 
-AgentEvent = TextDelta | ThinkingDelta | ToolCallStart | ToolCallDelta | ToolCallEnd | ToolProgress | ToolResult | PermissionRequest | QuestionRequest | Finish | Artifact | PlanUpdate | CompactStarting | CompactNotification | EditProposal | AssistantBoundary | WorkflowStartedEvent | WorkflowTaskEvent | WorkflowCompletedEvent | SystemMessage
+AgentEvent = TextDelta | ThinkingDelta | ToolCallStart | ToolCallDelta | ToolCallEnd | ToolProgress | ToolResult | PermissionRequest | QuestionRequest | Finish | Artifact | PlanUpdate | CompactStarting | CompactNotification | EditProposal | AssistantBoundary | WorkflowStartedEvent | WorkflowTaskEvent | WorkflowCompletedEvent | RetryNotice | SystemMessage | ModelSwitch
 
 
-# 鈹€鈹€ Multimodal Content Blocks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Multimodal Content Blocks ──────────────────────────────────────
 
 
 @dataclass
@@ -606,12 +718,14 @@ def create_tool_progress(
     tool_name: str,
     status: str,
     sub_agent_messages: list[dict[str, Any]] | None = None,
+    content: str | None = None,
 ) -> ToolProgress:
     return ToolProgress(
         id=id,
         tool_name=tool_name,
         status=status,
         sub_agent_messages=sub_agent_messages,
+        content=content,
     )
 
 
@@ -640,9 +754,12 @@ def create_question_request(tool_call_id: str, questions: list[dict[str, Any]]) 
 
 
 def create_finish(reason: FinishReason, usage: dict[str, Any] | None = None, error: str | None = None,
-                   error_code: str = "", error_category: str = "") -> Finish:
+                   error_code: str = "", error_category: str = "",
+                   compacted: bool = False,
+                   context_usage: dict[str, Any] | None = None) -> Finish:
     return Finish(reason=reason, usage=usage, error=error,
-                  error_code=error_code, error_category=error_category)
+                  error_code=error_code, error_category=error_category,
+                  compacted=compacted, context_usage=context_usage)
 
 
 def create_system_message(content: str, kind: str = "info") -> SystemMessage:
@@ -675,6 +792,15 @@ def create_backend_error(error: str, code: str = "unknown", category: str = "unk
     return BackendError(error=error, code=code, category=category,
                          retryable=retryable, retry_after=retry_after,
                          details=details)
+
+
+def create_retry_notice(scope: str = "request", attempt: int = 1,
+                        max_attempts: int = 0, delay_ms: int = 0,
+                        message: str = "", status_code: int = 0,
+                        error_class: str = "") -> RetryNotice:
+    return RetryNotice(scope=scope, attempt=attempt, max_attempts=max_attempts,
+                       delay_ms=delay_ms, message=message, status_code=status_code,
+                       error_class=error_class)
 
 
 def create_artifact(artifact: dict[str, Any]) -> Artifact:
@@ -730,6 +856,9 @@ def create_plan_review_data(
     dir_path: str = "",
     mode: str = "plan",
     status: str = "review",
+    files: list | None = None,
+    feedback: str = "",
+    call_id: str = "",
 ) -> PlanReviewData:
     return PlanReviewData(
         review_id=review_id,
@@ -738,14 +867,28 @@ def create_plan_review_data(
         dir_path=dir_path,
         mode=mode,
         status=status,
+        files=list(files or []),
+        feedback=feedback,
+        call_id=call_id,
     )
 
 
-# 鈹€鈹€ Branch Protocol Types 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Branch Protocol Types ──────────────────────────────────────────
 
 
 @dataclass
 class BranchMetaData:
+    """Static metadata describing a single conversation branch.
+
+    Carries the branch identity (``id``, ``parent_branch_id``), the
+    fork point that spawned it (``fork_point_message_id``), when it was
+    created (``created_at`` as a Unix timestamp), how many messages it
+    contains, and its token usage (``tokens`` with ``input``, ``output``,
+    ``total``).  This event is not part of the :data:`BranchEvent` union
+    — it is a one-time snapshot used by the session store to populate
+    the branch tree when a session is loaded.
+    """
+
     id: str
     parent_branch_id: str | None = None
     fork_point_message_id: str | None = None
@@ -756,6 +899,16 @@ class BranchMetaData:
 
 @dataclass
 class BranchUpdated:
+    """Emitted when the branch tree changes (a branch is created, deleted,
+    or its metadata is updated).
+
+    ``active_branch_id`` identifies the branch the session is currently
+    on.  ``branches`` is the full list of branch metadata dicts;
+    ``messages`` is the message list for the active branch.  The client
+    uses this event to refresh the branch sidebar without re-fetching
+    the entire session.
+    """
+
     active_branch_id: str
     branches: list[dict[str, Any]]
     messages: list[dict[str, Any]]
@@ -763,6 +916,14 @@ class BranchUpdated:
 
 @dataclass
 class BranchSwitched:
+    """Emitted when the user switches to a different branch.
+
+    ``branch_id`` is the newly active branch.  ``messages`` contains the
+    full message history for that branch so the client can render it
+    immediately.  ``branches`` is the updated branch tree.  ``tokens``
+    (optional) carries the token usage for the switched-to branch.
+    """
+
     branch_id: str
     messages: list[dict[str, Any]]
     branches: list[dict[str, Any]]
@@ -771,6 +932,14 @@ class BranchSwitched:
 
 @dataclass
 class BranchRolledBack:
+    """Emitted when a branch is rolled back (messages are removed).
+
+    ``branch_id`` is the branch that was rolled back.  ``removed_message_ids``
+    lists the IDs of the messages that were deleted.  The client uses
+    this to update the branch's message count and token usage without
+    re-fetching the message list.
+    """
+
     branch_id: str
     removed_message_ids: list[str]
 
@@ -779,7 +948,7 @@ class BranchRolledBack:
 BranchEvent = BranchUpdated | BranchSwitched | BranchRolledBack
 
 
-# 鈹€鈹€ Multimodal Capability Result Types 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Multimodal Capability Result Types ────────────────────────────────
 # These result types are returned by the multimodal methods declared on
 # :class:`encre.backends.base.BaseBackend`.  They are intentionally
 # self-contained (no streaming / delta variants) because each capability
@@ -917,7 +1086,7 @@ class FileListResponse:
 
 
 @dataclass
-class FileContent:
+class ProviderFileContent:
     """Raw content of a downloaded provider file."""
 
     file_id: str = ""
@@ -1079,7 +1248,7 @@ BackendMultimodalResult = (
     | ModerationResponse
     | FileObject
     | FileListResponse
-    | FileContent
+    | ProviderFileContent
     | BatchObject
     | BatchListResponse
     | FineTuneJob

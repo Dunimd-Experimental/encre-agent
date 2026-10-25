@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -26,6 +26,9 @@ from __future__ import annotations
 """Tests for AgentEvent union, BackendEvent union, and factory function variants."""
 
 
+import asyncio
+
+from encre.protocol.handlers.run import _coalesce_stream_deltas
 from encre.utils.types import (
     BackendError,
     BackendFinish,
@@ -510,3 +513,51 @@ class TestToolResultPatterns:
         big = "x" * 5000
         tr = ToolResult(id="t4", content=big, is_error=False)
         assert len(tr.content) == 5000, "large content payloads must be preserved without truncation"
+
+
+class TestStreamDeltaCoalescing:
+    """The transport batches consecutive deltas before encrypting each frame.
+
+    Batching must never reorder events or swallow the tail batch: a structural
+    event flushes what came before it, and the end of the stream flushes what
+    remains.
+    """
+
+    def test_coalesces_deltas_and_flushes_on_boundaries(self):
+        """Consecutive text deltas merge, boundaries flush, nothing is lost."""
+
+        async def source():
+            for ch in "abcdefghij":
+                yield TextDelta(ch)
+            yield ToolCallStart(name="read_file", id="call-1")
+            yield TextDelta("z")
+
+        async def collect():
+            return [event async for event in _coalesce_stream_deltas(source(), window=10.0)]
+
+        events = asyncio.run(collect())
+        text_frames = [event for event in events if isinstance(event, TextDelta)]
+        joined = "".join(event.text for event in text_frames)
+
+        assert joined == "abcdefghijz"
+        assert len(text_frames) < 11, "deltas inside the window must be merged"
+        boundary = next(i for i, event in enumerate(events) if isinstance(event, ToolCallStart))
+        before = "".join(e.text for e in events[:boundary] if isinstance(e, TextDelta))
+        assert before == "abcdefghij", "the batch before a boundary must be flushed first"
+        assert isinstance(events[-1], TextDelta), "the tail batch must be flushed at end of stream"
+
+    def test_never_merges_across_text_and_thinking(self):
+        """Text and thinking are separate streams in the renderer."""
+
+        async def source():
+            yield TextDelta("a")
+            yield ThinkingDelta("hmm")
+            yield TextDelta("b")
+
+        async def collect():
+            return [event async for event in _coalesce_stream_deltas(source(), window=10.0)]
+
+        events = asyncio.run(collect())
+        assert [type(event).__name__ for event in events] == [
+            "TextDelta", "ThinkingDelta", "TextDelta",
+        ]

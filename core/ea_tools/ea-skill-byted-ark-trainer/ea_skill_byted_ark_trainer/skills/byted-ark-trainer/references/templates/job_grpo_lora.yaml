@@ -1,0 +1,98 @@
+# ============================================================
+# GRPO LoRA 训练任务配置模板（GRPOLoRA）
+# ------------------------------------------------------------
+# 使用说明：
+# 1. 将本文件复制到当前实验子目录（experiments/exp_xxx/job.yaml），再按实际情况改值。
+# 2. hyperparameters 字段以 `ark get foundation-model --model <X> --version <Y> --fields hyperparameters`
+#    返回的 GRPOLoRA 小节为准；查询输出中没有出现的字段一律不允许加到本文件里。
+# 3. 提交命令：`ark create mcj -f job.yaml`（是 mcj，不是 customization-job）。
+# 4. custom_rl_pipeline 中的 plugin 有两种写法，本模板示范官方完整写法；另有简写形式
+#    （见文件末尾注释），两者都被 ark-sdk 接受。
+# 5. enable_trajectory 强烈建议开启（true），便于在控制台做轨迹分析（需预先开通 TLS 日志服务）。
+# ------------------------------------------------------------
+# 常见踩坑：
+# - model_version 必须是字符串（带引号）。
+# - GRPO 字段是 `lr` 不是 `learning_rate`；不要把 SFT 的 FinetuneLoRA 字段名搬过来。
+# - `num_generations` 必须落在查询返回的离散集合内（常见 {8, 16, 32}）。
+# - `num_iterations_per_batch` 会引入 off-policy，不熟悉的话保持默认。
+# - GRPO 必须配 custom_rl_pipeline；SFT 绝不能配 custom_rl_pipeline。
+# - 不允许出现凭印象添加的字段（例如 loss_name 等内部字段），以查询白名单为准。
+# ============================================================
+
+name: grpo-lora-demo                     # 任务名（必填）
+customization_type: GRPOLoRA             # 训练方式（GRPO-LoRA）
+
+model_reference:                         # 基础模型引用，两种二选一：
+  foundation_model:                      # (a) 直接基于基础模型训练
+    name: doubao-seed-1-6-flash
+    model_version: '250615'              # 字符串！
+  # (b) 基于 RFT/SFT 产出的自定义模型继续训练（GRPO 常见场景）：
+  # custom_model_id: cm-20260423172018-hkvtj
+
+data:
+  training_set:
+    local_files:                         # 单文件 ≤ 2GB，最多 20 个
+      - ./data/rl_train_data.jsonl
+  # 若有测试集：
+  # validation_set:
+  #   local_files:
+  #     - ./data/rl_test_data.jsonl
+
+hyperparameters:                         # 只能填查询结果中 GRPOLoRA 小节的字段
+  num_steps: 20
+  batch_size: 128
+  lr: 0.000001                           # 注意：GRPO 字段是 lr（不是 learning_rate）
+  lr_warmup_steps: 5
+  num_generations: 8                     # 每个样本 rollout 次数；必须在离散取值集合内
+  num_iterations_per_batch: 2
+  temperature: 1.0
+  top_p: 1
+  max_new_tokens: 1024
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  kl_coefficient: 0.001
+  loss_agg_mode: seq-mean-token-mean
+  save_every_n_steps: 10
+  test_every_n_steps: 5
+  test_num_generations: 1
+  test_top_p: 1
+
+custom_rl_pipeline:                      # GRPO 必填
+  graders:
+    - plugin:
+        name: random_reward
+        python_func: plugins.random_reward:random_reward_fn
+        envs:
+          foo: bar
+      weight: 0.5
+  rollout:
+    plugin:
+      name: demo_rollout
+      python_func: plugins.weather_rollout:demo_rollout
+      runtime:
+        instance: cpu1mem2
+        timeout: 900
+        min_replicas: 1
+        max_replicas: 10
+        max_concurrency: 100
+    weight: 1.0
+    envs:
+      foo: bar
+
+enable_trajectory: true                  # RL 建议开启（需预先开通 TLS 日志服务）
+save_model_limit: 1                      # 保留的训练产物数量上限（可选）
+
+# ------------------------------------------------------------
+# 【附】custom_rl_pipeline 的 plugin 简写形式（与上面等价）：
+# custom_rl_pipeline:
+#   pipeline_type: GRPOPipeline
+#   graders:
+#     - plugin: plugins.random_reward:random_reward_fn
+#       weight: 0.5
+#       envs:
+#         foo: bar
+#   rollout:
+#     plugin: plugins.weather_rollout:demo_rollout
+#     envs:
+#       foo: bar
+# ------------------------------------------------------------

@@ -33,10 +33,15 @@
 
 import { getState, setActiveWorkspace, setWorkspaceMode, subscribe, removeArchivedSessionById, clearMessages, setSessionId, setSessionState, getTraySessions, setSessionsList } from "../core/state.js";
 import { send } from "../core/ws.js";
-import { setRequestedSessionId, refreshAllData } from "../core/stream.js";
+import { setRequestedSessionId } from "../core/stream.js";
 import { t } from "../features/i18n.js";
 import { Dialog } from "../ui/dialog.js";
-import { showContextMenu, clampElLeft } from "../ui/context-menu.js";
+import { showContextMenu, hideContextMenu, renderContextMenuItems } from "../ui/context-menu.js";
+import { pluginMenuSpecs } from "../features/plugin_contributions.js";
+import { hideAnimated, showAnimated } from "../ui/animate.js";
+import { scheduleRender } from "../core/render_scheduler.js";
+import { guardRender } from "../core/ui_boundary.js";
+import { registerSurface, unregisterSurface } from "../core/scope.js";
 import { workspaceIconHtml } from "../chat/session-projection.js";
 import { bindTargetModelSelection, readTargetModelSelection, readTargetModelSelectionEnabled, renderTargetModelSelection } from "../settings/model-selection.js";
 import type { WorkspaceEntry, WorkspaceConfig, SessionEntryData } from "../core/types.js";
@@ -76,7 +81,7 @@ export class Workspace {
       } else if (mode !== "iwork" && this.isInWorkspaceMode) {
         this.isInWorkspaceMode = false;
       }
-    });
+    }, ["workspaceMode"]);
   }
 
   private esc(s: string): string {
@@ -144,10 +149,10 @@ export class Workspace {
       const requestId = crypto.randomUUID();
       setRequestedSessionId("", requestId);
       send({ type: "close_workspace", path: oldWs, request_id: requestId });
+    } else {
+      // No active workspace to close, so no backend state change happens and
+      // the existing snapshot is still current — no refill needed.
     }
-    // Unified refresh — workspace_closed also triggers it server-side, this
-    // call covers the case where no workspace was open to close.
-    refreshAllData();
     this.syncFirstNavActive();
     setTimeout(() => { this._exiting = false; }, 100);
   }
@@ -191,10 +196,11 @@ export class Workspace {
       setRequestedSessionId("", requestId);
       send({ type: "open_workspace", path: workspaces[0].path, request_id: requestId });
     } else {
-      // Already have an active workspace (or empty): refresh the sidebar
-      // session list and the tray cache for the current workspace context.
-      // Full unified pull so the model selector / settings also refresh.
-      refreshAllData();
+      // Already have an active workspace (or empty): no backend state change
+      // happens on this path (no open_workspace is sent, so the backend does
+      // not push a new snapshot), and the existing snapshot is still current
+      // — it was pushed when this workspace was opened and kept fresh by
+      // per-mutation broadcasts. Seed the sidebar below and render.
     }
 
     // Seed the sidebar with the cached iWork sessions for this workspace
@@ -226,10 +232,10 @@ export class Workspace {
       setRequestedSessionId("", requestId);
       send({ type: "close_workspace", path: oldWs, request_id: requestId });
     }
-    // Unified refresh — the close_workspace round-trip triggers workspace_closed
-    // (which also runs refreshAllData); this direct call covers edge cases.
-    refreshAllData();
-    // Symmetric seed: show the cached normal sessions right away instead of
+    // No close sent and no backend state change: the existing snapshot is
+    // still current (pushed at boot / on the last workspace transition and
+    // kept fresh by per-mutation broadcasts), so there is nothing to refill.
+    // Seed the cached normal sessions right away instead of
     // keeping the workspace's rows until the close_workspace round-trip lands.
     setSessionsList(getTraySessions().normal);
     this.syncFirstNavActive();
@@ -251,6 +257,16 @@ export class Workspace {
   private activate(path: string): void {
     if (this._exiting || this._transitioning || !this.isInWorkspaceMode) return;
     setActiveWorkspace(path);
+    // Seed the sidebar with cached sessions of the TARGET workspace (same
+    // pattern as enterWorkspaceMode) so the previous workspace's rows don't
+    // linger until the authoritative sessions_list lands with the
+    // workspace_opened snapshot.  The seed is replaced in one step — never
+    // cleared — so there is no empty flash in between.
+    const cached = getTraySessions().iwork.filter((s: any) => {
+      const wsPath = s?.metadata?.workspace_path || s?.metadata?.workspace || "";
+      return wsPath === path;
+    });
+    setSessionsList(cached);
     const requestId = crypto.randomUUID();
     setRequestedSessionId("", requestId);
     send({ type: "open_workspace", path, request_id: requestId });
@@ -328,19 +344,18 @@ export class WorkspaceManager {
       // session lists, a late workspace_config response, …) would otherwise
       // rebuild the form and snap unsaved toggles back to their saved value.
       if (this.view === "settings" && this.computeSettingsSig() === this.settingsSig) return;
-      try {
-        this.renderBody();
-      } catch (err) {
-        console.error("[workspace-manager] render failed:", err);
-      }
-    });
+      // Coalesced paint + shared boundary, like every other surface.
+      scheduleRender("workspace-manager", () => {
+        guardRender("workspace-manager", "body", () => this.renderBody());
+      }, 60);
+    }, ["workspaces", "activeWorkspace", "workspaceConfigs", "usageStats"]);
   }
 
   open(): void {
     this.view = "list";
     this.editingPath = "";
     if (!this.overlay) this.buildOverlay();
-    this.overlay!.classList.remove("hidden");
+    showAnimated(this.overlay);
     this.renderBody();
     window.addEventListener("keydown", this.onKeyDown);
   }
@@ -348,7 +363,8 @@ export class WorkspaceManager {
   close(): void {
     this.hideContextMenu();
     window.removeEventListener("keydown", this.onKeyDown);
-    this.overlay?.classList.add("hidden");
+    if (this.overlay) unregisterSurface(this.overlay);
+    hideAnimated(this.overlay);
   }
 
   /** Re-render the open overlay (used when async config responses arrive). */
@@ -381,7 +397,18 @@ export class WorkspaceManager {
       <div class="workspace-mgr-body" id="wsmgr-body"></div>
       <div class="dialog-footer workspace-mgr-footer" id="wsmgr-footer" style="display:none"></div>
     </div>`;
-    document.body.appendChild(overlay);
+    // Mount into the content area (not <body>) so the dimmed backdrop covers
+    // the region the manager belongs to. It is WORKSPACE-wide — it manages
+    // every conversation, not the open one — so it declares itself to the
+    // scope host as an APP surface: switching conversations must not shelf it
+    // or leave it repainted over somebody else's chat.
+    const mount = document.getElementById("main-content") ?? document.body;
+    mount.appendChild(overlay);
+    registerSurface(overlay, {
+      scope: "app",
+      parent: mount,
+      onClose: () => this.close(),
+    });
     this.overlay = overlay;
     overlay.addEventListener("click", (e) => {
       if (e.target === overlay) this.close();
@@ -397,11 +424,11 @@ export class WorkspaceManager {
     overlay.querySelector("#wsmgr-archive")?.addEventListener("click", (e) => {
       e.stopPropagation();
       this.view = "archive";
+      // Render purely from state: the archived list is filled by the boot
+      // pull and re-pushed by the backend after every archive/unarchive/
+      // delete mutation, and the state subscription re-renders this view —
+      // entering the tab must never fire a per-entry refill request.
       this.renderBody();
-      // Pull the latest archived sessions from the backend; the response
-      // (archived_sessions_list) fills state.archivedSessions and the state
-      // subscription re-renders this view.
-      send({ type: "list_archived_sessions" });
     });
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: overlay });
@@ -457,7 +484,6 @@ export class WorkspaceManager {
        const prior = this.captureSettingsFormState(body, ws);
        body.innerHTML = this.renderSettings(ws, prior);
        this.bindSettings(body, ws);
-       this.bindIndexCard(body);
        this.renderSettingsFooter(body, ws);
        this.settingsSig = this.computeSettingsSig();
     } else if (this.view === "archive") {
@@ -513,33 +539,41 @@ export class WorkspaceManager {
       item.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        this.showItemMenu(path, e.clientX, e.clientY);
+        this.showItemMenu(path, e.clientX, e.clientY, item);
       });
     });
   }
 
-  private showItemMenu(path: string, x: number, y: number): void {
+  private showItemMenu(path: string, x: number, y: number, target?: HTMLElement | null): void {
     if (!this.contextMenu) return;
-    this.contextMenu.innerHTML = `<div class="context-menu-item" id="wsmgr-ctx-settings"><i data-lucide="settings" class="lucide lucide-sm"></i><span>${t("workspace.settingsTitle")}</span></div>
-      <div class="context-menu-item context-menu-item-danger" id="wsmgr-ctx-delete"><i data-lucide="trash-2" class="lucide lucide-sm"></i><span>${t("workspace.delete")}</span></div>`;
-    showContextMenu(this.contextMenu, x, y);
-    this.contextMenu.querySelector("#wsmgr-ctx-settings")?.addEventListener("click", () => {
-      this.hideContextMenu();
-      this.view = "settings";
-      this.editingPath = path;
-      this.renderBody();
-    });
-    this.contextMenu.querySelector("#wsmgr-ctx-delete")?.addEventListener("click", () => {
-      this.hideContextMenu();
-      void this.handleDelete(path);
-    });
-    if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons({ root: this.contextMenu });
-    }
+    renderContextMenuItems(
+      [
+        {
+          id: "wsmgr-ctx-settings",
+          icon: "settings",
+          label: t("workspace.settingsTitle"),
+          onClick: () => {
+            this.view = "settings";
+            this.editingPath = path;
+            this.renderBody();
+          },
+        },
+        ...pluginMenuSpecs("workspace_manager", { path }),
+        {
+          id: "wsmgr-ctx-delete",
+          icon: "trash-2",
+          danger: true,
+          label: t("workspace.delete"),
+          onClick: () => void this.handleDelete(path),
+        },
+      ],
+      { container: this.contextMenu },
+    );
+    showContextMenu(this.contextMenu, x, y, { target });
   }
 
   private hideContextMenu(): void {
-    this.contextMenu?.classList.add("hidden");
+    hideAnimated(this.contextMenu);
   }
 
   private renderDetails(w: WorkspaceEntry): string {
@@ -608,7 +642,6 @@ export class WorkspaceManager {
         <input type="text" class="model-form-input" id="wsmgr-name-input" value="${this.esc(prior ? prior.name : w.name)}" />
       </div>
       ${ctxToggles}
-      ${this.indexCard(w)}
       ${renderTargetModelSelection({
         id: w.id,
         models: getState().modelConfigs || [],
@@ -622,123 +655,6 @@ export class WorkspaceManager {
     </div>`;
   }
 
-  /** Workspace index card: a title row (icon + name) with a control button on
-   *  the right, followed by a real progress bar and its percentage.  The bar is
-   *  always rendered — ready is 100%, indexing shows the live value, and an
-   *  unindexed workspace shows 0%. */
-  private indexCard(w: WorkspaceEntry): string {
-    const progress = w.index_progress ?? 0;
-    const status = w.index_status ?? "idle";
-    const hasIndex = status === "ready" || status === "error" || (progress || 0) > 0;
-    const isIndexing = status === "indexing";
-    const pct = status === "ready" ? 100 : Math.min(100, Math.max(0, progress));
-    const fillColor = status === "error"
-      ? "var(--error)"
-      : (hasIndex ? "var(--color-success, #22c55e)" : "var(--accent)");
-    const btnIcon = isIndexing ? "pause" : (hasIndex ? "settings" : "play");
-    const btnTitle = isIndexing ? "" : (hasIndex ? t("settings.indexActions") : t("settings.startIndex"));
-    return `<div class="model-form-thinking-card" data-index-card="${this.esc(w.id)}" style="display:block;padding:8px 12px">
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
-        <span class="model-form-thinking-title" style="margin:0;white-space:nowrap;flex-shrink:0">${t("workspace.index")}</span>
-        <span style="font-size:11px;color:var(--text-muted);white-space:nowrap;flex-shrink:0">${pct}%</span>
-        <button class="index-mgmt-btn" title="${btnTitle}" data-has-index="${hasIndex}" data-indexing="${isIndexing}" style="margin-left:auto;background:none;border:none;cursor:pointer;padding:4px;display:flex;align-items:center;justify-content:center;color:var(--text-secondary);border-radius:4px;transition:background 0.15s;flex-shrink:0">
-          <i data-lucide="${btnIcon}" style="width:14px;height:14px;display:block"></i>
-        </button>
-      </div>
-      <div class="workflow-progress-bar" style="margin:0 0 4px"><div class="workflow-progress-fill" style="width:${pct}%;background:${fillColor}"></div></div>
-    </div>`;
-  }
-
-  /** Bind the index-management button inside the card (dropdown for
-   *  reindex/delete, or direct start when no index exists yet). */
-  private bindIndexCard(container: HTMLElement): void {
-    const card = container.querySelector<HTMLElement>('[data-index-card]');
-    if (!card) return;
-    const btn = card.querySelector<HTMLButtonElement>(".index-mgmt-btn");
-    if (!btn) return;
-    const wId = card.dataset.indexCard || "";
-    const hasIndex = btn.dataset.hasIndex === "true";
-    const isIndexing = btn.dataset.indexing === "true";
-    const ws = getState().workspaces.find((x) => x.id === wId);
-    if (!ws) return;
-
-    // Use a single-shot click handler (remove on first call to avoid stack-up)
-    if ((btn as any)._bound) return;
-    (btn as any)._bound = true;
-
-    if (hasIndex || isIndexing) {
-      // Show dropdown with reindex / delete-index
-      let menu = document.getElementById("index-mgmt-menu") as HTMLElement | null;
-      if (!menu) {
-        menu = document.createElement("div");
-        menu.id = "index-mgmt-menu";
-        menu.className = "context-menu";
-        menu.style.cssText = "display:none;position:fixed;z-index:10000";
-        document.body.appendChild(menu);
-      }
-      menu.innerHTML = `
-        <div class="context-menu-item" data-action="reindex"><i data-lucide="refresh-cw" class="lucide lucide-sm"></i>${t("settings.reindex")}</div>
-        <div class="context-menu-item" data-action="delete-index"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("settings.deleteIndex")}</div>`;
-
-      btn.addEventListener("click", function _onSettingsClick(e: Event) {
-        e.stopPropagation();
-        const shown = menu!.style.display !== "none";
-        if (shown) {
-          menu!.style.display = "none";
-          return;
-        }
-        // Hide other context menus; show this one via showContextMenu
-        // which clears inline display:none and positions the menu.
-        document.querySelectorAll(".context-menu").forEach(m => {
-          if (m !== menu) (m as HTMLElement).style.display = "none";
-        });
-        const rect = btn.getBoundingClientRect();
-        showContextMenu(menu!, rect.right - 160, rect.bottom + 4);
-        requestAnimationFrame(() => (window as any).lucide.createIcons({ root: menu! }));
-        setTimeout(() => {
-          document.addEventListener("click", function _closeMenu() {
-            menu!.style.display = "none";
-            document.removeEventListener("click", _closeMenu);
-          });
-        }, 0);
-      });
-
-      menu.querySelectorAll(".context-menu-item").forEach((item) => {
-        item.addEventListener("click", (e) => {
-          e.stopPropagation();
-          menu!.style.display = "none";
-          const action = (item as HTMLElement).dataset.action!;
-          const isReindex = action === "reindex";
-          const doSend = () => {
-            send({ type: isReindex ? "reindex_workspace" : "delete_index", path: ws.path });
-          };
-          if (isReindex) {
-            Dialog.confirm(
-              t("workspace.confirmReindexTitle"),
-              t("workspace.confirmReindex", { name: ws.name }),
-              { container: document.getElementById("app") ?? undefined },
-            ).then((ok) => { if (ok) doSend(); });
-          } else {
-            Dialog.confirm(
-              t("workspace.confirmDeleteIndexTitle"),
-              t("workspace.confirmDeleteIndex", { name: ws.name }),
-              { priority: "high", container: document.getElementById("app") ?? undefined },
-            ).then((ok) => { if (ok) doSend(); });
-          }
-        });
-      });
-    } else {
-      // No index: clicking button directly starts indexing
-      btn.innerHTML = `<i data-lucide="play" style="width:14px;height:14px;display:block;color:var(--text-secondary)"></i>`;
-      btn.addEventListener("click", function _onStartClick(e: Event) {
-        e.stopPropagation();
-        send({ type: "reindex_workspace", path: ws.path });
-      });
-      if (typeof (window as any).lucide !== "undefined") {
-        requestAnimationFrame(() => (window as any).lucide.createIcons());
-      }
-    }
-  }
 
   /**
    * Snapshot the user's live, unsaved settings-form values from the DOM.
@@ -778,9 +694,6 @@ export class WorkspaceManager {
       st.workspaceConfigs[this.editingPath] ?? null,
       st.workspaceFiles[this.editingPath] ?? null,
       models,
-      ws?.index_status ?? "",
-      ws?.index_progress ?? 0,
-      ws?.index_files ?? 0,
     ]);
   }
 
@@ -926,29 +839,35 @@ export class WorkspaceManager {
       item.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        this.showArchiveMenu(sid, e.clientX, e.clientY);
+        this.showArchiveMenu(sid, e.clientX, e.clientY, item);
       });
     });
   }
 
   /** Context menu for an archived conversation: restore + delete. */
-  private showArchiveMenu(sid: string, x: number, y: number): void {
+  private showArchiveMenu(sid: string, x: number, y: number, target?: HTMLElement | null): void {
     if (!this.contextMenu) return;
-    this.contextMenu.innerHTML = `<div class="context-menu-item" id="wsmgr-ctx-unarchive"><i data-lucide="archive-restore" class="lucide lucide-sm"></i><span>${t("workspace.unarchive")}</span></div>
-      <div class="context-menu-divider"></div>
-      <div class="context-menu-item context-menu-item-danger" id="wsmgr-ctx-delete-archived"><i data-lucide="trash-2" class="lucide lucide-sm"></i><span>${t("workspace.delete")}</span></div>`;
-    showContextMenu(this.contextMenu, x, y);
-    this.contextMenu.querySelector("#wsmgr-ctx-unarchive")?.addEventListener("click", () => {
-      this.hideContextMenu();
-      void this.handleUnarchive(sid);
-    });
-    this.contextMenu.querySelector("#wsmgr-ctx-delete-archived")?.addEventListener("click", () => {
-      this.hideContextMenu();
-      void this.handleArchiveDelete(sid);
-    });
-    if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons({ root: this.contextMenu });
-    }
+    renderContextMenuItems(
+      [
+        {
+          id: "wsmgr-ctx-unarchive",
+          icon: "archive-restore",
+          label: t("workspace.unarchive"),
+          onClick: () => void this.handleUnarchive(sid),
+        },
+        ...pluginMenuSpecs("archived_sessions", { sid }),
+        { divider: true },
+        {
+          id: "wsmgr-ctx-delete-archived",
+          icon: "trash-2",
+          danger: true,
+          label: t("workspace.delete"),
+          onClick: () => void this.handleArchiveDelete(sid),
+        },
+      ],
+      { container: this.contextMenu },
+    );
+    showContextMenu(this.contextMenu, x, y, { target });
   }
 
   /** Restore an archived conversation back into the workspace history —
@@ -956,7 +875,7 @@ export class WorkspaceManager {
   private async handleUnarchive(sid: string): Promise<void> {
     const s = getState().archivedSessions.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (!(await Dialog.confirm(t("workspace.confirmUnarchiveTitle"), t("workspace.confirmUnarchive", { name }), { container: document.getElementById("app") ?? undefined }))) return;
+    if (!(await Dialog.confirm(t("workspace.confirmUnarchiveTitle"), t("workspace.confirmUnarchive", { name }), { scope: "app" }))) return;
     // Optimistically drop the row from the archive view; the backend
     // broadcast re-inserts the session into the workspace history list.
     removeArchivedSessionById(sid);
@@ -968,7 +887,7 @@ export class WorkspaceManager {
   private async handleArchiveDelete(sid: string): Promise<void> {
     const s = getState().archivedSessions.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (!(await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined }))) return;
+    if (!(await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { scope: "app" }))) return;
     // Optimistically drop the row from the archive view.
     removeArchivedSessionById(sid);
     // If the deleted session is the one currently being viewed, clear the
@@ -984,7 +903,7 @@ export class WorkspaceManager {
   private async handleDelete(path: string): Promise<void> {
     const ws = getState().workspaces.find((w) => w.path === path);
     const name = ws?.name || path;
-    const ok = await Dialog.confirm(t("workspace.confirmDeleteOneTitle"), t("workspace.confirmDeleteOne", { name }), { container: document.getElementById("app") ?? undefined });
+    const ok = await Dialog.confirm(t("workspace.confirmDeleteOneTitle"), t("workspace.confirmDeleteOne", { name }), { scope: "app" });
     if (!ok) return;
     send({ type: "remove_workspace", path });
     // Backend replies workspace_removed; the state subscription refreshes the list.

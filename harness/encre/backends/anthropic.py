@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -64,7 +62,8 @@ from typing import Any
 import httpx
 
 from encre.backends.auth import AuthManager
-from encre.backends.base import BaseBackend
+from encre.backends.base import BaseBackend, normalize_usage
+from encre.backends.catalog import get_context_window
 from encre.backends.connection import (
     ConnectionHealthMonitor,
     format_connection_error,
@@ -118,6 +117,7 @@ class AnthropicBackend(BaseBackend):
         auth_manager: AuthManager | None = None,
         connection_monitor: ConnectionHealthMonitor | None = None,
         fallback_keys: list[str] | None = None,
+        extra_headers: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialise the Anthropic backend.
@@ -183,13 +183,17 @@ class AnthropicBackend(BaseBackend):
         self.connection_monitor = connection_monitor or ConnectionHealthMonitor()
 
         # HTTP client (x-api-key in defaults for non-chat calls; overridden
-        # per-request in chat() when auth_manager is active for key rotation)
+        # per-request in chat() when auth_manager is active for key rotation).
+        # Custom ``extra_headers`` ride as client defaults and are merged last
+        # per-request too, so user values win over the built-in ones.
+        self.extra_headers: dict[str, str] = dict(extra_headers or {})
         self._client = httpx.AsyncClient(
             base_url="https://api.anthropic.com/v1",
             headers={
                 "x-api-key": self.auth_manager.api_key if self.auth_manager else self.api_key,
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
+                **self.extra_headers,
             },
             timeout=httpx.Timeout(300.0, connect=30.0),
         )
@@ -260,14 +264,49 @@ class AnthropicBackend(BaseBackend):
             except Exception:
                 logger.debug("[cache_edits] attach failed", exc_info=True)
 
-        # Assemble the Anthropic Messages API request body.
+        # Extract system messages: the Messages API requires them in the
+        # ``system`` parameter, not inside ``messages`` (which would 400).
+        # Multiple system messages are merged; text blocks keep their
+        # ``cache_control`` annotations so prompt caching still applies.
+        system_blocks: list[dict[str, Any]] = []
+        non_system_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") != "system":
+                non_system_messages.append(msg)
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if content:
+                    system_blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        system_blocks.append(dict(block))
+
+        # Assemble the Anthropic Messages API request body.  The harness
+        # history is OpenAI-format (tool_calls / role:"tool"), so it must be
+        # projected into native blocks before it can be sent.
         body: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": self._normalize_image_blocks(
+                self._project_messages(non_system_messages)
+            ),
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": stream,
         }
+        # Provider "advanced config" sampling overrides (top_k / top_p are
+        # native Anthropic Messages API fields).
+        self._merge_sampling_overrides(body)
+        if system_blocks:
+            if any("cache_control" in block for block in system_blocks):
+                body["system"] = system_blocks
+            else:
+                merged_system = "\n\n".join(
+                    block.get("text", "") for block in system_blocks
+                )
+                if merged_system:
+                    body["system"] = merged_system
         if tools:
             body["tools"] = tools
 
@@ -299,6 +338,8 @@ class AnthropicBackend(BaseBackend):
                 # attached a cache_edits block this request.
                 if _cache_edits_beta:
                     _req_headers["anthropic-beta"] = CACHE_EDITING_BETA_HEADER
+                if self.extra_headers:
+                    _req_headers.update(self.extra_headers)
 
                 _url = str(self._client.base_url)
                 try:
@@ -379,8 +420,7 @@ class AnthropicBackend(BaseBackend):
 
                                 mark_sent_to_api(cache_edits_state)
                             except Exception:
-                                pass
-
+                                logger.debug("exception suppressed", exc_info=True)
                     elif event_type == "content_block_start":
                         # A new content block begins (text, thinking, tool_use).
                         block = data.get("content_block", {})
@@ -457,13 +497,19 @@ class AnthropicBackend(BaseBackend):
                         logger.error(f"Anthropic stream error: {err_msg}")
                         yield create_backend_error(err_msg)
 
-                _usage = {"input_tokens": _input_tokens, "output_tokens": _output_tokens} if _input_tokens or _output_tokens or _cache_read or _cache_creation else None
-                if _usage and _cache_deleted:
-                    _usage["cache_deleted_input_tokens"] = _cache_deleted
-                if _usage and _cache_read:
-                    _usage["cache_read_input_tokens"] = _cache_read
-                if _usage and _cache_creation:
-                    _usage["cache_creation_input_tokens"] = _cache_creation
+                _usage = None
+                if _input_tokens or _output_tokens or _cache_read or _cache_creation:
+                    _raw_usage: dict[str, Any] = {
+                        "input_tokens": _input_tokens,
+                        "output_tokens": _output_tokens,
+                    }
+                    if _cache_read:
+                        _raw_usage["cache_read_input_tokens"] = _cache_read
+                    if _cache_creation:
+                        _raw_usage["cache_creation_input_tokens"] = _cache_creation
+                    if _cache_deleted:
+                        _raw_usage["cache_deleted_input_tokens"] = _cache_deleted
+                    _usage = normalize_usage(_raw_usage)
                 yield create_backend_finish(finish_reason, usage=_usage)
 
         except Exception as e:
@@ -518,12 +564,19 @@ class AnthropicBackend(BaseBackend):
     def context_window_size(self) -> int:
         """Return the context window size for Claude models.
 
+        The model catalog (:func:`encre.backends.catalog.get_context_window`)
+        is the single source of truth; the family heuristics below only run
+        for names the catalog does not know.
+
         2026 reference:
             - Claude Opus 5 / Fable 5 / Sonnet 5: 1,000,000 tokens
             - Claude Opus 4.8 / Sonnet 4.6: 1,000,000 tokens
             - Claude Opus 4.6 / Sonnet 4.5: 200,000 tokens
             - Claude Haiku 4.5 / 4.0: 200,000 tokens
         """
+        catalog_window = get_context_window(self.model)
+        if catalog_window is not None:
+            return catalog_window
         model_lower = self.model.lower()
         # 5th generation -- 1M context.
         if "opus-5" in model_lower or "fable-5" in model_lower or "sonnet-5" in model_lower:
@@ -598,6 +651,173 @@ class AnthropicBackend(BaseBackend):
         return models
 
     @staticmethod
+    def _project_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project the harness's OpenAI-format history into Anthropic blocks.
+
+        The Messages API has no ``tool_calls`` / ``role: "tool"`` message
+        shapes: assistant tool invocations must arrive as ``tool_use``
+        content blocks and tool results as ``tool_result`` blocks inside a
+        ``user`` message directly after them.  Thinking blocks are replayed
+        with the server-issued signatures stored in ``reasoning_blocks`` --
+        replaying thinking text alone (or with a stale signature) is a hard
+        400, so a block without a usable signature is omitted.
+
+        Consecutive ``tool`` results are merged into one ``user`` turn and
+        flushed before any following message, matching the API's strict
+        block ordering.  ``image_url`` blocks pass through untouched for
+        :meth:`_normalize_image_blocks` to convert afterwards.
+        """
+        out: list[dict[str, Any]] = []
+        pending_tool_results: list[dict[str, Any]] = []
+
+        def _flush_tool_results() -> None:
+            if pending_tool_results:
+                out.append({"role": "user", "content": list(pending_tool_results)})
+                pending_tool_results.clear()
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "tool":
+                result_content = (
+                    content
+                    if isinstance(content, str)
+                    else json.dumps(content or "", ensure_ascii=False)
+                )
+                # An empty tool_use_id is a hard 400 on the Messages API;
+                # tombstone/recovery paths can synthesize tool results
+                # before a real id exists, so placeholder ids keep the
+                # request sendable (and the pair visibly broken instead
+                # of crashing the whole turn).
+                result_block: dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id") or "toolu_missing_id",
+                    "content": result_content,
+                }
+                if msg.get("is_error"):
+                    result_block["is_error"] = True
+                pending_tool_results.append(result_block)
+                continue
+
+            # A tool_result must directly follow its tool_use inside a user
+            # turn -- flush before any other message shape lands.
+            _flush_tool_results()
+
+            if role == "assistant":
+                blocks: list[dict[str, Any]] = []
+                reasoning_blocks = msg.get("reasoning_blocks")
+                if not reasoning_blocks:
+                    reasoning_text = msg.get("reasoning_content", "")
+                    reasoning_blocks = (
+                        [{"text": reasoning_text, "signature": ""}] if reasoning_text else []
+                    )
+                for rb in reasoning_blocks:
+                    if not isinstance(rb, dict):
+                        continue
+                    sig = rb.get("signature") or ""
+                    if sig:
+                        blocks.append(
+                            {
+                                "type": "thinking",
+                                "thinking": rb.get("text") or "",
+                                "signature": sig,
+                            }
+                        )
+                text = (
+                    content
+                    if isinstance(content, str)
+                    else "".join(
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                )
+                if text:
+                    blocks.append({"type": "text", "text": text})
+                for tc in msg.get("tool_calls") or []:
+                    func = tc.get("function") or {}
+                    args = func.get("arguments", "")
+                    if isinstance(args, str):
+                        try:
+                            args_obj: Any = json.loads(args) if args else {}
+                        except ValueError:
+                            args_obj = {"_raw": args}
+                    else:
+                        args_obj = args or {}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.get("id") or f"toolu_missing_{len(blocks)}",
+                            "name": func.get("name", ""),
+                            "input": args_obj,
+                        }
+                    )
+                if blocks:
+                    out.append({"role": "assistant", "content": blocks})
+                continue
+
+            # user (and any other role): normalize the content into blocks.
+            if isinstance(content, str):
+                norm: list[dict[str, Any]] = [{"type": "text", "text": content}] if content else []
+            elif isinstance(content, list):
+                norm = [item if isinstance(item, dict) else {"type": "text", "text": str(item)} for item in content]
+            else:
+                norm = [{"type": "text", "text": json.dumps(content) if content else ""}]
+            if norm:
+                out.append({"role": "user", "content": norm})
+
+        _flush_tool_results()
+        return out
+
+    @staticmethod
+    def _normalize_image_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert OpenAI-style ``image_url`` blocks into native image blocks.
+
+        The Messages API expects ``{"type": "image", "source": {"type":
+        "base64", ...}}`` while the harness's lingua franca (and what the
+        computer tool's screenshot projection emits) is the OpenAI-style
+        ``{"type": "image_url", "image_url": {"url": "data:..."}}`` block.
+        Data URLs are rewritten to native source blocks; http(s) URLs are
+        rewritten to URL sources; any other block passes through untouched.
+        Non-mutating: messages without image blocks are returned as-is.
+        """
+        changed = False
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if not (isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "image_url" for b in content
+            )):
+                out.append(msg)
+                continue
+            blocks: list[dict[str, Any]] = []
+            for block in content:
+                if not (isinstance(block, dict) and block.get("type") == "image_url"):
+                    blocks.append(block)
+                    continue
+                url = (block.get("image_url") or {}).get("url", "")
+                if isinstance(url, str) and url.startswith("data:"):
+                    header, _, data = url.partition(",")
+                    media_type = header[5:].split(";", 1)[0] or "image/png"
+                    blocks.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    })
+                elif isinstance(url, str) and url.startswith(("http://", "https://")):
+                    blocks.append({
+                        "type": "image",
+                        "source": {"type": "url", "url": url},
+                    })
+                else:
+                    blocks.append(block)
+            new_msg = dict(msg)
+            new_msg["content"] = blocks
+            out.append(new_msg)
+            changed = True
+        return out if changed else messages
+
+    @staticmethod
     def _apply_prompt_caching(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Inject ``cache_control`` breakpoints for Anthropic prompt caching.
 
@@ -655,7 +875,7 @@ class AnthropicBackend(BaseBackend):
 
         return result
 
-    # 鈹€鈹€ Multimodal capability declarations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Multimodal capability declarations ───────────────────────────────
     # Anthropic natively supports: files (Files API), batch (Messages
     # Batches) and vision input (via chat).  Other modalities
     # (image generation, TTS, embeddings, moderation, fine-tuning,
@@ -671,7 +891,7 @@ class AnthropicBackend(BaseBackend):
     def supports_vision_input(self) -> bool:
         return True
 
-    # 鈹€鈹€ Files 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Files ────────────────────────────────────────────────────────────
 
     async def upload_file(
         self,
@@ -826,12 +1046,12 @@ class AnthropicBackend(BaseBackend):
         """Download the raw content of an Anthropic file."""
         import base64
 
-        from encre.utils.types import FileContent
+        from encre.utils.types import ProviderFileContent
 
         response = await self._client.get(f"/files/{file_id}/content")
         response.raise_for_status()
         content_b64 = base64.b64encode(response.content).decode("ascii")
-        return FileContent(
+        return ProviderFileContent(
             file_id=file_id,
             filename="",
             content_b64=content_b64,
@@ -839,7 +1059,7 @@ class AnthropicBackend(BaseBackend):
             provider="anthropic",
         )
 
-    # 鈹€鈹€ Messages Batches 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Messages Batches ─────────────────────────────────────────────────
 
     async def create_batch(
         self,

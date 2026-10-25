@@ -27,7 +27,7 @@
 |---|---|
 | Controller | Dunimd |
 | Contact | dunimd@outlook.com · dunimd.com |
-| Services | Encre Agent Desktop (AI agent platform), Encre Agent Framework (Python/Rust), 18 chat platform integrations, PiscesLx (hosted LLM), StadionOS, Dunimd Enterprise/Cloud/Studio |
+| Services | Encre Agent Desktop (AI agent platform), Encre Agent (Python/Rust), 18 chat platform integrations, PiscesLx (hosted LLM), StadionOS, Dunimd Enterprise/Cloud/Studio |
 | Open source | github.com/mf2023/Encre |
 
 ## 2. Legal framework and regulator

@@ -1,49 +1,30 @@
-欢迎使用 Encre Agent Desktop —— 你桌面上的 AI 智能体。
+---
+layout: home
+sidebar: false
 
-Encre Agent 是一款本地的 AI 智能体平台。它不只是对话工具，而是能真正**动手替你做事**的助手：读写文件、执行命令、浏览网页、管理代码、定时运行任务，并把结果推送到你常用的聊天平台。
+hero:
+  name: "Encre Agent"
+  text: "全产品帮助文档"
+  tagline: 选择产品线，开始阅读
+  actions:
+    - theme: brand
+      text: Encre Agent Desktop
+      link: /desktop/
+    - theme: alt
+      text: Encre Agent Harness
+      link: /harness
+    - theme: alt
+      text: Encre Agent Core
+      link: /core
 
-## 它能做什么
-
-**一次对话，多方帮助。** 无论你是想聊聊天、写代码、做市场调研、监控股价，还是每天早晨收到一份新闻简报，你都可以直接向 Encre Agent 描述你的需求。
-
-**多种使用方式。** Encre Agent 以对话为核心，提供三种工作模式：
-
-| 模式 | 用途 |
-| --- | --- |
-| **通用** | 日常对话、提问、分析问题 |
-| **工作（iWork）** | 在指定文件夹/代码项目上工作 |
-| **自动化** | 定时执行预定义任务并推送结果 |
-
-![主界面总览](/screenshots/main-overview.png)
-
-## 核心特性
-
-### 你的本地助手
-- **文件与命令**：读写、编辑文件，执行终端命令
-- **浏览器**：为你搜索网页、抓取信息、操作浏览器
-- **记忆**：跨会话记住你的偏好与信息，越用越懂你
-- **多智能体**：多角色分工协作完成复杂任务
-
-### 会用工具的平台
-- 内置 **84+ 工具**：文件、终端、浏览器、数据库、Git、Docker、邮件、图片生成、OCR 等
-- 支持 **MCP（Model Context Protocol）**：接入第三方能力扩展
-- **Swarm 多智能体系统**：多个智能体共享黑板协作
-
-### 无界连接
-- 支持 **31 家主流大模型服务商**，一个应用统一管理模型
-- 连接 **26+ 聊天平台**：Telegram、QQ、微信、Discord、钉钉、飞书、Slack、邮件、WhatsApp、Signal……你在哪，它就在哪
-
-### 放心交给它
-- 内置 **6 种权限模式**：默认先询问、完全放行、自动允许、仅允许编辑等
-- **SSRF 防护**（DNS + CIDR 黑名单）、**Docker 沙箱** + Linux Landlock
-- **AI 风险分类器**、请求频率限制
-- 本地数据使用 **AES-256-GCM 加密**
-
-## 开始吧
-
-想立刻上手？前往 [快速上手](getting-started.md) 完成第一段对话，大约只需要 5 分钟。
-
-有问题？看看 [常见问题](faq.md)，或点击右上角「关于」获取官方文档、反馈与支持渠道。
-
-> [!NOTE]
-> 本帮助文档会随应用版本更新。重复内容不常见，但如发现过时描述，欢迎在「关于」页面反馈。
+features:
+  - title: Encre Agent Desktop
+    details: "桌面客户端使用指南：安装登录、对话会话、工作区、自动化任务、模型与全部设置页。"
+    link: /desktop/
+  - title: Encre Agent Harness
+    details: "执行内核文档：插件系统、执行循环扩展与仲裁机制。"
+    link: /harness
+  - title: Encre Agent Core
+    details: "核心引擎文档（建设中）。"
+    link: /core
+---

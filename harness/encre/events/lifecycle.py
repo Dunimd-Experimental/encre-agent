@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -32,7 +31,6 @@ through the single event contract.
 """
 
 from dataclasses import dataclass
-from typing import Union
 
 
 @dataclass
@@ -70,15 +68,41 @@ class CheckpointCreated:
 
 @dataclass
 class UserMessagePersisted:
-    """The user message was flushed to durable storage."""
+    """The user message was flushed to durable storage.
+
+    ``content`` carries the verbatim user text so memory-side observers
+    (the significance judge) can judge what the user actually said; the
+    transcript itself is the durable record, this field feeds cognition.
+    """
     session_id: str
+    content: str = ""
 
 
-SessionEvent = Union[
-    SessionStarted,
-    SessionEnded,
-    TurnStarted,
-    TurnEnded,
-    CheckpointCreated,
-    UserMessagePersisted,
-]
+@dataclass
+class ConfigReloaded:
+    """A live loop re-applied its configuration without being rebuilt.
+
+    Published alongside the ``config_reloaded`` entry on the append-only
+    backbone, so a plugin or telemetry tap sees the reload through the same
+    typed contract as the rest of the lifecycle.  This is not an ``AgentEvent``
+    and therefore projects to no transport frame: reload is administrative,
+    and a client that needs to re-read settings should do so explicitly.
+    """
+
+    session_id: str
+    config_fingerprint: str = ""
+    config_changed: bool = False
+    surfaces: tuple[str, ...] = ()
+    skills_reloaded: int = 0
+    warnings: tuple[str, ...] = ()
+
+
+SessionEvent = (
+    SessionStarted
+    | SessionEnded
+    | TurnStarted
+    | TurnEnded
+    | CheckpointCreated
+    | UserMessagePersisted
+    | ConfigReloaded
+)

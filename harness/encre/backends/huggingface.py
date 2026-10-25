@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,16 +23,14 @@
 
 from __future__ import annotations
 
-from __future__ import annotations
-
 """
-Hugging Face backend -- Inference API for open-source models.
+Hugging Face backend -- Inference Providers for open-source models.
 
 Hugging Face provides access to thousands of open-source models through
-its Inference API, which now supports an OpenAI-compatible chat completion
+Inference Providers, which expose an OpenAI-compatible chat completion
 endpoint.
 
-Base URL: https://api-inference.huggingface.co/v1/
+Base URL: https://router.huggingface.co/v1
 Authentication: HF_TOKEN environment variable or explicit api_key.
 
 Aliases: huggingface, hf
@@ -44,13 +42,14 @@ from encre.backends.openai_sse import OpenAISSEBackend
 
 
 class HuggingFaceBackend(OpenAISSEBackend):
-    """Hugging Face Inference API backend.
+    """Hugging Face Inference Providers backend.
 
     Provides access to thousands of open-source models via Hugging Face's
-    OpenAI-compatible API endpoint.
+    OpenAI-compatible router endpoint (router.huggingface.co).  The legacy
+    ``api-inference.huggingface.co`` endpoint is deprecated upstream.
     """
 
-    DEFAULT_BASE_URL = "https://api-inference.huggingface.co/v1/"
+    DEFAULT_BASE_URL = "https://router.huggingface.co/v1"
 
     def __init__(
         self,

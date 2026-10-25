@@ -31,11 +31,15 @@
  */
 
 import { getState, subscribe, setSessionId, clearMessages, setSessionState, setSubAgentView, clearSubAgentBreadcrumb, setTempChat, markTempChatSession, removeSessionById, setActiveWorkspace } from "../core/state.js";
+import { scheduleRender } from "../core/render_scheduler.js";
+import { guardHtml, guardRender } from "../core/ui_boundary.js";
 import { send } from "../core/ws.js";
+import { pluginMenuSpecs } from "../features/plugin_contributions.js";
+import { renderSlot } from "../core/ui_slots.js";
 import { setRequestedSessionId } from "../core/stream.js";
 import { t, onLocaleChange } from "../features/i18n.js";
 import { Dialog } from "../ui/dialog.js";
-import { showContextMenu } from "../ui/context-menu.js";
+import { showContextMenu, hideContextMenu, renderContextMenuItems, renderMenu, type ContextMenuItemSpec } from "../ui/context-menu.js";
 import { nameHue, workspaceIconHtml } from "../chat/session-projection.js";
 import type { SessionEntryData, SessionSource, WorkspaceEntry } from "../core/types.js";
 
@@ -51,7 +55,6 @@ function workspacesSig(ws: readonly WorkspaceEntry[]): string {
  */
 export class Session {
   private el: HTMLElement;
-  private lastListJson: string = "";
   private contextMenuEl: HTMLElement;
   private contextTargetSid: string = "";
   private contextTargetEl: HTMLElement | null = null;
@@ -62,6 +65,14 @@ export class Session {
    *  skip DOM writes for rows that did not change, so sidebar rows are reused
    *  instead of being rebuilt (which previously flickered during streaming). */
   private rowCache: Map<string, string> = new Map();
+  /** How many sessions of the (recency-sorted) list are in the DOM. The
+   *  sidebar used to materialize every session on first paint; a large
+   *  history meant thousands of rows created in one synchronous task. The
+   *  active session is always included, and scrolling near the bottom
+   *  extends the window. */
+  private renderLimit = 80;
+  private static readonly RENDER_PAGE = 80;
+  private scrollRaf = 0;
   /**
    * Constructor: grabs sidebar DOM nodes and subscribes to state/locale changes.
    */
@@ -70,6 +81,7 @@ export class Session {
     this.contextMenuEl = document.getElementById("session-context-menu")!;
     this.batchBar = document.getElementById("batch-action-bar")!;
     let lastSid = "";
+    let lastListRef = getState().sessionsList;
     let lastWs = getState().activeWorkspace;
     let lastWsMode = getState().workspaceMode;
     // Workspace icon data lives in state.workspaces, NOT in sessionsList — so
@@ -80,7 +92,7 @@ export class Session {
     let lastWsListSig = workspacesSig(getState().workspaces);
     subscribe(() => {
       const st = getState();
-      const currentJson = JSON.stringify(st.sessionsList);
+      const listChanged = st.sessionsList !== lastListRef;
       const wsListSig = workspacesSig(st.workspaces);
       const wsListChanged = wsListSig !== lastWsListSig;
       const sidChanged = st.sessionId !== lastSid;
@@ -89,17 +101,34 @@ export class Session {
       // trip) must re-render; otherwise the list keeps showing the previous
       // workspace's sessions.
       const wsChanged = st.activeWorkspace !== lastWs || st.workspaceMode !== lastWsMode;
-      if (currentJson !== this.lastListJson || sidChanged || wsChanged || wsListChanged) {
-        this.lastListJson = currentJson;
+      if (listChanged || sidChanged || wsChanged || wsListChanged) {
+        lastListRef = st.sessionsList;
         lastWsListSig = wsListSig;
         lastSid = st.sessionId;
         lastWs = st.activeWorkspace;
         lastWsMode = st.workspaceMode;
-        this.render();
+        // A different workspace/channel is a different list; start its
+        // window small again instead of carrying an expanded one over.
+        if (wsChanged) this.renderLimit = 80;
+        this.requestRender();
       }
-    });
+    }, ["sessionsList", "workspaces", "sessionId", "activeWorkspace", "workspaceMode"]);
+    // Extend the rendered window as the user approaches the bottom. Rows are
+    // reconciled by id, so this only appends; existing scroll position and
+    // row nodes are untouched.
+    this.el.addEventListener("scroll", () => {
+      if (this.scrollRaf) return;
+      this.scrollRaf = requestAnimationFrame(() => {
+        this.scrollRaf = 0;
+        const nearBottom = this.el.scrollTop + this.el.clientHeight >= this.el.scrollHeight - 240;
+        if (!nearBottom) return;
+        if (this.renderLimit >= getState().sessionsList.length) return;
+        this.renderLimit += Session.RENDER_PAGE;
+        this.requestRender();
+      });
+    }, { passive: true });
     onLocaleChange(() => {
-      this.render();
+      this.requestRender();
       this.updateBatchBarLabels();
     });
     document.addEventListener("click", () => this.hideContextMenu());
@@ -145,7 +174,7 @@ export class Session {
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: this.batchBar });
     }
-    this.render();
+    this.requestRender();
   }
 
   private exitBatchMode(): void {
@@ -154,7 +183,18 @@ export class Session {
     const manageBtn = document.getElementById("btn-batch-manage");
     if (manageBtn) manageBtn.style.display = "";
     this.batchBar.classList.add("hidden");
-    this.render();
+    this.requestRender();
+  }
+
+  /** Flips one row's selection in place.  Never calls render(): rebuilding the
+   *  row would replay its fade-in, and `rowCache` diffs on the `checked`
+   *  attribute while the live value lives on the `checked` property. */
+  private toggleSelection(sid: string, row: HTMLElement): void {
+    const checked = !this.selectedIds.has(sid);
+    if (checked) this.selectedIds.add(sid);
+    else this.selectedIds.delete(sid);
+    const cb = row.querySelector<HTMLInputElement>(".session-checkbox");
+    if (cb) cb.checked = checked;
   }
 
   private batchSelectAll(): void {
@@ -166,7 +206,7 @@ export class Session {
         this.selectedIds.add(s.session_id);
       }
     }
-    this.render();
+    this.requestRender();
   }
 
   private async batchExport(): Promise<void> {
@@ -196,6 +236,11 @@ export class Session {
    *  rows are rebuilt individually, and reordering is done by moving existing
    *  nodes.  This avoids the whole-list `innerHTML` teardown that previously
    *  made the sidebar flash while the model streamed or on session switches. */
+  /** Coalesced paint: any number of pushes in one frame produce one render. */
+  private requestRender(): void {
+    scheduleRender("sidebar", () => this.render(), 20);
+  }
+
   render(): void {
     const st = getState();
     const sessions = st.sessionsList;
@@ -229,13 +274,32 @@ export class Session {
     // Transitioning from an empty state → drop the empty-state markup once.
     if (this.el.querySelector(".session-empty")) this.el.innerHTML = "";
 
+    // Materialize only a window of the recency-sorted list. The active
+    // session is always included even when it sits outside the window.
+    const activeIndex = filteredSessions.findIndex((s) => s.session_id === currentSid);
+    const limit = Math.max(this.renderLimit, activeIndex + 1);
+    const visibleSessions = filteredSessions.length > limit
+      ? filteredSessions.slice(0, limit)
+      : filteredSessions;
+
     const desiredIds: string[] = [];
     const htmlById = new Map<string, string>();
-    for (const s of filteredSessions) {
+    for (const s of visibleSessions) {
       desiredIds.push(s.session_id);
-      htmlById.set(s.session_id, this.rowHtml(s, s.session_id === currentSid));
+      // One malformed/plugin-overridden row must render as a minimal row, not
+      // abort the whole sidebar paint.
+      htmlById.set(
+        s.session_id,
+        guardHtml(
+          "session-row",
+          s.session_id,
+          () => this.rowHtml(s, s.session_id === currentSid),
+          this.faultRowHtml(s),
+        ),
+      );
     }
     const desiredSet = new Set(desiredIds);
+    const allIds = new Set(filteredSessions.map((s) => s.session_id));
 
     // Index existing rows by session id.
     const rowsById = new Map<string, HTMLElement>();
@@ -244,12 +308,13 @@ export class Session {
       if (sid && row.classList.contains("ws-tree-session-item")) rowsById.set(sid, row);
     }
 
-    // Drop rows whose session disappeared.
+    // Drop rows outside the window; keep their cached markup so scrolling
+    // back repopulates them without rebuilding every row.
     for (const [sid, row] of rowsById) {
       if (desiredSet.has(sid)) continue;
       row.remove();
-      this.rowCache.delete(sid);
       rowsById.delete(sid);
+      if (!allIds.has(sid)) this.rowCache.delete(sid);
     }
 
     // Create/update rows in place and keep them in the desired order.
@@ -263,6 +328,14 @@ export class Session {
         const tmp = document.createElement("div");
         tmp.innerHTML = html;
         row = tmp.firstElementChild as HTMLElement;
+        if (!row) {
+          // A plugin-provided row override can return anything (or nothing).
+          // Keep a valid anchor so reconciliation never dereferences null.
+          row = document.createElement("div");
+          row.className = "ws-tree-session-item";
+          row.dataset.sid = sid;
+          row.textContent = sid;
+        }
         rowsById.set(sid, row);
         this.rowCache.set(sid, html);
       } else if (this.rowCache.get(sid) !== html) {
@@ -270,8 +343,11 @@ export class Session {
         // element.  Replacing the element would replay the row's one-shot
         // CSS fade-in (`.ws-tree-session-item` → `sessionItemIn`), which looks
         // like a flash every time the active/state highlight changes.
-        this.patchRow(row, html);
-        this.rowCache.set(sid, html);
+        const target = row;
+        if (target) {
+          guardRender("session-row-patch", sid, () => this.patchRow(target, html));
+          this.rowCache.set(sid, html);
+        }
       }
       // Move the row into its desired slot (no-op when already in place).
       if (cursor === null) {
@@ -283,6 +359,14 @@ export class Session {
     }
 
     this.updateBatchBarLabels();
+  }
+
+  /** Last-resort row when a session's own markup cannot be produced. */
+  private faultRowHtml(s: SessionEntryData): string {
+    const label = s.name || s.preview || s.session_id;
+    return `<div class="ws-tree-session-item" data-sid="${s.session_id}">
+      <div class="session-item-top"><span class="session-preview">${this.esc(label)}</span></div>
+    </div>`;
   }
 
   /** Builds a single session row's markup for the current (batch/normal) mode. */
@@ -297,8 +381,17 @@ export class Session {
     // Each iWork history row carries the icon of the workspace it belongs to —
     // forced on for workspace-channel sessions so it NEVER disappears.
     const wsIcon = this.wsIconHtml(wsPathRaw, s.channel === "iwork");
-    if (this.batchMode) {
-      return `<div class="ws-tree-session-item" data-sid="${s.session_id}" data-ws="${wsPath}">
+    const batchMode = this.batchMode;
+    // Generic plugin override point ("session.row"): a plugin may replace the
+    // row markup declaratively or via the JS runtime; the markup below is the
+    // guarded fallback and MUST stay functionally identical to it (same
+    // data-sid / checkbox / classes) for event delegation to keep working.
+    return renderSlot(
+      "session.row",
+      { sid: s.session_id, name: displayName, preview, state: s.state || "idle", workspace: wsPathRaw, source: s.source?.platform || "" },
+      () => {
+        if (batchMode) {
+          return `<div class="ws-tree-session-item" data-sid="${s.session_id}" data-ws="${wsPath}">
         <div class="session-item-top">
           ${wsIcon}
           <input type="checkbox" class="session-checkbox" data-sid="${s.session_id}" ${this.selectedIds.has(s.session_id) ? "checked" : ""} />
@@ -306,14 +399,16 @@ export class Session {
           ${runningBadge}${this.sourceBadge(s.source)}
         </div>
       </div>`;
-    }
-    return `<div class="ws-tree-session-item${active ? " active" : ""}" data-sid="${s.session_id}" data-ws="${wsPath}">
+        }
+        return `<div class="ws-tree-session-item${active ? " active" : ""}" data-sid="${s.session_id}" data-ws="${wsPath}">
       <div class="session-item-top">
         ${wsIcon}
         <span class="session-preview">${this.esc(displayName)}</span>
         ${runningBadge}${this.sourceBadge(s.source)}
       </div>
     </div>`;
+      },
+    );
   }
 
   /** Renders the owning workspace's icon for a session row.  iWork rows are
@@ -354,7 +449,7 @@ export class Session {
       qqbot: "QQ", telegram: "Telegram", webhook: "Webhook", discord: "Discord",
       slack: "Slack", feishu: "Feishu", dingtalk: "DingTalk", wecom: "WeCom",
       weixin: "WeChat", whatsapp: "WhatsApp", signal: "Signal", matrix: "Matrix",
-      email: "Email", sms: "SMS", yuanbao: "Yuanbao",
+      email: "Email", sms: "SMS",
       bluebubbles: "iMessage", homeassistant: "HomeAssistant",
       google_chat: "GoogleChat", irc: "IRC", line: "LINE",
       mattermost: "Mattermost", ntfy: "ntfy", photon: "Photon",
@@ -373,12 +468,19 @@ export class Session {
    *  elements never accumulate duplicate listeners across renders. */
   private bindEventDelegation(): void {
     this.el.addEventListener("click", (e) => {
-      if (this.batchMode) return;
       const target = (e.target as HTMLElement).closest(".ws-tree-session-item") as HTMLElement | null;
       if (!target) return;
-      if ((e.target as HTMLElement).tagName === "INPUT") return;
       const sid = target.dataset.sid;
-      if (sid && sid !== getState().sessionId) {
+      if (!sid) return;
+      if (this.batchMode) {
+        // The whole row toggles the selection, not just the 15px box. A click
+        // that landed on the box itself already flipped `input.checked`, so it
+        // is left to the `change` listener below to avoid double-flipping.
+        if ((e.target as HTMLElement).tagName !== "INPUT") this.toggleSelection(sid, target);
+        return;
+      }
+      if ((e.target as HTMLElement).tagName === "INPUT") return;
+      if (sid !== getState().sessionId) {
         // Wipe the entire content area BEFORE flipping the session id so
         // every residual widget from the previous session is gone.  The
         // (window as any).__appCleanupContentArea() bridge is set by app.ts
@@ -430,9 +532,7 @@ export class Session {
       const sid = target.dataset.sid;
       if (!sid) return;
       this.contextTargetSid = sid;
-      if (this.contextTargetEl) this.contextTargetEl.classList.remove("context-target");
       this.contextTargetEl = target;
-      this.contextTargetEl.classList.add("context-target");
       this.showContextMenu(e.clientX, e.clientY);
     });
 
@@ -452,38 +552,30 @@ export class Session {
   private showContextMenu(x: number, y: number): void {
     // Archiving is a workspace (iWork) concept — it only appears in the
     // workspace-mode sidebar, not in the normal-mode conversation list.
-    const archiveItem = getState().workspaceMode === "iwork"
-      ? `<div class="context-menu-item" id="ctx-archive">
-        <i data-lucide="archive" class="lucide lucide-sm"></i>
-        <span>${this.esc(t("session.archive"))}</span>
-      </div>
-      <div class="context-menu-divider"></div>`
-      : "";
-    this.contextMenuEl.innerHTML = `
-      <div class="context-menu-item" id="ctx-rename">
-        <i data-lucide="pencil" class="lucide lucide-sm"></i>
-        <span>${this.esc(t("session.rename"))}</span>
-      </div>
-      <div class="context-menu-item" id="ctx-export">
-        <i data-lucide="arrow-up-right" class="lucide lucide-sm"></i>
-        <span>${this.esc(t("session.exportMd"))}</span>
-      </div>
-      <div class="context-menu-divider"></div>
-      ${archiveItem}
-      <div class="context-menu-item context-menu-item-danger" id="ctx-delete">
-        <i data-lucide="trash-2" class="lucide lucide-sm"></i>
-        <span>${this.esc(t("session.delete"))}</span>
-      </div>`;
-    showContextMenu(this.contextMenuEl, x, y);
-
-    document.getElementById("ctx-rename")?.addEventListener("click", () => this.handleRename());
-    document.getElementById("ctx-export")?.addEventListener("click", () => this.handleExport());
-    document.getElementById("ctx-archive")?.addEventListener("click", () => this.handleArchive());
-    document.getElementById("ctx-delete")?.addEventListener("click", () => this.handleDelete());
-
-    if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons({ root: this.contextMenuEl });
-    }
+    const archiveItems: ContextMenuItemSpec[] =
+      getState().workspaceMode === "iwork"
+        ? [
+            { id: "ctx-archive", icon: "archive", label: this.esc(t("session.archive")), onClick: () => this.handleArchive() },
+            { divider: true },
+          ]
+        : [];
+    // Plugin-contributed items ("sessions" surface), spliced through the one
+    // shared helper so escaping + the unified action round-trip live in a
+    // single place.
+    const pluginItems: ContextMenuItemSpec[] = pluginMenuSpecs("sessions", { sid: this.contextTargetSid });
+    renderMenu(
+      [
+        { id: "ctx-rename", icon: "pencil", label: this.esc(t("session.rename")), onClick: () => this.handleRename() },
+        { id: "ctx-export", icon: "arrow-up-right", label: this.esc(t("session.exportMd")), onClick: () => this.handleExport() },
+        ...pluginItems,
+        { divider: true },
+        ...archiveItems,
+        { id: "ctx-delete", icon: "trash-2", danger: true, label: this.esc(t("session.delete")), onClick: () => this.handleDelete() },
+      ],
+      {},
+      { container: this.contextMenuEl },
+    );
+    showContextMenu(this.contextMenuEl, x, y, { target: this.contextTargetEl });
   }
 
   /** Archive the right-clicked conversation: hide it from the sidebar (data
@@ -496,7 +588,7 @@ export class Session {
     if (!sid) return;
     const s = getState().sessionsList.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name }), { container: document.getElementById("app") ?? undefined }))) return;
+    if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name }), { scope: "app" }))) return;
     send({ type: "archive_session", session_id: sid });
     removeSessionById(sid);
     // If the archived session is currently open, clear the chat area so the
@@ -509,13 +601,8 @@ export class Session {
   }
 
   private hideContextMenu(): void {
-    this.contextMenuEl.classList.add("hidden");
-    if (this.contextTargetEl) {
-      this.contextTargetEl.classList.remove("context-target");
-      this.contextTargetEl = null;
-    }
-    // Also clear workspace-tree context targets (shared session-context-menu).
-    document.querySelectorAll(".context-target").forEach((el) => el.classList.remove("context-target"));
+    hideContextMenu(this.contextMenuEl);
+    this.contextTargetEl = null;
   }
 
   private handleRename(): void {
@@ -534,7 +621,7 @@ export class Session {
         placeholder: t("session.renamePlaceholder"),
         inputClass: "encre-dialog-input--text",
         defaultValue: currentName,
-        container: document.getElementById("app") ?? undefined,
+        scope: "app",
       },
     ).then((newName) => {
       const trimmed = newName?.trim();
@@ -558,7 +645,7 @@ export class Session {
     const sessions = getState().sessionsList;
     const s = sessions.find((x) => x.session_id === sid);
     const name = s?.name || s?.preview || sid.slice(0, 8);
-    if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined })) {
+    if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { scope: "app" })) {
       removeSessionById(sid);
       if (getState().sessionId === sid) {
         clearMessages();
@@ -605,7 +692,7 @@ export function showRenameDialog(currentName: string, onConfirm: RenameConfirmCa
       placeholder: t("session.renamePlaceholder"),
       inputClass: "encre-dialog-input--text",
       defaultValue: currentName,
-      container: document.getElementById("app") ?? undefined,
+      scope: "app",
     },
   ).then((newName) => {
     const trimmed = newName?.trim();
@@ -624,111 +711,97 @@ export function showSessionContextMenu(
   deleteOverride?: () => void,
   renameOverride?: () => void,
   noArchive?: boolean,
+  target?: HTMLElement | null,
 ): void {
   const menuEl = document.getElementById("session-context-menu")!;
   const currentSid = sid;
-  let items = "";
+
+  const items: ContextMenuItemSpec[] = [];
   if (!noRename) {
-    items += `
-    <div class="context-menu-item" id="ctx-rename-ws">
-      <i data-lucide="pencil" class="lucide lucide-sm"></i>
-      <span>${escHtml(t("session.rename"))}</span>
-    </div>`;
+    items.push({
+      id: "ctx-rename-ws",
+      icon: "pencil",
+      label: escHtml(t("session.rename")),
+      onClick: () => {
+        if (renameOverride) {
+          renameOverride();
+          return;
+        }
+        const sessions = getState().sessionsList;
+        const s = sessions.find((v) => v.session_id === currentSid);
+        const currentName = s?.name || s?.preview || "";
+        showRenameDialog(currentName, (newName) => {
+          send({ type: "rename_session", session_id: currentSid, new_name: newName });
+        });
+      },
+    });
   }
   if (!noExport) {
-    items += `
-    <div class="context-menu-item" id="ctx-export-ws">
-      <i data-lucide="arrow-up-right" class="lucide lucide-sm"></i>
-      <span>${escHtml(t("session.exportMd"))}</span>
-    </div>`;
+    items.push({
+      id: "ctx-export-ws",
+      icon: "arrow-up-right",
+      label: escHtml(t("session.exportMd")),
+      onClick: () => send({ type: "export_session", session_id: currentSid }),
+    });
   }
   if (!noRename || !noExport || !noArchive) {
-    items += `<div class="context-menu-divider"></div>`;
+    items.push({ divider: true });
   }
   if (!noArchive) {
-    items += `
-    <div class="context-menu-item" id="ctx-archive-ws">
-      <i data-lucide="archive" class="lucide lucide-sm"></i>
-      <span>${escHtml(t("session.archive"))}</span>
-    </div>
-    <div class="context-menu-divider"></div>`;
+    items.push({
+      id: "ctx-archive-ws",
+      icon: "archive",
+      label: escHtml(t("session.archive")),
+      onClick: async () => {
+        const s = getState().sessionsList.find((v) => v.session_id === currentSid);
+        const name = s?.name || s?.preview || currentSid.slice(0, 8);
+        if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name }), { scope: "app" }))) return;
+        // Hide the conversation from the sidebar immediately; the backend
+        // broadcast refreshes the archive manager view.
+        send({ type: "archive_session", session_id: currentSid });
+        removeSessionById(currentSid);
+        if (getState().sessionId === currentSid) {
+          clearMessages();
+          setSessionId("");
+          setSessionState("idle", "");
+        }
+      },
+    });
+    items.push({ divider: true });
   }
-  items += `
-    <div class="context-menu-item context-menu-item-danger" id="ctx-delete-ws">
-      <i data-lucide="trash-2" class="lucide lucide-sm"></i>
-      <span>${escHtml(t("session.delete"))}</span>
-    </div>`;
-  menuEl.innerHTML = items;
-  showContextMenu(menuEl, x, y);
-  if (typeof (window as any).lucide !== "undefined") {
-    (window as any).lucide.createIcons({ root: menuEl });
-  }
-
-  if (!noRename) {
-    document.getElementById("ctx-rename-ws")?.addEventListener("click", () => {
-      menuEl.classList.add("hidden");
-      if (renameOverride) {
-        renameOverride();
+  // Plugin-contributed items ("sessions" surface) before the destructive row.
+  items.push(...pluginMenuSpecs("sessions", { sid: currentSid }));
+  items.push({
+    id: "ctx-delete-ws",
+    icon: "trash-2",
+    danger: true,
+    label: escHtml(t("session.delete")),
+    onClick: async () => {
+      if (deleteOverride) {
+        deleteOverride();
         return;
       }
       const sessions = getState().sessionsList;
-      const s = sessions.find((x) => x.session_id === currentSid);
-      const currentName = s?.name || s?.preview || "";
-      showRenameDialog(currentName, (newName) => {
-        send({ type: "rename_session", session_id: currentSid, new_name: newName });
-      });
-    });
-  }
-  if (!noExport) {
-    document.getElementById("ctx-export-ws")?.addEventListener("click", () => {
-      send({ type: "export_session", session_id: currentSid });
-      menuEl.classList.add("hidden");
-    });
-  }
-  if (!noArchive) {
-    document.getElementById("ctx-archive-ws")?.addEventListener("click", async () => {
-      menuEl.classList.add("hidden");
-      const s = getState().sessionsList.find((x) => x.session_id === currentSid);
+      const s = sessions.find((v) => v.session_id === currentSid);
       const name = s?.name || s?.preview || currentSid.slice(0, 8);
-    if (!(await Dialog.confirm(t("session.confirmArchiveTitle"), t("session.confirmArchive", { name }), { container: document.getElementById("app") ?? undefined }))) return;
-      // Hide the conversation from the sidebar immediately; the backend
-      // broadcast refreshes the archive manager view.
-      send({ type: "archive_session", session_id: currentSid });
-      removeSessionById(currentSid);
-      if (getState().sessionId === currentSid) {
-        clearMessages();
-        setSessionId("");
-        setSessionState("idle", "");
+      if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { scope: "app" })) {
+        // Optimistically remove the session from the local state immediately,
+        // so the UI updates even if the server response is delayed or fails.
+        removeSessionById(currentSid);
+        // If the deleted session is the one currently being viewed, clear the
+        // chat area to show the "new task" welcome screen immediately.
+        if (getState().sessionId === currentSid) {
+          clearMessages();
+          setSessionId("");
+          setSessionState("idle", "");
+        }
+        send({ type: "delete_session", session_id: currentSid });
       }
-    });
-  }
-  document.getElementById("ctx-delete-ws")?.addEventListener("click", async () => {
-    menuEl.classList.add("hidden");
-    if (deleteOverride) {
-      deleteOverride();
-      return;
-    }
-    const sessions = getState().sessionsList;
-    const s = sessions.find((x) => x.session_id === currentSid);
-    const name = s?.name || s?.preview || currentSid.slice(0, 8);
-    if (await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined })) {
-      // Optimistically remove the session from the local state immediately,
-      // so the UI updates even if the server response is delayed or fails.
-      removeSessionById(currentSid);
-      // If the deleted session is the one currently being viewed, clear the
-      // chat area to show the "new task" welcome screen immediately.
-      if (getState().sessionId === currentSid) {
-        clearMessages();
-        setSessionId("");
-        setSessionState("idle", "");
-      }
-      send({ type: "delete_session", session_id: currentSid });
-    }
+    },
   });
 
-  if (typeof (window as any).lucide !== "undefined") {
-    (window as any).lucide.createIcons({ root: menuEl });
-  }
+  renderContextMenuItems(items, { container: menuEl });
+  showContextMenu(menuEl, x, y, { target });
 }
 
 /**
@@ -749,7 +822,7 @@ export function showRenameDialogForSession(sid: string): void {
       placeholder: t("session.renamePlaceholder"),
       inputClass: "encre-dialog-input--text",
       defaultValue: currentName,
-      container: document.getElementById("app") ?? undefined,
+      scope: "app",
     },
   ).then((newName) => {
     const trimmed = newName?.trim();

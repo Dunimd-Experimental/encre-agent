@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Catalog builder for the L1 device context block.
 
 Takes the collected provider data and produces a compact, human-readable
@@ -33,14 +35,14 @@ from typing import Any
 
 
 _DEVICE_TOOL_MAP: dict[str, str] = {
-    "platform_info": "device_info",
-    "hardware_info": "device_info",
-    "gpu_info": "device_info",
-    "battery_info": "device_battery",
-    "display_info": "device_display",
-    "network_info": "device_network",
-    "location_info": "device_location",
-    "sensor_info": "device_sensor",
+    "platform_info": "device",
+    "hardware_info": "device",
+    "gpu_info": "device",
+    "battery_info": "device",
+    "display_info": "computer",
+    "network_info": "device",
+    "location_info": "device",
+    "sensor_info": "device",
 }
 
 
@@ -89,23 +91,22 @@ def build_catalog(provider_data: dict[str, dict[str, Any] | None]) -> str:
                 f"OS location service: Latitude {lat:.4f}, Longitude {lon:.4f}"
                 f"{tz_suffix}.\n"
                 "This is ground truth about where the user is right now. When asked "
-                "(\"where am I\", \"鎴戠殑浣嶇疆\", nearby places, local weather/time), "
+                '("where am I", "我的位置", nearby places, local weather/time), '
                 "answer from these coordinates -- never claim you have no access to "
                 "the user's location while this section exists. You are expected to "
                 "recognise the approximate city/region yourself and say so directly "
                 "(city-level certainty is enough); optionally refine to a more "
-                f"precise place via web_search (\"{lat:.4f} {lon:.4f}\") when a finer "
+                f'precise place via web_search ("{lat:.4f} {lon:.4f}") when a finer '
                 "answer is needed.\n"
                 "IMPORTANT: never determine the user's location from IP addresses "
-                "or network lookups (curl ipinfo, \"my ip location\" searches, "
+                'or network lookups (curl ipinfo, "my ip location" searches, '
                 "etc.) -- proxy/VPN egress makes IP geolocation meaningless and it "
                 "WILL contradict these coordinates. When sources conflict, these "
                 "OS-provided coordinates always win."
             )
         elif tz_parts:
             lines.append(
-                "Location (user's timezone): " + ", ".join(tz_parts)
-                + " (GPS coordinates unavailable -- OS location permission denied. "
+                "Location (user's timezone): " + ", ".join(tz_parts) + " (GPS coordinates unavailable -- OS location permission denied. "
                 "Use the timezone for locale/time questions; never guess the "
                 "user's city from IP addresses -- proxy/VPN egress is unreliable.)"
             )
@@ -119,6 +120,8 @@ def build_catalog(provider_data: dict[str, dict[str, Any] | None]) -> str:
                 have_tools.append(label)
     if have_tools:
         lines.append("Device tools available: " + ", ".join(sorted(have_tools)))
-        lines.append("The above device context is already available in this prompt. Answer questions about device/location directly from this information. Call device_* tools only for real-time data or more detail beyond what is listed above.")
+        lines.append(
+            "The above device context is already available in this prompt. Answer questions about device/location directly from this information. Call device_* tools only for real-time data or more detail beyond what is listed above."
+        )
 
     return "\n".join(lines) if len(lines) > 1 else ""

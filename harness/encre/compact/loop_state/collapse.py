@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Context collapse layer: projected views over full conversation history.
 
@@ -105,7 +107,7 @@ def compute_collapse_boundaries(
             # Tool results are write boundaries
             is_write_boundary = True
         elif role == "assistant" and msg.get("tool_calls"):
-            # Tool calls precede results 鈥?boundary at the call
+            # Tool calls precede results — boundary at the call
             is_write_boundary = True
 
         if is_write_boundary and i - current_start >= MIN_MESSAGES_FOR_COLLAPSE:
@@ -139,7 +141,7 @@ def build_collapsed_messages(
     """Build a collapsed view of messages by replacing chunks with summaries.
 
     Only committed chunks are replaced.  Uncommitted chunks pass through
-    as-is (for now 鈥?they will be committed on the next collapse cycle).
+    as-is (for now — they will be committed on the next collapse cycle).
     """
     if not chunks:
         return list(messages)
@@ -192,10 +194,11 @@ def collapse_old_tool_outputs(
 
     A deterministic, LLM-free collapse pass: the most recent *keep_recent*
     tool results are preserved verbatim, and every older tool result longer
-    than *min_chars* is replaced by a one-line stub that records the tool
-    name, call id, and a truncated preview.  Assistant messages with
-    ``tool_calls`` are preserved (the stubs still reference their ids so
-    the API's tool-call/tool-result pairing stays valid).
+    than *min_chars* is replaced by a privacy-safe one-line stub that only
+    records the tool name and total length (no call id, no preview text).
+    Assistant messages with ``tool_calls`` are preserved (the stubs still
+    reference the pair id so the API's tool-call/tool-result pairing stays
+    valid).
 
     This is the cheap first stage of the collapse pipeline; the expensive
     model-driven summarisation in :class:`encre.compact.engine.CompactEngine`
@@ -219,8 +222,7 @@ def collapse_old_tool_outputs(
             if isinstance(content, str) and len(content) > min_chars:
                 stub = (
                     f"[collapsed tool result: {m.get('name', 'tool')} "
-                    f"call_id={m.get('tool_call_id', '')} "
-                    f"len={len(content)} preview={content[:80]!r}]"
+                    f"({len(content)} chars)]"
                 )
                 collapsed = dict(m)
                 collapsed["content"] = stub
@@ -244,7 +246,7 @@ async def drain_collapses(
 ) -> list[dict[str, Any]]:
     """Drain all pending collapses by summarizing them urgently.
 
-    Called when the model reports PTL (413) 鈥?commit all pending
+    Called when the model reports PTL (413) — commit all pending
     chunks to free up context space.
     """
     from encre.compact.engine import COMPACT_MAX_OUTPUT_TOKENS

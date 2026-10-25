@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,20 +21,25 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 # Hierarchical task decomposition for swarms.
 #
 # ``EncreTaskPlanner`` turns a high-level goal into a ``TaskTree`` (a DAG of
 # ``TaskNode``s with dependencies and role assignments).  Simple/recognised
 # goals use a fast rule-based path (known workflow patterns or a single task);
 # richer goals can be driven by an LLM via ``plan_with_llm`` /
-# ``plan_from_json``.  The produced tree is consumed by ``EncreOrchestrator``.
-
+# ``plan_from_json``.  The produced tree is consumed by ``DagExecutor``
+# (``encre.dag.executor``), the single TaskTree execution engine.
 import json
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from encre.logging_config import get_logger
 from encre.prompts.loader import PromptLoader
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -133,17 +138,112 @@ class EncreTaskPlanner:
             ],
         }
 
-    async def decompose(self, goal: str) -> TaskTree:
-        """Decompose a goal into a task tree (async-compatible)."""
+    async def decompose(
+        self, goal: str, backend: Any = None, context: str = "",
+    ) -> TaskTree:
+        """Decompose a goal into a task tree (async).
+
+        LLM planning is the primary path whenever a backend is supplied:
+        the model sees the real goal and produces a real DAG.  The keyword
+        templates in :meth:`plan` are demoted to the explicit no-backend
+        fallback -- they exist so a backend-less host still gets a sane
+        skeleton, never to impersonate an LLM plan.  When a backend was
+        supplied but planning failed, the fallback is a single honest
+        ``Execute`` node (with a warning), not a template masquerading as a
+        plan.
+
+        Args:
+            goal: The high-level goal text.
+            backend: Optional LLM backend for model-driven planning.
+            context: Optional shared context passed to the planning prompt.
+
+        Returns:
+            The planned ``TaskTree``.
+        """
+        if backend is not None:
+            tree = await self.plan_with_backend(goal, backend, context=context)
+            if tree is not None:
+                return tree
+            logger.warning(
+                "[swarm] LLM planning failed for goal=%r -- falling back to single-node execution",
+                goal[:120],
+            )
+            return self._simple_decompose(goal)
         return self.plan(goal)
 
-    def plan(self, goal: str, _context: str = "") -> TaskTree:
-        """Choose a decomposition strategy and build the task tree.
+    async def plan_with_backend(
+        self, goal: str, backend: Any, context: str = "",
+    ) -> TaskTree | None:
+        """Model-driven planning: one bounded thinking-off LLM call.
 
-        Recognised patterns (``build``/``debug``/``research``/``refactor``) map
-        to canned multi-step DAGs; everything else falls back to a single
-        ``Execute`` node.  ``_context`` is reserved for future LLM-based
-        planning and is currently unused by the rule-based path.
+        Builds the structured planning prompt via :meth:`plan_with_llm`,
+        calls the backend (thinking disabled: planning must be deterministic
+        output, not deliberation), and parses the JSON answer through
+        :meth:`plan_from_json`.  Fail-closed: a missing backend, a failed
+        call, an unparsable answer or an empty task list yields ``None`` --
+        the caller degrades to the single-node fallback instead of running
+        a fabricated plan.
+
+        Args:
+            goal: The high-level goal text.
+            backend: The LLM backend (thinking-disabled-cloned internally).
+            context: Optional shared context for the planning prompt.
+
+        Returns:
+            A ``TaskTree`` on success, else ``None``.
+        """
+        if backend is None:
+            return None
+        from encre.utils.backend_clone import thinking_off_clone
+        from encre.utils.types import BackendFinish, BackendText
+
+        scorer = thinking_off_clone(backend)
+        if scorer is None:
+            return None
+        prompt = self.plan_with_llm(goal, context)
+        full_text = ""
+        try:
+            async for event in scorer.chat(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000, stream=False,
+            ):
+                if isinstance(event, BackendText):
+                    full_text += event.text
+                elif isinstance(event, BackendFinish):
+                    break
+        except Exception:
+            logger.warning("[swarm] planning call failed", exc_info=True)
+            return None
+        payload = full_text.strip()
+        if payload.startswith("```"):
+            payload = payload.strip("`")
+            if payload.startswith("json"):
+                payload = payload[4:]
+            payload = payload.strip()
+        try:
+            tree = self.plan_from_json(goal, payload)
+        except Exception:
+            logger.warning("[swarm] planning answer unparsable; failing closed")
+            return None
+        if not tree.nodes:
+            logger.warning("[swarm] planning produced zero tasks; failing closed")
+            return None
+        return tree
+
+    def plan(self, goal: str, _context: str = "") -> TaskTree:
+        """No-backend fallback: recognise a known workflow pattern or wrap
+        the goal in a single ``Execute`` node.
+
+        This path never calls a model; it exists for backend-less hosts.
+        Backend-equipped callers must go through :meth:`decompose` /
+        :meth:`plan_with_backend` instead.
+
+        Args:
+            goal: The high-level goal text.
+            _context: Reserved; unused by the rule-based path.
+
+        Returns:
+            The planned ``TaskTree``.
         """
         pattern_key = _detect_pattern(goal)
         if pattern_key and pattern_key in self._known_patterns:

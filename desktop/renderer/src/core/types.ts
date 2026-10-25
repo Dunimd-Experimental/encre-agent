@@ -30,18 +30,24 @@
  * workspaces, models, MCP, skills, memories, notifications, …).
  */
 
+import type { PluginContribution } from "../features/plugin_contributions.js";
+
 export type ServerEvent =
   | TextDelta
   | ThinkingDelta
   | ToolCallStart
   | ToolCallDelta
   | ToolCallEnd
+  | QuestionRequestEvent
   | ToolProgress
   | ToolResult
   | FinishEvent
   | PongEvent
   | ErrorEvent
   | SessionReady
+  | DataBegin
+  | DataShard
+  | DataEnd
   | ConfiguredEvent
   | TelemetryEvent
   | PlanUpdate
@@ -53,18 +59,23 @@ export type ServerEvent =
   | CompactStartingEvent
   | CompactFailedEvent
   | CompactEvent
+  | ModelSwitchEvent
+  | RetryNoticeEvent
   | SystemMessageEvent
   | ModelsList
   | SessionsList
   | SessionsAll
   | ArchivedSessionsList
   | ConfigData
+  | ConfigPatch
   | ModelsUpdated
   | ModelsFetched
   | ModelValidated
   | ModelValidationError
   | SkillsUpdated
   | SkillsList
+  | SkillDetail
+  | SkillFile
   | SkillInstalled
   | SkillInstallError
   | SkillUninstalled
@@ -90,6 +101,7 @@ export type ServerEvent =
   | WorkspaceConfigResponse
   | WorkspaceClosed
   | MemoryList
+  | MemoryGraph
   | MemoryDetailEvent
   | GlobalRulesList
   | ProjectRulesList
@@ -98,13 +110,10 @@ export type ServerEvent =
   | GlobalRuleDeleted
   | GlobalRuleContentEvent
   | ProfileMessage
-  | IndexStatusEvent
   | GitignoreContentEvent
-  | DocumentsListEvent
-  | DocumentAddedEvent
-  | DocumentUpdatedEvent
-  | DocumentRemovedEvent
-  | DocumentErrorEvent
+  | LibraryTreeEvent
+  | LibraryContentEvent
+  | LibraryErrorEvent
   | PermissionRequest
   | EngineInstallRequestEvent
   | EngineInstallProgressEvent
@@ -114,7 +123,9 @@ export type ServerEvent =
   | BranchRolledBack
   | UsageStatsEvent
   | GatewayStatusEvent
-  | RunQueued
+  | QueuedSubmitsEvent
+  | QueuedRunStartedEvent
+  | RunStartedEvent
   | WechatScanResultEvent
   | AutomationJobsList
   | AutomationJobHistory
@@ -135,11 +146,63 @@ export type ServerEvent =
   | SpecUpdateEvent
   | PlanReviewEvent
   | ModeChanged
-  | CommandChanged;
+   | CommandChanged
+   | PluginChanged
+   | PluginInstalled
+   | PluginInstallError
+   | PluginUninstalled
+   | PluginUninstallError
+   | MarketInstalled
+   | MarketInstallError
+   | MarketCatalog
+   | PluginEnabled
+   | PluginEnableError
+   | PluginDisabled
+   | PluginDisableError
+   | PluginUiSync
+   | PluginConfirmRequest
+   | PluginUiResult
+   | QaNotification;
 
-export interface RunQueued {
-  type: "run_queued";
-  position: number;
+export interface QaNotification {
+  type: "qa_notification";
+  title: string;
+  message: string;
+  source: string;
+}
+
+/** One queued prompt as mirrored from the backend submit queue. */
+export interface QueuedPromptItem {
+  prompt?: string;
+  system_prompt?: string | null;
+  mode?: string | null;
+  mode_prompt?: string | null;
+  attachments?: unknown[] | null;
+  specialty?: string;
+  temp_chat?: boolean;
+  metadata?: { mode?: string | null } | null;
+}
+
+/** Server → client: one conversation's current queue state (full snapshot). */
+export interface QueuedSubmitsEvent {
+  type: "queued_submits";
+  session_id: string;
+  items: QueuedPromptItem[];
+}
+
+/** Server → client: a drained queue entry started running. */
+export interface QueuedRunStartedEvent {
+  type: "queued_run_started";
+  session_id: string;
+  prompt: string;
+  mode?: string | null;
+}
+
+/** Server → client: a run just staged the user message; its server id follows. */
+export interface RunStartedEvent {
+  type: "run_started";
+  session_id: string;
+  user_message_id: string;
 }
 
 export interface WorkflowStarted {
@@ -276,12 +339,24 @@ export interface ToolCallEnd {
   session_id?: string;
 }
 
+/** Backend-parsed ask payload for the question tool. Fires right before the
+ * tool blocks on the user's answer — tool_call_end for this call only lands
+ * AFTER the answer, so the form must render from this event instead. */
+export interface QuestionRequestEvent {
+  type: "question_request";
+  tool_call_id: string;
+  questions: Array<{ question: string; details?: string; options?: string[] }>;
+  session_id?: string;
+}
+
 export interface ToolProgress {
   type: "tool_progress";
   id: string;
   tool_name: string;
   status: string;
   session_id?: string;
+  /** Incremental output chunk (e.g. streaming terminal stdout). */
+  content?: string;
   sub_agent_messages?: Array<{ role: string; content: string | Array<{ type: string; text: string }>; tool_calls?: any[]; reasoning_content?: string; segments?: Array<{kind: string; text?: string; tool_id?: string}>; created_at?: number; mode?: string }>;
   sub_agent_session_id?: string;
 }
@@ -335,6 +410,39 @@ export interface SessionReady {
   branches?: BranchMeta[];
   active_branch_id?: string;
   state?: SessionState;
+  /** True when the transcript is longer than the tail shipped here; the rest
+   *  follows in a ``session_history_backfill`` frame right behind. */
+  has_earlier_history?: boolean;
+  /** Absolute count of user messages BEFORE this tail, so per-user-message
+   *  storage keys (fr:<sid>:<idx>) keep their full-list numbering. */
+  earlier_user_count?: number;
+}
+
+/**
+ * Generic sharded bulk-data channel, shared by EVERY large backend payload
+ * (session history today; memory graph, file listings, ... tomorrow).
+ * ``data_begin`` carries only small metadata, the items arrive in ordered
+ * ``data_shard`` frames, ``data_end`` completes the topic. The renderer
+ * routes topics by "<kind>:<scope>:<what>".
+ */
+export interface DataBegin {
+  type: "data_begin";
+  topic: string;
+  meta?: Record<string, unknown>;
+  total_shards?: number;
+  total_items?: number;
+}
+
+export interface DataShard {
+  type: "data_shard";
+  topic: string;
+  seq: number;
+  items?: Array<{ role: string; content: string | Array<{ type: string; text: string }>; tool_calls?: any[]; reasoning_content?: string }>;
+}
+
+export interface DataEnd {
+  type: "data_end";
+  topic: string;
 }
 
 export interface ConfiguredEvent {
@@ -407,19 +515,31 @@ export interface GatewayStatusEvent {
   status: GatewayStatusData;
 }
 
-/** Response from a WeChat QR code scan request.
- *  Contains the QR code URL for the frontend to display. */
+/** Response from a platform QR code scan request.
+ *  Contains the QR code URL for the frontend to display. Credentials are
+ *  platform-specific: WeChat (iLink) returns ilink credentials, QQ Bot
+ *  returns app_id/app_secret from the official bind-task flow. */
 export interface WechatScanResultEvent {
   type: "wechat_scan_result";
   qrcode_url: string;
   success: boolean;
   message: string;
   scan_confirmed?: boolean;
+  /** QR was scanned but confirmation is still pending on the phone — stop
+   *  the countdown and keep waiting. */
+  scan_detected?: boolean;
+  /** QR expired server-side (QQ bind task) — show the refresh overlay. */
+  qr_expired?: boolean;
   credentials?: {
-    ilink_bot_id: string;
-    bot_token: string;
-    baseurl: string;
-    ilink_user_id: string;
+    ilink_bot_id?: string;
+    bot_token?: string;
+    baseurl?: string;
+    ilink_user_id?: string;
+    app_id?: string;
+    app_secret?: string;
+    user_openid?: string;
+    bot_id?: string;
+    secret?: string;
   };
 }
 
@@ -482,6 +602,11 @@ export interface AutomationStreamEvent {
 /** The client→server message union sent over the WebSocket. */
 export type ClientMessage =
   | ClientRun
+  | ClientQueueList
+  | ClientQueuePop
+  | ClientQueueRemove
+  | ClientQueueMove
+  | ClientQueueSteer
   | ClientCancel
   | ClientResume
   | ClientConfigure
@@ -491,7 +616,7 @@ export type ClientMessage =
   | ClientListAllSessions
   | ClientNewSession
   | ClientGetConfig
-  | ClientUpdateModels
+  | ClientUpdateProviders
   | ClientSetActiveModel
   | ClientDeleteModel
   | ClientFetchModels
@@ -499,6 +624,8 @@ export type ClientMessage =
   | ClientUpdateSkills
   | ClientInstallSkill
   | ClientUninstallSkill
+  | ClientGetSkillDetail
+  | ClientGetSkillFile
   | ClientUpdateSkill
   | ClientUpdateMCP
   | ClientUpdateAgent
@@ -508,6 +635,7 @@ export type ClientMessage =
   | ClientEditMessage
   | ClientDeleteMessage
   | ClientDeleteSession
+  | ClientClearAllSessions
   | ClientExportSession
   | ClientExportSessionsBatch
   | ClientExportData
@@ -536,6 +664,7 @@ export type ClientMessage =
   | ClientRespondPermission
   | ClientRespondTakeover
   | ClientRespondPlan
+  | ClientPluginConfirm
   | ClientPlanApprove
   | ClientPlanReject
   | ClientRespondQuestion
@@ -545,8 +674,6 @@ export type ClientMessage =
   | ClientRetry
   | ClientSwitchBranch
   | ClientRollback
-  | ClientReindexWorkspace
-  | ClientDeleteIndex
   | ClientGetUsageStats
   | ClientWechatScan
   | ClientAutomationListJobs
@@ -557,12 +684,99 @@ export type ClientMessage =
   | ClientAutomationDeleteExecution
   | ClientAutomationRenameExecution
   | ClientAutomationToggleJob
-  | ClientSteer;
+  | ClientSteer
+  | PluginUiAction
+  | PluginInstallAction
+  | PluginInstallMcpAction
+  | PluginInstallAgentAction
+  | PluginUninstallAction
+  | PluginEnableAction
+  | PluginDisableAction
+  | MarketInstallAction;
 
 export interface ClientSteer {
   type: "steer";
   session_id?: string;
   prompt: string;
+}
+
+/**
+ * Client → server: the user clicked a plugin-contributed UI element (context
+ * menu item, search mode, ...).  Dispatched through the unified plugin WS
+ * handler surface, so the plugin receives it exactly like any custom message.
+ */
+export interface PluginUiAction {
+  type: "plugin_ui_action";
+  /** Contribution kind: context_menu | search_mode | settings | theme. */
+  kind: string;
+  /** Contributing plugin id. */
+  plugin: string;
+  /** Action id declared in the contribution spec. */
+  action: string;
+  /** UI context (e.g. the right-clicked session id, the search query). */
+  payload?: Record<string, unknown>;
+}
+
+/** Client → server: install a plugin package (base64 zip). */
+export interface PluginInstallAction {
+  type: "plugin_install";
+  data_b64: string;
+  filename: string;
+}
+
+/** Client → server: install an MCP server *as a plugin* — the backend
+ *  generates a manifest package declaring `contributes.mcp_servers`. */
+export interface PluginInstallMcpAction {
+  type: "plugin_install_mcp";
+  name: string;
+  server: Record<string, unknown>;
+}
+
+/** Client → server: install a sub-agent *as a plugin* — the backend
+ *  generates a manifest package declaring `contributes.agents`. */
+export interface PluginInstallAgentAction {
+  type: "plugin_install_agent";
+  agent: Record<string, unknown>;
+}
+
+/** Client → server: uninstall an installed plugin by name. */
+export interface PluginUninstallAction {
+  type: "plugin_uninstall";
+  name: string;
+}
+
+/** Client → server: enable/disable an installed plugin (persisted by the
+ *  backend in the installed.json ledger; reactivates or deactivates live). */
+export interface PluginEnableAction {
+  type: "plugin_enable";
+  name: string;
+}
+
+export interface PluginDisableAction {
+  type: "plugin_disable";
+  name: string;
+}
+
+/** Client → server: install a catalogue plugin by name (market one-click
+ *  install).  The backend writes the ledger entry and runs the plugin
+ *  through the dynamic-authorisation activation path — no zip payload. */
+export interface MarketInstallAction {
+  type: "market_install";
+  name: string;
+}
+
+/**
+ * Server → client: result of a plugin UI action (or any plugin-pushed UI
+ * event).  The renderer re-dispatches it as an `encre-plugin-ui-result` DOM
+ * event; plugins and UI surfaces subscribe via `onPluginUiResult`.
+ */
+export interface PluginUiResult {
+  type: "plugin_ui_result";
+  kind: string;
+  plugin: string;
+  action: string;
+  ok: boolean;
+  data?: unknown;
 }
 
 export interface ClientGetUsageStats {
@@ -633,6 +847,40 @@ export interface ClientRun {
   mode_prompt?: string;
 }
 
+/** Client → server: request one conversation's queue snapshot. */
+export interface ClientQueueList {
+  type: "queue_list";
+  session_id: string;
+}
+
+/** Client → server: pop the head of one conversation's queue and run it. */
+export interface ClientQueuePop {
+  type: "queue_pop";
+  session_id: string;
+}
+
+/** Client → server: delete one queued prompt by index. */
+export interface ClientQueueRemove {
+  type: "queue_remove";
+  session_id: string;
+  index: number;
+}
+
+/** Client → server: reorder one queued prompt (drag-and-drop). */
+export interface ClientQueueMove {
+  type: "queue_move";
+  session_id: string;
+  from_index: number;
+  to_index: number;
+}
+
+/** Client → server: pop one queued prompt and inject it as a mid-run steer. */
+export interface ClientQueueSteer {
+  type: "queue_steer";
+  session_id: string;
+  index: number;
+}
+
 export interface ClientCancel {
   type: "cancel";
   session_id: string;
@@ -674,9 +922,9 @@ export interface ClientGetConfig {
   type: "get_config";
 }
 
-export interface ClientUpdateModels {
-  type: "update_models";
-  models: ModelConfigMeta[];
+export interface ClientUpdateProviders {
+  type: "update_providers";
+  providers: ProviderConfigMeta[];
   active_model_index: number;
 }
 
@@ -708,7 +956,17 @@ export interface ClientValidateModel {
   /** Index of the model being edited; omit or -1 to add a new model. */
   model_index?: number;
   multimodal?: boolean;
+  /** Custom HTTP headers required by gateways (merged into every probe). */
+  headers?: Record<string, string>;
+  /** Run the live reasoning-level probe (capability toggle is on). */
+  probe_reasoning?: boolean;
   thinking_config?: ThinkingConfigData;
+  /** Correlation id echoed back on the validation reply. */
+  request_id?: string;
+  /** Per-model sampling overrides stamped onto the probe backends. */
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
 }
 
 export interface ClientUpdateSkills {
@@ -726,6 +984,21 @@ export interface ClientInstallSkill {
 export interface ClientUninstallSkill {
   type: "uninstall_skill";
   name: string;
+}
+
+/** Read one skill's own text by name (bundled skills are not in the boot
+ *  catalogue, so the plugin market asks for them per skill). */
+export interface ClientGetSkillDetail {
+  type: "get_skill_detail";
+  name: string;
+}
+
+/** Read one file inside a skill's own directory (its `references/…` docs,
+ *  templates, scripts).  `SKILL.md` is only the entry point of the package. */
+export interface ClientGetSkillFile {
+  type: "get_skill_file";
+  name: string;
+  path: string;
 }
 
 export interface ClientUpdateMCP {
@@ -769,12 +1042,19 @@ export interface ClientEditMessage {
 export interface ClientDeleteMessage {
   type: "delete_message";
   message_index: number;
+  /** Server message id of the target; preferred over message_index. */
+  message_id?: string;
   session_id?: string;
 }
 
 export interface ClientDeleteSession {
   type: "delete_session";
   session_id: string;
+}
+
+export interface ClientClearAllSessions {
+  type: "clear_all_sessions";
+  request_id?: string;
 }
 
 export interface ClientExportSession {
@@ -862,6 +1142,10 @@ export interface WorkspaceConfig {
   /** Persisted enable toggle for the model selection, independent of `models`
    *  so "enabled but nothing picked yet" survives a reload. */
   models_enabled?: boolean | null;
+  /** Model last chosen in this workspace. Stored as an identity (not a flat
+   *  index) so it survives provider edits and restarts; every conversation
+   *  in the workspace resolves it to the same model. */
+  active_model?: { model_id: string; backend_type: string; base_url: string } | null;
   /** Per-file enable toggles for workspace context files. Absent key = enabled;
    *  `{ "CLAUDE.md": false }` disables a file so its contents never reach the model. */
   context_files?: Record<string, boolean> | null;
@@ -886,16 +1170,6 @@ export interface WorkspaceConfigResponse {
   config: WorkspaceConfig;
   /** Which context files (AGENTS.md / CLAUDE.md) exist in this workspace. */
   files?: Record<string, boolean>;
-}
-
-export interface ClientReindexWorkspace {
-  type: "reindex_workspace";
-  path?: string;
-}
-
-export interface ClientDeleteIndex {
-  type: "delete_index";
-  path?: string;
 }
 
 export interface ClientUpdateSubAgents {
@@ -926,9 +1200,69 @@ export interface ModelConfigMeta {
   multimodal: boolean;
   /** Recorded probe result: "supported" | "unsupported" | "unknown". */
   multimodal_support?: "supported" | "unsupported" | "unknown";
+  /** Reasoning levels VERIFIED live against the endpoint.  Empty = none
+   *  accepted (thinking on/off only or unsupported). */
+  reasoning_levels?: string[];
   /** Verified per-endpoint capability map: node name -> "supported" | "unsupported". */
   capabilities?: Record<string, string>;
   thinking_config?: ThinkingConfigData;
+}
+
+/** A model row defined under a provider (credentials come from the provider). */
+export interface ProviderModelMeta {
+  name: string;
+  model_id: string;
+  max_tokens: number;
+  context_window?: number;
+  enabled: boolean;
+  multimodal: boolean;
+  multimodal_support?: "supported" | "unsupported" | "unknown";
+  reasoning_levels?: string[];
+  capabilities?: Record<string, string>;
+  thinking_config?: ThinkingConfigData;
+  /** Per-model sampling overrides (model sub-page).  Omitted = backend defaults. */
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  /** Digest of the validation probe this model passed.  Empty/omitted = never
+   *  validated; a matching digest on the next save skips the re-probe. */
+  validated_key?: string;
+}
+
+/** One service provider (服务商): credentials + all custom models under it. */
+export interface ProviderConfigMeta {
+  backend_type: string;
+  /** User-defined display name (custom providers only; must be unique). */
+  name?: string;
+  api_key: string;
+  base_url: string;
+  /** Custom HTTP headers sent with every request (OpenCode options.headers). */
+  headers?: Record<string, string>;
+  /** Provider master switch.  When false every model under this provider is
+   *  treated as unavailable, without altering the individual model flags. */
+  enabled?: boolean;
+  /** Legacy provider-level sampling overrides (old configs only).  Superseded
+   *  by the per-model fields; kept so old persisted data still loads. */
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  models: ProviderModelMeta[];
+}
+
+export interface ContextUsageBreakdown {
+  context_window: number;
+  system_prompt_tokens: number;
+  messages_tokens: number;
+  tools_tokens: {
+    total: number;
+    builtin: number;
+    mcp: number;
+    plugin: number;
+    subagents: number;
+  };
+  skills_tokens: number;
+  total_tokens: number;
+  free_tokens?: number | null;
 }
 
 export interface ContextUsageEvent {
@@ -936,6 +1270,7 @@ export interface ContextUsageEvent {
   context_tokens: number;
   context_window: number;
   session_id?: string;
+  breakdown?: ContextUsageBreakdown | null;
 }
 
 export interface AgentStateSnapshot {
@@ -984,6 +1319,10 @@ export interface SubAgentConfig {
   name: string;
   description: string;
   system_prompt: string;
+  /** Execution model: flat index into `modelConfigs` (defaults to the active one). */
+  model_index?: number;
+  /** Permission mode: "default" (manual) | "auto" | "bypass" | "custom". */
+  permission_mode?: string;
   hidden?: boolean;
   /** Origin: "user" (default) or "model" (created by manage tool). */
   source?: string;
@@ -1027,9 +1366,6 @@ export interface WorkspaceEntry {
   /** PNG data URL of the workspace icon (uploaded or generated). */
   icon_data?: string;
   session_count?: number;
-  index_status?: string;
-  index_files?: number;
-  index_progress?: number;
 }
 
 export interface WorkspaceOpened {
@@ -1038,9 +1374,6 @@ export interface WorkspaceOpened {
   name: string;
   id?: string;
   workspaces: WorkspaceEntry[];
-  index_status?: string;
-  index_files?: number;
-  progress?: number;
 }
 
 export interface WorkspacesList {
@@ -1116,9 +1449,21 @@ export interface ConfigData {
   config: Record<string, unknown>;
 }
 
+/**
+ * Incremental config update: the same payload shape as `ConfigData.config`,
+ * but carrying ONLY the top-level fields that changed since the last
+ * snapshot.  Applied through the same config applier as `config_data`, so
+ * consumers never need to distinguish a full snapshot from a patch.
+ */
+export interface ConfigPatch {
+  type: "config_patch";
+  config: Record<string, unknown>;
+}
+
 export interface ModelsUpdated {
   type: "models_updated";
   models: ModelConfigMeta[];
+  providers?: ProviderConfigMeta[];
   active_model_index: number;
 }
 
@@ -1131,9 +1476,12 @@ export interface ModelValidated {
   type: "model_validated";
   backend_type?: string;
   model_id?: string;
-  model_index?: number;
   /** Recorded probe result: "supported" | "unsupported" | "unknown". */
   multimodal_support?: string;
+  /** Reasoning levels verified live against the endpoint. */
+  reasoning_levels?: string[];
+  /** Verified per-endpoint capability map (incl. "reasoning"). */
+  capabilities?: Record<string, string>;
 }
 
 export interface ModelValidationError {
@@ -1150,6 +1498,32 @@ export interface SkillsUpdated {
 export interface SkillsList {
   type: "skills_list";
   skills: SkillInfo[];
+}
+
+/** Reply to `get_skill_detail`: the skill's own fields, or `error`. */
+export interface SkillDetail {
+  type: "skill_detail";
+  name: string;
+  description?: string;
+  when_to_use?: string;
+  argument_hint?: string;
+  source?: string;
+  license?: string;
+  compatibility?: string;
+  /** The skill's other files, relative to its directory — what `get_skill_file`
+   *  reads.  Empty when the package ships nothing besides `SKILL.md`. */
+  files?: string[];
+  body?: string;
+  error?: string;
+}
+
+/** Reply to `get_skill_file`: one file of a skill package, or `error`. */
+export interface SkillFile {
+  type: "skill_file";
+  name: string;
+  path: string;
+  content?: string;
+  error?: string;
 }
 
 export interface SkillInstalled {
@@ -1306,6 +1680,36 @@ export interface ClientGetMemoryDetail {
   path: string;
 }
 
+/** One node of the memory relationship graph. */
+export interface MemoryGraphNode {
+  id: string;
+  type: string;
+  title: string;
+  preview: string;
+  confidence: number;
+  uses: number;
+  updated: number;
+  weakened: boolean;
+  skill_candidate: boolean;
+}
+
+/** One typed edge of the memory relationship graph. */
+export interface MemoryGraphEdge {
+  from: string;
+  to: string;
+  relation: string;
+  weight: number;
+}
+
+export interface MemoryGraph {
+  type: "memory_graph";
+  graph: { nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[] };
+}
+
+export interface ClientGetMemoryGraph {
+  type: "get_memory_graph";
+}
+
 export interface ClientListGlobalRules {
   type: "list_global_rules";
 }
@@ -1429,42 +1833,25 @@ export interface ProfileMessage {
   profile: ProfileData;
 }
 
-export interface IndexStatusEvent {
-  type: "index_status";
-  files: number;
-  status: string;
-  progress?: number;
-  workspace_id?: string;
-}
-
 export interface GitignoreContentEvent {
   type: "gitignore_content";
   path: string;
   content: string;
 }
 
-export interface DocumentsListEvent {
-  type: "documents_list";
-  documents: DocumentEntry[];
+export interface LibraryTreeEvent {
+  type: "library_tree";
+  nodes: LibraryNode[];
 }
 
-export interface DocumentAddedEvent {
-  type: "document_added";
-  document: DocumentEntry;
-}
-
-export interface DocumentUpdatedEvent {
-  type: "document_updated";
-  document: DocumentEntry;
-}
-
-export interface DocumentRemovedEvent {
-  type: "document_removed";
+export interface LibraryContentEvent {
+  type: "library_content";
   id: string;
+  content: string;
 }
 
-export interface DocumentErrorEvent {
-  type: "document_error";
+export interface LibraryErrorEvent {
+  type: "library_error";
   message: string;
 }
 
@@ -1563,6 +1950,13 @@ export interface ClientRespondPermission {
   remember?: boolean;
 }
 
+/** User decision on a pending third-party plugin (dynamic authorisation). */
+export interface ClientPluginConfirm {
+  type: "plugin_confirm";
+  name: string;
+  approved: boolean;
+}
+
 export interface ClientRespondTakeover {
   type: "respond_takeover";
   decision: boolean;
@@ -1589,7 +1983,8 @@ export interface ClientPlanReject {
 export interface ClientRespondQuestion {
   type: "respond_question";
   tool_call_id: string;
-  answers: string;
+  /** One string for a single question, or one entry per question (ask order) for a batched ask. */
+  answers: string | string[];
 }
 
 export interface ClientSetPlanMode {
@@ -1628,6 +2023,10 @@ export interface ClientRollback {
   type: "rollback";
   branch_id: string;
   message_id: string;
+  /** Required in practice: the backend treats it as optional and silently
+   *  binds an omitted one to the connection's LAST session, so with two
+   *  sessions open the rollback lands in the wrong conversation. */
+  session_id?: string;
 }
 
 // ── Attachment ────────────────────────────────────────────────────────────
@@ -1669,7 +2068,11 @@ export interface Message {
   interruptedReason?: string;
   turnStatusText?: string;  // e.g. "任务完成" from backend
   cancelledText?: string;   // set when user presses stop button (reason="cancelled")
-  mode?: string;  // "plan" | "spec" | "terminal" | "task_divider" for mode-based messages
+  mode?: string;  // "plan" | "spec" | "terminal" | "task_divider" | "compact_marker" | "compact_notice" | "model_switch" for mode-based messages
+  /** compact_notice payload: before/after token + message counts. */
+  compactStats?: { oldTokens: number; newTokens: number; oldCount: number; newCount: number };
+  /** model_switch payload: the switch the notice records. */
+  switchInfo?: { fromModel: string; toModel: string; reason: string; source: string };
   taskIndex?: number;   // parallel sub-agent: 0-based task ordinal (task_divider only)
   taskName?: string;    // parallel sub-agent: task label / agent name (task_divider only)
   taskStatus?: string;  // parallel sub-agent: "running" | "done" | "error" (task_divider only)
@@ -1693,6 +2096,9 @@ export interface ToolCallState {
   isError?: boolean;
   errorCode?: string;
   errorCategory?: string;
+  /** Epoch ms the failure was observed, so the fault card can show a stable
+   *  "time of the incident" across re-renders and session reloads. */
+  errorAt?: number;
   status: "pending" | "running" | "done";
   /** When a single agent tool call executed multiple parallel tasks, this
    *  indexes the task currently being viewed (0-based). Undefined means the
@@ -1700,17 +2106,21 @@ export interface ToolCallState {
   taskIndex?: number;
 }
 
-export interface DocumentEntry {
+/** One node of the knowledge-library tree (space → folder → typed leaf).
+ *  Structural nodes (space/folder) carry no content; leaves mirror the
+ *  backend manifest fields for their backing body file. */
+export interface LibraryNode {
   id: string;
+  parent_id: string;
+  type: "space" | "folder" | "doc" | "sheet" | "clip" | "md" | "attachment";
   name: string;
-  source: string;
-  status: string;
-  original_url: string;
-  original_path: string;
-  content_path: string;
-  file_type: string;
-  size: number;
-  added_at: number;
+  order: number;
+  created_at: number;
+  status?: string;
+  original_url?: string;
+  original_path?: string;
+  file_type?: string;
+  size?: number;
 }
 
 export interface CustomCommand {
@@ -1733,6 +2143,8 @@ export interface SessionSnapshot {
   references: ReferenceItem[];
   compactEvents: CompactInfo[];
   compactStartingEvents: CompactStartingInfo[];
+  /** Transient in-flight retry notice (null when none). */
+  retryNotice: RetryNoticeInfo | null;
   systemMessages: SystemMessageInfo[];
   branches: BranchMeta[];
   activeBranchId: string;
@@ -1744,6 +2156,11 @@ export interface SessionSnapshot {
    *  it, so it cannot distinguish a permission wait from an active run. */
   sessionState: SessionState;
   agentState?: AgentStateSnapshot | null;
+  /** Per-session model choice: the flat modelConfigs index this conversation
+   *  last used.  Restored on session switch so each session keeps its own
+   *  model instead of every conversation inheriting whatever was selected
+   *  last.  Undefined = never switched in this session (inherits current). */
+  activeModelIndex?: number;
 }
 
 /** The complete global application state held by the state store. */
@@ -1760,6 +2177,9 @@ export interface AppState {
   activeToolId: string | null;
   theme: "dark" | "light";
   themePreference: "system" | "dark" | "light";
+  /** Active colour skin (ink / spring / autumn / winter / honey / grass /
+   *  sky / sunset). Mode (light/dark) stays on themePreference. */
+  themeSkin: string;
   telemetry: TelemetryData | null;
   usageStats: UsageStatsData | null;
   tokenUsage: TokenUsage | null;
@@ -1777,6 +2197,13 @@ export interface AppState {
   allSessions: SessionEntryData[];
   modelConfigs: ModelConfigMeta[];
   activeModelIndex: number;
+  /** Session id the current `activeModelIndex` belongs to. It lags behind
+   *  `sessionId` until the backend replies with that session's own model;
+   *  while it lags, the picker must not auto-fallback (that would push a
+   *  guessed model onto a conversation that is still loading). */
+  modelIndexSessionId: string;
+  /** Provider-centric model configuration (服务商) — canonical write shape. */
+  providers: ProviderConfigMeta[];
   skillsList: SkillInfo[];
   enabledSkills: string[];
   mcpServers: MCPServerConfig[];
@@ -1799,13 +2226,16 @@ export interface AppState {
    *  exist in the workspace), keyed by workspace path. */
   workspaceFiles: Record<string, Record<string, boolean>>;
   activeWorkspace: string;
+  /** Per-session files directories (sessions/<sid>/files), keyed by session
+   *  id and tagged with the session each config snapshot was built from —
+   *  the editor tree root in general mode. Keyed storage prevents one
+   *  session's file list from leaking into another's view. */
+  sessionFilesDirs: Record<string, string>;
   workspaceMode: "iwork" | "normal";
-  indexStatus: "idle" | "ready" | "indexing" | "error" | "no_workspace";
-  indexFiles: number;
-  indexProgress: number;
-  indexCurrentFile?: string;
   gitignoreContent: string;
-  docsList: DocumentEntry[];
+  libraryTree: LibraryNode[];
+  /** Last library content read (node id → body), cleared on node switch. */
+  libraryContent: { id: string; content: string } | null;
   gatewayStatus: GatewayStatusData | null;
   toolsInfo: ToolsInfo;
   modelCatalog: ModelCatalog;
@@ -1814,8 +2244,10 @@ export interface AppState {
   references: ReferenceItem[];
   compactEvents: CompactInfo[];
   compactStartingEvents: CompactStartingInfo[];
+  retryNotice: RetryNoticeInfo | null;
   systemMessages: SystemMessageInfo[];
   memoryList: MemoryEntry[];
+  memoryGraph: { nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[] } | null;
   memoryDetail: { path: string; content: string; error?: string } | null;
   globalRules: GlobalRuleEntry[];
   projectRules: ProjectRuleEntry[];
@@ -1836,6 +2268,7 @@ export interface AppState {
   searchFilter: SearchFilter;
   contextTokens: number;
   contextWindow: number;
+  contextUsageBreakdown: ContextUsageBreakdown | null;
   agentState: AgentStateSnapshot | null;
   spec: SpecData | null;
   planReview: PlanReviewData | null;
@@ -1896,6 +2329,21 @@ export interface GatewayAdapterInfo {
   connected: boolean;
   status: "connected" | "error" | "disconnected";
   error?: string;
+  /** Declarative connector-card spec from the adapter's ea-connector-*
+   *  plugin (GatewayAdapterSpec.ui on the backend); empty for built-in
+   *  infrastructure adapters like api_server. */
+  ui?: {
+    name?: string;
+    desc?: string;
+    docs?: string;
+    qr?: boolean;
+    fields?: {
+      key: string;
+      labelKey: string;
+      type: "text" | "password" | "number" | "textarea";
+      placeholderKey?: string;
+    }[];
+  };
 }
 
 export interface GatewayStatusData {
@@ -1914,21 +2362,12 @@ export interface ToolsInfo {
 
 // ── Model Catalog ─────────────────────────────────────────────────────────
 
-export interface ModelEntry {
-  id: string;
-  label: string;
-  context: number;
-  modalities: string[];
-}
-
 export interface ProviderEntry {
   id: string;
   label: string;
   base_url: string;
   docs: string;
-  allow_custom: boolean;
   auth: string;
-  models: ModelEntry[];
 }
 
 export interface ModelCatalog {
@@ -2007,6 +2446,243 @@ export interface CommandChanged {
   session_id?: string;
 }
 
+export interface PluginUiProvider {
+  name: string;
+  /** Owning plugin id.  Older servers omit this; the renderer falls back to
+   *  `name`, but new servers always send it so two plugins may legally ship
+   *  providers with the same display name without sharing a container. */
+  plugin?: string;
+  /** Stable provider id inside the owning plugin. */
+  provider_id?: string;
+  title: string;
+  description: string;
+  mount_point: string;
+  entry_point: string;
+  assets_url: string;
+}
+
+export type PluginToolUiCard = "strip" | "item" | "file" | "agent" | "question" | "info" | "hidden" | "plugin-error";
+
+export type PluginToolUiBody = "pre" | "terminal" | "diff" | "web-results" | "web-fetched";
+
+export type PluginToolUiResult = "text" | "json" | "file" | "match_count" | "file_count" | "discover" | "url";
+
+/**
+ * One tool's UI declaration, sent from the backend. The renderer owns no tool
+ * names: icon, label, card shape, result body and summary keys all come from
+ * here (or from the six hardcoded file-mutation tools).
+ */
+export interface PluginToolUiMeta {
+  icon?: string;
+  label?: string;
+  card?: PluginToolUiCard;
+  body?: PluginToolUiBody;
+  hidden?: boolean;
+  /** When true the key matches tool names by prefix, not exactly. */
+  prefix?: boolean;
+  result?: PluginToolUiResult;
+  /** Param keys lifted into the strip summary; first non-empty one wins. */
+  keys?: string[];
+  /** i18n key shown when no param is available yet. */
+  hint?: string;
+  /** Per-shell display names, resolved from the call's `terminal` argument. */
+  terminal_labels?: Record<string, string>;
+  /**
+   * Clone another declared tool's card shape as the base, then apply this
+   * meta's own fields on top. Lets a plugin reuse e.g. the terminal card by
+   * declaring `extends: "terminal"` plus only an icon/label.
+   */
+  extends?: string;
+  /** Strip-header actions to suppress, e.g. `["stop"]` for a terminal-shaped tool with no kill button. */
+  hide?: string[];
+  /** Free-form scalars forwarded to the body renderer (e.g. `maxLines`). */
+  props?: Record<string, string | number | boolean>;
+}
+
+export interface PluginToolMetaEntry {
+  name: string;
+  meta: PluginToolUiMeta;
+  source?: string;
+}
+
+export interface PluginUiSync {
+  type: "plugin_ui_sync";
+  providers: PluginUiProvider[];
+  /** Built-in catalog merged with every plugin's `contributes.tools_meta`. */
+  tool_meta?: PluginToolMetaEntry[];
+  /** Declarative UI contributions (theme/settings/context_menu/search_mode). */
+  contributions?: PluginContribution[];
+}
+
+/** Lifecycle snapshot entry carried by `plugin_changed`. */
+export interface PluginStateEntry {
+  name: string;
+  version: string;
+  tier: string;
+  source: string;
+  /** discovered | activated | failed | lazy | pending */
+  state: string;
+  /** Authoritative enabled flag from the installed.json ledger (a plugin
+   *  with no ledger record is always enabled). */
+  enabled: boolean;
+  /** True when the plugin has an installed.json ledger entry (the market's
+   *  "installed vs browsable" discriminator; absent records default false
+   *  for bundled core plugins that were never user-installed). */
+  installed?: boolean;
+  /** The plugin's one-line description from its manifest. */
+  description?: string;
+  /** Short human-friendly name shown to users; blank falls back to `name`. */
+  display_name?: string;
+  /** Manifest tags — the market derives its category chips from these. */
+  tags?: string[];
+  /** Declared permission strings shown before install. */
+  permissions?: string[];
+  /** Fail-closed engine grants (`file_read`, `network`, `process_spawn`, …)
+   *  — what the plugin may actually touch once activated. */
+  resources?: Record<string, unknown>;
+  /** Renderer surfaces the plugin's data may reach (`providers`,
+   *  `tool_meta`, `contributions`, `all`). */
+  ui_permissions?: Record<string, unknown>;
+  /** Free-form license identifier. */
+  license?: string;
+  /** Declarative capability lists keyed by surface (tools/skills/hooks/...). */
+  provides?: Record<string, string[]>;
+  /** Author display name, when the plugin declares one. */
+  author?: string;
+  /** Author e-mail — the support channel the fault card prefers first. */
+  email?: string;
+  /** Official site. */
+  homepage?: string;
+  /** Source repository, for filing issues. */
+  repository?: string;
+  /** Self-service troubleshooting docs. */
+  docs?: string;
+  /** The plugin's own glyph: an icon file it ships (``assets/icon.svg``), a
+   *  lucide icon name, or a single emoji.  Undeclared stays unrendered — the
+   *  app never substitutes a glyph for a plugin. */
+  icon?: string;
+}
+
+export interface PluginChanged {
+  type: "plugin_changed";
+  /** Full lifecycle snapshot of every registered plugin after the change. */
+  plugins: PluginStateEntry[];
+}
+
+/** Install/uninstall results for the settings plugins panel. */
+export interface PluginInstalled {
+  type: "plugin_installed";
+  name: string;
+}
+
+export interface PluginInstallError {
+  type: "plugin_install_error";
+  message: string;
+}
+
+export interface PluginUninstalled {
+  type: "plugin_uninstalled";
+  name: string;
+}
+
+export interface PluginUninstallError {
+  type: "plugin_uninstall_error";
+  name: string;
+  message: string;
+}
+
+/** Market one-click install results (reply frames of `market_install`). */
+export interface MarketInstalled {
+  type: "market_installed";
+  name: string;
+}
+
+export interface MarketInstallError {
+  type: "market_install_error";
+  name: string;
+  message: string;
+}
+
+/** One central-repository (ea-cwh) catalogue entry. */
+export interface MarketCatalogEntry {
+  name: string;
+  pypi_package: string;
+  version: string;
+  /** Short human-friendly name shown to users; blank falls back to `name`. */
+  display_name?: string;
+  description?: string;
+  author?: string;
+  icon?: string;
+  license?: string;
+  homepage?: string;
+  repository?: string;
+  docs?: string;
+  email?: string;
+  tags?: string[];
+  permissions?: string[];
+  provides?: Record<string, string[]>;
+  min_encre_version?: string;
+  /** Distribution file name → digest/size metadata published by CI. */
+  artifacts?: Record<string, { sha256?: string; size?: number }>;
+  published_at?: string;
+  yanked?: boolean;
+}
+
+/** Central-repository catalogue pushed by the backend
+ *  (initial `market_catalog` frame on connect, then on index change). */
+export interface MarketCatalog {
+  type: "market_catalog";
+  /** Where the payload came from: authoritative index, offline cache, or none. */
+  source: "index" | "cache" | "none";
+  index_version: string;
+  generated_at: string;
+  plugins: MarketCatalogEntry[];
+}
+
+/** Enable/disable results (reply frames of `plugin_enable`/`plugin_disable`). */
+export interface PluginEnabled {
+  type: "plugin_enabled";
+  name: string;
+}
+
+export interface PluginEnableError {
+  type: "plugin_enable_error";
+  name: string;
+  message: string;
+}
+
+export interface PluginDisabled {
+  type: "plugin_disabled";
+  name: string;
+}
+
+export interface PluginDisableError {
+  type: "plugin_disable_error";
+  name: string;
+  message: string;
+}
+
+/** Third-party plugin awaiting the user's activation confirmation. */
+export interface PluginPendingEntry {
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  tier: string;
+  source: string;
+  /** Permission capabilities the plugin declares (shown in the dialog). */
+  permissions: string[];
+  /** local | process | remote */
+  transport: string;
+  state: string;
+}
+
+/** Server push: third-party plugins discovered but not yet approved. */
+export interface PluginConfirmRequest {
+  type: "plugin_confirm_request";
+  plugins: PluginPendingEntry[];
+}
+
 export interface PlanResolved {
   type: "plan_resolved";
   proposal_id: string;
@@ -2043,14 +2719,75 @@ export interface AssistantBoundaryEvent {
   session_id?: string;
 }
 
+export interface SystemMessageEvent {
+  type: "system_message";
+  content: string;
+  kind: string;
+  session_id: string;
+}
+
+export interface CompactStartingInfo {
+  timestamp: number;
+  /** Stable id shared with the completion event and the persisted notice. */
+  noticeId: string;
+  /** Server id of the message the compaction consumed; the indicator is
+   *  anchored right after it so it flips in place when compaction ends. */
+  anchorId: string;
+}
+
+/** Persisted record that the context was compacted (survives reload). */
+export interface CompactNoticeInfo {
+  id: string;
+  oldTokens: number;
+  newTokens: number;
+  oldCount: number;
+  newCount: number;
+  timestamp: number;
+  anchorId: string;
+}
+
+/** Persisted record that the active model changed (survives reload). */
+export interface ModelSwitchInfo {
+  id: string;
+  fromModel: string;
+  toModel: string;
+  reason: string;
+  source: "manual" | "pool";
+  timestamp: number;
+  anchorId: string;
+}
+
+/**
+ * Transient announcement that a failed model call is being retried.
+ *
+ * Emitted by the harness *before* each backoff wait, so the client can show a
+ * live indicator during the (otherwise silent) stall.  It is dropped as soon
+ * as the retried attempt produces output — see the clear-on-first-token rules
+ * in `core/stream.ts`.
+ */
+export interface RetryNoticeEvent {
+  type: "retry";
+  scope: string;
+  attempt: number;
+  max_attempts: number;
+  delay_ms: number;
+  message: string;
+  status_code: number;
+  error_class: string;
+  session_id?: string;
+}
+
 export interface CompactStartingEvent {
   type: "compact_starting";
+  notice_id: string;
+  anchor_id: string;
   session_id?: string;
 }
 
 export interface CompactFailedEvent {
   type: "compact_failed";
-  reason?: string;
+  reason: string;
+  notice_id: string;
   session_id?: string;
 }
 
@@ -2060,16 +2797,32 @@ export interface CompactEvent {
   new_count: number;
   old_tokens: number;
   new_tokens: number;
+  notice_id: string;
+  messages?: unknown[];
+  plan_items?: unknown[];
+  artifacts?: unknown[];
+  references?: unknown[];
+  session_id?: string;
 }
 
-export interface SystemMessageEvent {
-  type: "system_message";
-  content: string;
-  kind: string;
-  session_id: string;
+export interface ModelSwitchEvent {
+  type: "model_switch";
+  from_model: string;
+  to_model: string;
+  reason: string;
+  source: string;
+  notice_id: string;
+  session_id?: string;
 }
 
-export interface CompactStartingInfo {
+export interface RetryNoticeInfo {
+  scope: string;
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  message: string;
+  statusCode: number;
+  errorClass: string;
   timestamp: number;
 }
 
@@ -2111,10 +2864,15 @@ export interface SpecUpdateEvent {
 export interface PlanReviewData {
   review_id: string;
   content: string;
-  file_path: string;  // path to plan.md
-  dir_path: string;   // directory containing plan.md, steps.md, checklist.md
+  file_path: string;  // primary artifact path
+  dir_path: string;   // review storage directory
   mode: string;
   status: string;
+  files?: { path: string; label: string }[];
+  feedback?: string;
+  /** Renderer-side id of the submit_review call that opened this card; the
+   *  timeline anchors the card on it so it sits in the turn that asked. */
+  call_id?: string;
 }
 
 export interface PlanReviewEvent {
@@ -2170,6 +2928,7 @@ export function createEmptySessionSnapshot(): SessionSnapshot {
     references: [],
     compactEvents: [],
     compactStartingEvents: [],
+    retryNotice: null,
     systemMessages: [],
     branches: [],
     activeBranchId: "",
@@ -2210,8 +2969,9 @@ export function createEmptyState(): AppState {
     subAgentBreadcrumb: [],
     settings: {},
     activeToolId: null,
-    theme: "dark",
-    themePreference: "system",
+    theme: "light",
+    themePreference: "light",
+    themeSkin: "ink",
     telemetry: null,
     usageStats: null,
     tokenUsage: sessionSnapshot.tokenUsage,
@@ -2225,6 +2985,8 @@ export function createEmptyState(): AppState {
     allSessions: [],
     modelConfigs: [],
     activeModelIndex: 0,
+    modelIndexSessionId: "",
+    providers: [],
     skillsList: [],
     enabledSkills: [],
     mcpServers: [],
@@ -2233,10 +2995,12 @@ export function createEmptyState(): AppState {
     references: sessionSnapshot.references,
     compactEvents: sessionSnapshot.compactEvents,
     compactStartingEvents: sessionSnapshot.compactStartingEvents,
+    retryNotice: sessionSnapshot.retryNotice,
     systemMessages: sessionSnapshot.systemMessages || [],
     spec: null,
     planReview: null,
     memoryList: [],
+    memoryGraph: null,
     memoryDetail: null,
     globalRules: [],
     projectRules: [],
@@ -2261,13 +3025,11 @@ export function createEmptyState(): AppState {
     workspaceConfigs: {},
     workspaceFiles: {},
     activeWorkspace: "",
+    sessionFilesDirs: {},
     workspaceMode: "normal",
-    indexStatus: "idle",
-    indexFiles: 0,
-    indexProgress: 0,
-    indexCurrentFile: undefined,
     gitignoreContent: "",
-    docsList: [],
+    libraryTree: [],
+    libraryContent: null,
     gatewayStatus: null,
     toolsInfo: {
       base: [],
@@ -2287,6 +3049,7 @@ export function createEmptyState(): AppState {
     searchFilter: defaultSearchFilter(),
     contextTokens: 0,
     contextWindow: 0,
+    contextUsageBreakdown: null,
     agentState: null,
   };
 }

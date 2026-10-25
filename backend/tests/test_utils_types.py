@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for utility types, event factories, enums, and union types."""
+"""Tests for encre.utils.types: event dataclasses, enums, and factory helpers.
+
+The suite covers the frontend-facing event dataclasses (text, thinking, and
+tool-call streams), the backend-facing counterparts, permission and task
+literals, the three thinking-mode configurations, and every create_* factory
+function that wraps those constructors.
+"""
 
 
 from encre.utils.types import (
@@ -69,8 +75,9 @@ from encre.utils.types import (
 # Event dataclasses
 # ===========================================================================
 
+
 class TestTextDelta:
-    """Engineered to validate the :class:`TextDelta` backend event type.
+    """Validate the :class:`TextDelta` frontend event type.
 
     ``TextDelta`` carries incremental text fragments streamed from the model
     backend. This class exercises its constructor and field accessors across
@@ -90,7 +97,7 @@ class TestTextDelta:
 
 
 class TestThinkingDelta:
-    """Engineered to validate the :class:`ThinkingDelta` backend event type.
+    """Validate the :class:`ThinkingDelta` frontend event type.
 
     ``ThinkingDelta`` represents streaming chunks of the model's internal
     chain-of-thought reasoning. Tests cover normal text delivery and the
@@ -119,7 +126,7 @@ class TestThinkingDelta:
 
 
 class TestToolCallStart:
-    """Engineered to validate the :class:`ToolCallStart` backend event type.
+    """Validate the :class:`ToolCallStart` frontend event type.
 
     ``ToolCallStart`` marks the beginning of a tool-invocation event carrying
     the call ID and tool name before arguments arrive incrementally. Tests
@@ -139,7 +146,7 @@ class TestToolCallStart:
 
 
 class TestToolCallDelta:
-    """Engineered to validate the :class:`ToolCallDelta` backend event type.
+    """Validate the :class:`ToolCallDelta` frontend event type.
 
     ``ToolCallDelta`` carries incremental argument fragments keyed to a
     specific call ID. Tests verify the three-field structure (id, key, value)
@@ -159,7 +166,7 @@ class TestToolCallDelta:
 
 
 class TestToolCallEnd:
-    """Engineered to validate the :class:`ToolCallEnd` backend event type.
+    """Validate the :class:`ToolCallEnd` frontend event type.
 
     ``ToolCallEnd`` signals completion of a tool-call argument stream. Its
     sole field (call ID) serves as the correlation key for matching start,
@@ -177,7 +184,7 @@ class TestToolCallEnd:
 
 
 class TestToolProgress:
-    """Engineered to validate the :class:`ToolProgress` backend event type.
+    """Validate the :class:`ToolProgress` frontend event type.
 
     ``ToolProgress`` conveys live status updates for an in-flight tool call
     (e.g. ``"running"``). Tests confirm all three fields are stored so the
@@ -198,12 +205,12 @@ class TestToolProgress:
 
 
 class TestToolResult:
-    """Engineered to validate the :class:`ToolResult` backend event type.
+    """Validate the :class:`ToolResult` frontend event type.
 
-    ``ToolResult`` delivers the completed output of a tool call back into
-    the session. Tests cover the success path and the error path, ensuring
-    the boolean flag distinguishes them so the agent can branch on whether
-    to treat the content as actionable output or an exception.
+    ``ToolResult`` delivers the completed output of a tool call back into the
+    session. Tests cover the success path and the error path, ensuring the
+    boolean flag distinguishes them so the agent can branch on whether to
+    treat the content as actionable output or an exception.
     """
 
     def test_verify_tool_result_constructor_stores_success_output(self):
@@ -220,7 +227,7 @@ class TestToolResult:
     def test_verify_tool_result_constructor_stores_error_flag(self):
         """Validate that ToolResult correctly records is_error=True on failure.
 
-        Error-flagged results are routed differently by the agent loop 鈥?the
+        Error-flagged results are routed differently by the agent loop - the
         test asserts the flag survives construction so downstream logic can
         surface the message to the user without swallowing the failure.
         """
@@ -229,7 +236,7 @@ class TestToolResult:
 
 
 class TestPermissionRequest:
-    """Engineered to validate the :class:`PermissionRequest` backend event type.
+    """Validate the :class:`PermissionRequest` frontend event type.
 
     ``PermissionRequest`` is emitted when a tool invocation requires user
     confirmation before proceeding. Tests verify the tool name and human-
@@ -249,7 +256,7 @@ class TestPermissionRequest:
 
 
 class TestFinish:
-    """Engineered to validate the :class:`Finish` backend event type.
+    """Validate the :class:`Finish` frontend event type.
 
     ``Finish`` terminates the agent loop and returns control to the caller
     along with usage metadata. Tests cover normal construction and the full
@@ -269,8 +276,8 @@ class TestFinish:
     def test_verify_finish_accepts_all_protocol_reasons(self):
         """Validate that Finish accepts every reason string defined by the protocol.
 
-        Each reason corresponds to a distinct loop-exit path; accepting all
-        of them guarantees the agent loop can terminate cleanly under any
+        Each reason corresponds to a distinct loop-exit path; accepting all of
+        them guarantees the agent loop can terminate cleanly under any
         termination condition without raising an unexpected-enum error.
         """
         reasons = ["stop", "tool_calls", "error", "max_tokens", "cancelled"]
@@ -283,13 +290,14 @@ class TestFinish:
 # Permission
 # ===========================================================================
 
+
 class TestPermissionEnums:
-    """Engineered to validate permission-related event types and literals.
+    """Validate permission-related event types and literals.
 
     Permission enums encode the policy decision (allow / deny / ask) that
     accompanies a permission request. Tests iterate over every allowed
-    literal value for both permission modes and task properties to ensure
-    the Literal-based validation is exhaustive and no stray values slip in.
+    literal value for both permission modes and task properties to ensure the
+    Literal-based validation is exhaustive and no stray values slip in.
     """
 
     def test_verify_permission_mode_literal_values_are_exhaustive(self):
@@ -337,13 +345,14 @@ class TestPermissionEnums:
 # Task enums
 # ===========================================================================
 
-class TestTaskEnums:
-    """Engineered to validate task-type and task-status literal enumerations.
 
-    Tasks in the encre system are dispatched as bash commands, nested
-    agent invocations, or workflow chains; their status progresses through
-    a fixed lifecycle. Tests confirm the allowed values match the Literal
-    definitions so the scheduler and UI stay in sync.
+class TestTaskEnums:
+    """Validate task-type and task-status literal enumerations.
+
+    Tasks in the encre system are dispatched as bash commands, nested agent
+    invocations, or workflow chains; their status progresses through a fixed
+    lifecycle. Tests confirm the allowed values match the Literal definitions
+    so the scheduler and UI stay in sync.
     """
 
     def test_verify_task_type_literal_values_are_exhaustive(self):
@@ -373,21 +382,22 @@ class TestTaskEnums:
 # Thinking config
 # ===========================================================================
 
-class TestThinkingConfig:
-    """Engineered to validate the three thinking-mode configurations.
 
-    Thinking mode controls whether the model emits a visible chain-of-
-    thought before answering. The three configurations 鈥?Adaptive (budget-
-    gated), Enabled (always on with explicit budget), Disabled (off) 鈥?must
-    each preserve their policy flags after construction.
+class TestThinkingConfig:
+    """Validate the three thinking-mode configurations.
+
+    Thinking mode controls whether the model emits a visible chain-of-thought
+    before answering. The three configurations - Adaptive (budget-gated),
+    Enabled (always on with explicit budget), Disabled (off) - must each
+    preserve their policy flags after construction.
     """
 
     def test_verify_adaptive_thinking_has_defaults(self):
         """Validate that AdaptiveThinking enables reasoning with a sensible default token budget.
 
-        Adatptive mode turns thinking on automatically when the prompt
-        exceeds min_tokens; the defaults must allow real models to enter the
-        reasoning path without extra configuration.
+        Adaptive mode turns thinking on automatically when the prompt exceeds
+        min_tokens; the defaults must allow real models to enter the reasoning
+        path without extra configuration.
         """
         tc = AdaptiveThinking()
         assert tc.enabled is True
@@ -396,7 +406,7 @@ class TestThinkingConfig:
     def test_verify_enabled_thinking_stores_budget_tokens(self):
         """Validate that EnabledThinking preserves the caller-provided token budget.
 
-        The budget_token ceiling is enforced by the reasoning router to keep
+        The budget_tokens ceiling is enforced by the reasoning router to keep
         inference costs predictable; the constructor must store it verbatim.
         """
         tc = EnabledThinking(budget_tokens=16000)
@@ -416,13 +426,14 @@ class TestThinkingConfig:
 # Backend event types
 # ===========================================================================
 
-class TestBackendEvents:
-    """Engineered to validate all backend-facing event dataclasses.
 
-    Backend events are the canonical internal representation of model
-    output. Tests exercise each variant's constructor to ensure the wire-
-    format fields are stored verbatim so the streaming renderer and the
-    session-accumulator can read them without post-processing.
+class TestBackendEvents:
+    """Validate all backend-facing event dataclasses.
+
+    Backend events are the canonical internal representation of model output.
+    Tests exercise each variant's constructor to ensure the wire-format fields
+    are stored verbatim so the streaming renderer and the session-accumulator
+    can read them without post-processing.
     """
 
     def test_verify_backend_text_event_stores_content(self):
@@ -447,9 +458,9 @@ class TestBackendEvents:
     def test_verify_backend_tool_call_event_stores_id_name_and_arguments(self):
         """Validate that BackendToolCall correctly stores id, name, and JSON arguments.
 
-        These three fields are the complete initial tool-call payload; all
-        must be present and unmodified so the renderer can show the pending
-        tool invocation before streaming deltas arrive.
+        These three fields are the complete initial tool-call payload; all must
+        be present and unmodified so the renderer can show the pending tool
+        invocation before streaming deltas arrive.
         """
         btc = BackendToolCall(id="call_1", name="bash", arguments='{"cmd": "ls"}')
         assert btc.name == "bash"
@@ -479,8 +490,8 @@ class TestBackendEvents:
         """Validate that BackendError correctly stores the error description fragment.
 
         Error messages may be truncated on the wire; the test asserts the
-        known prefix is present, reflecting the real constraint that
-        downstream code reads the message as a substring, not an equality match.
+        known prefix is present, reflecting the real constraint that downstream
+        code reads the message as a substring, not an equality match.
         """
         be = BackendError(error="Too many requests")
         assert "Too many" in be.error
@@ -490,13 +501,14 @@ class TestBackendEvents:
 # Factory functions
 # ===========================================================================
 
-class TestFactories:
-    """Engineered to validate all event factory functions.
 
-    Factory functions wrap dataclass construction behind a uniform
-    positional API so the streaming parser can emit events without
-    importing every dataclass by name. Tests verify each factory returns
-    the correct concrete type and preserves the passed-through payload.
+class TestFactories:
+    """Validate all event factory functions.
+
+    Factory functions wrap dataclass construction behind a uniform positional
+    API so the streaming parser can emit events without importing every
+    dataclass by name. Tests verify each factory returns the correct concrete
+    type and preserves the passed-through payload.
     """
 
     def test_verify_create_text_delta_returns_text_delta_instance(self):
@@ -551,8 +563,8 @@ class TestFactories:
     def test_verify_create_tool_progress_returns_tool_progress_instance(self):
         """Validate that create_tool_progress returns a ToolProgress instance.
 
-        Progress events carry the running status for the in-flight call;
-        they must reach the renderer without field loss.
+        Progress events carry the running status for the in-flight call; they
+        must reach the renderer without field loss.
         """
         event = create_tool_progress("id1", "bash", "running")
         assert isinstance(event, ToolProgress)
@@ -579,8 +591,8 @@ class TestFactories:
     def test_verify_create_finish_returns_finish_instance(self):
         """Validate that create_finish returns a Finish instance.
 
-        Finish terminates the run loop; the factory must preserve the
-        reason so the caller can branch on stop/error/max-tokens paths.
+        Finish terminates the run loop; the factory must preserve the reason
+        so the caller can branch on stop/error/max-tokens paths.
         """
         event = create_finish("stop")
         assert isinstance(event, Finish)
@@ -588,8 +600,8 @@ class TestFactories:
     def test_verify_create_backend_text_returns_backend_text_instance(self):
         """Validate that create_backend_text returns a BackendText instance.
 
-        Backend events are the canonical wire format; the factory must not
-        wrap or unwrap them into a different type.
+        Backend events are the canonical wire format; the factory must not wrap
+        or unwrap them into a different type.
         """
         event = create_backend_text("hello")
         assert isinstance(event, BackendText)
@@ -606,9 +618,9 @@ class TestFactories:
     def test_verify_create_backend_tool_call_returns_backend_tool_call_instance(self):
         """Validate that create_backend_tool_call returns a BackendToolCall instance.
 
-        Backend tool calls carry the full JSON arguments upfront (as opposed
-        to the delta-streamed frontend variant); the factory must not
-        truncate or reformat the arguments string.
+        Backend tool calls carry the full JSON arguments upfront (as opposed to
+        the delta-streamed frontend variant); the factory must not truncate or
+        reformat the arguments string.
         """
         event = create_backend_tool_call("id1", "bash", "{}")
         assert isinstance(event, BackendToolCall)
@@ -616,8 +628,8 @@ class TestFactories:
     def test_verify_create_backend_tool_call_delta_returns_backend_tool_call_delta_instance(self):
         """Validate that create_backend_tool_call_delta returns a BackendToolCallDelta instance.
 
-        The delta's index is critical for multi-call batch ordering; it
-        must be stored as an integer, not coerced to a string.
+        The delta's index is critical for multi-call batch ordering; it must be
+        stored as an integer, not coerced to a string.
         """
         event = create_backend_tool_call_delta(0, "key", "value")
         assert isinstance(event, BackendToolCallDelta)
@@ -625,8 +637,8 @@ class TestFactories:
     def test_verify_create_backend_finish_returns_backend_finish_instance(self):
         """Validate that create_backend_finish returns a BackendFinish instance.
 
-        The finish reason is the sole field; preserving it exactly lets the
-        loop dispatcher route to the correct teardown branch.
+        The finish reason is the sole field; preserving it exactly lets the loop
+        dispatcher route to the correct teardown branch.
         """
         event = create_backend_finish("stop")
         assert isinstance(event, BackendFinish)
@@ -634,8 +646,8 @@ class TestFactories:
     def test_verify_create_backend_error_returns_backend_error_instance(self):
         """Validate that create_backend_error returns a BackendError instance.
 
-        Error messages may be long; the factory must store the string
-        verbatim so the renderer can truncate rather than losing the cause.
+        Error messages may be long; the factory must store the string verbatim
+        so the renderer can truncate rather than losing the cause.
         """
         event = create_backend_error("Request timed out")
         assert isinstance(event, BackendError)

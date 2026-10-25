@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for encre.task -- EncreTask, EncreTaskManager, and EncreTaskExecutor."""
+"""Tests for the Encre task system: the EncreTask dataclass, the
+EncreTaskManager CRUD store, and the EncreTaskExecutor run loop.
+
+The suite pins down field defaults, UUID identity, parent-child linking,
+status filtering, sort order, and terminal-state transitions so the task
+records can be trusted by the scheduler, the executor, and the UI.
+"""
 
 import asyncio
 import time
@@ -35,18 +41,18 @@ import pytest
 # EncreTask dataclass
 # ===========================================================================
 
-class TestEncreTask:
-    """Engineered to validate the EncreTask dataclass field defaults and type constraints.
 
-    This test class exercises task construction across 10 scenarios 鈥?basic
-    field preservation, default status, empty result/error, null parent_id,
-    empty metadata, float timestamps, metadata injection, dataclass identity,
-    valid task_type values, and valid status values 鈥?to ensure the task
-    record is a faithful, immutable-by-convention carrier of all fields
-    required by the scheduler, executor, and UI layers. The design uses a
-    dataclass so that field order is stable and struct-type checks via
-    is_dataclass remain valid for serialization frameworks.
+class TestEncreTask:
+    """Validate the EncreTask dataclass field defaults and type constraints.
+
+    This class exercises task construction across 10 scenarios: basic field
+    preservation, default status, empty result/error, null parent_id, empty
+    metadata, float timestamps, metadata injection, dataclass identity, and
+    every legal task_type and status literal. Using a dataclass keeps field
+    order stable and makes is_dataclass introspection valid for serialization
+    frameworks.
     """
+
     def test_verify_task_creation_preserves_all_fields(self):
         """Validate that EncreTask stores all constructor arguments exactly.
 
@@ -224,22 +230,22 @@ class TestEncreTask:
 # EncreTaskManager CRUD
 # ===========================================================================
 
-class TestEncreTaskManager:
-    """Engineered to validate the EncreTaskManager CRUD operations and query semantics.
 
-    This test class exercises create, get, update, list, delete, and clear
-    across 15 scenarios to ensure the manager provides a complete persistence
-    layer for the task system: UUID generation on create, default status on
-    insert, None-on-miss on get, timestamp advancement on update, status
-    filtering and descending creation-order sorting on list, and full removal
-    on delete/clear. The autouse fixture clears the store before every test
-    to guarantee isolation between parallel or sequential test runs.
+class TestEncreTaskManager:
+    """Validate the EncreTaskManager CRUD operations and query semantics.
+
+    This class exercises create, get, update, list, delete, and clear across
+    17 scenarios: UUID generation on create, default status on insert,
+    None-on-miss on get, timestamp advancement on update, status filtering and
+    descending creation-order sorting on list, parent-child linking, metadata
+    passthrough, and full removal on delete/clear. The autouse fixture clears
+    the store before every test so runs stay isolated.
     """
-    """Tests for EncreTaskManager class-level CRUD operations."""
+    """Shared in-memory task store used by the scheduler, executor, and UI."""
 
     @pytest.fixture(autouse=True)
     def _clear_before_test(self):
-        """Clear tasks before each test to ensure isolation."""
+        """Clear the shared task store before each test so runs stay isolated."""
         from encre.task.manager import EncreTaskManager
         EncreTaskManager.clear()
 
@@ -515,22 +521,22 @@ class TestEncreTaskManager:
 # EncreTaskExecutor
 # ===========================================================================
 
-class TestEncreTaskExecutor:
-    """Engineered to validate the EncreTaskExecutor lifecycle and error handling.
 
-    This test class exercises construction, not-found handling, bash task
-    execution with success and failure, status transition through running
-    to completed, and unknown task-type handling across 6 scenarios to
-    ensure the executor correctly updates task state, captures command
-    output, and degrades gracefully when encountering unsupported types.
-    The autouse fixture clears the store before every test so executor
-    state does not leak between test runs.
+class TestEncreTaskExecutor:
+    """Validate the EncreTaskExecutor lifecycle and error handling.
+
+    This class exercises construction, not-found handling, bash task execution
+    with success and failure, the pending -> running -> completed transition,
+    and unknown task-type handling across 6 scenarios to ensure the executor
+    correctly updates task state, captures command output, and degrades
+    gracefully when it meets an unsupported type. The autouse fixture clears
+    the store before every test so executor state cannot leak between runs.
     """
-    """Tests for EncreTaskExecutor."""
+    """Runs bash, agent, and workflow tasks and records their outcome."""
 
     @pytest.fixture(autouse=True)
     def _clear_before_test(self):
-        """Clear tasks before each test to ensure isolation."""
+        """Clear the shared task store before each test so runs stay isolated."""
         from encre.task.manager import EncreTaskManager
         EncreTaskManager.clear()
 
@@ -557,6 +563,7 @@ class TestEncreTaskExecutor:
         from encre.task.executor import EncreTaskExecutor
 
         async def _test():
+            """Exercise the async not-found path driven by asyncio.run()."""
             executor = EncreTaskExecutor()
             result = await executor.execute_task("nonexistent-id")
             assert "not found" in result.lower()
@@ -576,6 +583,7 @@ class TestEncreTaskExecutor:
         from encre.task.manager import EncreTaskManager
 
         async def _test():
+            """Exercise the successful bash execution and its persisted output."""
             task_id = EncreTaskManager.create_task(
                 name="Bash Test",
                 description="Run echo",
@@ -604,6 +612,7 @@ class TestEncreTaskExecutor:
         from encre.task.manager import EncreTaskManager
 
         async def _test():
+            """Exercise a bash task whose command fails but must still terminate."""
             task_id = EncreTaskManager.create_task(
                 name="Failing Bash",
                 description="Run invalid command",
@@ -629,6 +638,7 @@ class TestEncreTaskExecutor:
         from encre.task.manager import EncreTaskManager
 
         async def _test():
+            """Exercise the pending-to-completed status transition of a bash task."""
             task_id = EncreTaskManager.create_task(
                 name="Status Test",
                 description="Test status transitions",
@@ -657,6 +667,7 @@ class TestEncreTaskExecutor:
         from encre.task.types import EncreTask
 
         async def _test():
+            """Exercise graceful degradation for an unsupported task type."""
             task_id = "fake-unknown-type-id"
             now = time.time()
             EncreTaskManager._tasks[task_id] = EncreTask(
@@ -682,16 +693,17 @@ class TestEncreTaskExecutor:
 # Public API exports
 # ===========================================================================
 
-class TestTaskPublicAPI:
-    """Engineered to validate the public API surface of the encre.task module.
 
-    This test class exercises module-level imports and type literal availability
+class TestTaskPublicAPI:
+    """Validate the public API surface of the encre.task package.
+
+    This class exercises package-level imports and type literal availability
     across 2 scenarios to ensure the public exports are stable and that
-    TaskType and TaskStatus enums are importable from encre.utils.types,
-    because downstream code and external integrations depend on these
-    symbols being present at the documented import paths.
+    TaskType and TaskStatus are importable from encre.utils.types, because
+    downstream code and external integrations depend on these symbols being
+    present at the documented import paths.
     """
-    """Verify the task module public exports."""
+    """Public symbols consumers are allowed to import from encre.task."""
 
     def test_verify_public_exports_are_importable(self):
         """Validate that EncreTask, EncreTaskManager, and EncreTaskExecutor are exported from encre.task.
@@ -699,7 +711,7 @@ class TestTaskPublicAPI:
         The test imports all three from the package-level module and asserts
         each is not None because the public API contract requires these three
         symbols to be accessible without importing internal submodules, enabling
-       绠€娲?usage patterns like 'from encre.task import EncreTask'.
+        simple usage patterns like 'from encre.task import EncreTask'.
         """
         from encre.task import EncreTask, EncreTaskExecutor, EncreTaskManager
         assert EncreTask is not None

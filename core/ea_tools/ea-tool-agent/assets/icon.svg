@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Sub-agent">
+  <style>
+    .sa { fill: #101014; }
+    @media (prefers-color-scheme: dark) { .sa { fill: #ededed; } }
+  </style>
+  <!-- Mirrors the frozen frame of the sub-agent glyph used in Settings:
+       3x3 grid, 4px cells, 1.5px gap, chevron through cells 2 / 4 / 8. -->
+  <g class="sa" opacity=".7">
+    <rect x="4.5" y="4.5" width="4" height="4" rx="1" opacity=".14"/>
+    <rect x="10" y="4.5" width="4" height="4" rx="1" opacity=".14"/>
+    <rect x="15.5" y="4.5" width="4" height="4" rx="1"/>
+    <rect x="4.5" y="10" width="4" height="4" rx="1" opacity=".14"/>
+    <rect x="10" y="10" width="4" height="4" rx="1"/>
+    <rect x="15.5" y="10" width="4" height="4" rx="1" opacity=".14"/>
+    <rect x="4.5" y="15.5" width="4" height="4" rx="1" opacity=".14"/>
+    <rect x="10" y="15.5" width="4" height="4" rx="1" opacity=".14"/>
+    <rect x="15.5" y="15.5" width="4" height="4" rx="1"/>
+  </g>
+</svg>

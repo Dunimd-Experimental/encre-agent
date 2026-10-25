@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -24,6 +24,8 @@
 # Plan-Do-Review engine: decompose a complex task into a step graph,
 # execute it turn-by-turn, and review each step (lightweight + periodic
 # deep review) so the agent can self-correct before continuing.
+
+from __future__ import annotations
 
 import json
 import re
@@ -55,7 +57,7 @@ class ReviewGrade(Enum):
 
 
 @dataclass
-class ToolCallRecord:
+class _ToolCallRecord:
     # English: one recorded tool invocation inside a step (name, args/result
     # summaries, error flag and latency).
     turn: int
@@ -75,7 +77,7 @@ class StepNode:
     description: str
     success_criteria: str
     status: StepStatus = StepStatus.PENDING
-    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    tool_calls: list[_ToolCallRecord] = field(default_factory=list)
     result_summary: str = ""
     error: str = ""
     retry_count: int = 0
@@ -169,39 +171,69 @@ class RuntimePlan:
 # Complex task detection
 # ---------------------------------------------------------------------------
 
-_PLAN_TRIGGER_KEYWORDS = [
-    # Keywords that signal a task is complex enough to warrant a plan.
-    "build", "create", "implement", "develop", "write a", "make a",
-    "refactor", "migrate", "convert", "multi-step", "pipeline", "workflow",
-    "analyze", "research", "investigate",
-]
+# Structural complexity estimation -- language-agnostic by design.  No
+# keyword tables: a word list is a vocabulary-shaped hole (it silently
+# degrades for every language it was not written for).  The signals below
+# are pure text statistics that behave identically across scripts:
+#   * length pressure (whitespace tokens)
+#   * line/block structure (explicit enumeration or blank-line sections)
+#   * interrogative share (a mostly-questioning prompt is conversation,
+#     not a work order)
+# Interrogative detection uses terminal punctuation only -- "?"/"？" and
+# the sentence split -- never vocabulary.
 
-_SIMPLE_KEYWORDS = [
-    # Keywords that signal a trivial / single-shot question (no plan needed).
-    "what is", "what's", "how do i", "how to", "explain",
-    "hello", "hi", "help",
-]
+_LIST_MARKER_RE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+")
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?。！？]+[)」』\]]*\s+")
+_QUESTION_ENDINGS = ("?", "？")
 
 
 def _estimate_complexity(task: str, max_turns: int = 0) -> float:
-    # Score task complexity in 0.0-1.0 from keywords, length, turn count.
-    text = task.lower()
-    for kw in _SIMPLE_KEYWORDS:
-        if text.startswith(kw) or text.strip().startswith(kw):
-            return 0.0
-    trigger_count = sum(1 for kw in _PLAN_TRIGGER_KEYWORDS if kw in text)
-    base = min(trigger_count * 0.15, 0.6)
-    length_factor = min(len(task) / 1000, 0.3)
-    if max_turns > 10:
-        base += 0.15
-    newlines = task.count("\n")
-    if newlines > 2:
-        base += min(newlines * 0.05, 0.15)
-    return min(base + length_factor, 1.0)
+    """Score task complexity in ``0.0``-``1.0`` from structural signals.
+
+    The score is a plain weighted sum of normalised statistics; the weights
+    are hand-tuned constants, but every term is a *measurement*, not a
+    vocabulary lookup.  Deterministic and O(len(task)).
+
+    Args:
+        task: The raw task text.
+        max_turns: Configured turn budget for the run (a generous budget
+            raises the bar for what is worth planning -- informational).
+
+    Returns:
+        The complexity score in ``[0.0, 1.0]``.
+    """
+    text = task.strip()
+    if not text:
+        return 0.0
+    # Length pressure: ~120 whitespace tokens saturate the term.
+    token_factor = min(len(text.split()) / 120, 0.35)
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    # Line structure: many distinct lines often encode structured intent.
+    line_factor = min(len(lines) / 12, 0.15)
+    # Explicit enumeration: numbered/bulleted items are the strongest
+    # structural hint that the author already thinks in steps.
+    listed = sum(1 for ln in lines if _LIST_MARKER_RE.match(ln))
+    list_factor = min(listed / 5, 0.25)
+    # Blank-line sections: multi-paragraph prompts carry more constraints.
+    blocks = len(re.split(r"\n\s*\n", text))
+    block_factor = min(max(blocks - 1, 0) / 4, 0.10)
+    # Interrogative share: a prompt that is mostly questions is a
+    # conversation opener, not a work order -- subtract it.
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if len(sentences) >= 2:
+        q_share = sum(
+            1 for s in sentences if s.rstrip().endswith(_QUESTION_ENDINGS)
+        ) / len(sentences)
+        question_penalty = min(q_share * 0.3, 0.3)
+    else:
+        question_penalty = 0.0
+    turn_bonus = 0.15 if max_turns > 10 else 0.0
+    score = token_factor + line_factor + list_factor + block_factor + turn_bonus - question_penalty
+    return round(min(max(score, 0.0), 1.0), 3)
 
 
 def should_plan(task: str, max_turns: int = 0) -> bool:
-    # Plan when estimated complexity reaches the activation threshold.
+    """Plan when estimated complexity reaches the activation threshold."""
     return _estimate_complexity(task, max_turns) >= 0.45
 
 
@@ -210,8 +242,20 @@ def should_plan(task: str, max_turns: int = 0) -> bool:
 # ---------------------------------------------------------------------------
 
 def decompose_task(task: str) -> list[dict[str, str]]:
-    # Turn a free-form task into an ordered list of step dicts (id/description/
-    # success_criteria), trying numbered list, bullet list, then heuristics.
+    """Turn a free-form task into an ordered list of step dicts.
+
+    Parsing order: numbered list -> bullet list -> single-step fallback.
+    Both list parsers are language-agnostic structural readers.  The rich
+    decomposition path (multi-step plans for unstructured prose) is the
+    model-assisted channel in :func:`decompose_task_with_model`; this sync
+    function never guesses steps from wording.
+
+    Args:
+        task: The raw task text.
+
+    Returns:
+        A list of step dicts with ``id``/``description``/``success_criteria``.
+    """
     text = task.strip()
     steps = _parse_numbered_list(text)
     if steps and len(steps) >= 2:
@@ -219,7 +263,100 @@ def decompose_task(task: str) -> list[dict[str, str]]:
     steps = _parse_bullet_list(text)
     if steps and len(steps) >= 2:
         return steps
-    return _heuristic_decompose(text)
+    return [
+        {"id": "step_1", "description": text[:300],
+         "success_criteria": "Task completed successfully"},
+    ]
+
+
+async def decompose_task_with_model(
+    task: str,
+    backend: Any,
+    max_steps: int = 12,
+) -> list[dict[str, str]] | None:
+    """Model-assisted task decomposition (the rich path).
+
+    One bounded, non-streaming, thinking-disabled call to the currently
+    active backend; the model must answer with a JSON array of step
+    objects (``description`` / ``success_criteria`` / optional
+    ``depends_on``).  Fail-closed: a missing backend, a failed call, an
+    unparsable answer, an empty array or any non-dict element yields
+    ``None`` -- the caller then falls back to the structural parsers, and
+    the plan degrades instead of being silently fabricated.  Steps are
+    capped at *max_steps* (overflow is truncated, never invented).
+
+    Args:
+        task: The raw task text.
+        backend: The loop backend (will be thinking-disabled-cloned).
+        max_steps: Upper bound on accepted steps.
+
+    Returns:
+        Step dicts on success, else ``None``.
+    """
+    from encre.logging_config import get_logger
+    from encre.prompts.loader import PromptLoader
+    from encre.utils.backend_clone import thinking_off_clone
+    from encre.utils.types import BackendFinish, BackendText
+
+    logger = get_logger(__name__)
+    if backend is None or not task.strip():
+        return None
+    scorer = thinking_off_clone(backend)
+    if scorer is None:
+        return None
+    try:
+        prompt = PromptLoader().load("task_decomposer", category="evolution")
+    except Exception:
+        logger.warning("[pdr] task_decomposer prompt missing; structural fallback")
+        return None
+    full_text = ""
+    try:
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": task[:4000]},
+        ]
+        async for event in scorer.chat(messages=messages, max_tokens=1200, stream=False):
+            if isinstance(event, BackendText):
+                full_text += event.text
+            elif isinstance(event, BackendFinish):
+                break
+    except Exception:
+        logger.warning("[pdr] model decomposition call failed", exc_info=True)
+        return None
+    # The model is instructed to answer with a bare JSON array; strip a
+    # possible markdown fence before parsing.
+    payload = full_text.strip()
+    if payload.startswith("```"):
+        payload = payload.strip("`")
+        if payload.startswith("json"):
+            payload = payload[4:]
+        payload = payload.strip()
+    try:
+        data = json.loads(payload)
+    except Exception:
+        logger.warning("[pdr] model decomposition unparsable; structural fallback")
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    steps: list[dict[str, str]] = []
+    for i, item in enumerate(data[:max_steps]):
+        if not isinstance(item, dict):
+            return None
+        description = str(item.get("description", "")).strip()
+        if not description:
+            return None
+        criteria = str(item.get("success_criteria", "")).strip() or (
+            f"Step {i + 1} completed successfully"
+        )
+        steps.append({
+            "id": f"step_{i + 1}",
+            "description": description[:300],
+            "success_criteria": criteria[:200],
+        })
+    if len(steps) < 2:
+        # A single-step "plan" from the model is not a plan.
+        return None
+    return steps
 
 
 def _parse_numbered_list(text: str) -> list[dict[str, str]]:
@@ -254,70 +391,6 @@ def _parse_bullet_list(text: str) -> list[dict[str, str]]:
     return []
 
 
-def _heuristic_decompose(text: str) -> list[dict[str, str]]:
-    # Fallback decomposition using blank-line blocks or sequencing keywords.
-    key_phrases = [
-        r'\bfirst\b', r'\bfirstly\b', r'\bfirst of all\b',
-        r'\bnext\b', r'\bthen\b', r'\bafter that\b',
-        r'\bfinally\b', r'\blastly\b', r'\bin the end\b',
-        r'\bstep\s+\d+\b',
-    ]
-    compound = re.compile("|".join(key_phrases), re.IGNORECASE)
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-
-    if len(text) > 200:
-        blocks = re.split(r'\n\s*\n', text)
-        if len(blocks) >= 3:
-            steps = []
-            for i, block in enumerate(blocks[:6]):
-                clean = block.strip()
-                if clean and len(clean) > 15:
-                    first_sent = re.split(r'(?<=[.!?])\s+', clean)[0].strip()
-                    steps.append({
-                        "id": f"step_{i+1}",
-                        "description": first_sent[:200],
-                        "success_criteria": _infer_criteria(first_sent),
-                    })
-            if len(steps) >= 2:
-                return steps
-
-    if compound.search(text) and len(sentences) >= 3:
-        steps = []
-        for i, sent in enumerate(sentences[:8]):
-            clean = sent.strip()
-            if clean and len(clean) > 10:
-                steps.append({
-                    "id": f"step_{i+1}",
-                    "description": clean[:200],
-                    "success_criteria": _infer_criteria(clean),
-                })
-        if len(steps) >= 2:
-            return steps
-
-    return [
-        {"id": "step_1", "description": text[:300],
-         "success_criteria": "Task completed successfully"},
-    ]
-
-
-def _infer_criteria(text: str) -> str:
-    # Guess a sensible success criterion for a step from its wording.
-    t = text.lower()
-    if "test" in t:
-        return "All tests pass without errors"
-    if "implement" in t or "write" in t or "create" in t:
-        return "Implementation is complete and correct"
-    if "analyze" in t or "research" in t:
-        return "Analysis is comprehensive and actionable"
-    if "refactor" in t or "restructure" in t:
-        return "Refactoring is complete with no regression"
-    if "deploy" in t:
-        return "Deployment is confirmed working"
-    if "debug" in t or "fix" in t:
-        return "Bug is fixed and verified"
-    return "Step completed successfully"
-
-
 # ---------------------------------------------------------------------------
 # Main engine
 # ---------------------------------------------------------------------------
@@ -336,10 +409,17 @@ class PlanDoReviewEngine:
         self.plan = RuntimePlan()
         self._is_active = False
 
-    def initialize(self, task: str) -> None:
-        # Build the step graph (capped at MAX_STEPS) and activate the engine.
+    def initialize(self, task: str, steps: list[dict[str, str]] | None = None) -> None:
+        """Build the step graph (capped at MAX_STEPS) and activate the engine.
+
+        Args:
+            task: The raw task text.
+            steps: Optional pre-decomposed steps (e.g. from
+                :func:`decompose_task_with_model`).  When omitted, the
+                structural parsers decide.
+        """
         self.plan = RuntimePlan(original_task=task[:2000])
-        raw_steps = decompose_task(task)
+        raw_steps = steps if steps else decompose_task(task)
         for i, s in enumerate(raw_steps[:self.MAX_STEPS]):
             self.plan.steps.append(StepNode(
                 id=s.get("id", f"step_{i+1}"),
@@ -405,7 +485,7 @@ class PlanDoReviewEngine:
         step = self.plan.current_step
         if step is None:
             return
-        step.tool_calls.append(ToolCallRecord(
+        step.tool_calls.append(_ToolCallRecord(
             turn=turn, tool_name=tool_name,
             args_summary=_summarize_args(args),
             result_summary=_truncate(result, 200) if result else "",
@@ -498,5 +578,6 @@ __all__ = [
     "StepNode",
     "StepStatus",
     "decompose_task",
+    "decompose_task_with_model",
     "should_plan",
 ]

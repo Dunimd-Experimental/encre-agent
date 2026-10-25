@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,18 +23,21 @@
 
 from __future__ import annotations
 
-"""Tests for the significance judgment engine -- the only memory entry point.
+"""Tests for the significance judge, the single gated entry point to memory.
 
-Core invariant (project principle): **context != memory**.  Memory is only
-written after the agent judges an experience to be meaningful to itself;
-anything below the significance threshold is dropped and produces no event
-and no write.
+The governing invariant (project principle) is that context is not memory:
+memory is written only after the judge decides that an experience is
+meaningful, and anything below the significance threshold is dropped with no
+event and no write.  Each signal is checked in isolation -- user correction,
+repetition, error or surprise, key decision, and strong association with
+existing memory -- together with explainable reasons, JSON round-trips, and
+configurable thresholds and weights.
 
-These tests exercise the real :class:`SignificanceJudge`, the real
-:class:`MemoryCandidate` / :class:`Experience` dataclasses, and the real
-append-only :class:`EventSourcedBus` backbone.  No mock judge or stub bus is
-used: the bus, the event conversion, the background scheduling and the
-end-of-turn hook are all the production implementations.
+The second half drives the judge through the real :class:`EventSourcedBus`
+backbone and the real end-of-turn dispatch hook, proving that candidates are
+published as ``memory_candidate`` events, that dispatch never blocks the
+critical turn path, and that a missing bus is a silent no-op.  The judge, the
+dataclasses and the bus are all production implementations.
 """
 
 import asyncio
@@ -46,9 +49,10 @@ from encre.events.ledger import EventSourcedBus
 from encre.loop.phases.end_of_turn import PhaseEndOfTurnMixin
 from encre.loop.turn_ctx import TurnContext
 from encre.memdir.judgment import Experience, MemoryCandidate, SignificanceJudge
+from encre.utils.types import BackendFinish, BackendText
 
 # The user correction from the spec scenario ("our project always uses port
-# 8080").  Must be recognised as a high-significance correction.
+# 8080").  It must be recognised as a high-significance correction.
 _USER_CORRECTION = "我们项目的端口固定用 8080，不要再用 3000 了"
 
 # A one-off, task-irrelevant intermediate output: a directory listing.
@@ -84,7 +88,7 @@ def test_user_correction_produces_candidate():
     assert candidate.source_refs == ["msg-42"]
     assert candidate.session_id == "sess-correction"
     assert candidate.suggested_type in {
-        "episodic", "semantic", "procedural", "autobiographical",
+        "fact", "preference", "decision", "lesson", "entity", "episode",
     }
 
 
@@ -124,7 +128,7 @@ def test_empty_and_tiny_content_is_not_memorized():
 
 
 def test_batch_filters_out_insignificant_experiences():
-    """judge_batch drops the None results and keeps only candidates."""
+    """judge_batch drops the None results and keeps only real candidates."""
     judge = SignificanceJudge()
     candidates = judge.judge_batch([
         Experience(kind="tool_result", content=_ONE_OFF_LISTING),
@@ -141,7 +145,7 @@ def test_batch_filters_out_insignificant_experiences():
 
 
 def test_repeated_pattern_raises_significance():
-    """A pattern seen repeatedly becomes more significant each time."""
+    """A pattern seen repeatedly becomes more significant with each sighting."""
     judge = SignificanceJudge()
     experience = Experience(
         kind="tool_result",
@@ -149,7 +153,7 @@ def test_repeated_pattern_raises_significance():
         metadata={"tool_name": "deploy"},
     )
 
-    # One occurrence carries no signal at all.
+    # A single occurrence carries no repetition signal at all.
     first = judge.judge(experience)
     assert first is None
 
@@ -162,7 +166,7 @@ def test_repeated_pattern_raises_significance():
     judge.record(experience)
     third = judge.judge(experience)
     assert third is not None
-    # Significance strictly rises with repetition.
+    # Significance must strictly rise as the pattern repeats.
     assert third.significance > second.significance
 
 
@@ -175,7 +179,7 @@ def test_repetition_is_isolated_per_session():
         session_id="other",
     )
     judge.record(a)
-    # Same content, different session: still the first occurrence there.
+    # Same content, different session: still a first occurrence over there.
     candidate = judge.judge(b)
     assert candidate is None
 
@@ -210,7 +214,7 @@ def test_tool_error_flag_produces_candidate():
 
 
 def test_surprise_alone_is_below_threshold():
-    """A generic surprise marker alone does not force a memory."""
+    """A generic surprise marker alone does not force a memory write."""
     judge = SignificanceJudge()
     candidate = judge.judge(Experience(
         kind="tool_result",
@@ -236,7 +240,7 @@ def test_key_decision_produces_candidate():
 
 
 def test_weak_decision_hint_alone_is_below_threshold():
-    """A generic 'let's' phrasing is not, by itself, a key decision."""
+    """A generic "let's" phrasing is not, by itself, a key decision."""
     judge = SignificanceJudge()
     candidate = judge.judge(Experience(
         kind="assistant_message",
@@ -251,27 +255,30 @@ def test_weak_decision_hint_alone_is_below_threshold():
 
 
 class _FakeRecallHit:
-    """Minimal stand-in for a RecallHit (score + entry)."""
+    """Minimal stand-in for a recall hit, carrying a score and an entry."""
 
     def __init__(self, score: float) -> None:
+        """Create a fake hit with a fixed score and a canned existing entry."""
         self.score = score
-        self.entry = SimpleNamespace(id="existing", type="semantic", content="existing")
+        self.entry = SimpleNamespace(id="existing", type="fact", content="existing")
 
 
 class _FakeRecallEngine:
     """Recall-engine stub exposing only the ``recall`` surface the judge uses."""
 
     def __init__(self, score: float) -> None:
+        """Create the stub with a fixed score every query will return."""
         self.score = score
         self.queries: list[str] = []
 
     def recall(self, query: str, *, top_k: int | None = None):  # noqa: ANN001
+        """Record the query and return one fake hit at the stubbed score."""
         self.queries.append(query)
         return [_FakeRecallHit(self.score)]
 
 
 def test_strong_association_with_existing_memory():
-    """High overlap with existing memory is a significance signal."""
+    """High overlap with existing memory counts as a significance signal."""
     engine = _FakeRecallEngine(score=0.8)
     judge = SignificanceJudge(recall_engine=engine)
     candidate = judge.judge(Experience(
@@ -284,7 +291,7 @@ def test_strong_association_with_existing_memory():
 
 
 def test_no_association_below_similarity_floor():
-    """Weak similarity to existing memory contributes nothing."""
+    """Weak similarity to existing memory contributes nothing to the score."""
     judge = SignificanceJudge(recall_engine=_FakeRecallEngine(score=0.2))
     candidate = judge.judge(Experience(
         kind="assistant_message",
@@ -294,10 +301,13 @@ def test_no_association_below_similarity_floor():
 
 
 def test_memory_system_failure_falls_back_to_rules():
-    """A failing recall must not break judgment (offline fallback)."""
+    """A failing recall engine must not break judgment (offline fallback)."""
 
     class _BrokenRecall:
+        """Recall engine that raises instead of answering, simulating failure."""
+
         def recall(self, query: str, *, top_k: int | None = None):  # noqa: ANN001
+            """Always raise to simulate an unavailable recall index."""
             raise RuntimeError("index unavailable")
 
     judge = SignificanceJudge(recall_engine=_BrokenRecall())
@@ -320,7 +330,7 @@ def test_threshold_is_configurable():
 
 
 def test_weights_are_configurable():
-    """Overriding a weight changes the aggregate significance."""
+    """Overriding a single weight changes the aggregate significance."""
     experience = Experience(kind="user_message", content=_USER_CORRECTION)
     default = SignificanceJudge().judge(experience)
     boosted = SignificanceJudge(weights={"user_correction": 1.0}).judge(experience)
@@ -330,7 +340,7 @@ def test_weights_are_configurable():
 
 
 def test_set_threshold_at_runtime():
-    """The threshold can be updated after construction."""
+    """The threshold can be updated after the judge is constructed."""
     judge = SignificanceJudge(threshold=0.99)
     experience = Experience(kind="user_message", content=_USER_CORRECTION)
     assert judge.judge(experience) is None
@@ -344,7 +354,7 @@ def test_set_threshold_at_runtime():
 
 
 def test_reasons_are_explainable():
-    """Each reason names the signal, its weight and its score."""
+    """Every reason names the signal, its weight and its score."""
     judge = SignificanceJudge()
     candidate = judge.judge(Experience(
         kind="user_message",
@@ -357,7 +367,7 @@ def test_reasons_are_explainable():
         assert "w=" in reason and "s=" in reason
     signals = candidate.metadata["signals"]
     assert signals["user_correction"] > 0.0
-    # No signal may be reported as fired without a positive score.
+    # No signal may be reported as fired without a positive score behind it.
     for reason in candidate.reasons:
         name = reason.split(" ")[0]
         assert signals.get(name, 0.0) > 0.0
@@ -400,7 +410,7 @@ def test_experience_to_from_dict_round_trip():
 
 
 async def test_candidate_is_published_on_the_backbone():
-    """A significant event observed on the bus yields a memory_candidate."""
+    """A significant event observed on the bus yields a memory_candidate event."""
     bus = EventSourcedBus("judgment-bus")
     judge = SignificanceJudge()
     judge.attach(bus)
@@ -444,7 +454,7 @@ async def test_insignificant_event_publishes_nothing():
 
 
 def test_attach_is_idempotent_per_bus():
-    """Attaching twice does not double-judge the same event."""
+    """Attaching the same judge twice does not double-judge an event."""
     bus = EventSourcedBus("judgment-idempotent")
     judge = SignificanceJudge()
     judge.attach(bus)
@@ -462,17 +472,41 @@ def test_attach_is_idempotent_per_bus():
 # ----------------------------------------------------------------------
 
 
+class _ScriptedScorer:
+    """The memory gate's scoring backend: keep the correction, drop the noise.
+
+    The production gate is fail-closed -- without a backend it drops every
+    candidate -- so the fake loop must expose one for the dispatch path to be
+    exercised at all.  Answers exactly what the scorer contract demands (one
+    decimal, nothing else), scoring the durable correction as worth keeping and
+    everything else as worthless, which is what the three hook tests assert.
+    """
+
+    async def chat(self, messages, tools=None, tool_choice="auto", temperature=0.0,
+                   max_tokens=4096, stream=True, enable_caching=False, cache_edits_state=None):
+        """Yield 1.0 for the port correction candidate, 0.0 for anything else."""
+        payload = " ".join(str(m.get("content", "")) for m in messages)
+        answer = "1.0" if "8080" in payload else "0.0"
+        yield BackendText(text=answer)
+        yield BackendFinish(reason="stop", usage={"input_tokens": 8, "output_tokens": 1})
+
+
 class _FakeLoop(PhaseEndOfTurnMixin):
-    """Minimal host exposing only what the judgment hook touches."""
+    """Minimal host exposing only the attributes the judgment hook touches."""
 
     def __init__(self, bus: EventSourcedBus) -> None:
+        """Attach the given bus plus a canned session id and no memory system."""
         self.event_bus = bus
-        self.session = SimpleNamespace(id="sess-loop")
+        # ``turn_count`` is part of the real session surface: every experience
+        # carries the turn it was produced in so rollback can archive exactly
+        # the memories a discarded turn wrote.
+        self.session = SimpleNamespace(id="sess-loop", turn_count=1)
         self.memory_system = None
+        self.backend = _ScriptedScorer()
 
 
 def _turn_context(prompt: str = "", prepared: list | None = None) -> TurnContext:
-    """Build a TurnContext carrying a prompt and prepared tool results."""
+    """Build a TurnContext carrying a prompt and optional prepared tool results."""
     ctx = TurnContext(prompt, None, "", "", None)
     ctx.turn_start = time.time()
     ctx.prepared = prepared or []
@@ -492,7 +526,7 @@ async def test_schedule_judgment_returns_an_independent_task():
     )
 
     assert isinstance(task, asyncio.Task)
-    assert not task.done()  # created but not yet run -> the caller did not block
+    assert not task.done()  # created but not yet run, so the caller did not block
     assert received == []
 
     await task
@@ -509,8 +543,8 @@ async def test_end_of_turn_hook_dispatches_without_blocking():
     ctx = _turn_context(prompt=_USER_CORRECTION)
     loop._dispatch_significance_judgment(ctx)
 
-    # Dispatch returned before the background task ran: the turn tail did
-    # not wait for judgment.
+    # Dispatch returned before the background task ran, so the turn tail did
+    # not wait for judgment to finish.
     assert received == []
     judge = loop._significance_judge
     assert judge._tasks  # an independent task was scheduled
@@ -521,7 +555,7 @@ async def test_end_of_turn_hook_dispatches_without_blocking():
 
 
 async def test_end_of_turn_hook_drops_insignificant_turn():
-    """A turn with only one-off tool output publishes nothing at all."""
+    """A turn holding only one-off tool output publishes nothing at all."""
     bus = EventSourcedBus("judgment-hook-quiet")
     loop = _FakeLoop(bus)
     received: list = []
@@ -539,7 +573,7 @@ async def test_end_of_turn_hook_drops_insignificant_turn():
 
 
 async def test_neutral_prompt_is_not_promoted_by_re_observation():
-    """A neutral run prompt seen on later turns is not a repeated pattern."""
+    """A neutral run prompt seen on later turns does not count as a repeat."""
     bus = EventSourcedBus("judgment-prompt-dedupe")
     loop = _FakeLoop(bus)
     received: list = []
@@ -555,7 +589,7 @@ async def test_neutral_prompt_is_not_promoted_by_re_observation():
 
 
 def test_end_of_turn_hook_without_bus_is_a_noop():
-    """With no event backbone wired the hook does nothing (never writes)."""
+    """With no event backbone wired the hook does nothing and never writes."""
     loop = _FakeLoop(bus=None)  # type: ignore[arg-type]
     ctx = _turn_context(prompt=_USER_CORRECTION)
     loop._dispatch_significance_judgment(ctx)  # must not raise

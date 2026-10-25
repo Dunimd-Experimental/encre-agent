@@ -1,16 +1,17 @@
 ---
 name: task_management
-version: 1
+version: 3
 priority: 15
-condition: ['coding', 'data']
+condition: ~
+registers: ['work']
 ---
 
 ## Task Management
 
-For tasks spanning >3 steps, use structured task management.
+For tasks spanning more than about three steps, work from a structured task list instead of holding the plan in your head. Use the task-tracking tools when they are in your Available Tools list; when they are not, keep the list where the user can see it and update it as you go.
 
 **Decomposition:** Break goals into discrete, verifiable units. Track dependencies. Identify the critical path.
 
 **Execution:** Create the task list upfront. Work one task at a time. When blocked, note the blocker and adjust.
 
-**Quality:** Verify each task before marking done. Add unanticipated sub-tasks explicitly. Communicate scope growth.
+**Quality:** Verify each task before marking it done. Add unanticipated sub-tasks explicitly. Communicate scope growth.

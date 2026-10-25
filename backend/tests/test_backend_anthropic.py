@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -24,7 +24,13 @@
 from __future__ import annotations
 
 """Tests for AnthropicBackend -- construction, capabilities, context window,
-thinking config, prompt caching, and token counting."""
+thinking config, prompt caching, and token counting.
+
+The suite instantiates the backend with dummy credentials and checks the
+model defaults, the per-tier capability predicates, the 200K context budget,
+the ephemeral cache_control injection in _apply_prompt_caching, the chat()
+signature, and the async close lifecycle.
+"""
 
 import asyncio
 
@@ -543,6 +549,6 @@ class TestAnthropicBackendLifecycle:
             """Close the backend twice in sequence."""
             be = AnthropicBackend(api_key="sk-ant-test")
             await be.aclose()
-            await be.aclose()  # Idempotent.
+            await be.aclose()  # Safe to call repeatedly.
 
         asyncio.run(_double_close())

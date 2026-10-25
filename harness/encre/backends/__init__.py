@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 Backends package -- multi-provider LLM inference adapters.
@@ -80,8 +82,6 @@ from encre.backends.catalog import (
     PROVIDERS,
     catalog_payload,
     default_output_tokens,
-    get_model,
-    get_provider,
 )
 from encre.backends.connection import (
     ConnectionErrorCategory,
@@ -91,7 +91,33 @@ from encre.backends.connection import (
     format_connection_error,
 )
 from encre.backends.deepseek import DeepSeekBackend
-from encre.backends.failover import BackendHealth, FailoverBackend
+from encre.backends.failover import FailoverBackend
+from encre.backends.gateway_providers import (
+    AtomicChatBackend,
+    AzureCognitiveBackend,
+    AzureOpenAIBackend,
+    BasetenBackend,
+    CerebrasBackend,
+    CortecsBackend,
+    DeepInfraBackend,
+    FireworksBackend,
+    FrogBotBackend,
+    HeliconeBackend,
+    IONetBackend,
+    LlamaCppBackend,
+    NebiusBackend,
+    OVHCloudBackend,
+    OllamaCloudBackend,
+    OpenAI302Backend,
+    ScalewayBackend,
+    STACKITBackend,
+    TogetherBackend,
+    VeniceBackend,
+    VercelAIGatewayBackend,
+    XAIBackend,
+    ZAIBackend,
+    ZenMuxBackend,
+)
 from encre.backends.github_copilot import GitHubCopilotBackend
 from encre.backends.glm import GLMBackend
 from encre.backends.gmi import GMIBackend
@@ -148,39 +174,63 @@ __all__ = [
     "AlibabaBackend",
     "AnthropicBackend",
     "ArceeBackend",
+    "AtomicChatBackend",
     "AuthManager",
+    "AzureCognitiveBackend",
+    "AzureOpenAIBackend",
+    "BasetenBackend",
     "BackendHealth",
     "BaseBackend",
     "BedrockBackend",
+    "CerebrasBackend",
+    "CortecsBackend",
     "CostTracker",
+    "DeepInfraBackend",
     "DeepSeekBackend",
     "FailoverBackend",
+    "FireworksBackend",
+    "FrogBotBackend",
     "GLMBackend",
     "GMIBackend",
     "GitHubCopilotBackend",
     "GoogleBackend",
     "GroqBackend",
     "HeartbeatSession",
+    "HeliconeBackend",
     "HuggingFaceBackend",
+    "IONetBackend",
     "KiloCodeBackend",
     "KimiBackend",
+    "LlamaCppBackend",
     "LMStudioBackend",
     "LocalBackend",
     "MiniMaxBackend",
+    "NebiusBackend",
     "NovitaBackend",
     "OllamaBackend",
+    "OllamaCloudBackend",
+    "OpenAI302Backend",
     "OpenAIBackend",
     "OpenAICompatibleBackend",
     "OpenAISSEBackend",
     "OpenCodeGoBackend",
     "OpenCodeZenBackend",
     "OpenRouterBackend",
+    "OVHCloudBackend",
     "RetryConfig",
     "RetryEvent",
     "RouterBackend",
+    "ScalewayBackend",
+    "STACKITBackend",
     "TaskCategory",
     "TencentBackend",
+    "TogetherBackend",
+    "VeniceBackend",
+    "VercelAIGatewayBackend",
+    "XAIBackend",
     "XiaomiBackend",
+    "ZAIBackend",
+    "ZenMuxBackend",
     "catalog_payload",
     "classify_error",
     "ConnectionErrorCategory",
@@ -188,7 +238,5 @@ __all__ = [
     "ConnectionHealthMonitor",
     "default_output_tokens",
     "format_connection_error",
-    "get_model",
-    "get_provider",
     "retry_with_backoff",
 ]

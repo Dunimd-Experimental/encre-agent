@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -62,9 +61,10 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Iterable, Sequence
+from typing import Any, ClassVar
 
 from encre.improve.feedback.learner import CorrectionRecord
 from encre.paths import get_data_dir
@@ -126,7 +126,6 @@ _TOOL_CAPABILITY: dict[str, str] = {
     "file_read": "file", "read_file": "file", "file_write": "file",
     "write_file": "file", "file_edit": "file", "edit_file": "file",
     "apply_patch": "file", "patch": "file", "grep": "file", "glob": "file",
-    "find_tool": "file",
     "bash": "bash_io", "bash_output": "bash_io", "shell": "bash_io",
     "execute": "bash_io",
     "rest_client": "network",
@@ -190,7 +189,7 @@ class PolicyEntry:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "PolicyEntry":
+    def from_dict(cls, data: dict[str, Any]) -> PolicyEntry:
         """Rebuild an entry from a dict produced by :meth:`to_dict`."""
         return cls(
             tool=str(data.get("tool", "") or ""),
@@ -232,7 +231,7 @@ class EncreSafetyPolicyReflow:
         self._storage_path = (
             Path(storage_path)
             if storage_path is not None
-            else get_data_dir("safety", "learned_policies.json")
+            else get_data_dir("safety") / "learned_policies.json"
         )
         self._bus = bus
         self._entries: list[PolicyEntry] = []

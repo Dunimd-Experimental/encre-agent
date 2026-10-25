@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,14 +21,16 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 
-# 鈹€鈹€ Enumerations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Enumerations ───────────────────────────────────────────────────
 
 class SandboxMode(str, Enum):
     """Execution mode for sandboxed operations."""
-    NONE = "none"           # Unrestricted 鈥?runs on host directly
+    NONE = "none"           # Unrestricted — runs on host directly
     PATH = "path"           # Path-only isolation (file ops confined)
     CONTAINER = "container" # Docker container isolation
     HYBRID = "hybrid"       # path + container (recommended for safety)
@@ -122,13 +124,13 @@ class SandboxConfig:
     Controls isolation level for all potentially dangerous operations
     (shell execution, file I/O, network access).
     """
-    # 鈹€鈹€ Core 鈹€鈹€
+    # ── Core ──
     mode: SandboxMode = SandboxMode.NONE
     image: str = "python:3.11-slim"
     workspace_mount: str = "/workspace"
     workspace_container_path: str = "/workspace"
 
-    # 鈹€鈹€ Sandboxing layers 鈹€鈹€
+    # ── Sandboxing layers ──
     path_isolation: bool = True           # Enable path-based file isolation
     path_sandbox_dir: str = ""            # Empty = auto from config
     network: NetworkConfig = field(default_factory=NetworkConfig)
@@ -138,7 +140,7 @@ class SandboxConfig:
     env: EnvConfig = field(default_factory=EnvConfig)
     timeout: int = 120                    # Default timeout in seconds
 
-    # 鈹€鈹€ Security hardening 鈹€鈹€
+    # ── Security hardening ──
     disable_sudo: bool = True
     disable_network_tooling: bool = True  # Block curl/wget in sandbox
     disable_interactive: bool = True      # Block commands that open TUIs
@@ -146,7 +148,7 @@ class SandboxConfig:
     max_command_length: int = 4096         # Max command string length
     max_output_bytes: int = 2 * 1024 * 1024  # 2 MB hard cap on output
 
-    # 鈹€鈹€ Container extras 鈹€鈹€
+    # ── Container extras ──
     container_labels: dict[str, str] = field(default_factory=dict)
     extra_mounts: dict[str, str] = field(default_factory=dict)
     extra_docker_opts: list[str] = field(default_factory=list)

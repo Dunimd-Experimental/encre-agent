@@ -26,7 +26,7 @@ If you maintain one of these projects and want us to fix or remove an entry, vis
 
 | Name | Role | Contact |
 |---|---|---|
-| Wenze Wei (WenzeWei) | Project lead, architecture, Rust core | [weiwenze20212021@outlook.com](mailto:weiwenze20212021@outlook.com) *(see [CONTRIBUTING.md](CONTRIBUTING.md))* |
+| Wenze Wei (WenzeWei) | Project lead, architecture, Encre Agent Core | [weiwenze20212021@outlook.com](mailto:weiwenze20212021@outlook.com) *(see [CONTRIBUTING.md](CONTRIBUTING.md))* |
 
 Maintainer list is updated in [CHANGELOG.md](CHANGELOG.md) when changes happen.
 
@@ -46,8 +46,8 @@ If we forgot you, please open a PR — see [How to Update This Document](#how-to
 ### Language & Region-Specific Thanks
 
 - **Chinese open-source community** — for the model APIs, the chat-platform adapters (Feishu, DingTalk, WeCom, WeChat, QQ Bot, Tencent Yuanbao), and the documentation reviews
-- **Hugging Face** — for the `transformers`, `tokenizers`, and `candle` ecosystem that powers our optional local-mode and embedding backends
-- **The Rust community** — for `serde`, `pyo3`, `tree-sitter`, and the broader ecosystem that makes a single Rust crate a viable cross-language acceleration layer
+- **Hugging Face** — for the `transformers` ecosystem that powers our optional local-mode backend
+- **The Rust community** — for `serde`, `pyo3`, and the broader ecosystem that makes a single Rust crate a viable cross-language acceleration layer
 
 ---
 
@@ -112,7 +112,6 @@ From [`pyproject.toml`](../pyproject.toml). Versions are pinned by the project; 
 | [PyYAML](https://pyyaml.org/) | MIT | `>=6.0` | YAML config parsing |
 | [cryptography](https://cryptography.io) | Apache 2.0 / BSD | `>=41.0` | Encryption primitives (AES-GCM, Fernet) |
 | [zero-api-key-web-search](https://pypi.org/project/zero-api-key-web-search/) | Apache 2.0 | `>=23.0` | Default `web_search` backend |
-| [pathspec](https://github.com/cpburnz/python-path-specification) | BSD 3-Clause | `>=0.12` | `.gitignore`-style path matching for the codebase indexer |
 | [websockets](https://websockets.readthedocs.io) | BSD 3-Clause | `>=12.0,<14` | WebSocket client/server |
 | [Pillow](https://python-pillow.org) | HPND | `>=10.0` | Image processing for the `image` tool |
 | [tiktoken](https://github.com/openai/tiktoken) | MIT | `>=0.5` | Tokenization for token counting |
@@ -127,8 +126,6 @@ From [`pyproject.toml`](../pyproject.toml). Versions are pinned by the project; 
 | [pytesseract](https://github.com/madmaze/pytesseract) | Apache 2.0 | `>=0.3` | OCR via Tesseract |
 | [uiautomation](https://github.com/pywinauto/uiautomation) | MIT | `>=2.0` | Windows UI automation |
 | [watchfiles](https://github.com/samuelcolvin/watchfiles) | MIT | `>=0.21` | File-system watcher |
-| [tree-sitter](https://tree-sitter.github.io) | MIT | `>=0.21` | Incremental parser used by the codebase indexer and LSP helpers |
-| [tree-sitter-language-pack](https://github.com/Goldziher/tree-sitter-language-pack) | MIT | `>=0.6` | Pre-built tree-sitter language grammars |
 
 ### Optional Dependencies
 
@@ -175,27 +172,8 @@ From [`native/crates/encre-core/Cargo.toml`](../native/crates/encre-core/Cargo.t
 | [serde_json](https://docs.rs/serde_json) | MIT / Apache 2.0 | JSON serialization |
 | [regex](https://docs.rs/regex) | MIT / Apache 2.0 | Regular expressions (used by `search.rs`) |
 | [walkdir](https://docs.rs/walkdir) | MIT / Apache 2.0 | Recursive directory traversal |
-| [ignore](https://docs.rs/ignore) | MIT / Apache 2.0 | `.gitignore`-aware directory traversal |
 | [similar](https://docs.rs/similar) | Apache 2.0 | Text diffing (used by `diff.rs`) |
 | [glob](https://docs.rs/glob) | MIT / Apache 2.0 | Glob pattern matching |
-| [tempfile](https://docs.rs/tempfile) | MIT / Apache 2.0 | Temporary file management |
-| [tree-sitter](https://tree-sitter.github.io) | MIT | Incremental parsing framework |
-| [tree-sitter-python](https://github.com/tree-sitter/tree-sitter-python) | MIT | Python grammar |
-| [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript) | MIT | JavaScript grammar |
-| [tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript) | MIT | TypeScript grammar |
-| [tree-sitter-rust](https://github.com/tree-sitter/tree-sitter-rust) | MIT | Rust grammar |
-| [tree-sitter-go](https://github.com/tree-sitter/tree-sitter-go) | MIT | Go grammar |
-| [tree-sitter-java](https://github.com/tree-sitter/tree-sitter-java) | MIT | Java grammar |
-| [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) | MIT | C grammar |
-| [tree-sitter-cpp](https://github.com/tree-sitter/tree-sitter-cpp) | MIT | C++ grammar |
-| [tree-sitter-c-sharp](https://github.com/tree-sitter/tree-sitter-c-sharp) | MIT | C# grammar |
-| [tree-sitter-php](https://github.com/tree-sitter/tree-sitter-php) | MIT | PHP grammar |
-| [tree-sitter-ruby](https://github.com/tree-sitter/tree-sitter-ruby) | MIT | Ruby grammar |
-| [tree-sitter-swift](https://github.com/alex-pinkus/tree-sitter-swift) | MIT | Swift grammar |
-| [tree-sitter-kotlin-ng](https://github.com/sergey-tokarev/tree-sitter-kotlin-ng) | MIT | Kotlin grammar |
-| [tree-sitter-scala](https://github.com/tree-sitter/tree-sitter-scala) | MIT | Scala grammar |
-| [candle-core](https://github.com/huggingface/candle) | MIT / Apache 2.0 | ML inference — **optional**, behind the `embedding` feature |
-| [tokenizers](https://github.com/huggingface/tokenizers) | Apache 2.0 | Tokenization — **optional**, behind the `embedding` feature |
 | [wide](https://github.com/starkat99/wide-rs) | MIT / Apache 2.0 | SIMD intrinsics — **optional**, behind the `simd` feature |
 | [windows-sys](https://github.com/microsoft/windows-rs) | MIT / Apache 2.0 | Windows API bindings (Windows targets only) |
 | [libc](https://github.com/rust-lang/libc) | MIT / Apache 2.0 | libc bindings (non-Windows targets only) |
@@ -326,7 +304,7 @@ Don't just delete it from the manifest — also delete the row from this file in
 
 ### Verification Script
 
-This file is consistent with the manifests as of release **0.4.3**. To re-verify after editing:
+This file is consistent with the manifests as of release **0.5.0**. To re-verify after editing:
 
 ```bash
 # Compare Python core deps with pyproject.toml
@@ -376,6 +354,6 @@ If you believe we are in violation of your license, see [SECURITY.md → Reporti
 
 ## Acknowledgments
 
-This document was last reviewed against the project manifests on **2026-08-23** for the **0.4.3** release. The dependency lists above match `pyproject.toml`, `desktop/package.json`, and `native/crates/*/Cargo.toml` at that commit.
+This document was last reviewed against the project manifests on **2026-08-23** for the **0.5.0** release. The dependency lists above match `pyproject.toml`, `desktop/package.json`, and `native/crates/*/Cargo.toml` at that commit.
 
 If you find a discrepancy, please open a PR — see [CONTRIBUTING.md → Development Setup](CONTRIBUTING.md#development-setup).

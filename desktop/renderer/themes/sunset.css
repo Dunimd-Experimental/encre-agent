@@ -1,0 +1,88 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Theme skin "sunset" (落霞) — generated from the theme-demo v5.2
+ * palette (自然材质色阶). One file per skin; the mode ("light" / "dark")
+ * stays on [data-theme], the skin on [data-skin]. Only colours live here;
+ * surfaces (content paper, chassis, form-control background) and the
+ * neutral hover/selection plates are NOT defined here — styles.css and
+ * themes/tokens.css own them and keep them identical across every skin. Text/semantic values meet WCAG 4.5 (body) / 4.0 (tertiary)
+ * / 3.4 (muted) against the mode paper. */
+
+/* ═══ 落霞 · 浅 ═══ */
+html[data-skin="sunset"] {
+  --text-primary: hsl(14 18% 21%);
+  --text-secondary: hsl(16 10% 43%);
+  --text-tertiary: hsl(16 7% 49%);
+  --text-muted: hsl(16 7% 54%);
+  --tool-text: hsl(16 10% 37%);
+  --accent: hsl(18 38% 46%);
+  --accent-hover: hsl(18 40% 41%);
+  --accent-light: hsl(18 38% 50% / .10);
+  --accent-contrast: #fff;
+  --success: hsl(150 20% 40%);
+  --error: hsl(4 38% 48%);
+  --warning: hsl(36 38% 39%);
+  --border: hsl(18 10% 85%);
+  --border-light: hsl(18 10% 87%);
+  --card-border: hsl(18 13% 84%);
+  --card-fill: hsl(18 10% 91%);
+  --border-control: hsl(18 10% 78%);
+  --checkbox-border: hsl(18 15% 73%);
+  --selection-bg: hsl(300 20% 64% / .26);
+  --seg-bg: hsl(18 11% 93.5%);
+  --seg-active-bg: #fffcf9;
+  --seg-text: hsl(16 10% 43%);
+  --seg-text-hover: hsl(14 18% 21%);
+  --seg-active-text: hsl(14 18% 21%);
+  --page:linear-gradient(172deg, #f9e2cf 0%, #f6ded7 40%, #efe0e9 76%, #e7dcec 100%);
+  --blob1:radial-gradient(920px 540px at 84% -12%, hsl(24 75% 78% / .50), transparent 68%);
+  --blob2:radial-gradient(820px 520px at -14% 46%, hsl(295 45% 80% / .38), transparent 66%);
+}
+
+/* ═══ 落霞 · 深 ═══ */
+html[data-skin="sunset"][data-theme="dark"] {
+  --text-primary: hsl(22 10% 89%);
+  --text-secondary: hsl(20 7% 64%);
+  --text-tertiary: hsl(18 5% 49.5%);
+  --text-muted: hsl(18 5% 42%);
+  --tool-text: hsl(22 10% 89%);
+  --accent: hsl(18 36% 60%);
+  --accent-hover: hsl(18 34% 66%);
+  --accent-light: hsl(18 36% 60% / .12);
+  --accent-contrast: hsl(18 25% 11%);
+  --success: hsl(150 20% 55%);
+  --error: hsl(4 30% 58%);
+  --warning: hsl(40 28% 58%);
+  --border: hsl(266 6% 24%);
+  --border-light: hsl(266 6% 26%);
+  --card-border: hsl(270 7% 26%);
+  --card-fill: hsl(278 7% 15%);
+  --border-control: hsl(266 6% 30%);
+  --checkbox-border: hsl(258 7% 34%);
+  --selection-bg: hsl(295 18% 58% / .28);
+  --seg-bg: hsl(272 6% 19%);
+  --seg-active-bg: hsl(266 6% 23%);
+  --seg-text: hsl(20 7% 64%);
+  --seg-text-hover: hsl(22 10% 89%);
+  --seg-active-text: hsl(22 10% 89%);
+  --page:linear-gradient(172deg, hsl(16 26% 17%) 0%, hsl(330 18% 13%) 45%, hsl(282 20% 11%) 78%, hsl(266 22% 10%) 100%);
+  --blob1:radial-gradient(900px 520px at 82% -12%, hsl(16 55% 56% / .15), transparent 68%);
+  --blob2:radial-gradient(760px 480px at -12% 42%, hsl(290 50% 56% / .11), transparent 66%);
+}

@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -31,7 +31,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from encre.memdir.judgment import _fingerprint
+from encre.memdir.judgment import _fingerprint, _tokenize
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 """Local, dependency-free semantic memory retrieval and consolidation.
 
@@ -43,37 +48,6 @@ initialised here. This module also provides a lightweight :class:`WorkingMemory`
 scratchpad and a :class:`MemoryConsolidator` that detects duplicate,
 conflicting, and stale memory files.
 """
-
-
-def _tokenize(text: str) -> list[str]:
-    """Split text into normalised tokens for similarity scoring.
-
-    Lowercases the input and extracts runs of at least two alphanumeric or
-    underscore characters. CJK characters (Unicode range U+4E00-U+9FFF) are
-    split into overlapping bigrams so that both English and Chinese memory
-    content contribute to the vocabulary.
-
-    Args:
-        text: Raw text to tokenize.
-
-    Returns:
-        List of lowercased token strings.
-    """
-    text = text.lower()
-    tokens: list[str] = []
-
-    # Alphanumeric tokens (words separated by spaces/punctuation)
-    tokens.extend(re.findall(r"[A-Za-z0-9_]{2,}", text))
-
-    # CJK bigrams: split each run of CJK characters into overlapping pairs
-    for run in re.findall(r"[\u4e00-\u9fff]+", text):
-        if len(run) >= 2:
-            for i in range(len(run) - 1):
-                tokens.append(run[i:i + 2])
-        elif len(run) == 1:
-            tokens.append(run)
-
-    return tokens
 
 
 def _build_idf(corpus: list[str]) -> dict[str, float]:
@@ -282,7 +256,7 @@ class SemanticMemorySearch:
                     except Exception:
                         files[entry.name] = raw  # plaintext fallback (legacy / test)
         except OSError:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
         self.index(files)
 
 

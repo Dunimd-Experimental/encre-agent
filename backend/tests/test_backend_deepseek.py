@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,15 @@
 
 from __future__ import annotations
 
-"""Tests for DeepSeekBackend -- construction, capabilities, context window, tokens."""
+"""Tests for DeepSeekBackend -- construction, capabilities, context window, tokens.
+
+The suite instantiates DeepSeekBackend with dummy credentials and checks model
+defaults and base-URL wiring, the legacy deepseek-chat/deepseek-reasoner alias
+mapping to the V4-Flash and V4-Pro variants, and the per-feature capability
+predicates. A separate section exercises _build_request_data to confirm
+DeepSeek-specific sanitization (internal field stripping, null-content coercion,
+JSON Schema keyword normalization) and finally covers the async close lifecycle.
+"""
 
 import asyncio
 
@@ -387,13 +395,17 @@ class TestDeepSeekBackendRequestBuilding:
     def test_verify_internal_message_fields_are_stripped(self):
         """Validate that Encre-internal fields are removed before sending to DeepSeek.
 
-        The test exercises a message containing internal fields such as
-        ``branch_id``, ``seq_in_branch``, ``id``, ``parent_id``, ``usage``,
-        ``segments``, ``reasoning_content``, and ``_client_id`` and asserts
-        none of these keys appear in the serialized assistant message while
-        ``content`` null is coerced to an empty string and ``tool_calls``
-        are cleaned of internal keys because DeepSeek's API rejects unknown
-        fields and null content strings.
+        The test exercises a message carrying internal fields -- ``branch_id``,
+        ``seq_in_branch``, ``id``, ``parent_id``, ``usage``, ``segments`` and
+        ``_client_id`` -- and asserts none survive, that ``content`` null is
+        coerced to an empty string, and that ``tool_calls`` lose their internal
+        keys, because DeepSeek's API rejects unknown fields and null content.
+
+        ``reasoning_content`` is the one field with a documented exception: the
+        official thinking-mode rule requires an assistant message that carries
+        ``tool_calls`` to have its reasoning passed back on every later request
+        while thinking is enabled, so it is kept there and stripped everywhere
+        else.  All four positions are pinned here.
         """
         be = DeepSeekBackend(api_key="sk-test")
         data = be._build_request_data(
@@ -422,9 +434,12 @@ class TestDeepSeekBackendRequestBuilding:
             }],
         )
         assistant = data["messages"][0]
-        for bad in ("branch_id", "seq_in_branch", "id", "parent_id", "usage", "segments", "reasoning_content", "_client_id"):
+        for bad in ("branch_id", "seq_in_branch", "id", "parent_id", "usage", "segments", "_client_id"):
             assert bad not in assistant, bad
         assert assistant["content"] == ""
+        # Thinking is on by default and this assistant carries tool_calls, so
+        # its reasoning must be passed back.
+        assert assistant["reasoning_content"] == "think"
         assert assistant["tool_calls"][0] == {
             "id": "call_1",
             "type": "function",
@@ -432,6 +447,31 @@ class TestDeepSeekBackendRequestBuilding:
         }
         tool_msg = data["messages"][1]
         assert tool_msg == {"role": "tool", "content": "ok", "tool_call_id": "call_1"}
+
+        # Thinking off: nothing reasoning-shaped may go back to the API, even
+        # on an assistant that carries tool_calls.
+        be.thinking_enabled = False
+        off = be._build_request_data(messages=[{
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"},
+            }],
+            "reasoning_content": "think",
+        }])["messages"][0]
+        assert "reasoning_content" not in off
+        assert off["tool_calls"][0]["id"] == "call_1"
+
+        # Thinking on but no tool_calls: the API ignores that reasoning, so it
+        # stays stripped rather than bloating every request.
+        plain = DeepSeekBackend(api_key="sk-test")._build_request_data(messages=[{
+            "role": "assistant",
+            "content": "an answer",
+            "reasoning_content": "think",
+        }])["messages"][0]
+        assert "reasoning_content" not in plain
 
     def test_verify_tool_schemas_are_normalized_for_deepseek_validation(self):
         """Validate that tool parameter schemas are normalized to pass DeepSeek's validator.

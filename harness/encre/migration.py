@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -52,6 +50,12 @@ from typing import Any, Callable
 from encre.config import get_data_dir
 from encre.crypto import decrypt_bytes, decrypt_raw, encrypt_bytes, encrypt_raw, ensure_keyfile
 
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
+
 __all__ = ["export_all", "import_all"]
 
 # A ``Callable[[int, int, str], None]`` that receives ``(done, total, current)``
@@ -68,7 +72,10 @@ _MANIFEST_VERSION = 1
 _ZIP_MAGIC = b"ENCRE-ZIP\x01"
 
 # Logs are intentionally excluded from backups (the user asked to skip them).
-_EXCLUDED_DIRS = frozenset({"logs"})
+# The keyfile directory is excluded too: a plaintext backup must never carry
+# key material -- even machine-wrapped -- because the archive travels between
+# machines; import_all re-encrypts against the target machine's own key.
+_EXCLUDED_DIRS = frozenset({"logs", "keys"})
 _EXCLUDED_FILES = frozenset({"yimd.log", "yimd.pid"})
 # Prior backups must not be re-exported inside a newer archive.
 _BACKUP_PREFIX = "encre-backup-"
@@ -86,7 +93,7 @@ def _fix_session_workspace(data: bytes) -> bytes:
             obj["metadata"]["workspace"] = ""
             return json.dumps(obj, ensure_ascii=False).encode("utf-8")
     except Exception:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
     return data
 
 
@@ -114,12 +121,12 @@ def _decrypt_or_copy(data: bytes) -> tuple[str | None, bytes]:
         if text and _BASE64_RE.fullmatch(text):
             return "text", decrypt_bytes(text)
     except Exception:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
     # Fall back to the raw binary format.
     try:
         return "raw", decrypt_raw(data)
     except Exception:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
     return None, data
 
 

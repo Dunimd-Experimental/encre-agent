@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -65,8 +64,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import re
 import time
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -121,8 +122,20 @@ _CORRECTION_PATTERNS: tuple[str, ...] = (
     r"\bremember\b",
     r"\bkeep in mind\b",
     r"\bnote that\b",
-    r"不要", r"不对", r"不能用", r"必须", r"应该", r"记住", r"注意", r"改成",
-    r"纠正", r"固定", r"统一", r"规定", r"默认(?:用|是|为)", r"以后都",
+    r"不要",
+    r"不对",
+    r"不能用",
+    r"必须",
+    r"应该",
+    r"记住",
+    r"注意",
+    r"改成",
+    r"纠正",
+    r"固定",
+    r"统一",
+    r"规定",
+    r"默认(?:用|是|为)",
+    r"以后都",
 )
 
 #: Phrases that signal an explicit emphasis (without a correction).
@@ -133,7 +146,9 @@ _EMPHASIS_PATTERNS: tuple[str, ...] = (
     r"\bmandatory\b",
     r"\bfrom now on\b",
     r"\bplease note\b",
-    r"重要", r"务必", r"一定要",
+    r"重要",
+    r"务必",
+    r"一定要",
 )
 
 #: Phrases that signal a deliberate, goal-advancing decision.
@@ -145,7 +160,11 @@ _DECISION_PATTERNS: tuple[str, ...] = (
     r"\bconclusion\b",
     r"\bsolution\b",
     r"\bwe agreed\b",
-    r"决定", r"方案", r"结论", r"采用", r"约定",
+    r"决定",
+    r"方案",
+    r"结论",
+    r"采用",
+    r"约定",
 )
 
 #: Weaker, higher-recall decision hints.  Alone they stay below threshold;
@@ -170,33 +189,47 @@ _SURPRISE_PATTERNS: tuple[str, ...] = (
     r"\bbut actually\b",
     r"\bturns out\b",
     r"\bdiscovered\b",
-    r"意外", r"竟然", r"出乎意料", r"反而",
+    r"意外",
+    r"竟然",
+    r"出乎意料",
+    r"反而",
 )
 
 #: Metadata flags that mark an experience as an error/failure.
 _ERROR_FLAGS: tuple[str, ...] = (
-    "is_error", "error", "failed", "failure", "exception", "traceback",
+    "is_error",
+    "error",
+    "failed",
+    "failure",
+    "exception",
+    "traceback",
 )
 
 #: Metadata flags that mark an experience as a user correction.
 _CORRECTION_FLAGS: tuple[str, ...] = (
-    "correction", "user_correction", "is_correction",
+    "correction",
+    "user_correction",
+    "is_correction",
 )
 
 #: Metadata flags that mark an experience as a goal-advancing decision.
 _DECISION_FLAGS: tuple[str, ...] = (
-    "decision", "key_decision", "is_decision", "goal_met", "milestone",
+    "decision",
+    "key_decision",
+    "is_decision",
+    "goal_met",
+    "milestone",
 )
 
 #: Metadata flags that mark an experience as an explicit emphasis.
 _EMPHASIS_FLAGS: tuple[str, ...] = (
-    "emphasis", "user_emphasis", "is_emphasis",
+    "emphasis",
+    "user_emphasis",
+    "is_emphasis",
 )
 
 #: Experience kinds whose content is intrinsically about a decision.
-_DECISION_KINDS: frozenset[str] = frozenset(
-    {"decision", "key_decision", "commitment", "plan", "goal"}
-)
+_DECISION_KINDS: frozenset[str] = frozenset({"decision", "key_decision", "commitment", "plan", "goal"})
 
 #: Experience kinds treated as conversational user input.
 _USER_KINDS: frozenset[str] = frozenset({"user_message", "user", "correction"})
@@ -209,6 +242,9 @@ SIGNALS: tuple[str, ...] = (
     "error_or_surprise",
     "key_decision",
     "strong_association",
+    "standing_assertion",
+    "entity_focus",
+    "novel_information",
 )
 
 #: Default per-signal weights.  The aggregate is ``1 - prod(1 - w_i * s_i)``,
@@ -221,10 +257,214 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "error_or_surprise": 0.65,
     "key_decision": 0.65,
     "strong_association": 0.60,
+    #: A user message that paraphrases an earlier one (high cosine overlap)
+    #: is a re-assertion of the same standing directive.  Pure distributional
+    #: math -- no language-specific vocabulary anywhere.
+    "standing_assertion": 0.80,
+    #: A message sharing a recurring token with message history extends
+    #: knowledge about something already being tracked.
+    "entity_focus": 0.65,
+    #: High information density (mean self-information of tokens) captures
+    #: novel, content-rich first mentions.  Cold-start friendly: as the
+    #: buffer fills, common vocabulary loses information content.
+    "novel_information": 0.60,
 }
+
+#: Rolling user-message history kept for the distributional signals.
+_MAX_MESSAGE_MEMORY = 512
 
 #: Content shorter than this is never a memory candidate.
 _MIN_CONTENT_CHARS = 8
+
+
+# ----------------------------------------------------------------------
+# Statistical CJK lexicon (unsupervised, corpus-derived, no word lists)
+# ----------------------------------------------------------------------
+
+#: Longest n-gram promoted into the lexicon (segmentation input).
+_LEXICON_MAX_GRAM = 3
+
+#: N-gram census length: one level above the promotion limit so a gram's
+#: "explained by a longer fixed phrase" coverage can be measured.
+_LEXICON_STAT_GRAM = 4
+
+#: A gram must occur at least this many times to be promoted at all.
+_LEXICON_MIN_FREQ = 2
+
+#: A gram is a word when it occurs far more often than its parts would
+#: predict: PMI = freq(gram) * total / max over splits of
+#: freq(prefix) * freq(suffix).  Casual adjacency of two independent words
+#: scores around ~1 (``freq("我的") * total / (freq("我") * freq("的"))``);
+#: a bound morpheme sequence ("李晓明", "图书馆") scores in the hundreds.
+#: The threshold separates the two bands with three orders of magnitude to
+#: spare -- pure counting arithmetic, one definition for every language.
+_LEXICON_MIN_PMI = 3.0
+
+#: Independence: a gram is only a word when a significant share of its
+#: occurrences are NOT explained by one longer fixed phrase.  Shredded
+#: sub-words (``晓明`` inside ``李晓明``, ``书馆`` inside ``图书馆``,
+#: ``户第一`` inside ``用户第一次``, ``和晓`` inside ``和晓明``) have
+#: essentially all their occurrences covered by one (n+1)-gram, while a
+#: real word always appears free somewhere (sentence edge, different
+#: collocation).  independence = (freq - max(freq(prefix+gram),
+#: freq(gram+suffix))) / freq >= this ratio -- pure counting arithmetic.
+_LEXICON_MIN_INDEPENDENCE = 0.1
+
+#: Derived word set (longest-match segmentation input).  Empty until the
+#: first :func:`refresh_lexicon`; the tokenizer then falls back to bigrams.
+_LEXICON_SET: set[str] = set()
+
+#: Fingerprint of the corpus the current lexicon was built from; repeated
+#: refreshes with an unchanged corpus are skipped entirely.
+_LEXICON_SIG: str = ""
+
+
+def refresh_lexicon(texts: Any, assisted: Any = None) -> None:
+    """Rebuild the statistical lexicon from the visible corpus.
+
+    Unsupervised new-word discovery, classical information theory only:
+    every CJK n-gram (2..4 chars) that recurs at least
+    :data:`_LEXICON_MIN_FREQ` times and whose observed frequency massively
+    exceeds the product of its split frequencies (PMI >=
+    :data:`_LEXICON_MIN_PMI`) becomes a word.  A 3-char name like
+    ``李晓明`` recurs as one block, so its internal bigrams (``李晓`` /
+    ``晓明``) occur **only** inside it and are absorbed by
+    longest-match-first segmentation -- exactly the failure the legacy
+    bigram window could never fix.
+
+    The statistical core is assisted by the model: candidates created
+    through ``memory_create`` may carry ``metadata["model_keywords"]`` and
+    those are passed here as ``assisted``.  Each suggestion is admitted
+    ONLY after corpus validation (2.._LEXICON_MAX_GRAM CJK chars AND at
+    least one occurrence in the corpus census), so a hallucinated term
+    can never reach the tokenizer -- the model proposes, the corpus
+    disposes.
+
+    Cheap to call often: an unchanged corpus (same character census
+    fingerprint) short-circuits to a no-op, so callers can refresh on every
+    curation pass.
+
+    Args:
+        texts: Iterable of raw corpus texts (memory contents).
+        assisted: Optional iterable of model-suggested words.
+    """
+    global _LEXICON_SET, _LEXICON_SIG
+    freq: Counter[str] = Counter()
+    total_chars = 0
+    for text in texts:
+        if not text:
+            continue
+        for run in re.findall(r"[\u4e00-\u9fff]+", text.lower()):
+            total_chars += len(run)
+            for n in range(1, _LEXICON_STAT_GRAM + 1):
+                for i in range(len(run) - n + 1):
+                    freq[run[i : i + n]] += 1
+    if not total_chars:
+        return
+
+    def _admit_assisted(target: set[str]) -> None:
+        if not assisted:
+            return
+        for word in assisted:
+            w = str(word or "").strip().lower()
+            if 2 <= len(w) <= _LEXICON_MAX_GRAM and re.fullmatch(r"[\u4e00-\u9fff]+", w) and freq.get(w, 0) >= 1:
+                target.add(w)
+
+    # Coverage census: for every gram, the largest count of an (n+1)-gram
+    # that contains it as prefix or suffix -- i.e. how many of its
+    # occurrences are explained by one longer fixed phrase.
+    max_cover: dict[str, int] = {}
+    for gram, count in freq.items():
+        if len(gram) < 2:
+            continue
+        for sub in (gram[:-1], gram[1:]):
+            if count > max_cover.get(sub, 0):
+                max_cover[sub] = count
+    # Corpus fingerprint: total CJK volume + gram-count census.  Any edit
+    # shifts at least one counter, so a genuine change never dedupes away.
+    sig = hashlib.sha1(
+        f"{total_chars}|{sum(freq.values())}|{len(freq)}".encode(),
+    ).hexdigest()
+    if sig == _LEXICON_SIG:
+        # Corpus unchanged, but fresh model suggestions still get admitted
+        # into the existing word set (validated against the census above).
+        _admit_assisted(_LEXICON_SET)
+        return
+    words: set[str] = set()
+    for gram, count in freq.items():
+        if len(gram) < 2 or len(gram) > _LEXICON_MAX_GRAM:
+            continue
+        if count < _LEXICON_MIN_FREQ:
+            continue
+        best_pmi = 0.0
+        for k in range(1, len(gram)):
+            split = freq.get(gram[:k], 0) * freq.get(gram[k:], 0)
+            if split > 0:
+                best_pmi = max(best_pmi, count * total_chars / split)
+        if best_pmi < _LEXICON_MIN_PMI:
+            continue
+        # Independence: occurrences explained by ONE longer fixed phrase
+        # (either single-character extension) do not count as free uses.
+        independent = count - max_cover.get(gram, 0)
+        if independent <= 0 or independent / count < _LEXICON_MIN_INDEPENDENCE:
+            continue
+        words.add(gram)
+    _admit_assisted(words)
+    _LEXICON_SET = words
+    _LEXICON_SIG = sig
+    logger.debug(
+        "[memdir.judgment] lexicon refreshed: {} statistical words from {} chars",
+        len(words),
+        total_chars,
+    )
+
+
+def _tokenize(text: str) -> list[str]:
+    """Split text into normalised tokens for distributional statistics.
+
+    Lowercases the input and extracts runs of at least two alphanumeric or
+    underscore characters. CJK characters (Unicode range U+4E00-U+9FFF) are
+    segmented against the statistical lexicon (see :func:`refresh_lexicon`)
+    with longest-match-first; runs no lexicon entry covers fall back to the
+    legacy overlapping-bigram window, and before the lexicon exists at all
+    the whole run uses that window.  No lexicons are hardcoded anywhere --
+    the lexicon is derived from the corpus itself by pointwise mutual
+    information.
+
+    Args:
+        text: Raw text to tokenize.
+
+    Returns:
+        List of lowercased token strings.
+    """
+    text = text.lower()
+    tokens: list[str] = []
+    tokens.extend(re.findall(r"[A-Za-z0-9_]{2,}", text))
+    for run in re.findall(r"[\u4e00-\u9fff]+", text):
+        pos = 0
+        n = len(run)
+        while pos < n:
+            matched = ""
+            if _LEXICON_SET:
+                for length in range(min(_LEXICON_MAX_GRAM, n - pos), 1, -1):
+                    candidate = run[pos : pos + length]
+                    if candidate in _LEXICON_SET:
+                        matched = candidate
+                        break
+            if matched:
+                tokens.append(matched)
+                pos += len(matched)
+            elif n - pos >= 2:
+                # Un-covered region: keep the legacy bigram granularity so
+                # cold-start behaviour and single-occurrence names still
+                # contribute tokens.
+                tokens.append(run[pos : pos + 2])
+                pos += 2
+            else:
+                tokens.append(run[pos])
+                pos += 1
+    return tokens
+
 
 #: Content longer than this is truncated when forming a candidate.
 _MAX_CANDIDATE_CHARS = 2000
@@ -264,7 +504,7 @@ class Experience:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Experience":
+    def from_dict(cls, data: dict[str, Any]) -> Experience:
         """Build an :class:`Experience` from a dict (see :meth:`to_dict`)."""
         return cls(
             kind=str(data.get("kind", "")),
@@ -290,8 +530,8 @@ class MemoryCandidate:
         reasons: The signals that fired, each with its contribution, e.g.
             ``"user_correction (w=0.85, s=1.00)"``.
         source_refs: Source references (event id / tool call id / message id).
-        suggested_type: One of ``"episodic"`` / ``"semantic"`` /
-            ``"procedural"`` / ``"autobiographical"``.
+        suggested_type: One of ``"fact"`` / ``"preference"`` /
+            ``"decision"`` / ``"lesson"`` / ``"entity"`` / ``"episode"``.
         session_id: Owning session.
         created_at: Wall-clock timestamp.
         metadata: Extra provenance (experience kind, judge version, ...).
@@ -301,7 +541,7 @@ class MemoryCandidate:
     significance: float
     reasons: list[str] = field(default_factory=list)
     source_refs: list[str] = field(default_factory=list)
-    suggested_type: str = "episodic"
+    suggested_type: str = "episode"
     session_id: str = ""
     created_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -320,14 +560,14 @@ class MemoryCandidate:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MemoryCandidate":
+    def from_dict(cls, data: dict[str, Any]) -> MemoryCandidate:
         """Build a :class:`MemoryCandidate` from a dict (see :meth:`to_dict`)."""
         return cls(
             content=str(data.get("content", "")),
             significance=float(data.get("significance", 0.0)),
             reasons=[str(r) for r in (data.get("reasons") or [])],
             source_refs=[str(r) for r in (data.get("source_refs") or [])],
-            suggested_type=str(data.get("suggested_type", "episodic")),
+            suggested_type=str(data.get("suggested_type", "episode")),
             session_id=str(data.get("session_id", "")),
             created_at=float(data.get("created_at", 0.0)),
             metadata=dict(data.get("metadata", {}) or {}),
@@ -349,6 +589,14 @@ class SignificanceJudge:
             (e.g. :class:`~encre.memdir.recall.RecallEngine`); used for the
             ``strong_association`` signal.  When absent the signal is simply
             inactive.
+        verifier: Optional async callable ``(candidates) -> candidates`` --
+            the model-assisted final gate.  The math threshold is a cheap
+            pre-filter; the verifier (when provided) re-judges each survivor
+            with the model -- one thinking-disabled call per candidate that
+            answers only a worth score -- and returns the subset worth
+            remembering.  The gate is fail-closed: a verifier that returns
+            an empty subset (scorer missing, call failed, score unparsable)
+            publishes nothing, so unverified candidates never reach storage.
         memory_system: Optional file facade kept for callers that still hold
             one; it is not used for retrieval (the facade has none).
         weights: Optional per-signal weight overrides.  Unknown keys are
@@ -366,11 +614,16 @@ class SignificanceJudge:
         *,
         threshold: float = 0.5,
         recall_engine: Any = None,
+        verifier: Any = None,
         memory_system: Any = None,
         weights: dict[str, float] | None = None,
     ) -> None:
         self.threshold = float(threshold)
         self._recall_engine = recall_engine
+        # The model-assisted final gate (async callable, optional).  See the
+        # class docstring: it filters the math-approved candidates and may
+        # attach subject keywords, but its failure never blocks publication.
+        self._verifier = verifier
         # Retained only so existing constructors keep working; retrieval no
         # longer flows through the file facade.
         self._memory_system = memory_system
@@ -379,6 +632,11 @@ class SignificanceJudge:
             for key, value in weights.items():
                 if key in self._weights:
                     self._weights[key] = float(value)
+        #: Rolling (token counter, l2 norm) pairs over past user messages,
+        #: plus the document-frequency table over their tokens.  The raw
+        #: statistics behind the distributional signals -- no lexicons.
+        self._msg_counters: deque[tuple[Counter, float]] = deque()
+        self._msg_df: Counter[str] = Counter()
 
         # Content fingerprint -> prior occurrences, per session.  Populated
         # by :meth:`record` (and automatically by :meth:`judge_batch` /
@@ -439,12 +697,26 @@ class SignificanceJudge:
             return None
 
         reasons = [
-            f"{name} (w={self._weights.get(name, 0.0):.2f}, s={signals[name]:.2f})"
-            for name in SIGNALS
-            if signals.get(name, 0.0) > 0.0
+            f"{name} (w={self._weights.get(name, 0.0):.2f}, s={signals[name]:.2f})" for name in SIGNALS if signals.get(name, 0.0) > 0.0
         ]
 
         stored = content[:_MAX_CANDIDATE_CHARS]
+        metadata: dict[str, Any] = {
+            "experience_kind": experience.kind,
+            "signals": dict(signals),
+            "detail": detail,
+            "judge_version": "1.0",
+        }
+        # Carry the origin turn so rollback can purge exactly the nodes
+        # produced by turns that were discarded.
+        experience_turn = (experience.metadata or {}).get("turn")
+        if isinstance(experience_turn, int) and not isinstance(experience_turn, bool):
+            metadata["turn"] = experience_turn
+        if len(content) > len(stored):
+            # The node keeps the truncated summary for lexical math; the
+            # verbatim statement rides along into the detail layer (the
+            # hippocampal-trace analog: details are never discarded).
+            metadata["full_content"] = content
         candidate = MemoryCandidate(
             content=stored,
             significance=round(significance, 6),
@@ -452,12 +724,7 @@ class SignificanceJudge:
             source_refs=list(experience.refs),
             suggested_type=self._suggest_type(experience, signals),
             session_id=experience.session_id,
-            metadata={
-                "experience_kind": experience.kind,
-                "signals": dict(signals),
-                "detail": detail,
-                "judge_version": "1.0",
-            },
+            metadata=metadata,
         )
         return candidate
 
@@ -504,6 +771,77 @@ class SignificanceJudge:
     # Signal scoring
     # ------------------------------------------------------------------
 
+    def _assertion_score(self, tokens: list[str]) -> float:
+        """Paraphrase overlap with prior user messages (cosine, no lexicon).
+
+        A user restating a directive in different words produces a high
+        cosine against the earlier wording in token space -- the
+        distributional signature of a standing assertion.
+        """
+        if not self._msg_counters or not tokens:
+            return 0.0
+        counts = Counter(tokens)
+        norm_a = math.sqrt(sum(v * v for v in counts.values()))
+        best = 0.0
+        for prior, norm_b in self._msg_counters:
+            dot = sum(v * prior[t] for t, v in counts.items() if t in prior)
+            if dot <= 0.0 or norm_a <= 0.0 or norm_b <= 0.0:
+                continue
+            best = max(best, dot / (norm_a * norm_b))
+        if best < 0.5:
+            return 0.0
+        return min(1.0, 0.75 + 0.25 * (best - 0.5) * 2.0)
+
+    def _entity_focus_score(self, tokens: list[str]) -> float:
+        """Recurring-token signal from the message history's DF table.
+
+        Sharing a token the user has already used in earlier messages means
+        the message extends knowledge about something already tracked.
+        """
+        if not self._msg_df or not tokens:
+            return 0.0
+        df_max = max((self._msg_df.get(t, 0) for t in set(tokens)), default=0)
+        if df_max < 2:
+            return 0.0
+        return min(0.9, 0.6 + 0.1 * (df_max - 2))
+
+    def _novelty_score(self, tokens: list[str]) -> float:
+        """Information density: mean self-information of the message tokens.
+
+        Normalised mean IDF over the message's vocabulary.  A content-rich
+        first mention scores high; stock phrases drain towards zero as the
+        rolling history fills.
+        """
+        unique = set(tokens)
+        if len(tokens) < 4 or not unique:
+            return 0.0
+        n = len(self._msg_counters) + 1
+        max_idf = math.log(n + 1)
+        if max_idf <= 0.0:
+            return 0.0
+        idf_sum = sum(math.log((n + 1) / (self._msg_df.get(token, 0) + 1)) for token in unique)
+        density = (idf_sum / len(unique)) / max_idf
+        if density < 0.7:
+            return 0.0
+        # The normalised density itself is the signal strength: no second
+        # mapping, so a 0.9-density message keeps 90% of the weight.
+        return min(1.0, density)
+
+    def _remember_message(self, tokens: list[str]) -> None:
+        """Fold one message into the rolling distributional history."""
+        counts = Counter(tokens)
+        norm = math.sqrt(sum(v * v for v in counts.values()))
+        self._msg_counters.append((counts, norm))
+        self._msg_df.update(counts.keys())
+        while len(self._msg_counters) > _MAX_MESSAGE_MEMORY:
+            old, _ = self._msg_counters.popleft()
+            for token in old:
+                remaining = self._msg_df.get(token, 0) - old[token]
+                if remaining > 0:
+                    self._msg_df[token] = remaining
+                else:
+                    self._msg_df.pop(token, None)
+
     def _score(self, experience: Experience) -> tuple[dict[str, float], dict[str, str]]:
         """Return ``({signal: score}, {signal: explanation})`` for one experience."""
         text = experience.content or ""
@@ -526,9 +864,7 @@ class SignificanceJudge:
         repetition = self._repetition_score(experience, text)
         if repetition > 0.0:
             scores["repeated_pattern"] = repetition
-            detail["repeated_pattern"] = (
-                f"content repeated {self._occurrences(experience, text)}x in session"
-            )
+            detail["repeated_pattern"] = f"content repeated {self._occurrences(experience, text)}x in session"
 
         error = self._error_score(experience, lowered, meta)
         if error > 0.0:
@@ -539,6 +875,23 @@ class SignificanceJudge:
         if decision > 0.0:
             scores["key_decision"] = decision
             detail["key_decision"] = "goal-advancing decision marker"
+
+        rule = experience.kind in _USER_KINDS
+        if rule:
+            tokens = _tokenize(text)
+            assertion = self._assertion_score(tokens)
+            if assertion > 0.0:
+                scores["standing_assertion"] = assertion
+                detail["standing_assertion"] = "high cosine overlap with prior messages"
+            focus = self._entity_focus_score(tokens)
+            if focus > 0.0:
+                scores["entity_focus"] = focus
+                detail["entity_focus"] = "shares a recurring token with history"
+            novelty = self._novelty_score(tokens)
+            if novelty > 0.0:
+                scores["novel_information"] = novelty
+                detail["novel_information"] = "high information density"
+            self._remember_message(tokens)
 
         association = self._association_score(experience, text)
         if association > 0.0:
@@ -564,9 +917,7 @@ class SignificanceJudge:
 
     # ---- user correction -------------------------------------------------
 
-    def _correction_score(
-        self, experience: Experience, lowered: str, meta: dict[str, Any]
-    ) -> float:
+    def _correction_score(self, experience: Experience, lowered: str, meta: dict[str, Any]) -> float:
         """Score explicit user correction/constraint, 0.0 when absent."""
         score = 0.0
         if any(bool(meta.get(flag)) for flag in _CORRECTION_FLAGS):
@@ -580,9 +931,7 @@ class SignificanceJudge:
         return score
 
     @staticmethod
-    def _correction_detail(
-        experience: Experience, lowered: str, meta: dict[str, Any]
-    ) -> str:
+    def _correction_detail(experience: Experience, lowered: str, meta: dict[str, Any]) -> str:
         if any(bool(meta.get(flag)) for flag in _CORRECTION_FLAGS):
             return "metadata correction flag"
         if experience.kind in ("correction", "user_correction"):
@@ -604,9 +953,7 @@ class SignificanceJudge:
     # ---- user emphasis ---------------------------------------------------
 
     @staticmethod
-    def _emphasis_score(
-        experience: Experience, lowered: str, meta: dict[str, Any]
-    ) -> float:
+    def _emphasis_score(experience: Experience, lowered: str, meta: dict[str, Any]) -> float:
         """Score explicit emphasis markers, 0.0 when absent."""
         if any(bool(meta.get(flag)) for flag in _EMPHASIS_FLAGS):
             return 1.0
@@ -632,16 +979,12 @@ class SignificanceJudge:
     def _occurrences(self, experience: Experience, text: str) -> int:
         """Return the total occurrence count of ``text`` including this one."""
         fingerprint = _fingerprint(text)
-        prior = self._session_fingerprints.get(experience.session_id, {}).get(
-            fingerprint, 0
-        )
+        prior = self._session_fingerprints.get(experience.session_id, {}).get(fingerprint, 0)
         return prior + 1
 
     # ---- error / surprise ------------------------------------------------
 
-    def _error_score(
-        self, experience: Experience, lowered: str, meta: dict[str, Any]
-    ) -> float:
+    def _error_score(self, experience: Experience, lowered: str, meta: dict[str, Any]) -> float:
         """Score tool failures, exceptions, and surprising outcomes."""
         score = 0.0
         if experience.kind in ("error", "exception", "tool_error"):
@@ -656,9 +999,7 @@ class SignificanceJudge:
             score = max(score, 0.6)
         return score
 
-    def _error_detail(
-        self, experience: Experience, lowered: str, meta: dict[str, Any]
-    ) -> str:
+    def _error_detail(self, experience: Experience, lowered: str, meta: dict[str, Any]) -> str:
         if experience.kind in ("error", "exception", "tool_error"):
             return f"error experience kind ({experience.kind})"
         if self._meta_error(meta):
@@ -672,16 +1013,11 @@ class SignificanceJudge:
     @staticmethod
     def _meta_error(meta: dict[str, Any]) -> bool:
         """Whether metadata indicates a failure."""
-        for flag in _ERROR_FLAGS:
-            if bool(meta.get(flag)):
-                return True
-        return False
+        return any(bool(meta.get(flag)) for flag in _ERROR_FLAGS)
 
     # ---- key decision ----------------------------------------------------
 
-    def _decision_score(
-        self, experience: Experience, lowered: str, meta: dict[str, Any]
-    ) -> float:
+    def _decision_score(self, experience: Experience, lowered: str, meta: dict[str, Any]) -> float:
         """Score a goal-advancing decision or commitment."""
         if any(bool(meta.get(flag)) for flag in _DECISION_FLAGS):
             return 1.0
@@ -695,7 +1031,7 @@ class SignificanceJudge:
 
     # ---- strong association ---------------------------------------------
 
-    def _association_score(self, experience: Experience, text: str) -> float:
+    def _association_score(self, _experience: Experience, text: str) -> float:
         """Score overlap with existing memory through associative recall.
 
         Retrieval goes only through
@@ -725,25 +1061,37 @@ class SignificanceJudge:
     # ------------------------------------------------------------------
 
     def _suggest_type(self, experience: Experience, scores: dict[str, float]) -> str:
-        """Suggest a memory type from the fired signals and experience kind.
+        """Suggest a graph node kind from the fired signals and experience kind.
 
-        * a goal-advancing decision or a stated constraint about the user /
-          project -> ``autobiographical``;
-        * a correction or a failure lesson -> ``procedural``;
-        * a repeated pattern -> ``semantic``;
-        * anything else (a lived event) -> ``episodic``.
+        * a goal-advancing decision or a stated commitment -> ``decision``;
+        * a correction or constraint about how to work -> ``preference``;
+        * a failure lesson -> ``lesson``;
+        * a repeated pattern or strong association -> ``fact``;
+        * anything else (a lived event) -> ``episode``.
         """
+        # A real failure's takeaway is always knowledge about what went
+        # wrong, even when the message text also sounds like a directive
+        # ("always run ruff first") -- the error evidence wins the typing.
+        if scores.get("error_or_surprise") and (experience.metadata or {}).get("is_error"):
+            return "lesson"
+        if scores.get("standing_assertion"):
+            # A paraphrased re-assertion of an earlier directive is a
+            # standing user preference.
+            return "preference"
+        if scores.get("entity_focus"):
+            # An extension of knowledge about an already-tracked subject.
+            return "fact"
         if scores.get("key_decision"):
-            return "autobiographical"
+            return "decision"
         if scores.get("user_correction"):
-            return "procedural"
+            return "preference"
         if scores.get("error_or_surprise"):
-            return "procedural"
+            return "lesson"
         if scores.get("repeated_pattern"):
-            return "semantic"
+            return "fact"
         if scores.get("strong_association"):
-            return "semantic"
-        return "episodic"
+            return "fact"
+        return "episode"
 
     # ------------------------------------------------------------------
     # Bus integration
@@ -835,9 +1183,26 @@ class SignificanceJudge:
         return task
 
     async def _judge_and_publish(self, experiences: list[Experience], bus: Any) -> None:
-        """Background worker for :meth:`schedule_judgment`."""
+        """Background worker for :meth:`schedule_judgment`.
+
+        When a model verifier is attached, the math-approved candidates pass
+        through it first and only the returned subset is published; a
+        fail-closed verifier (empty return) publishes nothing, so junk can
+        never bypass the model gate through a degraded path.
+        """
         try:
-            for candidate in self.judge_batch(experiences):
+            candidates = self.judge_batch(experiences)
+            if candidates and self._verifier is not None:
+                try:
+                    kept = await self._verifier(candidates)
+                    if kept is not None:
+                        candidates = list(kept)
+                except Exception:
+                    logger.warning(
+                        "[judge] model verification failed; publishing math-approved candidates",
+                        exc_info=True,
+                    )
+            for candidate in candidates:
                 self.publish_candidate(bus, candidate)
         except Exception:
             logger.warning("[judge] background judgment failed", exc_info=True)
@@ -866,15 +1231,20 @@ class SignificanceJudge:
 
         if not isinstance(payload, dict):
             return None
+        # The loop publishes typed lifecycle events wrapped as
+        # ``{"event": event}``; the judgeable fields live on the inner event.
+        payload = _unwrap_event_payload(payload)
 
         # Resolve the experience kind from the event kind and payload.
         exp_kind = kind
         if kind.startswith("phase:"):
-            phase = kind[len("phase:"):]
+            phase = kind[len("phase:") :]
             if phase in ("turn_end", "turn_started", "turn_start"):
                 exp_kind = "turn_end"
             else:
                 return None
+        if kind.startswith("user_message"):
+            exp_kind = "user_message"
 
         content = _extract_content(payload)
         if not content:
@@ -883,9 +1253,20 @@ class SignificanceJudge:
         metadata: dict[str, Any] = {
             key: payload[key]
             for key in (
-                "is_error", "error", "failed", "exception", "traceback",
-                "tool_name", "success", "source", "correction", "decision",
-                "emphasis", "goal_met", "milestone", "repeated",
+                "is_error",
+                "error",
+                "failed",
+                "exception",
+                "traceback",
+                "tool_name",
+                "success",
+                "source",
+                "correction",
+                "decision",
+                "emphasis",
+                "goal_met",
+                "milestone",
+                "repeated",
             )
             if key in payload
         }
@@ -920,9 +1301,56 @@ def _extract_content(payload: dict[str, Any]) -> str:
     return ""
 
 
+#: Scalar fields merged out of a wrapped typed event (see
+#: :func:`_unwrap_event_payload`): content-bearing names plus the metadata
+#: flags the judge consumes.
+_INNER_EVENT_FIELDS: tuple[str, ...] = (
+    "content",
+    "text",
+    "result",
+    "message",
+    "summary",
+    "error",
+    "is_error",
+    "failed",
+    "failure",
+    "exception",
+    "traceback",
+    "tool_name",
+    "success",
+    "source",
+    "correction",
+    "decision",
+    "emphasis",
+    "goal_met",
+    "milestone",
+    "repeated",
+)
+
+
+def _unwrap_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Merge the ``{"event": <typed event>}`` envelope into a flat dict.
+
+    The loop publishes typed lifecycle events wrapped as ``{"event": event}``
+    (:meth:`encre.events.stream.EventStream.publish`), so the judge reads the
+    *inner* event's fields: dataclass-style objects contribute their known
+    scalar fields, nested dicts are merged wholesale.  A plain payload
+    (direct bus publish) passes through unchanged.
+    """
+    inner = payload.get("event")
+    if inner is None or isinstance(inner, str | bytes):
+        return payload
+    merged = dict(payload)
+    if isinstance(inner, dict):
+        merged.update(inner)
+        return merged
+    for name in _INNER_EVENT_FIELDS:
+        value = getattr(inner, name, None)
+        if value is not None:
+            merged[name] = value
+    return merged
+
+
 def _matches(text: str, patterns: tuple[str, ...]) -> bool:
     """Return ``True`` when ``text`` matches any regex in ``patterns``."""
-    for pattern in patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return True
-    return False
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)

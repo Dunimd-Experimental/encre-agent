@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -46,6 +44,9 @@ Authentication: KIMI_API_KEY environment variable or explicit api_key.
 
 from typing import Any
 
+import re
+
+from encre.backends.catalog import get_context_window
 from encre.backends.openai_sse import OpenAISSEBackend
 
 
@@ -54,6 +55,9 @@ class KimiBackend(OpenAISSEBackend):
 
     Supports Kimi K2, K2.5, and K2.6 via Moonshot AI's OpenAI-compatible API.
     """
+
+    # Moonshot's OpenAI-compatible API supports stream_options.include_usage.
+    _include_stream_usage = True
 
     DEFAULT_BASE_URL = "https://api.moonshot.cn/v1"
 
@@ -114,8 +118,10 @@ class KimiBackend(OpenAISSEBackend):
         if "k2.7-code" in m or "k2-7-code" in m:
             return None
         # Kimi K3 always reasons; uses a top-level reasoning_effort and
-        # rejects the thinking envelope.
-        if "k3" in m or "-k3" in m or m.startswith("kimi-k3"):
+        # rejects the thinking envelope.  "k3" is matched as a standalone
+        # token so unrelated names containing "k3" inside a longer word
+        # are not misclassified.
+        if re.search(r"\bk3\b", m):
             effort = getattr(self, "reasoning_effort", "") or "max"
             return {"reasoning_effort": effort}
         # kimi-k2.5 / k2.6 / k2-thinking all accept the DeepSeek shape.
@@ -127,8 +133,43 @@ class KimiBackend(OpenAISSEBackend):
             }
         return None
 
+    def _build_request_data(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+        stream: bool = True,
+    ) -> dict[str, Any]:
+        """Build the request body, dropping sampling params for Kimi K3.
+
+        K3 pins ``temperature``/``top_p`` internally; explicitly sending
+        other values is rejected with an error, so they are omitted for
+        K3 models.
+        """
+        data = super()._build_request_data(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=stream,
+        )
+        if re.search(r"\bk3\b", (self.model or "").lower()):
+            data.pop("temperature", None)
+            data.pop("top_p", None)
+        return data
+
     def context_window_size(self) -> int:
-        """Return the context window size (in tokens) for Kimi models."""
+        """Return the context window size (in tokens) for Kimi models.
+
+        The model catalog (:func:`encre.backends.catalog.get_context_window`)
+        is consulted first; the table below only handles unknown names.
+        """
+        catalog_window = get_context_window(self.model)
+        if catalog_window is not None:
+            return catalog_window
         m = self.model.lower()
         if "kimi-k3" in m or "-k3" in m:
             return 1_000_000

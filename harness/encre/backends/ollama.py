@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 Ollama backend -- locally-hosted models via the Ollama API.
@@ -116,15 +118,21 @@ class OllamaBackend(OpenAISSEBackend):
         """
         if self._context_window_cache is None:
             await self._fetch_model_context_window()
-        async for event in super().chat(
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=stream,
-            enable_caching=enable_caching,
-        ):
+        # Forward the cache-edits state so prompt-cache edits survive the
+        # context-window probe wrapper.  Skipped when unset (None) so legacy
+        # chat() implementations predating the parameter keep working.
+        _chat_kwargs: dict[str, Any] = {
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+            "enable_caching": enable_caching,
+        }
+        if cache_edits_state is not None:
+            _chat_kwargs["cache_edits_state"] = cache_edits_state
+        async for event in super().chat(**_chat_kwargs):
             yield event
 
     def context_window_size(self) -> int:
@@ -163,14 +171,20 @@ class OllamaBackend(OpenAISSEBackend):
                     self._context_window_cache = ctx
                     return
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
         self._context_window_cache = 8192
 
     async def list_models(self) -> list[str]:
         """Fetch available models from the local Ollama instance.
 
         Uses Ollama's native ``/api/tags`` endpoint since the OpenAI
-        compatible ``/v1/models`` may not include all locally pulled models.
+        compatible ``/v1/models`` may not include all locally
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
+ pulled models.
         """
         import time
         now = time.time()
@@ -201,7 +215,7 @@ class OllamaBackend(OpenAISSEBackend):
         self._models_cache_key = cache_key
         return models
 
-    # 鈹€鈹€ Multimodal/Extended API capabilities 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Multimodal/Extended API capabilities ──────────────────────
     # Ollama is a local inference server.  It supports chat and
     # embeddings (model-dependent).  Vision (image input) depends on
     # the specific model.  It does NOT support image generation/editing,

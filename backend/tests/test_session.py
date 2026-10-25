@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,13 +23,14 @@
 
 from __future__ import annotations
 
-"""Tests for EncreSession and SessionCheckpoint.
+"""Tests for :class:`EncreSession` and :class:`SessionCheckpoint`.
 
-Session is the mutable conversation context that the agent accumulates
-messages into across turns. Checkpoint is a lightweight snapshot type
-used to mark recoverable points in the message history. Tests cover
-construction invariants, message mutation, checkpoint lifecycle, and
-utility methods (token estimation, serialization, renderer hygiene).
+EncreSession is the mutable conversation context the agent accumulates
+messages into across turns, while SessionCheckpoint is a lightweight
+snapshot type that marks a recoverable point in the message history.
+These tests cover construction invariants, message mutation, checkpoint
+lifecycle, and the utility methods for token estimation, serialization,
+and renderer hygiene.
 """
 
 import time
@@ -168,7 +169,7 @@ class TestEncreSessionConstruction:
         """
         config = EncreConfig()
         session = EncreSession(config)
-        # timestamps come from two separate time.time() calls, so allow small delta
+        # The constructor calls time.time() twice, so allow a small clock delta.
         assert abs(session.updated_at - session.created_at) < 0.01
 
     def test_verify_session_tool_call_count_is_zero_initially(self):
@@ -495,7 +496,7 @@ class TestEncreSessionUtility:
         ctx = session.get_context_messages()
         assert len(ctx) == 1
         ctx.append({"role": "assistant", "content": "extra"})
-        assert len(session.messages) == 1  # original unchanged
+        assert len(session.messages) == 1  # the copy does not touch session state
 
     def test_verify_renderer_messages_preserve_client_tool_ids_while_context_messages_do_not(self):
         """Validate that get_renderer_messages retains _client_id for UI correlation while get_context_messages strips it.

@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Unified per-run loop state for the agent main loop.
 
 Centralises the ~30+ scalar member variables that ``EncreLoop`` currently
@@ -33,10 +35,10 @@ dataclass.  This makes it possible to:
 
 Usage::
 
-    from encre.compact.loop_state.state import LoopState
+    from encre.compact.loop_state.state import LoopTurnState
 
     # At the top of `_run_impl()`:
-    state = LoopState(turn_count=self.session.turn_count)
+    state = LoopTurnState(turn_count=self.session.turn_count)
 
     # After each transition:
     state.transitions.record(TurnTransition.NEXT_TURN, turn=state.turn_count)
@@ -45,7 +47,6 @@ Usage::
     snapshot = state.snapshot()
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -54,7 +55,7 @@ from encre.compact.loop_state.transition import TransitionHistory
 
 
 @dataclass
-class LoopState:
+class LoopTurnState:
     """All mutable loop state for a single ``_run_impl()`` invocation.
 
     This dataclass is the **single source of truth** for per-run counters,
@@ -65,19 +66,19 @@ class LoopState:
 
     Migration strategy (phased, no behavioral changes):
 
-    Phase 1 鈥?present: Own the transition history and provide ``snapshot()``.
+    Phase 1 — present: Own the transition history and provide ``snapshot()``.
            Inline counters (``_empty_response_retry_count`` etc.) remain on
            ``EncreLoop`` for now; this class shadows them for observability.
 
-    Phase 2 鈥?next: Move the per-run counters into this class and have
+    Phase 2 — next: Move the per-run counters into this class and have
            ``_run_impl()`` reference ``self._state.empty_response_retry_count``
            instead of ``self._empty_response_retry_count``.
 
-    Phase 3 鈥?future: Merge with ``RecoveryStateMachine`` so the RSM consumes
+    Phase 3 — future: Merge with ``RecoveryStateMachine`` so the RSM consumes
            state from here rather than duplicating counters.
     """
 
-    # 鈹€鈹€ Turn tracking 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Turn tracking ───────────────────────────────────────────────
     turn_count: int = 0
     """Current turn number within this run (mirrors session.turn_count)."""
 
@@ -89,12 +90,12 @@ class LoopState:
     """Number of continuations within this chain (incremented on each
     ``NEXT_TURN`` transition)."""
 
-    # 鈹€鈹€ Transition history 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Transition history ──────────────────────────────────────────
     transitions: TransitionHistory = field(default_factory=TransitionHistory)
     """Ordered log of every turn transition, used for post-mortem
     diagnostics and telemetry."""
 
-    # 鈹€鈹€ Per-run counters (Phase 2 target) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Per-run counters (Phase 2 target) ──────────────────────────
     # These currently live as EncreLoop member variables but are tracked
     # here for snapshot/observability.  EncreLoop's own counters are the
     # authoritative source until Phase 2.
@@ -103,12 +104,12 @@ class LoopState:
     max_output_tokens_recovery_count: int = 0
     unknown_error_retry_count: int = 0
 
-    # 鈹€鈹€ Streaming tool execution 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Streaming tool execution ────────────────────────────────────
     streaming_tool_results: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """Maps ``client_id`` 鈫?pre-executed tool result.  Populated during the
+    """Maps ``client_id`` → pre-executed tool result.  Populated during the
     streaming phase and consumed during the post-streaming execution phase."""
 
-    # 鈹€鈹€ Slot / budget state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Slot / budget state ─────────────────────────────────────────
     slot_escalated: bool = False
     """True when ``default_slot_tokens`` has been escalated to
     ``max_tokens`` for this run."""
@@ -120,11 +121,11 @@ class LoopState:
     reactive_compacted: bool = False
     """True when a reactive compact has been performed in the current turn."""
 
-    # 鈹€鈹€ Session metadata cache 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Session metadata cache ──────────────────────────────────────
     last_backend_usage: dict[str, Any] | None = None
     """Token usage from the most recent backend.chat() call."""
 
-    # 鈹€鈹€ Factory / reset 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Factory / reset ─────────────────────────────────────────────
 
     @classmethod
     def create(
@@ -134,8 +135,8 @@ class LoopState:
         *,
         event_bus: Any = None,
         session_id: str = "",
-    ) -> LoopState:
-        """Create a fresh LoopState for a new ``_run_impl()`` invocation.
+    ) -> LoopTurnState:
+        """Create a fresh LoopTurnState for a new ``_run_impl()`` invocation.
 
         ``event_bus`` (the session's event backbone) and ``session_id`` are
         forwarded to the embedded :class:`TransitionHistory` so recorded
@@ -161,7 +162,7 @@ class LoopState:
         self.reactive_compacted = False
         self.last_backend_usage = None
 
-    # 鈹€鈹€ Snapshot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Snapshot ────────────────────────────────────────────────────
 
     def snapshot(self) -> dict[str, Any]:
         """Return a diagnostic snapshot of the current loop state.

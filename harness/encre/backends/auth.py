@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,10 +21,12 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """
 Auth management for LLM API calls.
 
-Provides credential lifecycle management 鈥?key rotation, automatic refresh on
+Provides credential lifecycle management — key rotation, automatic refresh on
 401/403 errors, and failure tracking.  Designed to integrate with the layered
 retry engine via ``RetryConfig.on_auth_required``.
 
@@ -35,7 +37,7 @@ Typical usage::
 
     auth = AuthManager(provider="anthropic")
 
-    # Register a refresh callback 鈥?called on 401/403.
+    # Register a refresh callback — called on 401/403.
     auth.on_auth_required = lambda: auth.set_api_key(new_key)
 
     config = RetryConfig(

@@ -46,16 +46,46 @@
 //! * **No Docker dependency, zero overhead.**
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+/// How a child process is confined at spawn time.
+#[derive(Debug, Clone, Default)]
+pub enum SandboxProfile {
+    /// No filesystem/network confinement (trusted in-process-adjacent work).
+    #[default]
+    None,
+    /// Legacy workspace profile: the child may touch only `workspace`.
+    Workspace(String),
+    /// Plugin worker profile: read-only runtime/package paths, read-write
+    /// state directory, no network.  The one profile used by every
+    /// third-party plugin worker.
+    Plugin {
+        read_paths: Vec<String>,
+        write_paths: Vec<String>,
+    },
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SandboxResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+/// Keep a console child (cmd / PowerShell / bash) from allocating a visible
+/// console window.
+///
+/// Encre Agent Desktop runs the backend under a GUI parent that owns no
+/// console, so without this flag every spawned console process gets a brand
+/// new terminal window.  Every spawn in this module must call it.
+#[cfg(target_os = "windows")]
+fn hide_console_window(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 }
 
 /// Execute *command* in a sandboxed subprocess.
@@ -86,8 +116,7 @@ pub fn sandbox_execute(
         cmd = std::process::Command::new("cmd.exe");
         cmd.arg("/C");
         cmd.arg(command);
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        hide_console_window(&mut cmd);
         // Do NOT pass /U (UTF-16 output): it only affects cmd built-ins,
         // while external programs keep writing in the system ANSI code page
         // (GBK on zh-CN), producing a mixed undecodable stream.  Instead we
@@ -218,66 +247,9 @@ fn _apply_linux_sandbox(cmd: &mut std::process::Command, workspace: Option<&str>
 /// macOS: sandbox_init(3) via pre_exec() in child process.
 #[cfg(target_os = "macos")]
 fn _apply_macos_sandbox(cmd: &mut std::process::Command, workspace: Option<&str>) {
-    use std::ffi::CString;
-    use std::os::unix::process::CommandExt as _;
-
-    extern "C" {
-        fn sandbox_init(
-            profile: *const std::os::raw::c_char,
-            flags: u64,
-            errorbuf: *mut *mut std::os::raw::c_char,
-        ) -> i32;
-        fn sandbox_free_error(errorbuf: *mut std::os::raw::c_char);
-    }
-
-    const SANDBOX_NAMED: u64 = 1;
-
     if let Some(ws) = workspace {
-        let ws_owned = ws.to_owned();
-        let escaped = ws_owned.replace('\\', "/");
-        let profile = format!(
-            "(version 1)\n\
-             (deny default)\n\
-             (allow file-read* file-write* (subpath \"{ws}\"))\n\
-             (allow file-read* (subpath \"/usr/lib\"))\n\
-             (allow file-read* (subpath \"/System/Library\"))\n\
-             (allow file-read* (literal \"/usr/share\"))\n\
-             (allow process-fork)\n\
-             (allow signal (target self))\n\
-             (allow sysctl-read)\n\
-             (allow file-read-metadata)\n\
-             (import \"system.sb\")\n",
-            ws = escaped,
-        );
-
-        unsafe {
-            cmd.pre_exec(move || {
-                let c_profile = CString::new(profile.as_str())
-                    .map_err(|_| std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "NUL in profile",
-                    ))?;
-                let mut errorbuf: *mut std::os::raw::c_char =
-                    std::ptr::null_mut();
-                let rv = sandbox_init(
-                    c_profile.as_ptr(), SANDBOX_NAMED, &mut errorbuf,
-                );
-                if rv != 0 {
-                    let msg = if !errorbuf.is_null() {
-                        let s = std::ffi::CStr::from_ptr(errorbuf)
-                            .to_string_lossy().into_owned();
-                        sandbox_free_error(errorbuf);
-                        s
-                    } else {
-                        format!("sandbox_init err {}", rv)
-                    };
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied, msg,
-                    ));
-                }
-                Ok(())
-            });
-        }
+        // Delegates to the profile shared with SandboxSession::spawn.
+        let _ = apply_macos_profile(cmd, ws);
     }
 }
 
@@ -464,6 +436,549 @@ pub fn sandbox_read_file(path: &str) -> Result<String, String> {
         return Err(format!("File not found: {path}"));
     }
     std::fs::read_to_string(p).map_err(|e| format!("Read error: {e}"))
+}
+
+// ── Persistent sandboxed sessions ─────────────────────────────────
+
+/// A long-lived sandboxed child process with piped stdio.
+///
+/// Used for persistent terminal/shell sessions: the OS-level confinement is
+/// applied by THIS process (Rust) at spawn time — Landlock on Linux,
+/// sandbox_init(3) on macOS, a kill-on-close Job Object on Windows — so the
+/// Python host never needs (and never gets) a privilege checkpoint that a
+/// child could bypass.  Python only drives the pipes.
+///
+/// The Windows job handle is owned by this struct: dropping the session
+/// closes the handle, which reaps the whole descendant tree
+/// (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
+pub struct SandboxSession {
+    child: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
+    /// Reader thread latch: stdout bytes land here.
+    stdout_buf: std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>,
+    stderr_buf: std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>,
+    /// The confined process' own id, kept for killpg on Unix.
+    child_id: u32,
+    /// Honest level report: "landlock" | "sandbox_init" | "job_object" | "none".
+    isolation: &'static str,
+    #[cfg(target_os = "windows")]
+    job_handle: std::sync::Arc<JobHandleBox>,
+}
+
+#[cfg(target_os = "windows")]
+struct JobHandleBox(std::sync::Mutex<isize>);
+
+/// Drain whatever bytes are pending in *buf* (up to *max_bytes*), waiting
+/// up to *timeout_ms* for the first byte to arrive.  Returns an empty vec
+/// on timeout.  Used by the Python side to poll for command completion
+/// markers without a busy read loop.
+fn drain_channel(
+    buf: &std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>,
+    max_bytes: usize,
+    timeout_ms: u64,
+) -> Vec<u8> {
+    let (lock, cvar) = &**buf;
+    let mut guard = match lock.lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    if guard.is_empty() && timeout_ms > 0 {
+        let deadline = std::time::Duration::from_millis(timeout_ms);
+        // wait_timeout_while hands back the guard together with the timeout
+        // result; the guard may now hold data even when the wait timed out.
+        let result = cvar.wait_timeout_while(guard, deadline, |b| b.is_empty());
+        guard = match result {
+            Ok((g, _)) => g,
+            Err(_) => return Vec::new(),
+        };
+    }
+    let take = guard.len().min(max_bytes);
+    guard.drain(..take).collect()
+}
+
+fn spawn_reader<S: std::io::Read + Send + 'static>(
+    mut stream: Option<S>,
+    buf: std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>,
+) {
+    thread::spawn(move || {
+        if let Some(s) = stream.as_mut() {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut g) = buf.0.lock() {
+                            g.extend_from_slice(&chunk[..n]);
+                            buf.1.notify_all();
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+impl SandboxSession {
+    /// Spawn *argv* under the platform sandbox with piped stdio.
+    ///
+    /// * `cwd`      — working directory for the child.
+    /// * `workspace` — confinement root for the Landlock / Seatbelt paths.
+    ///   Ignored on Windows (its Job Object has no path scope).
+    ///
+    /// Returns the session plus an honest isolation level string.
+    pub fn spawn(
+        argv: &[String],
+        cwd: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<(SandboxSession, &'static str), String> {
+        let profile = match workspace {
+            Some(ws) => SandboxProfile::Workspace(ws.to_string()),
+            None => SandboxProfile::None,
+        };
+        Self::spawn_with_env(argv, cwd, None, profile)
+    }
+
+    /// Spawn *argv* under *profile* with an explicit environment.
+    ///
+    /// This is the single spawn entry used by plugin workers: the caller
+    /// supplies the already-filtered environment (Rust policy), and the
+    /// sandbox profile decides filesystem/network confinement.  Keeping the
+    /// spawn here means Python never needs to know how a platform confines a
+    /// child — it only drives the pipes.
+    pub fn spawn_with_env(
+        argv: &[String],
+        cwd: Option<&str>,
+        env: Option<&HashMap<String, String>>,
+        #[cfg_attr(target_os = "windows", allow(unused_variables))]
+        profile: SandboxProfile,
+    ) -> Result<(SandboxSession, &'static str), String> {
+        if argv.is_empty() {
+            return Err("Empty argv".into());
+        }
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        if let Some(c) = cwd {
+            cmd.current_dir(c);
+        }
+        if let Some(env) = env {
+            cmd.env_clear();
+            cmd.envs(env);
+        }
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.env("PYTHONUTF8", "1");
+        cmd.env("PYTHONIOENCODING", "utf-8");
+        cmd.env("LANG", "C.UTF-8");
+        cmd.env("LC_ALL", "C.UTF-8");
+        cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+
+        // Persistent tool shells are the most common spawn in the app: without
+        // this they each pop a console window on Windows.
+        #[cfg(target_os = "windows")]
+        hide_console_window(&mut cmd);
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        let mut isolation: &'static str = "none";
+
+        #[cfg(target_os = "linux")]
+        {
+            match &profile {
+                SandboxProfile::Workspace(ws) => {
+                    if crate::landlock::landlock_available() {
+                        let ws = ws.clone();
+                        unsafe {
+                            use std::os::unix::process::CommandExt as _;
+                            cmd.pre_exec(move || {
+                                crate::landlock::landlock_workspace_sandbox(&ws)
+                                    .map_err(|e| std::io::Error::new(
+                                        std::io::ErrorKind::Other, e,
+                                    ))
+                            });
+                        }
+                        isolation = "landlock";
+                    }
+                }
+                SandboxProfile::Plugin { read_paths, write_paths } => {
+                    if crate::landlock::landlock_available() {
+                        let reads = read_paths.clone();
+                        let writes = write_paths.clone();
+                        unsafe {
+                            use std::os::unix::process::CommandExt as _;
+                            cmd.pre_exec(move || {
+                                crate::landlock::landlock_plugin_sandbox(&reads, &writes)
+                                    .map_err(|e| std::io::Error::new(
+                                        std::io::ErrorKind::Other, e,
+                                    ))
+                            });
+                        }
+                        isolation = "landlock_plugin";
+                    }
+                }
+                SandboxProfile::None => {}
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            match &profile {
+                SandboxProfile::Workspace(ws) => {
+                    apply_macos_profile(&mut cmd, ws)?;
+                    isolation = "sandbox_init";
+                }
+                SandboxProfile::Plugin { read_paths, write_paths } => {
+                    apply_macos_plugin_profile(&mut cmd, read_paths, write_paths)?;
+                    isolation = "sandbox_plugin";
+                }
+                SandboxProfile::None => {}
+            }
+        }
+
+        let mut child = cmd.spawn()
+            .map_err(|e| format!("Failed to spawn process: {e}"))?;
+
+        #[cfg(target_os = "windows")]
+        let job = _attach_windows_job_retained(&mut child);
+        #[cfg(target_os = "windows")]
+        let isolation: &'static str = if job.lock().map(|h| *h != 0).unwrap_or(false) {
+            "job_object"
+        } else {
+            "none"
+        };
+
+        let child_id = child.id();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let stdout_buf: std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)> =
+            std::sync::Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let stderr_buf: std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)> =
+            std::sync::Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        spawn_reader(stdout, std::sync::Arc::clone(&stdout_buf));
+        spawn_reader(stderr, std::sync::Arc::clone(&stderr_buf));
+
+        Ok((
+            SandboxSession {
+                child: Some(child),
+                stdin,
+                stdout_buf,
+                stderr_buf,
+                child_id,
+                isolation,
+                #[cfg(target_os = "windows")]
+                job_handle: std::sync::Arc::new(JobHandleBox(job)),
+            },
+            isolation,
+        ))
+    }
+
+    /// The honest isolation level reported at spawn time.
+    pub fn isolation_level(&self) -> &'static str {
+        self.isolation
+    }
+
+    /// The confined child's OS process id (also keeps `child_id` live on
+    /// platforms where kill does not need it).
+    pub fn pid(&self) -> u32 {
+        self.child_id
+    }
+
+    /// Write bytes to the child's stdin (returns bytes written).
+    pub fn write_stdin(&mut self, data: &[u8]) -> Result<usize, String> {
+        use std::io::Write;
+        match self.stdin.as_mut() {
+            Some(s) => s
+                .write_all(data)
+                .map(|_| data.len())
+                .map_err(|e| format!("stdin write failed: {e}")),
+            None => Err("stdin closed".into()),
+        }
+    }
+
+    /// Close the child's stdin (signals end-of-input for shells).
+    pub fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
+
+    /// Drain pending stdout bytes (waits up to *timeout_ms* for data).
+    pub fn drain_stdout(&self, max_bytes: usize, timeout_ms: u64) -> Vec<u8> {
+        drain_channel(&self.stdout_buf, max_bytes, timeout_ms)
+    }
+
+    /// Drain pending stderr bytes (waits up to *timeout_ms* for data).
+    pub fn drain_stderr(&self, max_bytes: usize, timeout_ms: u64) -> Vec<u8> {
+        drain_channel(&self.stderr_buf, max_bytes, timeout_ms)
+    }
+
+    /// Wait for exit up to *timeout_ms*; `Some(code)` on exit, `None` on
+    /// timeout.  Reaps the child on success.
+    pub fn wait(&mut self, timeout_ms: u64) -> Option<i32> {
+        if let Some(child) = self.child.as_mut() {
+            // Best-effort bounded wait: poll the exit status.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => return Some(status.code().unwrap_or(-1)),
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(_) => return Some(-1),
+                }
+            }
+        } else {
+            Some(-1)
+        }
+    }
+
+    /// Whether the child has exited.
+    pub fn is_running(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
+    /// Kill the whole process tree and reap.
+    pub fn kill(&mut self) {
+        self.stdin = None;
+        if let Some(child) = self.child.as_mut() {
+            #[cfg(not(target_os = "windows"))]
+            unsafe {
+                let _ = libc::killpg(self.child_id as i32, libc::SIGKILL);
+            }
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use std::os::windows::io::AsRawHandle;
+                let _ = windows_sys::Win32::System::Threading::TerminateProcess(
+                    child.as_raw_handle() as *mut _,
+                    1,
+                );
+            }
+            let _ = child.wait();
+        }
+        // Windows: dropping the retained job handle reaps survivors
+        // (KILL_ON_JOB_CLOSE) — handled by Drop on the session.
+    }
+}
+
+impl Drop for SandboxSession {
+    fn drop(&mut self) {
+        self.kill();
+        #[cfg(target_os = "windows")]
+        {
+            // Close the job handle last: KILL_ON_JOB_CLOSE reaps the tree.
+            if let Ok(mut h) = self.job_handle.0.lock() {
+                if *h != 0 {
+                    unsafe {
+                        windows_sys::Win32::Foundation::CloseHandle(*h as *mut _);
+                    }
+                    *h = 0;
+                }
+            }
+        }
+    }
+}
+
+/// macOS profile application shared by the one-shot and session paths.
+#[cfg(target_os = "macos")]
+fn apply_macos_profile(
+    cmd: &mut std::process::Command,
+    ws: &str,
+) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::process::CommandExt as _;
+
+    extern "C" {
+        fn sandbox_init(
+            profile: *const std::os::raw::c_char,
+            flags: u64,
+            errorbuf: *mut *mut std::os::raw::c_char,
+        ) -> i32;
+        fn sandbox_free_error(errorbuf: *mut std::os::raw::c_char);
+    }
+
+    const SANDBOX_NAMED: u64 = 1;
+
+    let escaped = ws.replace('\\', "/");
+    let profile = format!(
+        "(version 1)\n\
+         (deny default)\n\
+         (allow file-read* file-write* (subpath \"{ws}\"))\n\
+         (allow file-read* (subpath \"/usr/lib\"))\n\
+         (allow file-read* (subpath \"/System/Library\"))\n\
+         (allow file-read* (literal \"/usr/share\"))\n\
+         (allow process-fork)\n\
+         (allow signal (target self))\n\
+         (allow sysctl-read)\n\
+         (allow file-read-metadata)\n\
+         (import \"system.sb\")\n",
+        ws = escaped,
+    );
+
+    unsafe {
+        cmd.pre_exec(move || {
+            let c_profile = CString::new(profile.as_str())
+                .map_err(|_| std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "NUL in profile",
+                ))?;
+            let mut errorbuf: *mut std::os::raw::c_char = std::ptr::null_mut();
+            let rv = sandbox_init(c_profile.as_ptr(), SANDBOX_NAMED, &mut errorbuf);
+            if rv != 0 {
+                let msg = if !errorbuf.is_null() {
+                    let s = std::ffi::CStr::from_ptr(errorbuf)
+                        .to_string_lossy().into_owned();
+                    sandbox_free_error(errorbuf);
+                    s
+                } else {
+                    format!("sandbox_init err {}", rv)
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied, msg,
+                ));
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_plugin_profile(
+    cmd: &mut std::process::Command,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::process::CommandExt as _;
+
+    extern "C" {
+        fn sandbox_init(
+            profile: *const std::os::raw::c_char,
+            flags: u64,
+            errorbuf: *mut *mut std::os::raw::c_char,
+        ) -> i32;
+        fn sandbox_free_error(errorbuf: *mut std::os::raw::c_char);
+    }
+
+    const SANDBOX_NAMED: u64 = 1;
+    let mut rules = String::from(
+        "(version 1)\n(deny default)\n\
+         (allow process-fork)\n\
+         (allow signal (target self))\n\
+         (allow sysctl-read)\n\
+         (allow file-read-metadata)\n\
+         (import \"system.sb\")\n",
+    );
+    for p in read_paths {
+        let escaped = p.replace('\\', "/");
+        rules.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+    }
+    for p in write_paths {
+        let escaped = p.replace('\\', "/");
+        rules.push_str(&format!(
+            "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
+        ));
+    }
+
+    unsafe {
+        cmd.pre_exec(move || {
+            let c_profile = CString::new(rules.as_str()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in profile")
+            })?;
+            let mut errorbuf: *mut std::os::raw::c_char = std::ptr::null_mut();
+            let rv = sandbox_init(c_profile.as_ptr(), SANDBOX_NAMED, &mut errorbuf);
+            if rv != 0 {
+                let msg = if !errorbuf.is_null() {
+                    let s = std::ffi::CStr::from_ptr(errorbuf)
+                        .to_string_lossy()
+                        .into_owned();
+                    sandbox_free_error(errorbuf);
+                    s
+                } else {
+                    format!("sandbox_init err {rv}")
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    msg,
+                ));
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+/// Windows: create the job and assign the child, retaining the handle in the
+/// returned box (0 = creation/assignment failed → honest "none").
+#[cfg(target_os = "windows")]
+fn _attach_windows_job_retained(child: &mut std::process::Child) -> std::sync::Mutex<isize> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::JobObjects::*;
+
+    let retained: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job == INVALID_HANDLE_VALUE {
+            return retained;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Fork-bomb protection: at most 64 live processes in the tree.
+        info.BasicLimitInformation.ActiveProcessLimit = 64;
+
+        let mut ui_restrict: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
+        ui_restrict.UIRestrictionsClass =
+            JOB_OBJECT_UILIMIT_NONE
+            | JOB_OBJECT_UILIMIT_HANDLES
+            | JOB_OBJECT_UILIMIT_READCLIPBOARD
+            | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+            | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+            | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+            | JOB_OBJECT_UILIMIT_GLOBALATOMS
+            | JOB_OBJECT_UILIMIT_DESKTOP
+            | JOB_OBJECT_UILIMIT_EXITWINDOWS;
+
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        SetInformationJobObject(
+            job,
+            JobObjectBasicUIRestrictions,
+            &ui_restrict as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+        );
+
+        let proc_handle = child.as_raw_handle();
+        if AssignProcessToJobObject(job, proc_handle as *mut _) != 0 {
+            if let Ok(mut h) = retained.lock() {
+                *h = job as isize;
+            }
+        } else {
+            // Assignment failed: close the job immediately so the child is
+            // NOT left under a kill-on-close job that outlives the session.
+            windows_sys::Win32::Foundation::CloseHandle(job);
+        }
+    }
+    retained
 }
 
 /// Write a file inside the sandbox (path-bounded) atomically.

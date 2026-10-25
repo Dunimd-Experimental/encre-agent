@@ -1,7 +1,7 @@
 {
   "name": "encre-help",
   "private": true,
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Encre Agent Desktop - User Documentation",
   "scripts": {
     "dev": "vitepress dev",

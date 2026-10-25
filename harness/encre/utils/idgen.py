@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Deterministic, hierarchical id generator for sessions, branches and entities.
 
 Every id produced by :class:`BranchIDGenerator` follows the same colon-delimited
@@ -32,7 +34,12 @@ where ``entity_type`` is a short tag (``M`` for messages, ``TC`` for tool calls,
 ``AF`` for artifacts, ``CP`` for compacted snapshots, ``B`` for branches, ...).
 Keeping ids structured this way lets the rest of the system group, route and
 debug events without an extra lookup table.
+
+The format is the persisted on-disk format for session history (session JSONL
+message ids, branch records and compaction checkpoints all embed it), so it
+must remain stable across releases.
 """
+
 
 class BranchIDGenerator:
     """Generate IDs in format {session_id}:{branch_id}:{entity_type}:{local_id}"""

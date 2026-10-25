@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,17 +23,13 @@
 
 from __future__ import annotations
 
-"""End-to-end test: adapter -> gateway client -> server -> EventRouter -> back.
+"""End-to-end tests of the full message round trip: adapter -> gateway client -> server -> EventRouter -> back.
 
-Simulates the full QQ/Telegram message flow:
-1. Adapter receives a message and calls handle_message (or process_with_stream)
-2. GatewayClient sends SUBMIT_STREAM frame (with or without source)
-3. GatewayServer._handle_submit_stream resolves session and calls EventRouter
-4. EventRouter runs a fake agent (no real LLM) and yields events
-5. Events flow back to the adapter via GatewayClient
-6. Adapter.process_with_stream sends the final response via adapter.send()
-
-This catches any "message processed but no response sent back" bugs.
+Simulates a QQ/Telegram-style flow: an adapter submits a message over the WS
+bridge, the server resolves (or creates) a session and calls EventRouter with a
+fake agent that yields canned events, and the streamed response flows back to
+the adapter. These tests exist to catch the "message processed but never sent
+back" class of bug, and are skipped until the WS bridge protocol is aligned.
 """
 
 import asyncio
@@ -57,39 +53,48 @@ from encre.server.session_manager import SessionManager
 from encre.utils.types import Finish, TextDelta
 
 
-# ── Stub adapter that records sends ────────────────────────────────────
+# ---- Stub adapter that records sends ----
 
 
 class _StubAdapter:
-    """Adapter stub that connects to WsBridgeServer via GatewayClient.
+    """Adapter stub that talks to a WsBridgeServer through a GatewayClient.
 
-    This simulates a remote adapter connecting over WebSocket.
-    It records all received responses in self.sent.
+    Stands in for a remote adapter connected over WebSocket and records every
+    response it receives in self.sent so assertions can inspect what was sent.
     """
 
     name = "test"
 
     def __init__(self, gateway_url="ws://127.0.0.1:18799/gateway"):
+        """Create the outbound client and per-adapter state."""
         self._client = GatewayClient(gateway_url)
         self.sent: list[tuple[str, str]] = []
         self._message_handler = None
 
     def set_message_handler(self, handler):
+        """Register an optional handler that intercepts incoming MessageEvents."""
         self._message_handler = handler
 
     async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+        """Record the outbound message and report success."""
         self.sent.append((chat_id, content))
         return SendResult(success=True, message_id="m1")
 
     async def connect(self, *, is_reconnect=False) -> bool:
+        """Open the WebSocket connection to the gateway."""
         await self._client.connect()
         return True
 
     async def disconnect(self) -> None:
+        """Close the WebSocket connection to the gateway."""
         await self._client.disconnect()
 
     async def process_with_stream(self, text, chat_id, session_id=None, *, source=None):
-        """Submit via WS and collect responses."""
+        """Submit the text over the bridge and accumulate streamed responses.
+
+        Concatenates every text delta and, if anything was produced, records the
+        assembled response as a sent message for chat_id.
+        """
         response_text = ""
         async for event in self._client.submit_stream(text, source=source.to_dict() if source else None):
             if hasattr(event, 'text'):
@@ -98,7 +103,11 @@ class _StubAdapter:
             self.sent.append((chat_id, response_text))
 
     async def handle_message(self, event):
-        """Route through handler or fallback to process_with_stream."""
+        """Dispatch an incoming event to the handler, or fall back to streaming.
+
+        If a custom handler is registered it is invoked; otherwise the adapter
+        derives a chat id from the event source and streams the message itself.
+        """
         source = event.source
         chat_id = source.chat_id if source else ""
         if self._message_handler:
@@ -107,17 +116,23 @@ class _StubAdapter:
             await self.process_with_stream(event.text, chat_id, source=source)
 
 
-# ── Fake agent that yields canned events ───────────────────────────────
+# ---- Fake agent that yields canned events ----
 
 
 class _FakeAgent:
-    """Minimal agent mock that covers every attribute/method EventRouter
-    accesses on EncreAgent.  No real LLM is called."""
+    """Minimal agent double covering everything EventRouter reads from EncreAgent.
+
+    Provides the session, telemetry, and loop attributes plus run()/add_message()
+    so the router can be exercised without contacting a real LLM.
+    """
 
     def __init__(self, response_text: str = "Hello from agent"):
+        """Store the canned response text that run() will stream back."""
         self._text = response_text
 
     class _FakeSession:
+        """Stand-in session exposing the metadata dict the router mutates."""
+
         metadata = {"channel": "test"}
 
     session = _FakeSession()
@@ -125,32 +140,32 @@ class _FakeAgent:
     loop = type("obj", (object,), {"cancel": lambda: None})()
 
     def add_message(self, role: str, content: str) -> None:
+        """Accept a conversation turn and discard it, since no history is kept."""
         pass
 
     async def run(self, *, prompt, system_prompt=None, custom_instructions=None):
+        """Yield a single TextDelta followed by a Finish event."""
         yield TextDelta(text=self._text)
         yield Finish(reason="done")
 
 
-# ── End-to-end test ────────────────────────────────────────────────────
+# ---- End-to-end tests ----
 
 
 @pytest.mark.asyncio
 async def test_verify_legacy_path_no_source_returns_response():
-    """Validate that the legacy (no-source) flow delivers a response.
+    """The legacy no-source path must still deliver the agent's response.
 
-    The test exercises the QQ-style path where process_with_stream is called
-    without an explicit source object.  It expects the adapter to receive at
-    least one sent message containing the agent's canned response because the
-    legacy path must remain functional while the newer source-aware path
-    matures.
+    Submits a message with no source object (the old QQ-style flow) and asserts
+    the adapter records at least one sent message containing the canned reply,
+    so the legacy path cannot silently drop responses.
     """
     import os
 
-    # Pick a unique port to avoid conflicts.
+    # Fixed port; the three e2e tests use distinct ports to avoid conflicts.
     port = 18799
 
-    # 1. Set up the server side.
+    # 1. Build the server-side routing stack.
     sm = SessionManager()
     config = EncreConfig()
     from encre.protocol.session_router import EventRouter
@@ -158,10 +173,11 @@ async def test_verify_legacy_path_no_source_returns_response():
     router = EventRouter(sm, config)
     store = SessionStore(db_path=Path("/tmp/encre_test_routing.db"))
 
-    # Override adapter session creation to use the fake agent.
+    # Replace adapter session creation so every session carries the fake agent.
     original_create = sm.create_session
 
     def fake_create(*a, **kw):
+        """Create a real session, then swap in the fake agent."""
         info = original_create(*a, **kw)
         info.agent = _FakeAgent("Hello from agent")
         return info
@@ -169,10 +185,13 @@ async def test_verify_legacy_path_no_source_returns_response():
     sm.create_session = fake_create
 
     class _Engine:
+        """Runner stub exposing only what WsBridgeServer needs on this path."""
+
         _router = router
         _session_store = store
 
         async def ensure_adapter_session(self, name):
+            """Allocate a session for the adapter and return its id."""
             info = sm.create_session(config=config)
             return info.session_id
 
@@ -187,10 +206,10 @@ async def test_verify_legacy_path_no_source_returns_response():
     await adapter._client.connect()
     await asyncio.sleep(0.5)  # let the handshake complete
 
-    # 4. Simulate QQ-style: process_with_stream without source.
+    # 4. Simulate the legacy QQ-style call: no source argument at all.
     await adapter.process_with_stream("hello", "chat-1", session_id=None)
 
-    # 5. Verify the adapter received the response.
+    # 5. Confirm the response came back through the bridge.
     assert len(adapter.sent) >= 1, f"Expected response sent, got {adapter.sent}"
     chat_id, text = adapter.sent[0]
     assert chat_id == "chat-1"
@@ -204,13 +223,11 @@ async def test_verify_legacy_path_no_source_returns_response():
 
 @pytest.mark.asyncio
 async def test_verify_handle_message_no_handler_fallback_returns_response():
-    """Validate that handle_message falls back to process_with_stream cleanly.
+    """handle_message must fall back to streaming when no handler is registered.
 
-    The test calls handle_message without setting a custom _message_handler,
-    which forces the adapter into its fallback path that builds a source from
-    the incoming event and calls process_with_stream.  It expects at least one
-    sent message because the fallback must remain operational when no handler
-    is registered.
+    Without a custom _message_handler the adapter builds a source from the
+    incoming event and streams it, so the adapter must still record a response
+    for chat-2.
     """
     import os
     from pathlib import Path
@@ -226,6 +243,7 @@ async def test_verify_handle_message_no_handler_fallback_returns_response():
     original_create = sm.create_session
 
     def fake_create(*a, **kw):
+        """Create a real session, then swap in the fake agent."""
         info = original_create(*a, **kw)
         info.agent = _FakeAgent("Response from handle_message")
         return info
@@ -233,11 +251,15 @@ async def test_verify_handle_message_no_handler_fallback_returns_response():
     sm.create_session = fake_create
 
     class _Engine:
+        """Runner stub that resolves sessions through the session store."""
+
         _router = router
         _session_store = store
 
         async def resolve_session(self, conn, source):
+            """Look up or create a session for the given source."""
             def _create():
+                """Allocate the session and stamp its metadata with the source."""
                 info = sm.create_session(config=config)
                 info.metadata["source"] = source.to_dict()
                 info.metadata["channel"] = source.platform
@@ -258,7 +280,7 @@ async def test_verify_handle_message_no_handler_fallback_returns_response():
     await adapter._client.connect()
     await asyncio.sleep(0.5)
 
-    # handle_message without _message_handler -> fallback to process_with_stream with source.
+    # No _message_handler set, so handle_message uses the fallback path with source.
     event = MessageEvent(
         text="hello from handle_message",
         source=SessionSource(platform="test", chat_id="chat-2", chat_type="dm", user_id="u1"),
@@ -277,12 +299,11 @@ async def test_verify_handle_message_no_handler_fallback_returns_response():
 
 @pytest.mark.asyncio
 async def test_verify_handle_message_with_handler_returns_response():
-    """Validate that a registered _message_handler intercepts and processes the event.
+    """A registered handler must be invoked and must still produce a response.
 
-    The test registers a handler that delegates to process_with_stream and then
-    asserts the handler flag is set and a response is recorded.  This covers the
-    normal adapter-driven path where custom handlers are used for pre/post
-    processing before the gateway flow begins.
+    Registers a handler that delegates to process_with_stream, then asserts the
+    handler ran and that the canned reply was recorded for chat-3, covering the
+    normal adapter-driven path with custom pre/post processing.
     """
     port = 18797
     sm = SessionManager()
@@ -295,6 +316,7 @@ async def test_verify_handle_message_with_handler_returns_response():
     original_create = sm.create_session
 
     def fake_create(*a, **kw):
+        """Create a real session, then swap in the fake agent."""
         info = original_create(*a, **kw)
         info.agent = _FakeAgent("Handler response")
         return info
@@ -302,11 +324,15 @@ async def test_verify_handle_message_with_handler_returns_response():
     sm.create_session = fake_create
 
     class _Engine:
+        """Runner stub that resolves sessions through the session store."""
+
         _router = router
         _session_store = store
 
         async def resolve_session(self, conn, source):
+            """Look up or create a session for the given source."""
             def _create():
+                """Allocate the session and stamp its metadata with the source."""
                 info = sm.create_session(config=config)
                 info.metadata["source"] = source.to_dict()
                 info.metadata["channel"] = source.platform
@@ -327,10 +353,11 @@ async def test_verify_handle_message_with_handler_returns_response():
     await adapter._client.connect()
     await asyncio.sleep(0.5)
 
-    # Set a message handler that runs the normal flow.
+    # Install a handler that runs the normal streaming flow.
     handler_called = False
 
     async def handler(event):
+        """Flag the handler call and delegate to the adapter's streaming path."""
         nonlocal handler_called
         handler_called = True
         # Delegate to process_with_stream (the normal adapter-driven path).

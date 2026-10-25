@@ -28,7 +28,7 @@ Using any Dunimd service constitutes acceptance of these terms together with the
 | Service | Description |
 |---|---|
 | Encre Agent Desktop | Local-first AI agent application (Windows/macOS/Linux) |
-| Encre Agent Framework | Python framework + Rust native core (github.com/mf2023/Encre) |
+| Encre Agent | Python gateway + Rust native core (github.com/mf2023/Encre) |
 | Chat-platform integrations | Connectors for 18 chat platforms |
 | PiscesLx | Hosted LLM inference (subscription, optional) |
 | StadionOS | Operating-system project (separate licence) |

@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -35,11 +35,17 @@ Exports:
   iteration, projected over the backbone (the single contract between the
   loop and every event consumer: frontend transport, plugin taps, telemetry).
 * ``PHASE_*`` constants -- well-known phase names.
+* ``KIND_CONFIG_RELOADED`` -- the kind published on the backbone when a live
+  loop re-applies its configuration (see :mod:`encre.loop.hot_reload`).
 * Session-lifecycle events (:mod:`~encre.events.lifecycle`) -- typed
-  ``SessionEvent`` dataclasses published through the backbone.
+  ``SessionEvent`` dataclasses published through the backbone, including
+  :class:`ConfigReloaded` for a hot reload.
+* Wire projection (:mod:`~encre.events.wire`) -- the single source of truth
+  that maps an ``AgentEvent`` onto the frame every transport ships.
 """
 
 from encre.events.ledger import (
+    KIND_CONFIG_RELOADED,
     PHASE_PRE_MODEL_REQUEST,
     PHASE_SESSION_END,
     PHASE_SESSION_START,
@@ -50,6 +56,7 @@ from encre.events.ledger import (
 )
 from encre.events.lifecycle import (
     CheckpointCreated,
+    ConfigReloaded,
     SessionEnded,
     SessionEvent,
     SessionStarted,
@@ -58,11 +65,20 @@ from encre.events.lifecycle import (
     UserMessagePersisted,
 )
 from encre.events.stream import EventStream
+from encre.events.wire import (
+    SessionSnapshot,
+    SnapshotNeed,
+    WireFrame,
+    project_event,
+    session_snapshot_need,
+)
 
 __all__ = [
     "CheckpointCreated",
+    "ConfigReloaded",
     "EventSourcedBus",
     "EventStream",
+    "KIND_CONFIG_RELOADED",
     "LedgerEvent",
     "PHASE_PRE_MODEL_REQUEST",
     "PHASE_SESSION_END",
@@ -71,8 +87,13 @@ __all__ = [
     "PHASE_TURN_START",
     "SessionEnded",
     "SessionEvent",
+    "SessionSnapshot",
     "SessionStarted",
+    "SnapshotNeed",
     "TurnEnded",
     "TurnStarted",
     "UserMessagePersisted",
+    "WireFrame",
+    "project_event",
+    "session_snapshot_need",
 ]

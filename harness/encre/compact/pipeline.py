@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -28,7 +28,13 @@ a single :class:`CompactionPipeline`.  Stages run synchronously in
 pipeline order, each feeding its transformed message list into the next,
 so budget/collapse/microcompact/snip effects actually reach the API call.
 Autocompact itself is triggered as a synchronous step in the caller.
+
+Evidence markers contributed by the loop (verification evidence, plan
+state) can be passed via ``protected_texts`` and survive the
+deterministic stages verbatim.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -49,6 +55,12 @@ class StageResult:
     detail: str = ""
 
 
+#: Stages that only *decide* whether a later, separate compaction should run.
+#: They never rewrite the message list, so ``did_work`` on them must not be
+#: read as "the messages changed".
+_DECISION_ONLY_STAGES = frozenset({"autocompact"})
+
+
 @dataclass
 class PipelineReport:
     stages: list[StageResult] = field(default_factory=list)
@@ -63,20 +75,45 @@ class PipelineReport:
     def total_tokens_saved(self) -> int:
         return sum(s.tokens_before - s.tokens_after for s in self.stages if s.did_work)
 
+    @property
+    def changed(self) -> bool:
+        """Whether any rewriting stage actually modified the message list.
+
+        This is the authoritative "did the pipeline alter the conversation?"
+        signal.  ``messages`` is always *some* list -- :meth:`CompactionPipeline.run`
+        builds new list objects at every stage boundary -- so callers must
+        never infer change from object identity; they must ask this property.
+        Reading it as identity is what made the loop rewrite the session
+        branch (and rebind ``session.messages``) on every single turn even
+        when nothing was compacted.
+
+        The decision-only stages (:data:`_DECISION_ONLY_STAGES`) are excluded:
+        ``autocompact`` merely reports that a separate compaction *should* run
+        and leaves the list untouched.
+        """
+        return any(
+            s.did_work for s in self.stages if s.name not in _DECISION_ONLY_STAGES
+        )
+
 
 class CompactionPipeline:
     """Unified compression pipeline.
 
     Usage::
 
-        pipeline = CompactionPipeline()
+        pipeline = CompactionPipeline(compact_engine)
         report = await pipeline.run(messages, backend=backend, config=config)
         if report.needs_compact:
             # schedule async compact task (caller's responsibility)
     """
 
-    def __init__(self) -> None:
-        self._compact_engine: Any = None
+    def __init__(self, compact_engine: Any = None) -> None:
+        # Share the caller's CompactEngine: circuit-breaker counters,
+        # cooldowns and the pre-compact cache live on the engine, so a
+        # privately-constructed second instance would split-brain those
+        # against the loop's own engine.  When omitted, an engine is
+        # lazily constructed for standalone use.
+        self._compact_engine: Any = compact_engine
 
     async def run(
         self,
@@ -85,13 +122,25 @@ class CompactionPipeline:
         backend: Any,
         config: Any,
         extra_tokens: int = 0,
+        compact_engine: Any = None,
+        protected_texts: list[str] | None = None,
     ) -> PipelineReport:
         """Run the compression pipeline.
 
         ``extra_tokens`` is the fixed per-request overhead (system prompt +
         tool schemas) added to the autocompact trigger check so it compares
         the REAL request size against the window, not just the messages.
+
+        ``compact_engine`` optionally injects the caller's existing
+        :class:`~encre.compact.engine.CompactEngine` so the pipeline stages
+        share its state with the rest of the loop.
+
+        ``protected_texts`` carries core-contributed evidence markers
+        (verification evidence, plan state): tool results containing any of
+        them survive microcompact verbatim.
         """
+        if compact_engine is not None:
+            self._compact_engine = compact_engine
         report = PipelineReport(messages=list(messages))
         window = backend.context_window_size() if backend else 128_000
         est_tokens = _count_tokens(messages)
@@ -111,7 +160,9 @@ class CompactionPipeline:
                 est_tokens = s.tokens_after
 
         # Stage 2: microcompact
-        s, messages = await self._stage_microcompact(messages, window, est_tokens)
+        s, messages = await self._stage_microcompact(
+            messages, window, est_tokens, protected_texts=protected_texts,
+        )
         report.add_stage(s)
         if s.did_work:
             est_tokens = s.tokens_after
@@ -218,12 +269,18 @@ class CompactionPipeline:
         messages: list[dict[str, Any]],
         window: int,
         est_tokens: int,
+        protected_texts: list[str] | None = None,
     ) -> tuple[StageResult, list[dict[str, Any]]]:
         engine = self._get_compact_engine()
         if engine.should_microcompact(messages, window):
-            micro = await engine.microcompact(messages, window)
-            if len(micro) != len(messages):
-                new_tokens = _count_tokens(micro)
+            micro = await engine.microcompact(
+                messages, window, protected_texts=protected_texts,
+            )
+            # microcompact truncates content in place without dropping
+            # messages, so message count is not a work signal -- compare
+            # token estimates before/after instead.
+            new_tokens = _count_tokens(micro)
+            if new_tokens < est_tokens:
                 return (
                     StageResult(
                         name="microcompact",
@@ -254,7 +311,7 @@ class CompactionPipeline:
         est_tokens: int,
     ) -> tuple[StageResult, list[dict[str, Any]]]:
         try:
-            from encre.compact.strategies import EncreSnipStrategy
+            from encre.compact.engine import EncreSnipStrategy
 
             snipper = EncreSnipStrategy()
             if await snipper.should_compact(messages, window):

@@ -1,0 +1,56 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-connector-mattermost"
+version = "0.5.0"
+description = "EA (Encre Agent) — system-default Mattermost connector plugin."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "connector",
+    "mattermost",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+    "encre-core>=0.5.0",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.entry-points."ea.plugins"]
+mattermost = "ea_connector_mattermost.plugin:create_plugin"
+
+[project.optional-dependencies]
+all = [
+    "aiohttp>=3.9",
+]
+
+[tool.ea]
+icon = "message-circle"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_connector_mattermost*",
+]

@@ -4,4 +4,4 @@ IMPORTANT: You must always respond to the USER in English throughout the entire 
 
 ### Sub-Agent Communication: English Only
 
-When you delegate tasks to sub-agents (via the `agent` or `swarm` tools), write the delegation prompt in English. Sub-agents think, reason, and respond in English for reliable state matching and output parsing.
+When you delegate tasks to sub-agents (via the `agent` or `workflow` tools), write the delegation prompt in English. Sub-agents think, reason, and respond in English for reliable state matching and output parsing.

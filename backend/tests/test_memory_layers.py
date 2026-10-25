@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,24 +23,21 @@
 
 from __future__ import annotations
 
-"""Tests for layered memory and consolidation (Task 4).
+"""Tests for the layered memory store and its consolidation rules.
 
-The store under test is the real :class:`MemoryLayerStore`: the real
-:class:`MemoryConsolidator` (entry-level dedupe), the real encrypted
+The store under test is the real :class:`MemoryLayerStore`, backed by the real
+entry-level :class:`MemoryConsolidator`, real encrypted
 :mod:`encre.secure_io` persistence, the real append-only
 :class:`EventSourcedBus`, and the real :class:`SignificanceJudge`.  No mock
-store, consolidator or bus is used.
+store, consolidator or bus is substituted.
 
-Covered invariants:
-
-1. all five memory kinds round-trip, and :class:`MemoryEntry` serialisation is
-   lossless;
-2. a repeated pattern consolidates to exactly one long-term memory;
-3. a one-off, unreferenced candidate is evicted (never reaches long-term);
-4. a candidate that is re-referenced (link / retrieval hit) is promoted;
-5. ``attach(bus)`` intakes ``memory_candidate`` events and is idempotent;
-6. layer files are encrypted at rest and survive a reload unchanged;
-7. content that never clears the significance threshold produces no memory.
+The suite pins down that all memory kinds round-trip losslessly through
+serialisation, that a repeated pattern consolidates to exactly one long-term
+memory, that unreferenced one-off candidates are evicted by capacity or TTL
+while re-referenced ones are promoted, that ``attach(bus)`` intakes
+``memory_candidate`` events idempotently and swallows malformed payloads, that
+layer files are ciphertext at rest and reload identically, and that
+below-threshold content never produces a memory at all.
 """
 
 import json
@@ -72,13 +69,13 @@ _ONE_OFF_LISTING = "\n".join([
     "tests/test_a.py",
 ])
 
-#: A user correction -- high significance, becomes a candidate.
+#: A user correction: high significance, which should become a candidate.
 _USER_CORRECTION = "我们项目的端口固定用 8080，不要再用 3000 了"
 
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
-    """A layer store rooted in a temp tree, with the data dir isolated."""
+    """Layer store rooted in a temp tree, with the data directory isolated."""
     monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "data"))
     return MemoryLayerStore(root=tmp_path / "memory")
 
@@ -87,11 +84,11 @@ def _candidate(
     content: str,
     *,
     significance: float = 0.7,
-    suggested_type: str = "semantic",
+    suggested_type: str = "fact",
     session_id: str = "sess-1",
     refs: list[str] | None = None,
 ) -> MemoryCandidate:
-    """Build a judged candidate (the shape the judge publishes)."""
+    """Build a judged candidate in the exact shape the judge publishes."""
     return MemoryCandidate(
         content=content,
         significance=significance,
@@ -103,25 +100,27 @@ def _candidate(
 
 
 # ----------------------------------------------------------------------
-# 1. Five layers + lossless entry serialisation
+# 1. Memory kinds + lossless entry serialisation
 # ----------------------------------------------------------------------
 
 
-def test_five_memory_kinds_exist():
-    """The enum carries exactly the five kinds from the spec."""
+def test_memory_kinds_exist():
+    """The enum carries exactly the node kinds defined by the spec."""
     assert {m.value for m in MemoryType} == {
-        "working", "episodic", "semantic", "procedural", "autobiographical",
+        "working", "fact", "preference", "decision", "lesson", "entity", "episode",
     }
 
 
-def test_all_five_layers_write_and_read_back(store):
-    """Each of the five kinds persists and reloads through one schema."""
+def test_all_layers_write_and_read_back(store):
+    """Each long-term kind persists and reloads through a single schema."""
     written: dict[str, MemoryEntry] = {}
     for memory_type in (
-        MemoryType.EPISODIC,
-        MemoryType.SEMANTIC,
-        MemoryType.PROCEDURAL,
-        MemoryType.AUTOBIOGRAPHICAL,
+        MemoryType.FACT,
+        MemoryType.PREFERENCE,
+        MemoryType.DECISION,
+        MemoryType.LESSON,
+        MemoryType.ENTITY,
+        MemoryType.EPISODE,
     ):
         entry = MemoryEntry(
             content=f"durable memory of kind {memory_type.value}",
@@ -140,17 +139,19 @@ def test_all_five_layers_write_and_read_back(store):
     store.reload()
 
     for memory_type in (
-        MemoryType.EPISODIC,
-        MemoryType.SEMANTIC,
-        MemoryType.PROCEDURAL,
-        MemoryType.AUTOBIOGRAPHICAL,
+        MemoryType.FACT,
+        MemoryType.PREFERENCE,
+        MemoryType.DECISION,
+        MemoryType.LESSON,
+        MemoryType.ENTITY,
+        MemoryType.EPISODE,
     ):
         entries = store.by_type(memory_type)
         assert [e.id for e in entries] == [written[memory_type.value].id]
         assert entries[0].content == written[memory_type.value].content
         assert entries[0].memory_type is memory_type
 
-    assert len(store.long_term()) == 4
+    assert len(store.long_term()) == 6
     restored_working = store.load_working()
     assert restored_working.current_goal == "ship the unified memory layers"
     assert "reused, not redefined" in " ".join(restored_working.findings)
@@ -160,13 +161,13 @@ def test_memory_entry_serialisation_round_trip():
     """MemoryEntry survives a JSON round trip with every field intact."""
     entry = MemoryEntry(
         content="the deploy pipeline is reproducible",
-        type=MemoryType.PROCEDURAL.value,
+        type=MemoryType.LESSON.value,
         importance=0.83,
         created_at=1700000000.5,
         links=[
             MemoryLink(
                 target_id="abc123",
-                relation=LinkRelation.DEPENDENCY.value,
+                relation=LinkRelation.SUPPORTS.value,
                 weight=0.75,
                 created_at=1700000001.0,
             ),
@@ -196,14 +197,14 @@ def test_memory_entry_serialisation_round_trip():
 def test_repeated_candidate_consolidates_to_single_long_term(store):
     """A pattern seen twice yields one merged long-term memory, not two."""
     text = "deploy always uses the blue environment"
-    first = store.intake(_candidate(text, suggested_type="procedural"))
+    first = store.intake(_candidate(text, suggested_type="lesson"))
     original_importance = first.importance
 
-    # First sighting: buffered only, no long-term memory yet.
+    # First sighting is buffered only; no long-term memory exists yet.
     assert [e.id for e in store.buffer()] == [first.id]
     assert store.long_term() == []
 
-    second = store.intake(_candidate(text, suggested_type="procedural"))
+    second = store.intake(_candidate(text, suggested_type="lesson"))
     assert second.id == first.id
 
     long_term = store.long_term()
@@ -214,21 +215,21 @@ def test_repeated_candidate_consolidates_to_single_long_term(store):
     assert long_term[0].decay.access_count == 2
     assert long_term[0].importance > original_importance
 
-    # A third sighting merges into the same long-term memory.
-    third = store.intake(_candidate(text, suggested_type="procedural"))
+    # A third sighting merges into that same long-term memory.
+    third = store.intake(_candidate(text, suggested_type="lesson"))
     assert third.id == first.id
     assert len(store.long_term()) == 1
     assert store.long_term()[0].decay.access_count == 3
     assert store.long_term()[0].version >= 3
 
-    # Still a single record after a reload (no duplicate revisions visible).
+    # Still one logical record after a reload: no duplicate revision survives.
     store.reload()
     assert len(store.long_term()) == 1
     assert store.long_term()[0].content == text
 
 
 def test_high_similarity_candidate_merges_instead_of_duplicating(store):
-    """Near-identical content deduplicates via the consolidator's similarity."""
+    """Near-identical content is deduplicated by the consolidator's similarity."""
     base = "the authentication service issues jwt tokens per request"
     variant = "the authentication service issues jwt tokens per request now"
 
@@ -246,7 +247,7 @@ def test_high_similarity_candidate_merges_instead_of_duplicating(store):
 
 
 def test_one_off_candidates_are_evicted_by_capacity(tmp_path, monkeypatch):
-    """Unreferenced candidates overflow the buffer and are dropped."""
+    """Unreferenced candidates overflow the buffer capacity and are dropped."""
     monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "data"))
     store = MemoryLayerStore(root=tmp_path / "memory", buffer_capacity=2)
 
@@ -270,7 +271,7 @@ def test_one_off_candidates_are_evicted_by_capacity(tmp_path, monkeypatch):
 
 
 def test_one_off_candidate_expires_by_ttl(tmp_path, monkeypatch):
-    """A candidate older than the buffer TTL is evicted."""
+    """A candidate older than the buffer TTL is evicted on consolidation."""
     monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "data"))
     store = MemoryLayerStore(root=tmp_path / "memory", buffer_ttl=0.0)
 
@@ -289,7 +290,7 @@ def test_one_off_candidate_expires_by_ttl(tmp_path, monkeypatch):
 
 
 def test_retrieval_hit_promotes_buffered_candidate(store):
-    """A buffered candidate hit by retrieval becomes long-term memory."""
+    """A buffered candidate hit by retrieval is promoted to long-term memory."""
     entry = store.intake(_candidate("the cache layer uses redis"))
     assert store.long_term() == []
 
@@ -303,19 +304,19 @@ def test_retrieval_hit_promotes_buffered_candidate(store):
 
 
 def test_link_reference_promotes_buffered_candidate(store):
-    """A candidate referenced by an explicit link becomes long-term memory."""
+    """A candidate referenced by an explicit link is promoted to long-term."""
     source = store.store(MemoryEntry(
         content="project goal: keep deployments reproducible",
-        type=MemoryType.AUTOBIOGRAPHICAL.value,
+        type=MemoryType.EPISODE.value,
         importance=0.9,
     ))
     target = store.intake(_candidate("the release checklist has seven steps"))
 
-    linked = store.link(source.id, target.id, LinkRelation.SAME_GOAL)
+    linked = store.link(source.id, target.id, LinkRelation.CO_OCCURS)
 
     assert linked is source
     assert source.links[0].target_id == target.id
-    assert source.links[0].relation == "same_goal"
+    assert source.links[0].relation == "co_occurs"
     assert store.buffer() == []
     assert store.get(target.id) is not None
 
@@ -329,7 +330,7 @@ def test_attach_intakes_candidates_and_is_idempotent(store):
     """One subscription per bus: a candidate is intaken exactly once."""
     bus = EventSourcedBus("mem-layers-attach")
     store.attach(bus)
-    store.attach(bus)  # second attach must be a no-op
+    store.attach(bus)  # a second attach must be a no-op
 
     candidate = _candidate("our project always uses port 8080", refs=["msg-7"])
     bus.publish(
@@ -351,12 +352,12 @@ def test_attach_intakes_candidates_and_is_idempotent(store):
     long_term = store.long_term()
     assert len(long_term) == 1
     assert store.buffer() == []
-    # access_count would be 4 with a duplicated subscription; it is 2 with one.
+    # access_count would reach 4 with a duplicated subscription; one gives 2.
     assert long_term[0].decay.access_count == 2
 
 
 def test_attach_survives_malformed_and_empty_events(store):
-    """A malformed payload never raises into the backbone or writes memory."""
+    """A malformed payload never raises into the backbone and never writes."""
     bus = EventSourcedBus("mem-layers-bad-payload")
     store.attach(bus)
 
@@ -378,16 +379,16 @@ def test_layers_are_encrypted_at_rest_and_survive_reload(store):
     """Every layer file is ciphertext on disk and reloads to the same content."""
     text = "the staging database is reset every night"
     store.intake(_candidate(text))
-    store.intake(_candidate(text))  # promote -> long-term file written
+    store.intake(_candidate(text))  # the repeat promotes it -> long-term file written
 
     working = WorkingMemory()
     working.set_goal("verify encryption at rest")
     store.save_working(working)
 
     store.intake(_candidate("an unrelated buffered observation"))
-    assert store.buffer()  # buffer file written too
+    assert store.buffer()  # the buffer file is written too
 
-    long_term_raw = (store.layers_dir / "semantic.jsonl").read_text(encoding="utf-8")
+    long_term_raw = (store.layers_dir / "fact.jsonl").read_text(encoding="utf-8")
     long_term_lines = [line for line in long_term_raw.splitlines() if line.strip()]
     assert long_term_lines
     assert all(is_encrypted(line) for line in long_term_lines)
@@ -413,13 +414,13 @@ def test_layers_are_encrypted_at_rest_and_survive_reload(store):
 
 
 def test_low_significance_content_produces_no_memory(store):
-    """A one-off listing never becomes a candidate, so no memory is written."""
+    """A one-off listing never becomes a candidate, so nothing is written."""
     bus = EventSourcedBus("mem-layers-low-sig")
     judge = SignificanceJudge()
     judge.attach(bus)
     store.attach(bus)
 
-    # Directly: the judge refuses the one-off output.
+    # Direct path: the judge refuses the one-off output outright.
     assert judge.judge(Experience(
         kind="tool_result",
         content=_ONE_OFF_LISTING,
@@ -436,7 +437,7 @@ def test_low_significance_content_produces_no_memory(store):
     assert store.buffer() == []
     assert store.long_term() == []
 
-    # Control: a real correction does flow through the same pipeline.
+    # Control: a genuine correction does flow through the same pipeline.
     bus.publish(
         "user_message",
         session_id="sess-1",

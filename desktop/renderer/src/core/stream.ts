@@ -30,15 +30,17 @@
  * resume/open responses to the right session.
  */
 
-import { ServerEvent, WorkspaceEntry, BranchUpdated, BranchSwitched, BranchRolledBack, UsageStatsEvent, SessionState } from "./types.js";
+import { ServerEvent, WorkspaceEntry, BranchUpdated, BranchSwitched, BranchRolledBack, UsageStatsEvent, SessionState, QueuedSubmitsEvent, QueuedRunStartedEvent } from "./types.js";
+import type { PluginPendingEntry, PluginStateEntry } from "./types.js";
 import * as state from "./state.js";
 import { send, getWorkspaceIntent } from "./ws.js";
 import { Chat } from "../chat/chat.js";
 import { Tools } from "../features/tools.js";
-import { Permissions } from "../features/permissions.js";
+import { Permissions } from "../ui/permissions.js";
 import { Settings } from "../settings/settings.js";
 import { t } from "../features/i18n.js";
 import { Dialog } from "../ui/dialog.js";
+import { pruneStaleKeybinds } from "../ui/keybind-scope.js";
 import { handleEngineInstallRequest, handleEngineInstallProgress } from "../features/engine_install.js";
 import type { WechatScanResultEvent } from "./types.js";
 
@@ -52,9 +54,86 @@ let _automationShowResultCallback: ((data: any) => void) | null = null;
 let _automationStreamCallback: ((event: import("./types.js").AutomationStreamEvent) => void) | null = null;
 /** Progress dialog handle for full data-dir export/import. */
 let _migrationProgress: ReturnType<typeof Dialog.progress> | null = null;
+
+/** Error codes that can leave the local transcript out of step with the
+ *  backend, so the frontend must re-request the authoritative session state.
+ *
+ *  The rollback / branch / retry family is the direct case: the UI truncates
+ *  optimistically before the server answers, so a refusal leaves a ghost
+ *  user message on screen. The lookup and capacity codes mean the request
+ *  was never applied at all, which is the same inconsistency. */
+const RESYNC_ERROR_CODES: ReadonlySet<string> = new Set([
+  "rollback_error",
+  "branch_not_found",
+  "retry_error",
+  "no_session",
+  "busy",
+  "delete_error",
+  "not_found",
+  "invalid_request",
+]);
+
+/** Re-requests the authoritative state for the active session after the
+ *  backend refused a request the UI applied optimistically. Drops the pending
+ *  rollback edit too -- nothing was actually rolled back, so a lingering
+ *  marker would cut whichever message merely sits at the remembered ordinal. */
+function resyncActiveSession(): void {
+  state.clearPendingRollbackEdit();
+  const sid = state.getState().sessionId;
+  if (!sid) return;
+  const rid = crypto.randomUUID();
+  setRequestedSessionId(sid, rid);
+  send({ type: "resume", session_id: sid, request_id: rid } as any);
+}
 /** Registers a callback for WeChat QR code scan results. */
 export function onWechatScanResult(cb: (event: WechatScanResultEvent) => void): void {
   _wechatScanCallback = cb;
+}
+
+/** Serialised pending-plugin confirmation queue (dynamic authorisation). */
+let _pluginConfirmBusy = false;
+const _pluginConfirmQueue: PluginPendingEntry[] = [];
+
+/**
+ * Shows one activation-confirmation dialog per pending third-party plugin,
+ * strictly one at a time, and reports each decision back to the backend.
+ *
+ * The dialog reuses the standard confirm shell (same overlay/card/buttons
+ * as the deletion confirmation) so the design language stays consistent.
+ * Approve imports + activates the plugin; deny drops the inert shell and
+ * the plugin's code is never imported.
+ */
+async function handlePluginConfirmQueue(plugins: PluginPendingEntry[]): Promise<void> {
+  _pluginConfirmQueue.push(...plugins);
+  if (_pluginConfirmBusy) return;
+  _pluginConfirmBusy = true;
+  try {
+    while (_pluginConfirmQueue.length) {
+      const plugin = _pluginConfirmQueue.shift()!;
+      const description = plugin.description ? `\n\n${plugin.description}` : "";
+      const perms = plugin.permissions && plugin.permissions.length
+        ? `\n\n${t("permissions.pluginPerms", { perms: plugin.permissions.join(", ") })}`
+        : "";
+      let approved = false;
+      try {
+        approved = await Dialog.confirm(
+          t("permissions.pluginTitle", { name: plugin.name }),
+          t("permissions.pluginBody", { name: plugin.name, version: plugin.version })
+            + description + perms,
+          {
+            priority: "critical",
+            scope: "session",
+            restore: true,
+          },
+        );
+      } catch {
+        approved = false;
+      }
+      send({ type: "plugin_confirm", name: plugin.name, approved });
+    }
+  } finally {
+    _pluginConfirmBusy = false;
+  }
 }
 
 /** Registers a callback invoked whenever the automation jobs list arrives. */
@@ -91,7 +170,13 @@ export function onAutomationJobCancelled(cb: (jobId: string) => void): void {
 export function onAutomationStreamEvent(cb: (event: import("./types.js").AutomationStreamEvent) => void): void {
   _automationStreamCallback = cb;
 }
-import { applyServerCommands, applyProjectCommands } from "../features/slash_commands.js";
+import { applyServerCommands, applyProjectCommands } from "../ui/slash-commands.js";
+import { resetPluginUi, syncPluginUiProviders } from "../features/plugin_ui.js";
+import { resetPluginContributions, syncPluginContributions } from "../features/plugin_contributions.js";
+import { setPluginInfo } from "./plugin_info.js";
+import { setMarketIndex } from "./market_index.js";
+import { setToolMetaEntries } from "../chat/tool_meta.js";
+import { dispatchServerSignal } from "./server_signals.js";
 
 let chat: Chat | null = null;
 let tools: Tools | null = null;
@@ -100,14 +185,149 @@ let _settings: Settings | null = null;
 let permissionResolve: ((allowed: boolean) => void) | null = null;
 let _sessionGeneration = 0;
 let _requestedSessionId = "";
+/**
+ * Session whose pre-tail history is still owed by a tail-first open.
+ *
+ * Set when a `session_ready` carries `has_earlier_history`, drained when the
+ * matching topic completes. Guards the prepend so a stale or duplicated
+ * backfill can never land in the wrong conversation.
+ */
+let _pendingBackfillSid = "";
+
+/**
+ * Generic topic assembler for the sharded bulk-data channel
+ * (data_begin -> data_shard* -> data_end). ONE reassembly path shared by
+ * every bulk backend payload; consumers register by topic shape below.
+ * A dropped or duplicated shard poisons only its own topic, never others.
+ */
+const _topicBuffers = new Map<string, {
+  meta: Record<string, unknown>;
+  items: any[];
+  nextSeq: number;
+  totalShards: number;
+}>();
+
+function handleDataBegin(topic: string, meta: Record<string, unknown>, totalShards: number): void {
+  _topicBuffers.set(topic, { meta: meta || {}, items: [], nextSeq: 0, totalShards });
+}
+
+function handleDataShard(topic: string, seq: number, items: any[] | undefined): void {
+  const buf = _topicBuffers.get(topic);
+  if (!buf) return;
+  if (seq !== buf.nextSeq) {
+    // Gap: the topic is corrupt (reconnect raced a push). Drop it; the
+    // producer's contract is strict sequential shards, so partial assembly
+    // would silently lose history.
+    _topicBuffers.delete(topic);
+    console.warn("[stream] topic shard gap, dropping:", topic, "expected", buf.nextSeq, "got", seq);
+    return;
+  }
+  if (items && items.length > 0) buf.items.push(...items);
+  buf.nextSeq = seq + 1;
+  // Bootstrap fill: the first shard of a session list is the newest ~80
+  // rows, exactly what the sidebar window shows. Apply it immediately so the
+  // sidebar populates without waiting for all 5k rows; the final assembled
+  // list replaces it at data_end.
+  if (seq === 0 && !_sessionsArrived) {
+    const listTopic = /^sessions:list:(normal|iwork)$/.exec(topic);
+    if (listTopic && buf.items.length > 0) {
+      handleEvent({
+        type: "sessions_list",
+        sessions: buf.items.slice(),
+        channel: listTopic[1],
+      } as unknown as ServerEvent);
+    }
+  }
+}
+
+function handleDataEnd(topic: string): void {
+  const buf = _topicBuffers.get(topic);
+  if (!buf) return;
+  _topicBuffers.delete(topic);
+  // Route the completed topic. New bulk producers add one entry here.
+  // Session lists arrive sharded: thousands of rows would otherwise parse
+  // as one multi-megabyte JSON blob in a single long task.
+  // Generic list-plane sharding: the backend sends any large list panel
+  // under "plane:<frame type>" and names the payload field in meta.
+  const planeMatch = /^plane:([a-z0-9_]+)$/.exec(topic);
+  if (planeMatch) {
+    const kwarg = String(buf.meta.kwarg || "");
+    if (kwarg) {
+      handleEvent({
+        type: planeMatch[1],
+        [kwarg]: buf.items,
+      } as unknown as ServerEvent);
+    }
+    return;
+  }
+  const sessionsTopic = /^sessions:(list:(normal|iwork)|all)$/.exec(topic);
+  if (sessionsTopic) {
+    if (sessionsTopic[1] === "all") {
+      const items = buf.items as Array<Record<string, unknown>>;
+      const normal = items.filter((s) => (s.channel as string) !== "iwork");
+      const iwork = items.filter((s) => (s.channel as string) === "iwork");
+      handleEvent({ type: "sessions_all", normal, iwork } as unknown as ServerEvent);
+    } else {
+      handleEvent({
+        type: "sessions_list",
+        sessions: buf.items,
+        channel: sessionsTopic[2],
+      } as unknown as ServerEvent);
+    }
+    return;
+  }
+  const historyMatch = /^session:(.+):history-backfill$/.exec(topic);
+  if (historyMatch) {
+    const sid = historyMatch[1];
+    if (_pendingBackfillSid === sid && sid === state.getState().sessionId) {
+      _pendingBackfillSid = "";
+      if (buf.items.length > 0) {
+        // Older history arrives after the tail is on screen. Keep the same
+        // deferred treatment for it and upgrade in idle slices; otherwise
+        // prepending a long history re-parsed every block at once.
+        if (chat) chat.deferMarkdown = true;
+        state.prependSessionMessages(buf.items, sid);
+        chat?.requestRender();
+        chat?.beginMarkdownUpgrade();
+        console.log("[stream] history-backfill topic assembled, total:", state.getState().messages.length);
+      }
+    }
+  }
+}
+/**
+ * Session ids with a `resume` request in flight.
+ *
+ * Populated by `setRequestedSessionId` (every resume path calls it right
+ * before sending) and drained when the matching `session_ready` (or an
+ * `error`) frame arrives.  The chat view reads it to distinguish "switched
+ * to a session with no cached transcript, backend is loading it" from
+ * "opened a genuinely empty new chat", so it can show a loading placeholder
+ * instead of either the previous session's stale content or a welcome flash.
+ */
+const _pendingResumes = new Set<string>();
 let _requestedSessionRequestId = "";
 let _activeStreamSessionId = "";
 let _toolCallGeneration: Record<string, number> = {};
-let _validationResolve: (() => void) | null = null;
-let _validationReject: ((reason: string) => void) | null = null;
+/** Whether the agent-control lock was already announced for the current
+ *  turn. Turn-scoped ON PURPOSE: consecutive browser calls in one turn
+ *  (start → result → start → …) must announce ONCE, or every re-sent
+ *  "active" would be treated by main as a fresh operation and silently
+ *  strip a user takeover that happened in between (the "it steals control
+ *  back" bug). Released only at the turn boundary (finish). */
+let _browserControlAnnounced = false;
+let _validationPending = new Map<string, { resolve: (v: any) => void; reject: (r: string) => void }>();
 
 function _hasSessionId(event: { session_id?: string | null }): event is { session_id: string } {
   return typeof event.session_id === "string" && event.session_id.length > 0;
+}
+
+/** Lifecycle identity of a plugin snapshot for signal deduplication. */
+function _pluginStatesSignature(plugins: readonly PluginStateEntry[]): string {
+  let out = "";
+  for (const p of plugins) {
+    out += `${p.name}|${p.version || ""}|${p.state || ""}|${p.installed ? 1 : 0}|${p.enabled === false ? 0 : 1};`;
+  }
+  return out;
 }
 
 function _shouldRejectSessionScopedEvent(event: ServerEvent): boolean {
@@ -148,6 +368,7 @@ function _isSessionBoundStreamEvent(type: ServerEvent["type"]): boolean {
     type === "tool_call_start" ||
     type === "tool_call_delta" ||
     type === "tool_call_end" ||
+    type === "question_request" ||
     type === "tool_progress" ||
     type === "tool_result" ||
     type === "permission_request" ||
@@ -165,7 +386,9 @@ function _isSessionBoundStreamEvent(type: ServerEvent["type"]): boolean {
     type === "plan_resolved" ||
     type === "assistant_boundary" ||
     type === "compact" ||
-    type === "compact_starting";
+    type === "compact_starting" ||
+    type === "retry" ||
+    type === "run_started";
 }
 
 function _requiresExplicitSessionId(type: ServerEvent["type"]): boolean {
@@ -182,7 +405,8 @@ function _requiresExplicitSessionId(type: ServerEvent["type"]): boolean {
 /** Create an assistant message when a queued run starts streaming.
  *  The submit() call only adds the user message (without starting an assistant),
  *  so we detect the transition here: the last message is user and no streaming
- *  assistant exists yet. */
+ *  assistant exists yet.  The prompt queue itself is drained server-side —
+ *  the ``queued_run_started`` event mirrors the transition for queued turns. */
 function _ensureAssistantMessage(sessionId?: string): void {
   const st = state.getState();
   // Bail early if the event belongs to a different session than the one
@@ -190,35 +414,18 @@ function _ensureAssistantMessage(sessionId?: string): void {
   const resolvedSid = sessionId || st.sessionId;
   if (resolvedSid && resolvedSid !== st.sessionId) return;
 
-  let msgs = st.messages;
+  const msgs = st.messages;
   const last = msgs[msgs.length - 1];
-  let shouldSendRun = false;
-  if (last?.role !== "user" && st.queuedPrompts.length > 0 && !st.running) {
-    const qp = st.queuedPrompts[0];
-    state.addUserMessage(qp.text, qp.mode);
-    msgs = state.getState().messages;
-    shouldSendRun = true;
-  }
-  const lastAfter = msgs[msgs.length - 1];
-  if (lastAfter?.role !== "user") return;
-  const streamingAsst = msgs.find(m => m.role === "assistant" && m.isStreaming);
-  if (streamingAsst) return;
+  if (last?.role !== "user") return;
+  // Create the turn's assistant message only when the boundary after the
+  // last user message is still empty.  We deliberately do NOT reuse a
+  // streaming assistant found anywhere earlier in the list: a stale one left
+  // open by a suspended question tool (or a missed finish event) belongs to a
+  // PREVIOUS turn, and appending to it rendered new tool cards up inside the
+  // old turn.  getLastAssistantMessage already stops at the last user
+  // message, so "undefined" here means this turn has no assistant yet.
+  if (state.getLastAssistantMessage()) return;
   state.startAssistantMessage();
-  if (shouldSendRun) {
-    state.setSessionState("running");
-    state.shiftQueuedPrompt();
-    state.setPendingQueueCount(Math.max(0, st.pendingQueueCount - 1));
-    const text = typeof lastAfter.content === "string" ? lastAfter.content : "";
-    if (text) {
-      // Use the explicit session id passed in (already validated above
-      // to match st.sessionId) so we always record the right owner.
-      _activeStreamSessionId = st.sessionId || "";
-      // A brand-new turn: reset the auto-open dismiss guard so the first
-      // sub-agent of this turn opens live again (per the auto-open setting).
-      (window as any).__subAgentAutoOpenDismissed = false;
-      send({ type: "run", prompt: text, session_id: st.sessionId || undefined } as any);
-    }
-  }
 }
 
 function _eventSessionId(event: { session_id?: string }): string {
@@ -229,6 +436,20 @@ function _eventSessionId(event: { session_id?: string }): string {
 export function setRequestedSessionId(sid: string, requestId = ""): void {
   _requestedSessionId = sid;
   _requestedSessionRequestId = requestId;
+  if (sid) _pendingResumes.add(sid);
+}
+
+/**
+ * True while a `resume` for `sid` has been sent and not yet answered.
+ *
+ * Args:
+ *   sid: The session id to check. An empty id is never pending.
+ *
+ * Returns:
+ *   Whether the backend is still loading that session's transcript.
+ */
+export function isResumePending(sid: string): boolean {
+  return !!sid && _pendingResumes.has(sid);
 }
 
 /**
@@ -251,7 +472,9 @@ export function refreshAllData(): void {
   // panel is ever left with stale/empty data after a mode switch.
   send({ type: "list_global_rules" });
   send({ type: "get_memory_list" });
-  send({ type: "list_documents" } as any);
+  send({ type: "get_memory_graph" } as any);
+  send({ type: "get_profile" });
+  send({ type: "library_list" } as any);
   send({ type: "get_usage_stats" });
   send({ type: "automation_list_jobs" });
   send({ type: "list_project_rules" });
@@ -290,7 +513,11 @@ export function pullBootData(): void {
     const st = state.getState();
     if (!st.connected) return;
     if (!("startup_session_mode" in st.settings)) send({ type: "get_config" });
-    if (st.sessionsList.length === 0 && st.allSessions.length === 0) {
+    // Only re-request when the push never materialised.  An *empty* session
+    // list that arrived normally is a complete answer — re-requesting it
+    // makes the backend rebuild and re-broadcast the whole listing for
+    // nothing (and zero-session users hit this on every single launch).
+    if (!_sessionsArrived) {
       send({ type: "list_sessions" });
       send({ type: "list_all_sessions" });
     }
@@ -305,20 +532,48 @@ export function init(c: Chat, t: Tools, p: Permissions, s?: Settings): void {
   tools = t;
   permissions = p;
   _settings = s ?? null;
+  // Replay a channel-mismatched sessions_list once the local mode catches
+  // up with the backend's channel.  Subscribed once here (init runs exactly
+  // once per page load); the callback is a no-op while nothing is stashed.
+  state.subscribe(() => {
+    const pending = _pendingChannelSessions;
+    if (!pending) return;
+    const cur = state.getState().workspaceMode === "iwork" ? "iwork" : "normal";
+    if (pending.channel === cur) {
+      _pendingChannelSessions = null;
+      // Re-dispatch through the normal path: the channel filter now passes,
+      // so this applies the list, tray cache and session-state sync exactly
+      // as an in-order frame would have.
+      handleEvent(pending.event);
+    }
+  }, ["workspaceMode"]);
 }
 
-/** Resolves once model validation has completed. */
-export function waitForModelValidation(): Promise<void> {
+/**
+ * Resolves when the `model_validated` probe payload arrives for the given
+ * correlation id.  Requests are keyed by `requestId` (falling back to the
+ * model id for legacy callers) so several outstanding validations — one per
+ * row in a provider save — can run in parallel and each response is routed
+ * to its own waiter.  The key MUST be unique per request: model ids repeat
+ * across providers (two providers may both list "deepseek-v4-flash"), so
+ * keying by model id alone would orphan earlier waiters until they time out
+ * and abort the whole provider save.
+ *
+ * The per-waiter timeout is intentionally a bit wider than the backend's
+ * worst-case probe budget so a legitimately slow endpoint is not reported
+ * as a client-side timeout.
+ */
+export function waitForModelValidation(modelId: string, requestId?: string): Promise<any> {
+  const key = requestId || modelId;
   return new Promise((resolve, reject) => {
-    _validationResolve = resolve;
-    _validationReject = reject;
+    const entry = { resolve, reject };
+    _validationPending.set(key, entry);
     setTimeout(() => {
-      if (_validationReject) {
-        _validationReject(t("stream.validationTimedOut"));
-        _validationResolve = null;
-        _validationReject = null;
+      if (_validationPending.get(key) === entry) {
+        _validationPending.delete(key);
+        reject(t("stream.validationTimedOut"));
       }
-    }, 30000);
+    }, 75000);
   });
 }
 
@@ -332,18 +587,101 @@ export function waitForModelValidation(): Promise<void> {
  * made the first painted frame arrive while side panels were still churning.
  * Holding them back and applying them in one batch right after the reveal
  * keeps the boot path short without changing what any panel ends up showing
- * (the automation jobs plane is deliberately NOT deferred: the automation view
- * is a first-class startup surface and must be populated when it is revealed).
+ * (the automation jobs and history planes are deliberately NOT deferred: the
+ * automation view is a first-class startup surface and must be fully populated
+ * when it is revealed — entering it must never trigger a per-entry refill).
  */
+/**
+ * Data-application priorities (lower = earlier). Streaming and boot-critical
+ * frames are absent: they apply immediately through the ordered inbound
+ * chain. Everything here is panel/cold data that must never compete with a
+ * render frame — it is applied in idle slices instead.
+ */
+const COLD_PLANE_PRIORITY: Readonly<Record<string, number>> = {
+  // Visible plugin chrome / tool cards: near-term, still idle-only.
+  plugin_ui_sync: 1,
+  plugin_changed: 1,
+  market_catalog: 1,
+  tools_updated: 1,
+  skills_updated: 2,
+  skills_list: 2,
+  automation_jobs_list: 2,
+  automation_job_history: 2,
+  memory_list: 3,
+  memory_graph: 3,
+  library_tree: 3,
+  usage_stats: 3,
+  profile_data: 3,
+  global_rules_list: 4,
+  project_rules_list: 4,
+  project_hooks_list: 4,
+  archived_sessions_list: 4,
+  memory_detail: 4,
+  gitignore_content: 4,
+};
+
+function _planePriority(type: string): number {
+  return COLD_PLANE_PRIORITY[type] ?? 3;
+}
+
+let _coldQueue: ServerEvent[] = [];
+let _coldDraining = false;
+let _coldScheduled = false;
+
+function _scheduleColdDrain(): void {
+  if (_coldDraining || _coldScheduled) return;
+  // Never apply cold planes while the splash window is still settling; the
+  // reveal path drains its own prioritised queue and then kicks this one.
+  if (_bootGateHolding) return;
+  _coldScheduled = true;
+  const run = () => {
+    _coldScheduled = false;
+    _drainColdPlanes();
+  };
+  const ric = (window as any).requestIdleCallback as
+    | ((cb: () => void, opts?: { timeout: number }) => number)
+    | undefined;
+  if (ric) ric(run, { timeout: 400 });
+  else window.setTimeout(run, 16);
+}
+
+/** Apply queued cold planes in priority order, ~8ms per idle slice. */
+function _drainColdPlanes(): void {
+  if (_coldDraining) return;
+  _coldDraining = true;
+  // Stable sort: priority tiers first, arrival order within a tier.
+  const batch = _coldQueue;
+  _coldQueue = [];
+  batch.sort((a, b) => _planePriority(a.type) - _planePriority(b.type));
+  const started = performance.now();
+  let index = 0;
+  for (; index < batch.length; index++) {
+    if (index > 0 && performance.now() - started >= 8) break;
+    try {
+      handleEvent(batch[index]);
+    } catch (e) {
+      console.warn(`[stream] cold plane failed for ${(batch[index] as any).type}:`, e);
+    }
+  }
+  if (index < batch.length) {
+    _coldQueue = batch.slice(index).concat(_coldQueue);
+    _coldDraining = false;
+    _scheduleColdDrain();
+    return;
+  }
+  _coldDraining = false;
+  if (_coldQueue.length > 0) _scheduleColdDrain();
+}
+
 const BOOT_DEFERRED_EVENTS: ReadonlySet<string> = new Set([
   "global_rules_list",
   "memory_list",
-  "documents_list",
+  "memory_graph",
+  "library_tree",
   "usage_stats",
   "project_rules_list",
   "project_hooks_list",
   "archived_sessions_list",
-  "index_status",
   "profile_data",
   "skills_list",
   "memory_detail",
@@ -353,6 +691,32 @@ const BOOT_DEFERRED_EVENTS: ReadonlySet<string> = new Set([
 let _bootGateHolding = false;
 let _bootDeferredQueue: ServerEvent[] = [];
 let _bootGateSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+/** True while the queued planes are being drained in idle slices, so a second
+ *  release call (safety timer + reveal) cannot replay the same queue twice. */
+let _bootGateDraining = false;
+
+/**
+ * Whether at least one sessions plane has arrived from the backend this
+ * session.  The boot reveal waits on this (via `sessionsArrived()`) instead
+ * of `sessionsList.length > 0`: a brand-new user has zero sessions, and
+ * requiring a non-empty list made every one of their launches sit on the
+ * splash for the full priority-data deadline even though the (empty) session
+ * snapshot had long since landed.
+ */
+let _sessionsArrived = false;
+
+/** True once a `sessions_list` or `sessions_all` plane has been applied. */
+export function sessionsArrived(): boolean {
+  return _sessionsArrived;
+}
+
+/**
+ * Latest `sessions_list` whose channel did not match the local mode at
+ * arrival time, waiting for the matching `workspaceMode` flip.  At most one
+ * is kept: every frame carries the full authoritative list, so the newest
+ * always supersedes an older stash.
+ */
+let _pendingChannelSessions: { channel: string; event: ServerEvent } | null = null;
 
 /**
  * How long the boot gate may stay shut if the reveal never happens (e.g. the
@@ -371,18 +735,317 @@ export function holdNonCriticalPlanes(): void {
   }, BOOT_GATE_MAX_HOLD_MS);
 }
 
-/** Applies every plane held back during boot, in arrival order. */
+/** Applies the planes held back during boot, in arrival order.
+ *
+ *  Drained in ~8 ms slices rather than in one loop: this runs exactly as the
+ *  splash hides, and applying a dozen planes synchronously (memory graph,
+ *  library tree, skills, usage stats, ...) blocked the first interactive
+ *  frames -- the "window is up but every button is stuck" boot symptom.
+ *  The gate stays closed while draining so a plane arriving now queues
+ *  behind the older ones instead of overtaking them.
+ */
 export function releaseNonCriticalPlanes(): void {
   if (_bootGateSafetyTimer !== null) {
     clearTimeout(_bootGateSafetyTimer);
     _bootGateSafetyTimer = null;
   }
-  if (!_bootGateHolding) return;
-  _bootGateHolding = false;
-  const queued = _bootDeferredQueue;
-  _bootDeferredQueue = [];
-  for (const ev of queued) {
-    handleEvent(ev);
+  if (!_bootGateHolding || _bootGateDraining) return;
+  _bootGateDraining = true;
+  // Apply visible/near-term planes before cold settings-only planes.
+  _bootDeferredQueue.sort((a, b) => _planePriority(a.type) - _planePriority(b.type));
+  let index = 0;
+  const step = () => {
+    // Reclaim the processed prefix instead of keeping one ever-growing array.
+    if (index > 512) {
+      _bootDeferredQueue = _bootDeferredQueue.slice(index);
+      index = 0;
+    }
+    const started = performance.now();
+    while (index < _bootDeferredQueue.length && performance.now() - started < 8) {
+      const ev = _bootDeferredQueue[index++];
+      try {
+        // The gate must be OPEN while replaying: handleEvent re-queues any
+        // event seen while the gate is held, so replaying with it closed
+        // pushed every event back onto this queue until it hit
+        // "RangeError: Invalid array length" -- the boot stall.
+        const wasHolding = _bootGateHolding;
+        _bootGateHolding = false;
+        try {
+          handleEvent(ev);
+        } finally {
+          _bootGateHolding = wasHolding;
+        }
+      } catch (e) {
+        // One malformed deferred event must not discard the rest of the batch.
+        console.warn(`[stream] deferred replay failed for ${(ev as any).type}:`, e);
+      }
+    }
+    if (index < _bootDeferredQueue.length) {
+      const ric = (window as any).requestIdleCallback as
+        | ((cb: () => void, opts?: { timeout: number }) => number)
+        | undefined;
+      if (ric) ric(step, { timeout: 300 });
+      else setTimeout(step, 0);
+      return;
+    }
+    _bootDeferredQueue = [];
+    _bootGateHolding = false;
+    _bootGateDraining = false;
+    // Boot is settled: cold planes queued meanwhile can now drain in idle.
+    if (_coldQueue.length > 0) _scheduleColdDrain();
+  };
+  step();
+}
+
+/**
+ * Resolve which model the refreshed list should mark active.
+ *
+ * A `config_patch` is diffed key by key, so `models` can arrive WITHOUT
+ * `active_model_index` whenever the index itself did not change.  Reading
+ * that absent key as `0` silently moved the active model to the FIRST entry
+ * of the list -- and the selector's auto-fallback then persisted the switch,
+ * so picking a reasoning level looked like it reset the user's model choice.
+ * An omitted index therefore means "keep the current active model": hold the
+ * index when the entry at that position is still the same model, otherwise
+ * follow the model through the new list, and only fall back to index 0 when
+ * the model is genuinely gone.
+ *
+ * @param cfg - The `config` field of a `config_data` / `config_patch` frame.
+ * @param models - The refreshed flat model list.
+ * @returns The index to activate within *models*.
+ */
+function resolveActiveModelIndex(cfg: any, models: any[]): number {
+  if (typeof cfg.active_model_index === "number") {
+    return models.length ? Math.max(0, Math.min(cfg.active_model_index, models.length - 1)) : 0;
+  }
+  const cur = state.getState();
+  const prev = (cur.modelConfigs || [])[cur.activeModelIndex];
+  if (!prev) return Math.min(cur.activeModelIndex || 0, Math.max(0, models.length - 1));
+  const same = (m: any): boolean =>
+    !!m && m.model_id === prev.model_id && m.backend_type === prev.backend_type && m.base_url === prev.base_url;
+  if (same(models[cur.activeModelIndex])) return cur.activeModelIndex;
+  const found = models.findIndex(same);
+  return found >= 0 ? found : Math.min(cur.activeModelIndex || 0, Math.max(0, models.length - 1));
+}
+
+/**
+ * Applies one config payload (full snapshot OR incremental patch) into the
+ * state store.  Every section is guarded by the presence of its keys, so the
+ * same applier serves both frame types: a full `config_data` always carries
+ * every field, while a `config_patch` carries only the changed ones and the
+ * absent keys are simply no-ops instead of resets.
+ *
+ * @param cfg - The `config` field of a `config_data` or `config_patch` frame.
+ */
+function applyConfigSnapshot(cfg: Record<string, unknown>): void {
+  const cfgAny = cfg as any;
+  if (cfg.models && Array.isArray(cfg.models)) {
+    const idx = resolveActiveModelIndex(cfgAny, cfg.models as any[]);
+    const cfgSid = typeof cfgAny.session_id === "string" ? cfgAny.session_id : "";
+    const activeSid = state.getState().sessionId;
+    state.setModelConfigs(cfg.models as any[], idx);
+    // Pin the settled index onto the active session's snapshot so each
+    // conversation remembers its own model across session switches. A
+    // snapshot built from another session must not touch the active one.
+    if (!cfgSid || cfgSid === activeSid) {
+      state.recordSessionModel(idx);
+      state.markModelIndexSynced(cfgSid);
+    }
+  }
+  if (cfg.providers && Array.isArray(cfg.providers)) {
+    state.setProviders(cfg.providers as any[]);
+  }
+  if (cfg.mcp_servers && Array.isArray(cfg.mcp_servers)) {
+    // Normalize old-format MCP servers to new standard format
+    const normalized = (cfg.mcp_servers as any[]).map(srv => {
+      if (srv.type) return srv; // already new format
+      return {
+        name: srv.name,
+        type: srv.transport || "stdio",
+        ...(srv.transport === "http"
+          ? { url: srv.server_url || "", timeout: srv.http_timeout ?? 60, headers: srv.headers || {} }
+          : { command: srv.command || "", args: srv.args || [] }),
+        ...(srv.cwd ? { cwd: srv.cwd } : {}),
+        ...(srv.env ? { env: srv.env } : {}),
+        ...(srv.disabled ? { disabled: true } : {}),
+      };
+    });
+    state.setMcpServers(normalized);
+  }
+  if (cfg.enabled_skills && Array.isArray(cfg.enabled_skills)) {
+    state.setEnabledSkills(cfg.enabled_skills as string[]);
+  }
+  if (cfg.available_skills && Array.isArray(cfg.available_skills)) {
+    state.setSkillsList(cfg.available_skills as any[]);
+  }
+  if (cfg.model_catalog && typeof cfg.model_catalog === "object") {
+    state.setModelCatalog(cfg.model_catalog as any);
+  }
+  if (cfg.mcp_catalog && typeof cfg.mcp_catalog === "object") {
+    state.setMcpCatalog(cfg.mcp_catalog as any);
+  }
+  if (cfg.custom_slash_commands && Array.isArray(cfg.custom_slash_commands)) {
+    state.setCustomCommands(cfg.custom_slash_commands as any[]);
+    applyServerCommands(cfg.custom_slash_commands as any[]);
+  }
+  if (cfg.slash_commands && Array.isArray(cfg.slash_commands)) {
+    applyProjectCommands(cfg.slash_commands as any[]);
+  }
+  // Restore persisted active_command from the snapshot (survives restart).
+  // The snapshot is tagged with the session it was built from: only
+  // mirror it when it describes the session actually being viewed,
+  // otherwise another session's sticky command leaks into this one and
+  // resurrects the chip after restarts / config refreshes.
+  if ("active_command" in cfg) {
+    const ac = (cfg as any).active_command;
+    const snapshotSid = (cfg as any).session_id || "";
+    const cmdApp = (window as any).__app;
+    if (cmdApp && (!snapshotSid || snapshotSid === state.getState().sessionId)) {
+      const hasCmd = !!(ac && ac.name);
+      cmdApp._activeCommand = hasCmd
+        ? { name: ac.name, prompt: ac.prompt, icon: ac.icon, title: ac.title }
+        : null;
+      // Re-render the toolbar command chip: without this the restored (or
+      // cleared) command only shows up on the next unrelated chip update.
+      cmdApp.updateChipState?.();
+    }
+  }
+  if (("custom_slash_commands" in cfg) || ("slash_commands" in cfg)) {
+    window.dispatchEvent(new CustomEvent("slash-commands-updated"));
+  }
+  if (cfg.sub_agents && Array.isArray(cfg.sub_agents)) {
+    state.setSubAgents(cfg.sub_agents as any[]);
+  }
+  // Root for the editor tree in general mode: the backend-resolved
+  // per-session files directory (sessions/<sid>/files). Stored keyed by
+  // the session the snapshot was built from, so a config snapshot for
+  // one session can never seed another session's editor view.
+  const snapshotSid = (cfg as any).session_id || "";
+  if (typeof cfg.session_files_dir === "string" && cfg.session_files_dir && snapshotSid) {
+    state.setSessionFilesDir(snapshotSid, cfg.session_files_dir);
+  }
+  if (("system_prompt" in cfg) || ("default_specialty" in cfg) || ("permission_mode" in cfg) || ("max_turns" in cfg)) {
+    state.setAgentConfig({
+      system_prompt: (cfg.system_prompt as string) || "",
+      specialty: (cfg.default_specialty as string) || "general",
+      permission_mode: (cfg.permission_mode as string) || "default",
+      max_turns: (cfg.max_turns as number) ?? 0,
+    });
+  }
+  if (cfg.permission_settings) {
+    state.setPermissionPolicies(normalizePermissionPolicies(cfg.permission_settings));
+  }
+  // Sync workspace mode from server config (don't override active workspace).
+  // Skip the iWork branch when the renderer just closed a workspace: the
+  // config snapshot may have been generated before the backend processed
+  // close_workspace, and flipping back to iWork would re-enter a mode the
+  // user already left.
+  //
+  // Only ever *enter* iWork from here, never leave it. A config snapshot
+  // can lag behind a just-sent open_workspace (its `workspace_mode` is
+  // derived from the backend's current `_workspace_path`, which is still
+  // empty until the open is processed). Forcing "normal" on that stale
+  // snapshot was dropping the user straight back to normal right after
+  // they clicked the workspace tab. Genuine exits set "normal" explicitly
+  // via exitWorkspaceMode / workspace_closed.
+  if (("workspace_mode" in cfg) && !state.getState().activeWorkspace) {
+    if (cfg.workspace_mode === "iwork" && getWorkspaceIntent() !== "close") {
+      state.setWorkspaceMode("iwork");
+    }
+  }
+  // Surface general settings from backend config into state.settings
+  // so the settings panel shows the correct values on page refresh.
+  const _settingsUpdate: Record<string, unknown> = {};
+  const _generalKeys = [
+    "shortcut_send_mode", "default_link_behavior",
+    "auto_expand", "sub_agent_auto_open_view", "automation_auto_open_view",
+    "startup_session_mode", "startup_session_behavior",
+    "default_search_engine", "default_search_engine_url",
+    "language", "language_preference",
+    // Model pool + cycling strategy (pool settings dialog reads these).
+    "model_pool_enabled", "model_pool_fallback_enabled",
+    "model_pool_cycle_order", "model_pool_cooldown_ms",
+    "model_pool_recycle_wait_ms", "model_pool_max_fallbacks",
+    // Auxiliary-panel display preferences (assist panel).
+    "terminal_font_size", "terminal_cursor_blink", "terminal_scrollback",
+    "terminal_font_family", "terminal_line_height", "terminal_cursor_style",
+    "terminal_cursor_inactive", "terminal_bold_bright",
+    "terminal_bell", "terminal_copy_on_select", "terminal_right_click",
+    "terminal_cols_mode", "terminal_shell", "terminal_start_dir",
+    "terminal_cursor_width", "terminal_font_weight", "terminal_letter_spacing",
+    "terminal_min_contrast", "terminal_convert_eol", "terminal_word_separator",
+    "editor_font_size", "editor_word_wrap", "editor_minimap",
+    "editor_line_numbers", "editor_tab_size", "editor_detect_indentation",
+    "editor_render_whitespace", "editor_cursor_blink", "editor_font_ligatures",
+    "editor_sticky_scroll", "editor_auto_save",
+    "editor_tab_indent", "editor_use_spaces", "editor_word_wrap_column",
+    "editor_folding", "editor_glyph_margin", "editor_format_on_paste",
+    "editor_rulers", "editor_cursor_style",
+    "editor_cursor_blinking",
+    "review_split_view", "review_collapse_unified",
+    "review_wrap", "review_word_diff", "review_hide_whitespace", "review_full_file",
+    "review_default_filter", "review_max_lines",
+    "browser_homepage", "browser_record_history", "browser_do_not_track",
+    "browser_deny_site_permissions",
+    "browser_block_popups", "browser_zoom_percent", "browser_ask_before_download",
+    "browser_download_dir", "browser_block_third_party_cookies", "browser_fresh_session",
+    "browser_force_light_page", "browser_identity", "browser_history_limit",
+    // Device permissions (general panel).  `device_context_providers` is
+    // an array, so the `!== ""` guard below keeps even an empty list.
+    "device_context_enabled", "device_context_providers",
+  ] as const;
+  for (const key of _generalKeys) {
+    const val = cfg[key];
+    if (val !== undefined && val !== null && val !== "") {
+      _settingsUpdate[key] = val;
+    }
+  }
+  // Ensure startup_session_mode is always set so the startup mode
+  // subscribe fires -- but only for FULL snapshots: a patch that did not
+  // touch the startup mode must not inject the "normal" default over the
+  // user's persisted choice.
+  if (!("startup_session_mode" in cfg)) {
+    delete _settingsUpdate["startup_session_mode"];
+  } else {
+    _settingsUpdate["startup_session_mode"] = _settingsUpdate["startup_session_mode"] || cfg["startup_session_mode"] || "normal";
+  }
+  if (Object.keys(_settingsUpdate).length > 0) {
+    state.setSettings({ ...state.getState().settings, ..._settingsUpdate });
+  }
+  // Note: locale is a frontend preference stored in localStorage.
+  // The backend's language field is only synced for settings display;
+  // do NOT call setLocale() here or it would override the user's choice
+  // when the backend (default zh) pushes config asynchronously.
+  // Sync keybinds from backend config.  Patches that do not carry the
+  // keybinds field skip this entirely -- the localStorage fallback below
+  // exists for corrupted FULL snapshots, not for absent patch fields.
+  if ("keybinds" in cfg) {
+    if (cfgAny.keybinds && typeof cfgAny.keybinds === "object" && Array.isArray(cfgAny.keybinds.keybinds)) {
+      // Backend data may still carry ids whose feature was removed (the
+      // encrypted file is only rewritten when defaults change shape).
+      // Prune so removed shortcuts never reach the store or the panel.
+      state.setSettings({ ...state.getState().settings, keybinds: pruneStaleKeybinds(cfgAny.keybinds) });
+    } else if (Array.isArray(cfgAny.models)) {
+      // Full-snapshot path only: backend sent no keybinds or corrupted data
+      try {
+        const saved = localStorage.getItem("encre_keybinds");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed && typeof parsed === "object" && Array.isArray(parsed.keybinds)) {
+            state.setSettings({ ...state.getState().settings, keybinds: pruneStaleKeybinds(parsed) });
+          }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  // Sync adapter_* keys from backend config into settings (for gateway panel)
+  const _adapterKeys = Object.keys(cfgAny).filter(k => k.startsWith("adapter_"));
+  if (_adapterKeys.length > 0) {
+    const _adapterSettings: Record<string, unknown> = {};
+    for (const k of _adapterKeys) {
+      _adapterSettings[k] = cfg[k];
+    }
+    state.setSettings({ ...state.getState().settings, ..._adapterSettings });
   }
 }
 
@@ -397,6 +1060,41 @@ export function handleEvent(event: ServerEvent): void {
   if (_bootGateHolding && BOOT_DEFERRED_EVENTS.has(_perfType)) {
     _bootDeferredQueue.push(event);
     return;
+  }
+  // Cold/panel data: never apply inside an interactive frame. Queued and
+  // drained in idle slices, lowest priority first; the boot drain bypasses
+  // this because it already slices and prioritises its own queue.
+  if (
+    !_bootGateDraining &&
+    !_coldDraining &&
+    COLD_PLANE_PRIORITY[_perfType] !== undefined
+  ) {
+    _coldQueue.push(event);
+    _scheduleColdDrain();
+    return;
+  }
+  // Each config_data frame carries its own session_id + session_files_dir.
+  // The generic session-scope filters further below reject config frames
+  // whose session doesn't match the active one (or while no session is
+  // active), which orphans the per-session files directory root used by
+  // the editor tree.  Record it by the frame's own sid so the map stays
+  // complete; keying on the frame's session_id cannot cross sessions.
+  if (_perfType === "config_data") {
+    const cfg = (event as any).config as
+      | { session_id?: string | null; session_files_dir?: string | null }
+      | undefined;
+    const fsSid = (cfg?.session_id as string) || ((event as any).session_id as string) || "";
+    if (fsSid && cfg?.session_files_dir) {
+      state.setSessionFilesDir(fsSid, cfg.session_files_dir);
+    }
+  }
+  if (event.type === "plan_review") {
+    // Breadcrumb before the session filters: a review card that fails to
+    // appear can be dropped either here or by the timeline anchor, and neither
+    // was visible before -- see the matching "[review] card suppressed" log.
+    console.log("[stream] plan_review inbound: status=", (event as any).status,
+      "session_id=", (event as any).session_id, "active=", state.getState().sessionId,
+      "review=", (event as any).review?.review_id);
   }
   if (_requiresExplicitSessionId(event.type) && !_hasSessionId(event as { session_id?: string | null })) {
     return;
@@ -465,7 +1163,14 @@ export function handleEvent(event: ServerEvent): void {
       _sessionGeneration++;
       const previousSid = state.getState().sessionId;
       const nextSid = event.session_id || "";
+      // The backend answered the resume: the loading placeholder (if any)
+      // can be considered served from here on.
+      _pendingResumes.delete(nextSid);
       const switched = previousSid && previousSid !== nextSid;
+      // session_ready is an authoritative load and does NOT apply a pending
+      // rollback edit, so a marker left over from an operation in the
+      // previous session would only ever cut the wrong list later.
+      state.clearPendingRollbackEdit();
       // When this switch is the result of the user opening a *session-backed*
       // sub-agent from its parent tool-call card, the breadcrumb pushed by
       // __openSubAgentView already records the parent session (and the exact
@@ -508,6 +1213,21 @@ export function handleEvent(event: ServerEvent): void {
         state.markExternalChannelSession(event.session_id);
       }
       state.setSessionId(event.session_id);
+      // The resume reply carries this session's backend-resolved files dir:
+      // record it so the session-inner editor tree roots at the right folder
+      // immediately, without a config re-pull after the session switch.
+      const readyFilesDir = (event as { session_files_dir?: string }).session_files_dir;
+      if (readyFilesDir) state.setSessionFilesDir(event.session_id, readyFilesDir);
+      // The backend is the single source of truth for a session's model: the
+      // resume reply carries the target session's own active index, so the
+      // indicator always reflects what this conversation will actually run on.
+      const backendModelIdx = (event as { active_model_index?: number }).active_model_index;
+      if (typeof backendModelIdx === "number") {
+        const models = state.getState().modelConfigs || [];
+        state.setActiveModelIndex(models.length
+          ? Math.max(0, Math.min(backendModelIdx, models.length - 1))
+          : backendModelIdx);
+      }
       // Reset persistent mode on session switch - backend will re-send mode_changed if the session has a mode
       const _app = (window as any).__app;
       if (_app) {
@@ -535,8 +1255,23 @@ export function handleEvent(event: ServerEvent): void {
       state.setConnected(true);
       state.setSessionState(evState, event.session_id);
       if (event.messages && event.messages.length > 0) {
-        state.loadSessionMessages(event.messages, event.session_id);
+        // Tail-first open: the backend ships only the most recent turns in
+        // this frame; the absolute user-message ordinal continues where the
+        // (still incoming) backfill chunk leaves off, keeping the per-user
+        // storage keys (fr:<sid>:<idx>) aligned with full-list numbering.
+        state.loadSessionMessages(event.messages, event.session_id, {
+          userIndexOffset: (event as any).earlier_user_count || 0,
+        });
         console.log("[stream] loadSessionMessages done, state.messages.length:", state.getState().messages.length);
+        // The tail paints now; the older history lands via the generic
+        // sharded-topic channel and must be prepended exactly once, into
+        // THIS conversation. Any topic buffers from the previous session
+        // are dead on arrival -- drop them so they can never leak memory
+        // or fire into the wrong conversation later.
+        _pendingBackfillSid = (event as any).has_earlier_history ? (event.session_id || "") : "";
+        for (const topic of Array.from(_topicBuffers.keys())) {
+          if (topic.startsWith("session:")) _topicBuffers.delete(topic);
+        }
         // Repopulate _toolCallGeneration for the current session's tool calls.
         // This is critical for running sub-agents: after switching back to this
         // session, subsequent tool_progress events must pass the generation check
@@ -585,15 +1320,46 @@ export function handleEvent(event: ServerEvent): void {
       if (event.references) {
         state.setReferences(event.references, event.session_id);
       }
+      // Rebuild the review card from the session's persisted submit_review
+      // record; clear the slot when the session has none so a stale card
+      // from an earlier resume of this same session cannot linger.
+      {
+        const pr = (event as any).plan_review;
+        state.updatePlanReview(pr && pr.review_id ? pr : null, event.session_id);
+      }
       // Restore branch state
       if (event.branches && event.active_branch_id) {
         state.setBranches(event.branches, event.active_branch_id, event.session_id);
       }
-      // Re-render when session changes (skip sub-agent sessions)
-      chat?.renderForce?.();
-      (window as any).__sessionInner?.render?.();
+      // Render on the next frame instead of synchronously: the state writes
+      // above already queued a render, and a restored transcript used to be
+      // parsed (markdown + highlight.js) in this event handler, freezing the
+      // title bar, sidebar and composer together. Larger sessions first paint
+      // as plain text and are upgraded to markdown during idle time.
+      if (chat) {
+        const restored = event.messages?.length ?? 0;
+        chat.deferMarkdown = restored > 20;
+        chat.requestRender();
+        if (restored > 20) chat.beginMarkdownUpgrade();
+      }
+      (window as any).__sessionInner?.requestRender?.();
       _requestedSessionId = "";
       _requestedSessionRequestId = "";
+      break;
+    }
+
+    case "data_begin": {
+      handleDataBegin((event as any).topic, (event as any).meta || {}, (event as any).total_shards || 0);
+      break;
+    }
+
+    case "data_shard": {
+      handleDataShard((event as any).topic, (event as any).seq, (event as any).items);
+      break;
+    }
+
+    case "data_end": {
+      handleDataEnd((event as any).topic);
       break;
     }
 
@@ -605,6 +1371,7 @@ export function handleEvent(event: ServerEvent): void {
       const _tdSid = _eventSessionId(event);
       const _activeTdSid = state.getState().sessionId;
       if (_tdSid && _activeTdSid && _tdSid !== _activeTdSid) break;
+      state.clearRetryNotice(_tdSid || _activeTdSid);
       _ensureAssistantMessage(_tdSid);
       state.appendTextDelta(event.text, _tdSid);
       // Deltas arrive per-token (dozens per second). A synchronous render on
@@ -619,6 +1386,7 @@ export function handleEvent(event: ServerEvent): void {
       const _thSid = _eventSessionId(event);
       const _activeThSid = state.getState().sessionId;
       if (_thSid && _activeThSid && _thSid !== _activeThSid) break;
+      state.clearRetryNotice(_thSid || _activeThSid);
       _ensureAssistantMessage(_thSid);
       state.appendThinkingDelta(event.text, _thSid);
       chat?.requestRender();
@@ -629,6 +1397,7 @@ export function handleEvent(event: ServerEvent): void {
     case "tool_call_start": {
       // Track which session generation this tool call belongs to
       _toolCallGeneration[event.id] = _sessionGeneration;
+      state.clearRetryNotice(_eventSessionId(event));
       _ensureAssistantMessage(_eventSessionId(event));
       // Thinking phase ends when tool calls begin
       state.finishThinking();
@@ -684,9 +1453,19 @@ export function handleEvent(event: ServerEvent): void {
       // browser tool, so the user can see what the model is doing.
       if (event.name === "browser") {
         window.dispatchEvent(new CustomEvent("browser-tool-call"));
+        // Announce "Agent is operating" once per turn: the lock engages on
+        // the FIRST browser call and stays up across every consecutive one.
+        // Re-announcing mid-turn would reset a user takeover in main.
+        if (!_browserControlAnnounced) {
+          _browserControlAnnounced = true;
+          window.electronAPI?.agentControlUpdate?.(true);
+        }
       }
       tools?.requestRender();
-      chat?.renderForce?.();
+      // A new tool item only extends the timeline tail, which the regular
+      // render path patches in place. Forcing a full transcript rebuild here
+      // re-parsed every earlier turn on every single tool call.
+      chat?.requestRender();
       break;
     }
 
@@ -718,6 +1497,21 @@ export function handleEvent(event: ServerEvent): void {
       break;
     }
 
+    case "question_request": {
+      // The question tool blocks BEFORE tool_call_end fires — end only lands
+      // after the user answers, so the raw `{` fragment placeholder would sit
+      // on screen for the whole wait.  The request carries the fully parsed
+      // questions: fill the tool call's params directly and re-render.
+      if (_toolCallGeneration[event.tool_call_id] !== undefined && _toolCallGeneration[event.tool_call_id] !== _sessionGeneration) break;
+      const tc = state.findToolCall(event.tool_call_id, _eventSessionId(event));
+      if (tc && Array.isArray(event.questions) && event.questions.length > 0) {
+        tc.params = { questions: event.questions };
+        tc.status = "running";
+        chat?.renderForce?.();
+      }
+      break;
+    }
+
     case "tool_call_end": {
       if (_toolCallGeneration[event.id] !== _sessionGeneration) break;
       // Try to parse accumulated JSON params into a structured form
@@ -732,17 +1526,19 @@ export function handleEvent(event: ServerEvent): void {
           // Keep raw string params if JSON parse fails
         }
       }
-      // Force re-render so question card shows parsed params
-      chat?.renderForce?.();
+      // Parsing the accumulated JSON changed tool params, which the summary
+      // line updates in place. Only the question card derives its markup from
+      // params (it cannot be patched incrementally), so only it needs a
+      // structural rebuild.
+      if (tc?.name === "question") chat?.renderForce?.();
+      else chat?.requestRender();
       break;
     }
 
     case "tool_progress":
       if (_toolCallGeneration[event.id] !== _sessionGeneration) {
-        console.log("[stream] tool_progress REJECTED by generation check, id:", event.id, "tc_gen:", _toolCallGeneration[event.id], "session_gen:", _sessionGeneration);
         break;
       }
-      console.log("[stream] tool_progress accepted, id:", event.id, "sub_agent_messages:", event.sub_agent_messages?.length ?? 0);
       const progressPatch: Partial<import("./types.js").ToolCallState> = {
         status: event.status === "done" ? "done" : "running",
       };
@@ -752,6 +1548,10 @@ export function handleEvent(event: ServerEvent): void {
           current?.subAgentMessages,
           state.restoreMessages(event.sub_agent_messages),
         );
+      }
+      if (typeof event.content === "string" && event.content.length > 0) {
+        const current = state.findToolCall(event.id, _eventSessionId(event));
+        progressPatch.result = (current?.result ?? "") + event.content;
       }
       if ((event as any).sub_agent_session_id) {
         progressPatch.subAgentSessionId = (event as any).sub_agent_session_id;
@@ -775,6 +1575,9 @@ export function handleEvent(event: ServerEvent): void {
         isError: event.is_error,
         errorCode: (event as any).error_code || "",
         errorCategory: (event as any).error_category || "",
+        // Stamped once, here: the fault card renders on every chat repaint, so
+        // a render-time clock would show a different time each time.
+        ...(event.is_error ? { errorAt: (event as any).occurred_at || Date.now() } : {}),
         status: "done",
       };
       if (event.sub_agent_messages && event.sub_agent_messages.length > 0) {
@@ -789,8 +1592,12 @@ export function handleEvent(event: ServerEvent): void {
       }
       state.updateToolCall(event.id, resultPatch, _eventSessionId(event));
       _syncSubAgentView(event.id);
+      // Note: a browser tool_result does NOT release the agent-control lock
+      // — the turn may issue more browser calls; release is turn-scoped.
       tools?.requestRender();
-      chat?.render();
+      // Only this card's markup changed (body / error state / info source).
+      // Patch that single card rather than repainting every earlier turn.
+      if (!chat?.patchToolItem?.(event.id)) chat?.renderForce?.();
       _syncSessionEntry(state.getState().sessionId, state.getState());
       break;
 
@@ -858,7 +1665,15 @@ export function handleEvent(event: ServerEvent): void {
       break;
 
     case "finish": {
+      // Turn boundary — release the browser lock unconditionally, BEFORE any
+      // session-scoped early return (a background session finishing must
+      // release too, or the overlay would stick). This is the safety net
+      // that keeps the lock from outliving a turn that dies mid-tool
+      // (interrupt / error) and whose browser tool_result never lands.
+      _browserControlAnnounced = false;
+      window.electronAPI?.agentControlUpdate?.(false);
       if (!_hasSessionId(event)) break;
+      state.clearRetryNotice(_eventSessionId(event));
       if (event.reason === "error" || event.error) {
         console.log("[stream] finish with error:", event.reason, event.error);
       }
@@ -871,19 +1686,23 @@ export function handleEvent(event: ServerEvent): void {
       }
       _activeStreamSessionId = "";
       state.setSessionState("idle", _eventSessionId(event));
+      // A turn that finishes while boot/session deferral is still running
+      // would leave its completed blocks as plain text; upgrade them in the
+      // same idle pipeline as the restored history.
+      if (chat?.deferMarkdown) chat.beginMarkdownUpgrade();
+      const sid = _eventSessionId(event);
       // For error finishes without a streaming assistant (e.g. API failed
       // immediately, no text_delta received), create a placeholder so the
       // error card renders on the correct turn rather than the previous one.
+      // Same user-boundary rule as _ensureAssistantMessage: a stale streaming
+      // assistant from an earlier turn must not suppress the placeholder.
       if (event.reason === "error" || event.error) {
-        const msgs = state.getState().messages;
-        const hasStreaming = msgs.some(m => m.role === "assistant" && m.isStreaming);
-        if (!hasStreaming) {
-          state.startAssistantMessage();
+        if (!state.getLastAssistantMessage(sid)) {
+          state.startAssistantMessage(sid);
         }
       }
       // Store server-side message ID before finishing — emit() in
       // finishAssistantMessage will trigger segment cache save with this set.
-      const sid = _eventSessionId(event);
       const lastMsg = state.getLastAssistantMessage(sid);
       if (lastMsg) {
         if (event.assistant_message_id) {
@@ -944,15 +1763,60 @@ export function handleEvent(event: ServerEvent): void {
       if ((event as any).compacted && (event as any).references) {
         state.setReferences((event as any).references, sid);
       }
-      chat?.render();
-      (window as any).__sessionInner?.render?.();
+      chat?.requestRender();
+      (window as any).__sessionInner?.requestRender?.();
       break;
     }
 
-    case "run_queued":
-      state.setPendingQueueCount(event.position);
-      chat?.render();
+    case "queued_submits": {
+      // Backend-owned queue snapshot: repaint the panel only when the
+      // event is for the conversation being viewed.
+      const q = event as QueuedSubmitsEvent;
+      if (q.session_id && q.session_id !== state.getState().sessionId) break;
+      state.setQueuedPrompts(
+        q.items.map(it => ({
+          text: it.prompt || "",
+          mode: (it.metadata && it.metadata.mode) || it.mode || undefined,
+        })),
+      );
       break;
+    }
+
+    case "queued_run_started": {
+      // A drained queue entry began running server-side: render the user
+      // bubble and switch to the running state exactly like a local send.
+      const re = event as QueuedRunStartedEvent;
+      if (re.session_id && re.session_id !== state.getState().sessionId) break;
+      state.addUserMessage(re.prompt, re.mode || undefined);
+      state.startAssistantMessage();
+      state.setSessionState("running");
+      _activeStreamSessionId = re.session_id || state.getState().sessionId || "";
+      // A brand-new turn: reset the auto-open dismiss guard so the first
+      // sub-agent of this turn opens live again (per the auto-open setting).
+      (window as any).__subAgentAutoOpenDismissed = false;
+      break;
+    }
+
+    case "run_started": {
+      // The backend just staged this run's user message; it reports the
+      // message's server id here so the newest optimistic user bubble can be
+      // stamped with it. Without this the just-sent message can only be
+      // addressed by positional index on rollback/edit, and that index drifts
+      // one turn off after retries and branch operations.
+      if (!_hasSessionId(event)) break;
+      if (event.session_id && event.session_id !== state.getState().sessionId) break;
+      const umid = event.user_message_id;
+      if (!umid) break;
+      const msgs = state.getState().messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.role === "user" && !state.isNoticeMode(m.mode) && !m.serverId) {
+          m.serverId = umid;
+          break;
+        }
+      }
+      break;
+    }
 
     case "pong":
       state.setConnected(true);
@@ -960,6 +1824,10 @@ export function handleEvent(event: ServerEvent): void {
 
     case "error":
       {
+        // A failed resume (e.g. empty model pool) must clear the pending
+        // marker, otherwise a later switch to the same session would be
+        // treated as "still loading" forever.
+        if (event.session_id) _pendingResumes.delete(event.session_id);
         const _migCode = (event as any).code || "";
         if (_migCode === "export_data_error" || _migCode === "import_data_error") {
           const msg = (event as any).message || "";
@@ -971,15 +1839,50 @@ export function handleEvent(event: ServerEvent): void {
           break;
         }
       }
+      // The backend queues prompts for busy conversations instead of
+      // dropping them; the authoritative snapshot arrives via the
+      // ``queued_submits`` broadcast.  Swallow the busy notice here so it
+      // does not flip the viewed session to idle or show an error box.
+      if ((event as any).code === "busy") {
+        break;
+      }
+      // Operation-level failures (a button whose handler raised, a frame that
+      // could not be parsed or dispatched) say nothing about the running turn.
+      // Marking the session idle here hides live UI that is still waiting --
+      // e.g. the review card of a turn that is genuinely blocked on the user.
+      {
+        const _opCode = (event as any).code || "";
+        if (_opCode === "handler_error" || _opCode === "parse_error" || _opCode === "unhandled") {
+          state.addNotification({
+            id: crypto.randomUUID(),
+            type: "error",
+            title: t("stream.notificationError"),
+            message: event.message,
+            source: "System",
+            timestamp: Date.now(),
+            read: false,
+          });
+          break;
+        }
+      }
+      // code="no_session" answers a rollback with no session id at all, so
+      // the guard below would swallow it. The rollback was refused with
+      // nothing to roll back against, the optimistic local truncation is
+      // still on screen, and the pending marker is void -- drop both and
+      // re-request the session that is actually in view.
+      if (!_hasSessionId(event) && (event as any).code === "no_session") {
+        resyncActiveSession();
+        break;
+      }
       if (!_hasSessionId(event)) break;
       _activeStreamSessionId = "";
+      state.clearRetryNotice(_eventSessionId(event));
       // Background session error — update snapshot without touching active UI.
       if (event.session_id && event.session_id !== state.getState().sessionId) {
         state.setSessionState("idle", event.session_id);
         break;
       }
       state.setSessionState("idle", _eventSessionId(event));
-      state.clearPendingQueueCount();
       // Session/operation-level errors (rollback, branch, retry, capacity,
       // job/execution lookup, parse, etc.) are NOT tied to any single turn —
       // stamping them onto the last assistant message would show an error box
@@ -1020,18 +1923,26 @@ export function handleEvent(event: ServerEvent): void {
         timestamp: Date.now(),
         read: false,
       });
-      // Rollback/branch operations are optimistically truncated in the UI before
-      // the server confirms. When the server rejects them ("message not found", 
-      // "branch not found", retry of a missing user message), re-request the
-      // authoritative session state so the frontend stops rendering the ghost
-      // user message and matches the real backend conversation.
-      if (_errCode === "rollback_error" || _errCode === "branch_not_found" || _errCode === "retry_error") {
-        const _rs = state.getState().sessionId;
-        const _rid = crypto.randomUUID();
-        setRequestedSessionId(_rs, _rid);
-        send({ type: "resume", session_id: _rs, request_id: _rid } as any);
-      }
+      // Optimistic rollback / branch / delete / retry requests truncate the
+      // UI before the server answers. When the server refuses any of them,
+      // re-request the authoritative session state so the frontend stops
+      // rendering the ghost user message and matches the real backend
+      // conversation.
+      if (RESYNC_ERROR_CODES.has(_errCode)) resyncActiveSession();
       break;
+
+    case "qa_notification": {
+      state.addNotification({
+        id: crypto.randomUUID(),
+        type: "info",
+        title: (event as any).title || "QA Notification",
+        message: (event as any).message || "This is a QA test notification.",
+        source: (event as any).source || "QA",
+        timestamp: Date.now(),
+        read: false,
+      });
+      break;
+    }
 
     case "configured":
       console.log("[stream] configured event, config keys:", Object.keys(event.config ?? {}));
@@ -1064,6 +1975,110 @@ export function handleEvent(event: ServerEvent): void {
       state.setGatewayStatus(event.status);
       break;
 
+    case "plugin_ui_sync": {
+      syncPluginUiProviders(event.providers || []);
+      const toolMetaChanged = setToolMetaEntries(event.tool_meta || []);
+      syncPluginContributions(event.contributions || []);
+      if (toolMetaChanged) {
+        // A client connecting during plugin warmup painted its transcript
+        // against an empty catalog; every tool card resolves its card shape /
+        // icon / label from that catalog at render time. Announce the real
+        // catalog's arrival so already-rendered cards restyle immediately
+        // instead of waiting for an unrelated view switch to force a rebuild.
+        window.dispatchEvent(new CustomEvent("encre-tool-meta-updated"));
+      }
+      break;
+    }
+
+    case "plugin_changed": {
+      // The connect-time replay of the persisted snapshot only carries the
+      // installed-plugin facts (no provider code): apply it without tearing
+      // down mounted plugin UI. A live lifecycle change may carry changed
+      // provider code, so that one still resets everything and lets the
+      // following `plugin_ui_sync` re-mount the fresh set.
+      if (!(event as { cached?: boolean }).cached) {
+        resetPluginUi();
+        resetPluginContributions();
+      }
+      // Feed the shared plugin-fact store the fault card reads, then publish
+      // the lifecycle snapshot for management surfaces (settings plugins
+      // panel) through the same DOM-event dispatch.
+      setPluginInfo(event.plugins || []);
+      dispatchServerSignal(
+        "encre-plugin-states",
+        event.plugins || [],
+        _pluginStatesSignature(event.plugins || []),
+      );
+      break;
+    }
+
+    case "plugin_ui_result": {
+      // Backend result for a plugin UI action (or any plugin-pushed UI
+      // event).  Re-dispatched as a DOM event so subscribers registered via
+      // `onPluginUiResult` (plugin bridge, contributed surfaces) receive it
+      // through the same unified dispatch as every other server event.
+      // One result per user action: never dedupe these, a legitimate repeat
+      // click must reach its subscriber.
+      window.dispatchEvent(new CustomEvent("encre-plugin-ui-result", {
+        detail: { kind: event.kind, plugin: event.plugin, action: event.action, ok: event.ok, data: event.data },
+      }));
+      break;
+    }
+
+    case "plugin_installed":
+    case "plugin_uninstalled":
+    case "market_installed":
+    case "plugin_enabled":
+    case "plugin_disabled": {
+      // Lifecycle replies acknowledge user actions; always deliver them.
+      window.dispatchEvent(new CustomEvent("encre-plugin-lifecycle-ok", {
+        detail: { type: event.type, name: event.name },
+      }));
+      break;
+    }
+
+    case "plugin_install_error":
+    case "plugin_uninstall_error":
+    case "market_install_error":
+    case "plugin_enable_error":
+    case "plugin_disable_error": {
+      window.dispatchEvent(new CustomEvent("encre-plugin-lifecycle-error", {
+        detail: { type: event.type, name: (event as { name?: string }).name || "", message: event.message },
+      }));
+      break;
+    }
+
+    case "plugin_confirm_request": {
+      // Dynamic authorisation: third-party plugins discovered by the
+      // backend are waiting for the user's approve/deny decision.  Their
+      // code is NOT imported until approved, so each decision is final
+      // for this run of the app.
+      void handlePluginConfirmQueue(event.plugins || []);
+      break;
+    }
+
+    case "market_catalog": {
+      // Central-repository (ea-cwh) catalogue: pushed on connect and again
+      // whenever the daily index refresh changes its fingerprint.  The
+      // market view merges it with the local `encre-plugin-states` snapshot
+      // (installable / updatable / installed), so hand it over verbatim.
+      // It also lands in the index store: the market binds its listener
+      // when it opens, which is normally after this single frame went by.
+      const catalog = {
+        source: event.source,
+        index_version: event.index_version,
+        generated_at: event.generated_at,
+        plugins: event.plugins || [],
+      };
+      setMarketIndex(catalog);
+      dispatchServerSignal(
+        "encre-market-catalog",
+        catalog,
+        `${catalog.source}|${catalog.index_version}|${catalog.generated_at}|${catalog.plugins.length}`,
+      );
+      break;
+    }
+
     case "wechat_scan_result":
       if (typeof _wechatScanCallback === "function") {
         _wechatScanCallback(event as any);
@@ -1084,8 +2099,8 @@ export function handleEvent(event: ServerEvent): void {
           (window as any).__app?.openSummaryPanel?.();
         }
       }
-      chat?.render();
-      (window as any).__sessionInner?.render?.();
+      chat?.requestRender();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "plan_proposal":
@@ -1096,7 +2111,7 @@ export function handleEvent(event: ServerEvent): void {
     case "plan_mode_changed":
       if (!_hasSessionId(event)) break;
       state.setPlanModeActive(event.active, _eventSessionId(event));
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "mode_changed":
@@ -1133,7 +2148,7 @@ export function handleEvent(event: ServerEvent): void {
     case "plan_resolved":
       if (!_hasSessionId(event)) break;
       state.removePlanProposal(event.proposal_id, _eventSessionId(event));
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "models_list":
@@ -1141,8 +2156,19 @@ export function handleEvent(event: ServerEvent): void {
       break;
 
     case "sessions_list": {
+      _sessionsArrived = true;
       const currentChannel = state.getState().workspaceMode === "iwork" ? "iwork" : "normal";
-      if (event.channel && event.channel !== currentChannel) break;
+      if (event.channel && event.channel !== currentChannel) {
+        // Stash instead of dropping: the frame's channel is authoritative
+        // backend state (e.g. the user's workspace is open server-side) and
+        // the local mode may lag it by a frame or fail to arrive at all (a
+        // failed config build).  Re-dispatched on the workspaceMode change
+        // that matches, so the sidebar fills with the right channel's data
+        // instead of staying empty until an unrelated push.
+        _pendingChannelSessions = { channel: event.channel, event };
+        break;
+      }
+      _pendingChannelSessions = null;
 
       state.setSessionsList(event.sessions);
       const isIworkMode = state.getState().workspaceMode === "iwork";
@@ -1171,6 +2197,7 @@ export function handleEvent(event: ServerEvent): void {
     }
 
     case "sessions_all": {
+      _sessionsArrived = true;
       const normal = (event as any).normal || [];
       const iwork = (event as any).iwork || [];
       state.setTraySessions(normal, iwork);
@@ -1196,150 +2223,43 @@ export function handleEvent(event: ServerEvent): void {
     }
 
     case "config_data": {
-      const cfg = event.config as Record<string, unknown>;
-      if (cfg.models && Array.isArray(cfg.models)) {
-        state.setModelConfigs(cfg.models as any[], (cfg.active_model_index as number) || 0);
-      }
-      if (cfg.mcp_servers && Array.isArray(cfg.mcp_servers)) {
-        // Normalize old-format MCP servers to new standard format
-        const normalized = (cfg.mcp_servers as any[]).map(srv => {
-          if (srv.type) return srv; // already new format
-          return {
-            name: srv.name,
-            type: srv.transport || "stdio",
-            ...(srv.transport === "http"
-              ? { url: srv.server_url || "", timeout: srv.http_timeout ?? 60, headers: srv.headers || {} }
-              : { command: srv.command || "", args: srv.args || [] }),
-            ...(srv.cwd ? { cwd: srv.cwd } : {}),
-            ...(srv.env ? { env: srv.env } : {}),
-            ...(srv.disabled ? { disabled: true } : {}),
-          };
-        });
-        state.setMcpServers(normalized);
-      }
-      if (cfg.enabled_skills && Array.isArray(cfg.enabled_skills)) {
-        state.setEnabledSkills(cfg.enabled_skills as string[]);
-      }
-      if (cfg.available_skills && Array.isArray(cfg.available_skills)) {
-        state.setSkillsList(cfg.available_skills as any[]);
-      }
-      if (cfg.model_catalog && typeof cfg.model_catalog === "object") {
-        state.setModelCatalog(cfg.model_catalog as any);
-      }
-      if (cfg.mcp_catalog && typeof cfg.mcp_catalog === "object") {
-        state.setMcpCatalog(cfg.mcp_catalog as any);
-      }
-      if (cfg.custom_slash_commands && Array.isArray(cfg.custom_slash_commands)) {
-        state.setCustomCommands(cfg.custom_slash_commands as any[]);
-        applyServerCommands(cfg.custom_slash_commands as any[]);
-      }
-      if (cfg.slash_commands && Array.isArray(cfg.slash_commands)) {
-        applyProjectCommands(cfg.slash_commands as any[]);
-      }
-      // Restore persisted active_command from config_data (survives restart).
-      // The snapshot is tagged with the session it was built from: only
-      // mirror it when it describes the session actually being viewed,
-      // otherwise another session's sticky command leaks into this one and
-      // resurrects the chip after restarts / config refreshes.
-      const ac = (cfg as any).active_command;
-      const snapshotSid = (cfg as any).session_id || "";
-      const cmdApp = (window as any).__app;
-      if (cmdApp && (!snapshotSid || snapshotSid === state.getState().sessionId)) {
-        const hasCmd = !!(ac && ac.name);
-        cmdApp._activeCommand = hasCmd
-          ? { name: ac.name, prompt: ac.prompt, icon: ac.icon, title: ac.title }
-          : null;
-        // Re-render the toolbar command chip: without this the restored (or
-        // cleared) command only shows up on the next unrelated chip update.
-        cmdApp.updateChipState?.();
-      }
-      window.dispatchEvent(new CustomEvent("slash-commands-updated"));
-      if (cfg.sub_agents && Array.isArray(cfg.sub_agents)) {
-        state.setSubAgents(cfg.sub_agents as any[]);
-      }
-      state.setAgentConfig({
-        system_prompt: (cfg.system_prompt as string) || "",
-        specialty: (cfg.default_specialty as string) || "general",
-        permission_mode: (cfg.permission_mode as string) || "default",
-        max_turns: (cfg.max_turns as number) ?? 0,
+      // A config_data frame dispatches ~15 set* calls in one tick.  Without a
+      // batch each one schedules its own microtask flush; with it the whole
+      // plane lands as a single transaction, so subscribers with keys fire at
+      // most once and never see a half-applied snapshot.
+      state.batch(() => {
+        applyConfigSnapshot(event.config as Record<string, unknown>);
       });
-      if (cfg.permission_settings) {
-        state.setPermissionPolicies(normalizePermissionPolicies(cfg.permission_settings));
-      }
-      // Sync workspace mode from server config (don't override active workspace).
-      // Skip the iWork branch when the renderer just closed a workspace: the
-      // config snapshot may have been generated before the backend processed
-      // close_workspace, and flipping back to iWork would re-enter a mode the
-      // user already left.
-      //
-      // Only ever *enter* iWork from here, never leave it. A config snapshot
-      // can lag behind a just-sent open_workspace (its `workspace_mode` is
-      // derived from the backend's current `_workspace_path`, which is still
-      // empty until the open is processed). Forcing "normal" on that stale
-      // snapshot was dropping the user straight back to normal right after
-      // they clicked the workspace tab. Genuine exits set "normal" explicitly
-      // via exitWorkspaceMode / workspace_closed.
-      if (!state.getState().activeWorkspace) {
-        if (cfg.workspace_mode === "iwork" && getWorkspaceIntent() !== "close") {
-          state.setWorkspaceMode("iwork");
-        }
-      }
-      // Surface general settings from backend config into state.settings
-      // so the settings panel shows the correct values on page refresh.
-      const _settingsUpdate: Record<string, unknown> = {};
-      const _generalKeys = [
-        "shortcut_send_mode", "default_link_behavior",
-        "auto_expand", "sub_agent_auto_open_view", "automation_auto_open_view",
-        "startup_session_mode", "startup_session_behavior",
-        "default_search_engine", "default_search_engine_url",
-        "language", "language_preference",
-      ] as const;
-      for (const key of _generalKeys) {
-        const val = cfg[key];
-        if (val !== undefined && val !== null && val !== "") {
-          _settingsUpdate[key] = val;
-        }
-      }
-      // Always ensure startup_session_mode is set so the startup mode subscribe fires
-      _settingsUpdate["startup_session_mode"] = _settingsUpdate["startup_session_mode"] || cfg["startup_session_mode"] || "normal";
-      if (Object.keys(_settingsUpdate).length > 0) {
-        state.setSettings({ ...state.getState().settings, ..._settingsUpdate });
-      }
-      // Note: locale is a frontend preference stored in localStorage.
-      // The backend's language field is only synced for settings display;
-      // do NOT call setLocale() here or it would override the user's choice
-      // when the backend (default zh) pushes config asynchronously.
-      // Sync keybinds from backend config
-      const cfgAny = cfg as any;
-      if (cfgAny.keybinds && typeof cfgAny.keybinds === "object" && Array.isArray(cfgAny.keybinds.keybinds)) {
-        state.setSettings({ ...state.getState().settings, keybinds: cfgAny.keybinds });
-      } else {
-        // Backend sent no keybinds or corrupted data — try localStorage fallback
-        try {
-          const saved = localStorage.getItem("encre_keybinds");
-          if (saved) {
-            const parsed = JSON.parse(saved);
-            if (parsed && typeof parsed === "object" && Array.isArray(parsed.keybinds)) {
-              state.setSettings({ ...state.getState().settings, keybinds: parsed });
-            }
-          }
-        } catch { /* ignore */ }
-      }
-      // Sync adapter_* keys from backend config into settings (for gateway panel)
-      const _adapterKeys = Object.keys(cfgAny).filter(k => k.startsWith("adapter_"));
-      if (_adapterKeys.length > 0) {
-        const _adapterSettings: Record<string, unknown> = {};
-        for (const k of _adapterKeys) {
-          _adapterSettings[k] = cfg[k];
-        }
-        state.setSettings({ ...state.getState().settings, ..._adapterSettings });
-      }
+      break;
+    }
+
+    case "config_patch": {
+      // Incremental config update: the backend diffs the post-change config
+      // against its last full snapshot and sends ONLY the changed top-level
+      // fields.  Applied through the same applier as config_data, so every
+      // panel consumer stays identical -- the guards inside
+      // applyConfigSnapshot make absent keys no-ops instead of resets.
+      state.batch(() => {
+        applyConfigSnapshot(event.config as Record<string, unknown>);
+      });
       break;
     }
 
     case "models_updated": {
-      console.log("[stream] models_updated, count:", event.models?.length, "active_index:", event.active_model_index);
+      const eventSid = (event as { session_id?: string }).session_id || "";
+      const activeSid = state.getState().sessionId;
+      // A background conversation (or a run that fell back while the user
+      // moved on) must never repaint the selector of the conversation that
+      // is actually open. Frames are tagged with their owning session.
+      if (eventSid && activeSid && eventSid !== activeSid) {
+        console.log("[stream] models_updated for background session", eventSid, "ignored");
+        break;
+      }
+      console.log("[stream] models_updated, count:", event.models?.length, "active_index:", event.active_model_index, "sid:", eventSid);
       state.setModelConfigs(event.models, event.active_model_index);
+      if (event.providers) state.setProviders(event.providers);
+      state.recordSessionModel(event.active_model_index);
+      state.markModelIndexSynced(eventSid);
       break;
     }
 
@@ -1352,6 +2272,28 @@ export function handleEvent(event: ServerEvent): void {
 
     case "skills_list":
       state.setSkillsList(event.skills);
+      break;
+
+    case "skill_detail": {
+      // One skill's own description and SKILL.md body, answering the market's
+      // per-skill request.  Re-dispatched as a DOM event: the plugin page is
+      // the only consumer and it fills the card that asked.
+      dispatchServerSignal(
+        "encre-skill-detail",
+        event,
+        `${(event as { name?: string }).name || ""}|${((event as { body?: string }).body || "").length}`,
+      );
+      break;
+    }
+
+    case "skill_file":
+      // One file inside a skill package (its references/, templates/, scripts/),
+      // which the market's skill reader follows.
+      dispatchServerSignal(
+        "encre-skill-file",
+        event,
+        `${(event as { name?: string }).name || ""}|${(event as { path?: string }).path || ""}|${((event as { content?: string }).content || "").length}`,
+      );
       break;
 
     case "mcp_updated":
@@ -1392,6 +2334,10 @@ export function handleEvent(event: ServerEvent): void {
       state.setMemoryList(event.entries);
       break;
 
+    case "memory_graph":
+      state.setMemoryGraph(event.graph);
+      break;
+
     case "global_rules_list":
       state.setGlobalRulesList(event.rules);
       break;
@@ -1418,40 +2364,22 @@ export function handleEvent(event: ServerEvent): void {
       state.setProfile(event.profile);
       break;
 
-    case "index_status":
-      state.setIndexStatus(event.status as any);
-      state.setIndexFiles(event.files);
-      if (event.progress !== undefined) {
-        state.setIndexProgress(event.progress);
-      }
-      // Also update per-workspace index state for sidebar tree
-      if ((event as any).workspace_id) {
-        state.updateWorkspaceIndex(
-          (event as any).workspace_id,
-          event.status as string,
-          event.files,
-          event.progress,
-        );
-      }
-      break;
-
     case "gitignore_content":
       state.setGitignoreContent(event.content);
       break;
 
-    case "documents_list":
-      state.setDocsList(event.documents);
+    case "library_tree":
+      state.setLibraryTree(event.nodes);
       break;
 
-    case "document_added":
-    case "document_updated":
-    case "document_removed":
-      // The backend pushes the refreshed documents_list with each document
-      // operation — nothing to fetch here.
+    case "library_content":
+      state.setLibraryContent({ id: event.id, content: event.content });
       break;
 
-    case "document_error":
-      state.showToast(t("common.documentError"), "", "error", "Index");
+    case "library_error":
+      // The backend carries the real failure text; surface it as a toast so
+      // a failed tree op never dies silently.
+      state.showToast(t("session.documentError"), event.message || t("settings.documentError"), "error", "Library");
       break;
 
     case "skill_installed":
@@ -1478,9 +2406,54 @@ export function handleEvent(event: ServerEvent): void {
       state.setMemoryDetail({ path: event.path, content: event.content, error: event.error });
       break;
 
+    case "retry":
+      // Transient: a failed model call is being retried.  Shown at the bottom
+      // of the conversation until the retried attempt produces output (the
+      // streaming handlers below clear it) or the turn ends.
+      if (!_hasSessionId(event as any)) break;
+      state.setRetryNotice({
+        scope: (event as any).scope || "request",
+        attempt: Number((event as any).attempt) || 1,
+        maxAttempts: Number((event as any).max_attempts) || 0,
+        delayMs: Number((event as any).delay_ms) || 0,
+        message: (event as any).message || "",
+        statusCode: Number((event as any).status_code) || 0,
+        errorClass: (event as any).error_class || "",
+        timestamp: Date.now(),
+      }, _eventSessionId(event as any));
+      break;
+
     case "compact_starting":
       if (!_hasSessionId(event as any)) break;
-      state.addCompactStartingEvent(_eventSessionId(event as any));
+      state.addCompactStartingEvent(
+        String((event as any).notice_id || ""),
+        String((event as any).anchor_id || ""),
+        _eventSessionId(event as any),
+      );
+      break;
+
+    case "model_switch":
+      // The active model changed -- manual selection or automatic model-pool
+      // cycling.  The backend has already persisted the notice on the
+      // session (recorded like a tool call), so appending it here makes the
+      // line appear immediately and a later full-history reload replaces it
+      // in place at the same anchor.
+      if (!_hasSessionId(event as any)) break;
+      state.appendNoticeMessage(
+        "model_switch",
+        {
+          id: String((event as any).notice_id || "") || `ms-${Date.now()}`,
+          timestamp: Date.now(),
+          from_model: (event as any).from_model || "",
+          to_model: (event as any).to_model || "",
+          reason: (event as any).reason || "",
+          source: (event as any).source || "manual",
+          // Server id of the message the switch happened after — the line is
+          // inserted THERE, never below a still-streaming reply.
+          anchor_id: (event as any).anchor_id || "",
+        },
+        _eventSessionId(event as any),
+      );
       break;
 
     case "compact_failed":
@@ -1488,21 +2461,24 @@ export function handleEvent(event: ServerEvent): void {
       // the "compressing" indicator; the conversation continues with the
       // uncompressed context.
       if (!_hasSessionId(event as any)) break;
-      state.clearCompactStartingEvents();
+      state.clearCompactStartingEvents(String((event as any).notice_id || ""), _eventSessionId(event as any));
       break;
 
     case "compact":
       if (!_hasSessionId(event as any)) break;
       // Compaction finished: drop the "compressing" indicator; the inline
-      // divider comes from the compact_marker in the refreshed messages.
-      state.clearCompactStartingEvents();
+      // divider comes from the compact notice in the refreshed messages.
+      state.clearCompactStartingEvents(String((event as any).notice_id || ""), _eventSessionId(event as any));
       state.addCompactEvent({
         old_count: (event as any).old_count,
         new_count: (event as any).new_count,
         old_tokens: (event as any).old_tokens,
         new_tokens: (event as any).new_tokens,
       }, _eventSessionId(event as any));
-      if ((event as any).messages) {
+      // Guard: an empty payload means "no session attached", not "the
+      // conversation is empty" -- reloading with [] would wipe the
+      // transcript on screen.
+      if (Array.isArray((event as any).messages) && (event as any).messages.length > 0) {
         state.loadSessionMessages((event as any).messages, _eventSessionId(event as any));
       }
       // The backend persists summary-panel data (plan/artifacts/references)
@@ -1534,23 +2510,50 @@ export function handleEvent(event: ServerEvent): void {
       {
         const sev = event as any;
         state.updateSpec(sev.spec || null, _eventSessionId(sev));
-        (window as any).__sessionInner?.render?.();
+        (window as any).__sessionInner?.requestRender?.();
       }
       break;
 
     case "plan_review":
       {
         const sev = event as any;
+        console.log("[stream] plan_review accepted:", sev.status, "review=", sev.review?.review_id, "call=", sev.review?.call_id);
+        if (!sev.review) {
+          // Mode closed: the backend dismissed the pending review, so drop
+          // the card instead of merging into the stale one.
+          state.updatePlanReview(null, _eventSessionId(sev));
+          break;
+        }
         const review = sev.review || {};
         const existing = state.getState().planReview || {} as any;
-        state.updatePlanReview({
+        if (
+          existing.review_id && review.review_id
+          && existing.review_id !== review.review_id && sev.status !== "review"
+        ) {
+          // Late echo for a review the card no longer shows (e.g. a decision
+          // that only surfaced after the user already resubmitted). Applying
+          // it would swap the live card back to the dead one.
+          break;
+        }
+        const merged = {
           review_id: review.review_id || existing.review_id || "",
           content: review.content || existing.content || "",
           file_path: review.file_path || existing.file_path || "",
           dir_path: review.dir_path || existing.dir_path || "",
           mode: review.mode || existing.mode || "",
           status: sev.status || existing.status || "review",
-        }, _eventSessionId(sev));
+          files: review.files || existing.files || [],
+          feedback: sev.feedback || review.feedback || existing.feedback || "",
+          call_id: review.call_id || existing.call_id || "",
+        };
+        // The card is one-shot: it exists only while the decision is owed.
+        // Approving, rejecting, cancelling or timing out retires it, and the
+        // turn's own output is the record -- a resolved card lingering at
+        // the bottom of the transcript reads as a second pending question.
+        state.updatePlanReview(
+          merged.status === "review" || merged.status === "draft" ? merged : null,
+          _eventSessionId(sev),
+        );
       }
       break;
 
@@ -1560,8 +2563,9 @@ export function handleEvent(event: ServerEvent): void {
         (event as any).context_tokens,
         (event as any).context_window,
         _eventSessionId(event as any),
+        (event as any).breakdown ?? null,
       );
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "agent_state":
@@ -1573,21 +2577,21 @@ export function handleEvent(event: ServerEvent): void {
           : (event as any).state,
         _eventSessionId(event as any),
       );
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "artifacts_update":
       if (!_hasSessionId(event)) break;
       // Append new artifacts; the server sends one at a time during streaming.
       state.appendArtifacts(event.artifacts, _eventSessionId(event));
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "references_update":
       if (!_hasSessionId(event)) break;
       // Append new references; the server sends one at a time during streaming.
       state.appendReferences(event.references, _eventSessionId(event));
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "messages_updated":
@@ -1599,6 +2603,13 @@ export function handleEvent(event: ServerEvent): void {
         if (event.session_id) {
           state.setSessionId(event.session_id);
         }
+        // Drop the frame, but not a pending rollback edit. The server can
+        // answer a rollback only after the user already fired the next turn,
+        // and leaving the marker alive would let the next list load cut the
+        // user's own re-sent message, which sits at the same ordinal with
+        // the same text. The optimistic local truncation already stands, so
+        // no list rewrite is needed here.
+        state.clearPendingRollbackEdit();
         break;
       }
       // Sync session ID and reset running state for reliable subsequent sends.
@@ -1608,7 +2619,11 @@ export function handleEvent(event: ServerEvent): void {
         state.setSessionId(event.session_id);
       }
       state.setSessionState("idle", _eventSessionId(event));
-      state.loadSessionMessages(state.applyPendingRollbackEdit(event.messages || []), _eventSessionId(event));
+      // If this confirms a pending rollback edit, the conversation was
+      // truncated: pin the next render to the bottom instead of keeping
+      // the pre-rollback scroll offset.
+      if (state.hasPendingRollbackEdit(_eventSessionId(event))) chat?.requestPinToBottom?.();
+      state.loadSessionMessages(state.applyPendingRollbackEdit(event.messages || [], _eventSessionId(event)), _eventSessionId(event));
       state.setPlanItems(event.plan_items || [], _eventSessionId(event));
       if (event.artifacts) {
         state.setArtifacts(event.artifacts, _eventSessionId(event));
@@ -1616,8 +2631,8 @@ export function handleEvent(event: ServerEvent): void {
       if (event.references) {
         state.setReferences(event.references, _eventSessionId(event));
       }
-      chat?.render();
-      (window as any).__sessionInner?.render?.();
+      chat?.requestRender();
+      (window as any).__sessionInner?.requestRender?.();
       // Sync sidebar session entry (message count, preview)
       _syncSessionEntry(event.session_id, state.getState());
       break;
@@ -1631,7 +2646,7 @@ export function handleEvent(event: ServerEvent): void {
         state.setSessionId(event.session_id);
       }
       state.setSessionState("idle", _eventSessionId(event));
-      state.loadSessionMessages(state.applyPendingRollbackEdit(event.messages || []), _eventSessionId(event));
+      state.loadSessionMessages(state.applyPendingRollbackEdit(event.messages || [], _eventSessionId(event)), _eventSessionId(event));
       state.setPlanItems(event.plan_items || [], _eventSessionId(event));
       if (event.artifacts) {
         state.setArtifacts(event.artifacts, _eventSessionId(event));
@@ -1662,27 +2677,37 @@ export function handleEvent(event: ServerEvent): void {
           }
         }
       }
-      // Restore attachment chips from the rolled-back user message
+      // Restore attachment chips from the SAME user message whose text was
+      // restored above (the new tail of the truncated conversation).  The
+      // old code scanned backwards past the tail for ANY user message with
+      // refs, so after a rollback + text-only resend it resurrected chips
+      // from an older image message the moment the turn ended (the ghost
+      // image chip bug).  Replace semantics: stale chips never survive.
       {
         const msgs = state.getState().messages;
+        let tailRefs: import("./types.js").AttachmentMeta[] | undefined;
         for (let i = msgs.length - 1; i >= 0; i--) {
-          const refs = msgs[i].fileRefs;
-          if (msgs[i].role === "user" && refs && refs.length > 0) {
-            const atts: import("./types.js").AttachmentMeta[] = [];
-            for (const r of refs) {
-              if (r.mime_type === "text/x-terminal") continue;
-              if (r.path) {
-                atts.push({ name: r.name, path: r.path, content: "", mime_type: r.mime_type || "", size: r.size, is_binary: false });
-              }
-            }
-            if (atts.length > 0) state.addAttachments(atts);
+          if (msgs[i].role === "user") {
+            tailRefs = (msgs[i] as any).fileRefs;
             break;
           }
         }
+        const atts: import("./types.js").AttachmentMeta[] = [];
+        for (const r of tailRefs || []) {
+          if (r.mime_type === "text/x-terminal") continue;
+          if (r.path) {
+            atts.push({ name: r.name, path: r.path, content: "", mime_type: r.mime_type || "", size: r.size, is_binary: false });
+          }
+        }
+        state.clearAttachments();
+        if (atts.length > 0) state.addAttachments(atts);
       }
       _syncSessionEntry(event.session_id, state.getState());
+      // The session was truncated by the rollback: pin the next render to
+      // the bottom instead of preserving the pre-rollback scroll offset.
+      chat?.requestPinToBottom?.();
       chat?.renderForce?.();
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "session_deleted":
@@ -1699,8 +2724,8 @@ export function handleEvent(event: ServerEvent): void {
         state.clearMessages();
         state.setSessionState("idle", "");
       }
-      chat?.render();
-      (window as any).__sessionInner?.render?.();
+      chat?.requestRender();
+      (window as any).__sessionInner?.requestRender?.();
       // Refresh automation history — the deleted session may be a sub-agent
       // session shown in the automation history timeline, which uses its own
       // independent this.history array (not global sessionsList).
@@ -1755,7 +2780,7 @@ export function handleEvent(event: ServerEvent): void {
             : t("settings.storageImportTitle");
           _migrationProgress = Dialog.progress(title, "", {
             cancellable: false,
-            container: document.getElementById("settings-view") ?? undefined,
+            scope: "app"
           });
         }
         _migrationProgress.update(event.percent, `${event.done} / ${event.total}`);
@@ -1783,24 +2808,30 @@ export function handleEvent(event: ServerEvent): void {
     case "session_renamed":
       // The backend broadcasts the refreshed sessions_list with the rename —
       // nothing to fetch here.
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
-    case "model_validated":
-      if (_validationResolve) {
-        _validationResolve();
-        _validationResolve = null;
-        _validationReject = null;
+    case "model_validated": {
+      // Route by the caller's correlation id first; legacy backends (or
+      // callers) that never sent one still route by model id.
+      const key = ((event as any).request_id as string | undefined) || ((event as any).model_id as string | undefined);
+      const entry = key ? _validationPending.get(key) : undefined;
+      if (entry) {
+        _validationPending.delete(key as string);
+        entry.resolve(event);
       }
       break;
+    }
 
-    case "model_validation_error":
-      if (_validationReject) {
-        _validationReject(event.message);
-        _validationResolve = null;
-        _validationReject = null;
+    case "model_validation_error": {
+      const key = ((event as any).request_id as string | undefined) || ((event as any).model_id as string | undefined);
+      const entry = key ? _validationPending.get(key) : undefined;
+      if (entry) {
+        _validationPending.delete(key as string);
+        entry.reject(event.message);
       }
       break;
+    }
 
     case "workspace_opened":
       state.setWorkspaces(event.workspaces);
@@ -1810,21 +2841,18 @@ export function handleEvent(event: ServerEvent): void {
       // them back into iWork a few seconds later. Keep the refreshed
       // workspace list but ignore the mode switch.
       if (getWorkspaceIntent() === "close") {
-        (window as any).__sessionInner?.render?.();
+        (window as any).__sessionInner?.requestRender?.();
         break;
       }
       state.setActiveWorkspace(event.path);
       state.setWorkspaceMode("iwork");
-      state.setSessionsList([]);
-      // Capture initial index state for sidebar tree display
-      if ((event as any).index_status) {
-        state.updateWorkspaceIndex(
-          (event as any).id || "",
-          (event as any).index_status,
-          (event as any).index_files || 0,
-          (event as any).progress,
-        );
-      }
+      // NOTE: no setSessionsList([]) here.  The sidebar was already seeded
+      // with cached iWork rows by enterWorkspaceMode(); clearing between
+      // that seed and the authoritative sessions_list (pushed by the
+      // backend's unified snapshot below) produced the
+      // "sessions → empty → sessions" flash on every mode switch.
+      // The backend's _push_all_data (sent right after workspace_opened)
+      // replaces the seeded list in one step.
       // If a tray-driven resume is pending after opening this workspace, fire it.
       const pending = (window as any).__pendingTrayResume;
       if (pending && pending.sessionId) {
@@ -1841,11 +2869,11 @@ export function handleEvent(event: ServerEvent): void {
         chat?.renderForce?.();
         (window as any).__sessionInner?.restoreSidebarVisibility?.();
       }
-      // Refresh every data plane (sessions, config+models, workspaces) so the
-      // sidebar, model selector and settings all reflect the new workspace
-      // context instead of keeping the previous session's stale data.
-      refreshAllData();
-      (window as any).__sessionInner?.render?.();
+      // No refreshAllData() here either: the backend pushes the full unified
+      // snapshot (config/sessions/workspaces/workspace_config/models) as part
+      // of processing open_workspace, so an explicit re-pull would only
+      // duplicate every frame and re-render the same data twice.
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "workspace_closed":
@@ -1853,22 +2881,25 @@ export function handleEvent(event: ServerEvent): void {
       // workspace (open_workspace sent after this close), this late close
       // must not drop them back to normal — the pending open will land next.
       if (getWorkspaceIntent() === "open") {
-        (window as any).__sessionInner?.render?.();
+        (window as any).__sessionInner?.requestRender?.();
         break;
       }
       state.setActiveWorkspace("");
       state.setWorkspaceMode("normal");
-      state.setSessionsList([]);
-      // Back to the global/normal context: pull the full data set again so
-      // the sidebar / model selector / settings show the global state.
-      refreshAllData();
+      // NOTE: no setSessionsList([]) — symmetric to workspace_opened.
+      // exitWorkspaceMode() already seeded the sidebar with cached normal
+      // rows; clearing here flashed "no sessions" until the backend's
+      // unified push (sent after workspace_closed) refilled the list.
+      // Back to the global/normal context: the backend's _push_all_data
+      // triggered by close_workspace refreshes sidebar / model selector /
+      // settings from the global state — no explicit re-pull needed.
       state.setSessionState("idle");
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "workspaces_list":
       state.setWorkspaces(event.workspaces);
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "workspace_config":
@@ -1880,14 +2911,15 @@ export function handleEvent(event: ServerEvent): void {
     case "workspace_removed":
       state.setWorkspaces(event.workspaces);
       // If the deleted workspace was active, clean up state.  The backend
-      // pushes the unified snapshot after removal — nothing to fetch here.
+      // pushes the unified snapshot after removal — nothing to fetch here,
+      // and no list clear: the pushed sessions_list replaces the rows in
+      // one step (clearing would flash an empty sidebar first).
       if (state.getState().activeWorkspace === (event as any).path) {
         state.setActiveWorkspace("");
         state.setWorkspaceMode("normal");
-        state.setSessionsList([]);
         state.setSessionState("idle");
       }
-      (window as any).__sessionInner?.render?.();
+      (window as any).__sessionInner?.requestRender?.();
       break;
 
     case "assistant_boundary":
@@ -1909,16 +2941,21 @@ export function handleEvent(event: ServerEvent): void {
       if (ev.messages && !state.getState().running) {
         state.loadSessionMessages(ev.messages, ev.session_id);
       }
-      chat?.render();
-      (window as any).__sessionInner?.render?.();
+      chat?.requestRender();
+      (window as any).__sessionInner?.requestRender?.();
       break;
     }
 
     case "branch_switched": {
       const ev = event as BranchSwitched;
       if (_shouldRejectSessionScopedEvent(ev)) break;
+      // A branch switch is only the rollback's own reply when it belongs to
+      // the conversation the marker was started in. A switch from anywhere
+      // else must not consume the pending edit -- and a marker for another
+      // session is stale by the time the user is navigating this branch.
+      if (!state.hasPendingRollbackEdit(ev.session_id)) state.clearPendingRollbackEdit();
       state.setBranches(ev.branches, ev.branch_id, ev.session_id);
-      state.loadSessionMessages(state.applyPendingRollbackEdit(ev.messages), ev.session_id);
+      state.loadSessionMessages(state.applyPendingRollbackEdit(ev.messages, ev.session_id), ev.session_id);
       if (ev.artifacts) {
         state.setArtifacts(ev.artifacts, ev.session_id);
       }
@@ -1930,16 +2967,19 @@ export function handleEvent(event: ServerEvent): void {
       // being queued waiting for a "running=false" transition that never comes.
       state.setSessionState("idle", ev.session_id);
       state.setSessionId(ev.session_id);
-      chat?.render();
-      (window as any).__sessionInner?.render?.();
+      // Branch switch replaces the whole timeline: pin the next render to
+      // the bottom so the user lands on the last turn of the new branch.
+      chat?.requestPinToBottom?.();
+      chat?.requestRender();
+      (window as any).__sessionInner?.requestRender?.();
       break;
     }
 
     case "branch_rolled_back": {
       const ev = event as BranchRolledBack;
       state.removeBranchMessages(new Set(ev.removed_message_ids), ev.session_id);
-      chat?.render();
-      (window as any).__sessionInner?.render?.();
+      chat?.requestRender();
+      (window as any).__sessionInner?.requestRender?.();
       break;
     }
 
@@ -2017,7 +3057,7 @@ export function handleEvent(event: ServerEvent): void {
         failedCount: 0,
         skippedCount: 0,
       });
-      chat?.render();
+      chat?.requestRender();
       break;
 
     case "workflow_task":
@@ -2028,7 +3068,7 @@ export function handleEvent(event: ServerEvent): void {
         taskName: (event as any).task_name,
         status: (event as any).status,
       });
-      chat?.render();
+      chat?.requestRender();
       break;
 
     case "workflow_completed":
@@ -2045,11 +3085,18 @@ export function handleEvent(event: ServerEvent): void {
         skippedCount: (event as any).skipped_count,
         totalDuration: (event as any).total_duration,
       });
-      chat?.render();
+      chat?.requestRender();
       break;
 
     default:
       break;
+  }
+  // Attribution for the remaining synchronous work (state application and
+  // subscribers that run inside this task). Scheduled paints are logged
+  // separately by the render scheduler.
+  const _evtMs = performance.now() - _perfNow;
+  if (_evtMs >= 30) {
+    console.warn(`[perf] handleEvent ${_perfType} ${Math.round(_evtMs)}ms`);
   }
 }
 
@@ -2064,14 +3111,9 @@ function _syncSubAgentView(toolCallId: string): void {
   if (!view || !state.toolCallMatchesId(view, toolCallId)) return;
   const fresh = state.findToolCall(toolCallId);
   if (!fresh) return;
-  const dividerCount = fresh.subAgentMessages?.filter((m) => m.mode === "task_divider").length ?? 0;
-  // Parallel runs now surface each task as its own card in the parent
-  // transcript. Drop the combined sub-agent view unless the user already
-  // picked a specific task to inspect.
-  if (dividerCount >= 2 && view.taskIndex === undefined) {
-    state.setSubAgentView(null);
-    return;
-  }
+  // The combined view (no task picked) now tiles each parallel task into its
+  // own pane (fullRenderParallel), so it is a legitimate live view and no
+  // longer dropped back to the parent transcript on the first tick.
   state.setSubAgentView({ ...fresh, taskIndex: view.taskIndex });
 }
 

@@ -1,0 +1,87 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * You may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * DISCLAIMER: Users must comply with applicable AI regulations.
+ * Non-compliance may result in service termination or legal liability.
+ */
+
+/* Theme skin "ink" (水墨) — the pure black-and-white palette the app
+ * shipped with.  One file per skin; the mode ("light" / "dark") stays on
+ * [data-theme], the skin on [data-skin]. This is the default skin and
+ * doubles as the no-skin fallback.  Surfaces (content paper, chassis,
+ * form-control background) and the neutral hover/selection plates are
+ * NOT defined here — styles.css and themes/tokens.css own them and
+ * keep them identical across every skin. */
+
+/* ═══ 水墨 · 浅（纯白）═══ */
+html[data-skin="ink"]:not([data-theme="dark"]),
+html:not([data-skin])[data-theme="light"] {
+  --text-primary: #1a1a1a;
+  --text-secondary: #5b6066;
+  --text-tertiary: #797d83;
+  --text-muted: #85898f;
+  --tool-text: #4a4f55;
+  --accent: #666666;
+  --accent-hover: #444444;
+  --accent-light: rgba(102, 102, 102, 0.10);
+  --accent-contrast: #ffffff;
+  --success: #0d7a55;
+  --error: #c0352b;
+  --warning: #a16207;
+  --border: #d9d9d9;
+  --border-light: #dedee1;
+  --card-border: #d2d2d6;
+  --card-fill: #e3e5ea;
+  --border-control: #c2c2c7;
+  --checkbox-border: #b6b6bb;
+  --selection-bg: hsl(0 0% 30% / .18);
+  --seg-bg: #eeeeee;
+  --seg-active-bg: #ffffff;
+  --seg-text: #666666;
+  --seg-text-hover: #1f1f1f;
+  --seg-active-text: #1f1f1f;
+}
+
+/* ═══ 水墨 · 深（纯黑）═══ */
+html[data-skin="ink"][data-theme="dark"],
+html:not([data-skin]):not([data-theme="light"]) {
+  --text-primary: #f5f5f7;
+  --text-secondary: #a1a1aa;
+  --text-tertiary: #7d7d86;
+  --text-muted: #6b6b73;
+  --tool-text: #f5f5f7;
+  --accent: #999999;
+  --accent-hover: #bbbbbb;
+  --accent-light: rgba(153, 153, 153, 0.15);
+  --accent-contrast: #111111;
+  --success: #22c55e;
+  --error: #ef4444;
+  --warning: #f59e0b;
+  --border: #2f2f31;
+  --border-light: #353537;
+  --card-border: #353537;
+  --card-fill: #111111;
+  --border-control: #3f3f42;
+  --checkbox-border: #4a4a4d;
+  --selection-bg: hsl(0 0% 80% / .26);
+  --seg-bg: #2a2a2a;
+  --seg-active-bg: #3a3a3a;
+  --seg-text: #999999;
+  --seg-text-hover: #f5f5f5;
+  --seg-active-text: #f5f5f5;
+}

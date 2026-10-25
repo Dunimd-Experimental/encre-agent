@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,31 +23,20 @@
 
 from __future__ import annotations
 
-"""Tests for ``.md`` memory-file ingestion (Task 1, single memory store).
+"""Tests for ``.md`` memory-file ingestion into the single layered memory store.
 
-The store under test is the real :class:`MemoryLayerStore` on a real
-``tmp_path`` memory directory: the real encrypted :mod:`encre.secure_io`
-persistence, the real file facade's front-matter parser, and the real
-:class:`RecallEngine`.  No mock store or parser is used.
+Every component under test is real and nothing is mocked: the store is a real
+:class:`MemoryLayerStore` rooted in a ``tmp_path`` directory, persistence goes
+through the real encrypted :mod:`encre.secure_io` layer log, the front matter is
+parsed by the real file facade, and retrieval runs through the real
+:class:`RecallEngine`.  Together the tests pin down that a human-edited
+``.md`` memory lands in the store exactly once, that re-ingesting an unchanged
+tree is a no-op, that editing a body revises the same logical entry rather than
+duplicating it, and that ``MEMORY.md`` stays out of ingestion but still reaches
+the production recall prompt verbatim as the curated index.
 
-Covered invariants:
-
-1. a real ``.md`` file with front matter becomes a long-term entry that
-   :meth:`RecallEngine.recall` can retrieve;
-2. re-ingesting an unchanged directory creates nothing new (no duplicate
-   logical entry, no extra on-disk record);
-3. editing the file body appends a *revision* of the same entry (still exactly
-   one logical entry, carrying the new content);
-4. ``MEMORY.md`` is skipped, and the explicit ``directory`` argument is honoured;
-5. end-to-end: ingestion through the facade's ``refresh()`` makes a real
-   ``.md`` memory reachable from :meth:`ContextBuilder.build_recall_prompt`,
-   the production prompt path;
-6. the human-curated ``MEMORY.md`` index is rendered verbatim by
-   ``build_recall_prompt`` (it is excluded from ingestion, so this is the only
-   way it still reaches the model).
-
-The data root is redirected to ``tmp_path`` via ``ENCRE_DATA_DIR`` and the
-store is rooted in the temp tree, so the real user data directory is never
+The data root is redirected to ``tmp_path`` through ``ENCRE_DATA_DIR`` and the
+store is rooted inside the temp tree, so the real user data directory is never
 touched.
 """
 
@@ -71,7 +60,7 @@ from encre.secure_io import read_jsonl
 
 @pytest.fixture
 def memory_dir(tmp_path, monkeypatch) -> Path:
-    """An isolated real memory directory with an isolated data root."""
+    """Isolated memory directory plus an isolated data root for every test."""
     monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "data"))
     directory = tmp_path / "memory"
     directory.mkdir(parents=True, exist_ok=True)
@@ -84,10 +73,10 @@ def _write_memory(
     *,
     description: str,
     body: str,
-    memory_type: str = "semantic",
+    memory_type: str = "fact",
     tags: tuple[str, ...] = (),
 ) -> Path:
-    """Write one human-editable memory file (front matter + body)."""
+    """Write a single human-editable memory file made of front matter and a body."""
     lines = ["---", f"description: {description}", f"type: {memory_type}"]
     if tags:
         lines.append("tags:")
@@ -99,8 +88,8 @@ def _write_memory(
 
 
 def _record_count(store: MemoryLayerStore) -> int:
-    """Number of encrypted records in the semantic layer file."""
-    return len(read_jsonl(store.layers_dir / f"{MemoryType.SEMANTIC.value}.jsonl"))
+    """Count the encrypted records written to the semantic layer log."""
+    return len(read_jsonl(store.layers_dir / f"{MemoryType.FACT.value}.jsonl"))
 
 
 # ----------------------------------------------------------------------
@@ -128,11 +117,11 @@ def test_md_file_is_ingested_and_recallable(memory_dir):
     assert len(entries) == 1
     entry = entries[0]
     assert entry.source == "md:gateway-port.md"
-    assert entry.type == MemoryType.SEMANTIC.value
+    assert entry.type == MemoryType.FACT.value
     assert "port 8080" in entry.content
-    # The front-mattered summary stays in the retrievable content.
+    # The front-matter summary becomes part of the retrievable content.
     assert "Gateway port decision" in entry.content
-    # The YAML block itself is metadata, not memory.
+    # The YAML delimiter belongs to metadata, so it never enters the memory text.
     assert "---" not in entry.content
     assert entry.metadata["tags"] == ["networking", "config"]
     assert entry.metadata["path"] == str(memory_dir / "gateway-port.md")
@@ -149,7 +138,7 @@ def test_md_file_is_ingested_and_recallable(memory_dir):
 
 
 def test_reingesting_unchanged_directory_is_idempotent(memory_dir):
-    """A second ingest of the same content writes no record and no entry."""
+    """A second ingest of identical content writes neither a record nor an entry."""
     _write_memory(
         memory_dir,
         "release-checklist.md",
@@ -162,12 +151,12 @@ def test_reingesting_unchanged_directory_is_idempotent(memory_dir):
     assert _record_count(store) == 1
     entry_id = store.long_term()[0].id
 
-    # Unchanged -> nothing created, nothing updated, nothing appended.
+    # Unchanged content: nothing created, nothing updated, nothing appended.
     assert store.ingest_memory_dir() == 0
     assert [entry.id for entry in store.long_term()] == [entry_id]
     assert _record_count(store) == 1
 
-    # And the no-op survives a reload (nothing was persisted in between).
+    # The no-op also survives a reload, since nothing was persisted in between.
     store.reload()
     assert [entry.id for entry in store.long_term()] == [entry_id]
     assert _record_count(store) == 1
@@ -179,7 +168,7 @@ def test_reingesting_unchanged_directory_is_idempotent(memory_dir):
 
 
 def test_changed_body_appends_a_revision_not_a_second_entry(memory_dir):
-    """Editing the file updates the one logical entry, appending a revision."""
+    """Editing the file updates the single logical entry by appending a revision."""
     path = _write_memory(
         memory_dir,
         "deploy-steps.md",
@@ -208,17 +197,17 @@ def test_changed_body_appends_a_revision_not_a_second_entry(memory_dir):
     assert "nine steps" in entries[0].content
     assert "seven steps" not in entries[0].content
     assert entries[0].version == original_version + 1
-    # The revision is appended to the append-only layer log, never duplicated.
+    # The revision is appended to the append-only log and never creates a twin.
     assert _record_count(store) == 2
 
-    # Last record wins on reload: still exactly one logical entry.
+    # The newest record wins on reload: still exactly one logical entry.
     store.reload()
     entries = store.long_term()
     assert len(entries) == 1
     assert entries[0].id == original_id
     assert "nine steps" in entries[0].content
 
-    # Re-ingesting the edited file is again a no-op.
+    # Re-ingesting the already-edited file is again a no-op.
     assert store.ingest_memory_dir() == 0
     assert _record_count(store) == 2
 
@@ -229,7 +218,7 @@ def test_changed_body_appends_a_revision_not_a_second_entry(memory_dir):
 
 
 def test_entrypoint_is_skipped_and_directory_argument_is_honoured(memory_dir):
-    """The entrypoint is never ingested, and an explicit directory is scanned."""
+    """The entrypoint is never ingested and an explicit directory is scanned."""
     (memory_dir / "MEMORY.md").write_text(
         "# Entrypoint\n\nThis is the entrypoint, not a memory.\n",
         encoding="utf-8",
@@ -261,9 +250,9 @@ def test_entrypoint_is_skipped_and_directory_argument_is_honoured(memory_dir):
 def test_ingested_memory_reaches_the_recall_prompt(memory_dir):
     """A memory written to disk and ingested is rendered by build_recall_prompt.
 
-    Every component is real: the facade's ``refresh()`` trigger, the
-    ``MemoryLayerStore`` (encrypted persistence), the ``RecallEngine`` and the
-    ``ContextBuilder`` that the production loop uses to enrich the system
+    Every piece of the chain is real: the facade's ``refresh()`` trigger, the
+    ``MemoryLayerStore`` with encrypted persistence, the ``RecallEngine``, and
+    the ``ContextBuilder`` that the production loop uses to enrich the system
     prompt.
     """
     _write_memory(
@@ -284,7 +273,7 @@ def test_ingested_memory_reaches_the_recall_prompt(memory_dir):
         recall_engine=RecallEngine(store),
     )
 
-    # Before the ingestion trigger nothing is associated with the query.
+    # Before the ingestion trigger fires nothing is associated with the query.
     assert builder.build_recall_prompt("gateway port 8080") == ""
 
     facade.refresh()
@@ -292,11 +281,11 @@ def test_ingested_memory_reaches_the_recall_prompt(memory_dir):
     prompt = builder.build_recall_prompt("gateway port 8080")
     assert prompt
     assert "The gateway always listens on port 8080." in prompt
-    # The rendered block names the memory type and is a real prompt block.
+    # The rendered block is a real prompt block that names the memory type.
     assert "## Relevant Memories" in prompt
-    assert f"[{MemoryType.SEMANTIC.value}]" in prompt
+    assert f"[{MemoryType.FACT.value}]" in prompt
 
-    # An unrelated query recalls nothing, so the block stays empty.
+    # An unrelated query recalls nothing, so the block is not rendered.
     assert builder.build_recall_prompt("watercolour painting techniques") == ""
 
 
@@ -304,9 +293,9 @@ def test_curated_entrypoint_memory_reaches_build_recall_prompt(memory_dir):
     """The human-curated ``MEMORY.md`` index still reaches the prompt.
 
     ``MEMORY.md`` is deliberately excluded from ingestion, so it is not
-    reachable through ``RecallEngine``.  It must instead be rendered verbatim
-    as the curated index ahead of any recall hits -- otherwise the entrypoint
-    the user maintains by hand would silently stop reaching the model, which
+    reachable through the ``RecallEngine``.  It must instead be rendered
+    verbatim as the curated index ahead of any recall hits; otherwise the
+    hand-maintained entrypoint would silently stop reaching the model, which
     would be a regression from the legacy facade's ``build_prompt()``.
     """
     curated = "# MEMORY\n\nTeam conventions:\n- gateway always on 8080\n"
@@ -321,13 +310,13 @@ def test_curated_entrypoint_memory_reaches_build_recall_prompt(memory_dir):
         recall_engine=RecallEngine(store),
     )
 
-    # No recall hits, but the curated index is still present.
+    # There are no recall hits, yet the curated index is still present.
     prompt = builder.build_recall_prompt("pipeline")
     assert prompt
     assert "gateway always on 8080" in prompt
     assert "## Curated Memory Index" in prompt
 
-    # It coexists with recall hits once a memory is ingested.
+    # It coexists with recall hits once a memory has been ingested.
     _write_memory(
         memory_dir,
         "pipeline.md",

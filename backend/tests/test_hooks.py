@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for hooks system and event types."""
+"""Tests for the hook system: lifecycle event dataclasses and the dispatch engine.
+
+Covers the three event types emitted while a hook runs (started, progress,
+response) and the EncreHookSystem itself: handler registration and
+unregistration, emission across every hook phase, observer fan-out, rejection
+of unknown event types, and the enabled gate that short-circuits all dispatch.
+"""
 
 import asyncio
 
@@ -37,23 +43,21 @@ from encre.hooks.types import (
 
 
 class TestHookEventTypes:
-    """Engineered to validate the shape and field wiring of hook lifecycle events.
+    """Validates the shape and field wiring of the hook lifecycle events.
 
-    This test class exercises the three concrete event types emitted by the
-    hook pipeline 鈥?started, progress, and response 鈥?across 4 scenarios to
-    ensure each carries its constructor arguments verbatim into the exposed
-    attributes. The design follows the invariant that event dataclasses are
-    pure data carriers so that downstream handlers can reason about hook
-    state without introspection overhead.
+    Exercises the three concrete event types emitted by the hook pipeline —
+    started, progress, and response — and checks that each carries its
+    constructor arguments verbatim into the exposed attributes. The events are
+    pure data carriers, so downstream handlers can reason about hook state
+    without any introspection overhead.
     """
 
     def test_verify_started_event_carries_hook_identity_and_phase(self):
-        """Validate that HookStartedEvent correctly propagates hook identity
-        and phase name when constructed.
+        """Checks that HookStartedEvent propagates hook identity and phase.
 
-        The test exercises direct construction with known values and asserts
-        that each attribute matches because the event dataclass must preserve
-        constructor arguments without transformation for reliable serialization.
+        Constructs the event with known values and asserts every attribute
+        matches, because the dataclass must preserve its constructor arguments
+        without transformation for reliable serialization.
         """
         event = HookStartedEvent(
             hook_id="h1", hook_name="test_hook", event_type="pre_tool_exec"
@@ -63,13 +67,12 @@ class TestHookEventTypes:
         assert event.event_type == "pre_tool_exec", "event_type must match the constructor argument"
 
     def test_verify_progress_event_carries_execution_output_and_streams(self):
-        """Validate that HookProgressEvent correctly propagates output, stdout,
-        and stderr when constructed.
+        """Checks that HookProgressEvent propagates output, stdout, and stderr.
 
-        The test exercises direct construction with mixed output values and
-        asserts each field matches because progress events stream intermediate
-        state and must preserve empty strings (not None) to distinguish
-        'no output yet' from 'output omitted'.
+        Constructs the event with mixed output values and asserts each field,
+        because progress events stream intermediate state and must preserve
+        empty strings rather than None to tell "no output yet" apart from
+        "output omitted".
         """
         event = HookProgressEvent(
             hook_id="h1",
@@ -84,13 +87,11 @@ class TestHookEventTypes:
         assert event.stdout == "out", "stdout must be preserved verbatim for streaming"
 
     def test_verify_response_event_carries_success_outcome_and_exit_code(self):
-        """Validate that HookResponseEvent correctly carries a success outcome
-        with exit_code 0 and descriptive output.
+        """Checks that HookResponseEvent carries a success outcome and exit code 0.
 
-        The test exercises construction of a completed-hook response and asserts
-        that output, outcome, and exit_code all match because downstream
-        dispatch logic branches on outcome to determine whether the tool
-        execution path should continue or abort.
+        Constructs a completed-hook response and asserts that output, outcome,
+        and exit_code all match, because downstream dispatch branches on outcome
+        to decide whether the tool execution path continues or aborts.
         """
         event = HookResponseEvent(
             hook_id="h1",
@@ -106,13 +107,11 @@ class TestHookEventTypes:
         assert event.exit_code == 0, "exit_code must indicate a clean process termination"
 
     def test_verify_response_event_carries_error_outcome_and_nonzero_exit_code(self):
-        """Validate that HookResponseEvent correctly carries an error outcome
-        with a nonzero exit_code when the tool fails.
+        """Checks that HookResponseEvent carries an error outcome and a nonzero exit code.
 
-        The test exercises construction of a failed-hook response and asserts
-        that outcome is 'error' and exit_code is 1 because error-reporting
-        paths rely on these fields to route diagnostics back to the caller
-        without additional context lookups.
+        Constructs a failed-hook response and asserts that outcome is "error"
+        and exit_code is 1, because the error-reporting paths rely on those
+        fields to route diagnostics back to the caller without extra lookups.
         """
         event = HookResponseEvent(
             hook_id="h1",
@@ -127,25 +126,22 @@ class TestHookEventTypes:
 
 
 class TestHookSystem:
-    """Engineered to validate the full lifecycle of the hook dispatch system.
+    """Validates the full lifecycle of the hook dispatch system.
 
-    This test class exercises handler registration, unregistration, event
-    emission across all hook phases (pre-tool, post-tool, session, turn,
-    error), observer notification, invalid-type rejection, and the enabled
-    gate across 12 scenarios to ensure the hook system correctly isolates
-    side effects and returns blocking decisions upstream. The design follows
-    the invariant that hooks must be opt-in (disabled by default via the
-    enabled flag) so that unconfigured deployments never pay dispatch cost.
+    Exercises handler registration and unregistration, emission across every
+    hook phase (pre-tool, post-tool, session, turn, error), observer
+    notification, invalid-type rejection, and the enabled gate, and checks
+    that the system isolates side effects and returns blocking decisions
+    upstream. Hooks are opt-in — disabled by default via the enabled flag —
+    so an unconfigured deployment never pays the dispatch cost.
     """
 
     def test_verify_system_constructs_with_default_enabled_state(self):
-        """Validate that EncreHookSystem constructs with handlers dict and
-        enabled flag set to True by default.
+        """Checks that EncreHookSystem constructs with an enabled flag set to True.
 
-        The test exercises bare construction and asserts internal state because
-        the hook system must be immediately usable without explicit
-        initialization while still allowing consumers to inspect the default
-        enabled gate.
+        Exercises bare construction and asserts internal state, because the
+        system must be immediately usable without explicit initialization while
+        still letting consumers inspect the default enabled gate.
         """
         hooks = EncreHookSystem()
         assert hooks is not None, "constructor must return a valid instance"
@@ -153,17 +149,16 @@ class TestHookSystem:
         assert hooks.enabled is True, "hooks must be enabled by default for backward compatibility"
 
     def test_verify_handler_registration_stores_callable_under_event_type(self):
-        """Validate that register_handler stores the callable in the correct
-        event-type bucket and returns the explicitly provided handler id.
+        """Checks that register_handler files the callable under the right event type.
 
-        The test exercises registration with a named id and asserts the return
-        value and bucket length because the dispatch path indexes by
-        event_type string, so mismatched keys would silently drop handlers.
+        Registers a handler with an explicit id and asserts both the returned
+        id and the bucket size, because dispatch indexes by the event_type
+        string and a mismatched key would silently drop handlers.
         """
         hooks = EncreHookSystem()
 
         async def handler(name, context, extra):
-            """Handler."""
+            """Echoes a non-blocking hook decision."""
             return {"block": False}
 
         hid = hooks.register_handler("pre_tool_exec", handler, "test_handler")
@@ -171,17 +166,16 @@ class TestHookSystem:
         assert len(hooks._handlers["pre_tool_exec"]) == 1, "exactly one handler must be registered"
 
     def test_verify_handler_registration_generates_unique_auto_id(self):
-        """Validate that register_handler generates a non-empty string id when
-        no explicit id is provided.
+        """Checks that register_handler generates a non-empty id when none is given.
 
-        The test exercises registration without an id argument and asserts the
-        returned id is a non-empty string because auto-generated ids are used
-        as the lookup key for subsequent unregister calls.
+        Registers without an id argument and asserts the returned id is a
+        non-empty string, because the auto-generated id is the lookup key for
+        the later unregister call.
         """
         hooks = EncreHookSystem()
 
         async def handler(name, context, extra):
-            """Handler."""
+            """Returns an empty hook decision."""
             return {}
 
         hid = hooks.register_handler("pre_tool_exec", handler)
@@ -189,17 +183,16 @@ class TestHookSystem:
         assert len(hid) > 0, "auto-generated id must not be empty"
 
     def test_verify_handler_unregistration_removes_callable_and_clears_bucket(self):
-        """Validate that unregister_handler removes the callable from the
-        event-type bucket and returns True on successful removal.
+        """Checks that unregister_handler removes the callable and returns True.
 
-        The test exercises a register-then-unregister cycle and asserts the
-        bucket is empty because stale handlers would fire on every emit and
-        cause unintended side effects in downstream consumers.
+        Runs a register-then-unregister cycle and asserts the bucket is empty,
+        because a stale handler would fire on every emit and cause unintended
+        side effects in downstream consumers.
         """
         hooks = EncreHookSystem()
 
         async def handler(name, context, extra):
-            """Handler."""
+            """Returns an empty hook decision."""
             return {}
 
         hid = hooks.register_handler("pre_tool_exec", handler, "test_handler")
@@ -208,32 +201,29 @@ class TestHookSystem:
         assert len(hooks._handlers["pre_tool_exec"]) == 0, "bucket must be empty after removal"
 
     def test_verify_unregister_nonexistent_handler_returns_false(self):
-        """Validate that unregister_handler returns False when invoked with an
-        id that was never registered.
+        """Checks that unregister_handler returns False for an unknown id.
 
-        The test exercises unregistration of a nonexistent id and asserts False
-        because the system must not raise on benign cleanup paths 鈥?callers
-        often unregister in teardown without knowing whether registration
-        succeeded.
+        Unregisters an id that was never registered and asserts False, because
+        the system must not raise on benign cleanup paths — callers often
+        unregister in teardown without knowing whether registration succeeded.
         """
         hooks = EncreHookSystem()
         assert hooks.unregister_handler("nonexistent_id") is False, "unregister of unknown id must be safe"
 
     def test_verify_emit_pre_tool_invokes_registered_handler_and_propagates_block(self):
-        """Validate that emit_pre_tool invokes all registered pre-tool handlers
-        and returns their blocking decision when present.
+        """Checks that emit_pre_tool invokes registered handlers and propagates the block flag.
 
-        The test exercises handler registration followed by emission and asserts
-        the handler was called because pre-tool hooks are the primary gating
-        mechanism for tool execution safety checks.
+        Registers a handler, emits a pre-tool event, and asserts the handler
+        was called, because pre-tool hooks are the primary gating mechanism for
+        tool execution safety checks.
         """
         async def _test():
-            """Helper: Test."""
+            """Runs the async registration-and-emit check."""
             hooks = EncreHookSystem()
             called = False
 
             async def handler(name, context, extra):
-                """Handler."""
+                """Marks itself as called and allows the tool through."""
                 nonlocal called
                 called = True
                 return {"block": False}
@@ -245,20 +235,19 @@ class TestHookSystem:
         asyncio.run(_test())
 
     def test_verify_emit_pre_tool_returns_block_decision_when_handler_requests_stop(self):
-        """Validate that emit_pre_tool returns the handler's block decision
-        dict when a registered handler requests the tool execution be stopped.
+        """Checks that emit_pre_tool returns the handler's blocking decision.
 
-        The test exercises a handler that returns {"block": True} and asserts
-        the returned result carries that decision because blocking is the
-        primary safety mechanism 鈥?the caller must act on the returned dict
-        rather than ignoring it.
+        Uses a handler that returns {"block": True} and asserts the result
+        carries that decision, because blocking is the primary safety
+        mechanism — the caller must act on the returned dict rather than
+        ignoring it.
         """
         async def _test():
-            """Helper: Test."""
+            """Runs the async blocking-handler check."""
             hooks = EncreHookSystem()
 
             async def handler(name, context, extra):
-                """Handler."""
+                """Blocks the tool call with a reason."""
                 return {"block": True, "block_reason": "unsafe"}
 
             hooks.register_handler("pre_tool_exec", handler, "test")
@@ -269,20 +258,19 @@ class TestHookSystem:
         asyncio.run(_test())
 
     def test_verify_emit_post_tool_injects_handler_output_into_result_string(self):
-        """Validate that emit_post_tool passes handler return values into the
-        resulting output string so that post-tool hooks can enrich context.
+        """Checks that emit_post_tool merges handler output into the result string.
 
-        The test exercises a handler returning {"extra_context": "..."} and
-        asserts the injected text appears in the emitted result because the
-        post-tool hook contract promises that handler outputs are merged into
-        the tool result before it reaches the caller.
+        Uses a handler returning {"extra_context": "..."} and asserts the
+        injected text appears in the emitted result, because the post-tool
+        contract promises handler outputs are merged into the tool result
+        before it reaches the caller.
         """
         async def _test():
-            """Helper: Test."""
+            """Runs the async post-tool injection check."""
             hooks = EncreHookSystem()
 
             async def handler(name, context, extra):
-                """Handler."""
+                """Adds extra context to the tool result."""
                 return {"extra_context": "injected context"}
 
             hooks.register_handler("post_tool_exec", handler, "test")
@@ -293,20 +281,19 @@ class TestHookSystem:
         asyncio.run(_test())
 
     def test_verify_emit_session_start_invokes_registered_on_session_start_handler(self):
-        """Validate that emit_session_start invokes handlers registered under
-        the on_session_start event type.
+        """Checks that emit_session_start invokes handlers registered for on_session_start.
 
-        The test exercises registration and emission and asserts the handler
-        flag flipped because session-start hooks are the hook point for
-        initializing per-session state like memory warm-up.
+        Registers and emits, then asserts the handler flag flipped, because
+        session-start hooks are the hook point for initializing per-session
+        state such as memory warm-up.
         """
         async def _test():
-            """Helper: Test."""
+            """Runs the async session-start check."""
             hooks = EncreHookSystem()
             called = False
 
             async def handler(name, context, extra):
-                """Handler."""
+                """Marks itself as called."""
                 nonlocal called
                 called = True
                 return {}
@@ -318,20 +305,19 @@ class TestHookSystem:
         asyncio.run(_test())
 
     def test_verify_emit_turn_start_invokes_registered_on_turn_start_handler(self):
-        """Validate that emit_turn_start invokes handlers registered under the
-        on_turn_start event type with the turn index passed through.
+        """Checks that emit_turn_start invokes handlers registered for on_turn_start.
 
-        The test exercises registration and emission and asserts the handler
-        was called because turn-start hooks anchor per-turn bookkeeping such
-        as budget tracking and turn-level summaries.
+        Registers and emits with a turn index, then asserts the handler was
+        called, because turn-start hooks anchor per-turn bookkeeping such as
+        budget tracking and turn-level summaries.
         """
         async def _test():
-            """Helper: Test."""
+            """Runs the async turn-start check."""
             hooks = EncreHookSystem()
             called = False
 
             async def handler(name, context, extra):
-                """Handler."""
+                """Marks itself as called."""
                 nonlocal called
                 called = True
                 return {}
@@ -343,21 +329,20 @@ class TestHookSystem:
         asyncio.run(_test())
 
     def test_verify_emit_error_invokes_registered_on_error_handler(self):
-        """Validate that emit_error invokes handlers registered under the
-        on_error event type and forwards the exception object.
+        """Checks that emit_error invokes handlers registered for on_error.
 
-        The test exercises registration with a ValueError and asserts the
-        handler was called because error hooks are the designated pathway for
-        telemetry and alerting 鈥?they must fire even when the primary path
-        catches and swallows the exception.
+        Registers a handler and emits a ValueError, then asserts it was
+        called, because error hooks are the designated pathway for telemetry
+        and alerting — they must fire even when the primary path catches and
+        swallows the exception.
         """
         async def _test():
-            """Helper: Test."""
+            """Runs the async error-emit check."""
             hooks = EncreHookSystem()
             called = False
 
             async def handler(name, context, extra):
-                """Handler."""
+                """Marks itself as called."""
                 nonlocal called
                 called = True
                 return {}
@@ -369,26 +354,25 @@ class TestHookSystem:
         asyncio.run(_test())
 
     def test_verify_on_event_observer_receives_all_emitted_events(self):
-        """Validate that the observer callback registered via on_event receives
-        every event emitted during a hook lifecycle.
+        """Checks that an on_event observer receives every emitted lifecycle event.
 
-        The test exercises emission of a pre-tool hook and asserts at least two
-        events were observed because each emit fires a started event and a
-        response event, proving the observer sees the full lifecycle.
+        Emits a pre-tool hook and asserts at least two events were observed,
+        because each emit fires both a started event and a response event, so
+        the observer must see the complete lifecycle.
         """
         hooks = EncreHookSystem()
         events = []
 
         def observer(event):
-            """Observer."""
+            """Records each emitted event for later inspection."""
             events.append(event)
 
         hooks.on_event(observer)
 
         async def _test():
-            """Helper: Test."""
+            """Runs the async emit used to drive the observer."""
             async def handler(name, context, extra):
-                """Handler."""
+                """Returns an empty hook decision."""
                 return {}
 
             hooks.register_handler("pre_tool_exec", handler, "test")
@@ -398,38 +382,35 @@ class TestHookSystem:
         assert len(events) >= 2, "observer must receive at least started and response events"
 
     def test_verify_register_handler_raises_on_invalid_event_type(self):
-        """Validate that register_handler rejects unknown event type strings
-        with a ValueError to prevent silent handler storage under invalid keys.
+        """Checks that register_handler rejects unknown event types with ValueError.
 
-        The test exercises registration with "invalid_event_type" and asserts
-        the exception because the event-type enum is the contract boundary 鈥?        invalid keys would break dispatch lookup and be nearly impossible to
-        debug at runtime.
+        Registers under "invalid_event_type" and asserts the exception, because
+        the event-type enum is the contract boundary — invalid keys would break
+        dispatch lookup and be nearly impossible to debug at runtime.
         """
         hooks = EncreHookSystem()
 
         async def handler(name, context, extra):
-            """Handler."""
+            """Returns an empty hook decision."""
             return {}
 
         with pytest.raises(ValueError):
             hooks.register_handler("invalid_event_type", handler)
 
     def test_verify_disabled_hooks_return_none_on_emit(self):
-        """Validate that when the enabled flag is False, all emit methods return
-        None instead of dispatching to registered handlers.
+        """Checks that disabled hooks return None from every emit method.
 
-        The test exercises disabling the system, registering a blocking
-        handler, and asserting the emit result is None because the enabled
-        gate is the fast-path skip that prevents any dispatch overhead when
-        hooks are not in use.
+        Disables the system, registers a blocking handler, and asserts the emit
+        result is None, because the enabled gate is the fast-path skip that
+        prevents any dispatch overhead when hooks are not in use.
         """
         async def _test():
-            """Helper: Test."""
+            """Runs the async disabled-hooks check."""
             hooks = EncreHookSystem()
             hooks.enabled = False
 
             async def handler(name, context, extra):
-                """Handler."""
+                """Requests a block that must never be evaluated."""
                 return {"block": True}
 
             hooks.register_handler("pre_tool_exec", handler, "test")

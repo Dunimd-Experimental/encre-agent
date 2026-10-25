@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Unified state pipeline for the agent main loop.
 
@@ -46,6 +48,7 @@ from collections.abc import Callable
 from typing import Any
 
 from encre.logging_config import get_logger
+from encre.modes.goal import GOAL_META_KEY
 
 logger = get_logger(__name__)
 
@@ -64,6 +67,9 @@ META_DELEGATE_HISTORY = "delegate_history"
 META_USER_REQ_SUMMARY = "user_requirements_summary"
 META_SLASH_COMMAND_MODE = "slash_command_mode"
 META_PLAN_MODE_ACTIVE = "plan_mode_active"
+#: The standing goal is owned by :mod:`encre.modes.goal`; its metadata key is
+#: defined once there and reused here so the two cannot drift apart.
+META_ACTIVE_GOAL = GOAL_META_KEY
 META_ACTIVE_COMMAND = "active_command"
 META_MILESTONE_SUMMARIES = "milestone_summaries"
 
@@ -122,9 +128,12 @@ class StateManager:
         # Change log: list of {"key", "old", "new", "timestamp", "seq"}
         self._changes: list[dict[str, Any]] = []
         self._change_seq: int = 0
+        # Run-scoped: set when the user approves a plan, cleared when the mode
+        # changes or a new run starts. Never persisted.
+        self._plan_gate_released: bool = False
         self._set_defaults()
 
-    # 鈹€鈹€ Internal helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Internal helpers ──────────────────────────────────────────────
 
     def _set_defaults(self) -> None:
         meta = self._session.metadata
@@ -192,7 +201,7 @@ class StateManager:
                 exc_info=True,
             )
 
-    # 鈹€鈹€ Typed accessors 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Typed accessors ───────────────────────────────────────────────
 
     @property
     def task_stage(self) -> str:
@@ -275,6 +284,39 @@ class StateManager:
         self._set(META_PLAN_MODE_ACTIVE, value)
 
     @property
+    def plan_gate_released(self) -> bool:
+        """True while an approved plan authorises writes without a per-write
+        proposal, for the run that was approved.
+
+        Deliberately an instance attribute and not ``session.metadata``: a
+        run-scoped gate must not survive into a reloaded session, where it
+        would leave writes ungated with nothing ever approved them.  A
+        standing goal (``active_goal``) is what makes the gate survive a run:
+        it is persisted, and every run start re-derives the gate from it.
+        """
+        return self._plan_gate_released
+
+    @plan_gate_released.setter
+    def plan_gate_released(self, value: bool) -> None:
+        self._plan_gate_released = bool(value)
+
+    @property
+    def active_goal(self) -> dict[str, Any] | None:
+        """The standing plan/spec objective, or ``None``.
+
+        Persisted in ``session.metadata`` -- an approved plan is a commitment
+        that outlives the run, so unlike the write gate it must survive a
+        reload.  Read through :class:`~encre.modes.goal.ActiveGoal.from_dict`
+        for the typed view.
+        """
+        raw = self._get(META_ACTIVE_GOAL, None)
+        return raw if isinstance(raw, dict) and raw else None
+
+    @active_goal.setter
+    def active_goal(self, value: dict[str, Any] | None) -> None:
+        self._set(META_ACTIVE_GOAL, value or None)
+
+    @property
     def active_command(self) -> dict[str, Any] | None:
         return self._get(META_ACTIVE_COMMAND, None)
 
@@ -290,7 +332,7 @@ class StateManager:
     def milestone_summaries(self, value: list[dict[str, Any]]) -> None:
         self._set(META_MILESTONE_SUMMARIES, value)
 
-    # 鈹€鈹€ Dict-style access for existing code that reads raw metadata 鈹€鈹€
+    # ── Dict-style access for existing code that reads raw metadata ──
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._session.metadata.get(key, default)
@@ -301,7 +343,7 @@ class StateManager:
             return default
         return self._session.metadata[key]
 
-    # 鈹€鈹€ Bulk operations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Bulk operations ───────────────────────────────────────────────
 
     def update(self, **kwargs: Any) -> None:
         """Set multiple fields at once, recording a single change entry."""
@@ -322,7 +364,7 @@ class StateManager:
         self._changes.clear()
         self._set_defaults()
 
-    # 鈹€鈹€ Snapshot (frontend-facing AgentStateSnapshot) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Snapshot (frontend-facing AgentStateSnapshot) ─────────────────
 
     def snapshot(self) -> dict[str, Any]:
         """Produce a dict matching the frontend ``AgentStateSnapshot``."""
@@ -337,7 +379,7 @@ class StateManager:
             "tool_semantics": meta.get(META_TOOL_SEMANTICS, {}),
         }
 
-    # 鈹€鈹€ Change log (audit / replay) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Change log (audit / replay) ──────────────────────────────────
 
     def change_log(self) -> list[dict[str, Any]]:
         """Return the full sequenced change log."""

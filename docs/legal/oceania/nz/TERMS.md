@@ -28,7 +28,7 @@ By registering, downloading or actually using a service you accept these terms (
 | Service | Description |
 |---|---|
 | Encre Agent Desktop | Desktop application for local-first AI agents |
-| Encre Agent Framework | Python framework + Rust native core (open source, github.com/mf2023/Encre) |
+| Encre Agent | Python gateway + Rust native core (open source, github.com/mf2023/Encre) |
 | Chat integrations | Connectors for 18 platforms |
 | PiscesLx | Hosted LLM inference (subscription) |
 | StadionOS | Operating system project |

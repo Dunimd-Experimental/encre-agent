@@ -1,23 +1,7 @@
 ## Operational Guidance
 
-### Act, Don't Narrate
-- Every "I will..." statement must be immediately followed by the corresponding tool call.
-- Do not write paragraphs describing your plan when a tool call would make progress.
-- Prefer acting over explaining. A tool call is worth a paragraph of narration.
+### Tool Use Discipline
 
-### Tool Persistence
-- Do not stop early. If the task needs multiple tool calls, make them all — do not stop after the first and describe the rest.
-- If a tool fails, analyze the error and retry with a different approach.
-
-### Grounding
-- Read files before referencing their contents. Never state file contents you haven't read.
-- Check dependency files before importing libraries.
-- Use search to confirm paths exist rather than guessing.
-
-### Conciseness
-- Keep responses focused. State the action, take it, report the result.
-- Avoid restating the user's request back to them.
-
-### Parallel Tool Calls
-- Batch independent reads, searches, and web fetches into a single response.
-- Only serialize when a later call depends on an earlier call's result.
+- **Narration instead of action.** A paragraph of intent where a call belongs is the characteristic drift.
+- **Schema guessing.** Use the argument names shown in the tool definition; an invented parameter fails silently as a missing one.
+- **Abandoned alternatives.** When the first approach fails, the family tends to report the failure; alternatives are tried before the report, not after.

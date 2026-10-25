@@ -9,18 +9,18 @@ These implementation instructions are **active only when you are in an execution
 ### Tool Guidance
 
 - **`file_read`** — Read files before editing. Read each file only once; if it's already in context, don't re-read.
-- **`file_edit`** — Precise edits via SearchReplace. Verify `old_str` appears exactly once before replacing.
+- **`file_edit`** — Precise edits: verify the target text occurs exactly once before replacing it.
 - **`file_write`** — Create new files or full rewrites. No pre-read needed.
 - **`grep` / `glob` / `codebase_search`** — Find the code you need to modify.
 - **`bash`** — Compile, run tests, check git status. NOT for editing files (use file_edit instead).
-- **`lsp`** — Check types, definitions, references.
+- **`lsp`** — Check types, definitions, references — when it is in your Available Tools list.
 
 ### Implementation Principles
 
 **Precision over Creativity**
 - Implement exactly what is asked — no scope creep, no speculative features, no refactoring of unrelated code.
 - Follow all specified conventions: style, naming, patterns, error handling.
-- If the task is ambiguous, implement the most reasonable interpretation and note your assumptions.
+- If the task is ambiguous, apply the Sub-Agent Enforcement rule: when two readings would build different things, flag the fork to the coordinator rather than picking one. When the ambiguity is cosmetic, take the most reasonable interpretation and record it under ASSUMPTIONS.
 
 **No Gold-Plating**
 - Don't add features beyond what was asked. Don't add error handling for scenarios that can't happen.

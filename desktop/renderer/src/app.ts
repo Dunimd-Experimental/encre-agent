@@ -1,4 +1,3 @@
-console.log("[perf] app.js eval start epoch=" + Date.now());
 /**
  * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
  *
@@ -21,8 +20,13 @@ console.log("[perf] app.js eval start epoch=" + Date.now());
  * Non-compliance may result in service termination or legal liability.
  */
 
-import { connect, send, sendRetry, sendSwitchBranch, sendRollback } from "./core/ws.js";
-import { handleEvent, init as streamInit, onAutomationShowResult, setRequestedSessionId, onAutomationStreamEvent, refreshAllData, pullBootData, holdNonCriticalPlanes, releaseNonCriticalPlanes } from "./core/stream.js";
+console.log("[perf] app.js eval start epoch=" + Date.now());
+
+import { connect, send, sendRetry, sendSwitchBranch, sendRollback, abortConnect } from "./core/ws.js";
+import { appendChipWithCaret, moveChipToFront, removeChipWithSeparator, wireChipClose, isChipSeparator } from "./ui/chip.js";
+import { handleEvent, init as streamInit, onAutomationShowResult, setRequestedSessionId, onAutomationStreamEvent, refreshAllData, pullBootData, holdNonCriticalPlanes, releaseNonCriticalPlanes, sessionsArrived } from "./core/stream.js";
+import { installUiErrorBoundaries, reportUiFault } from "./core/ui_boundary.js";
+import { scheduleRender, runScheduledRenderNow } from "./core/render_scheduler.js";
 import {
   addUserMessage,
   addMessage,
@@ -30,6 +34,8 @@ import {
   setSessionState,
   setTheme,
   setThemePreference,
+  setThemeSkin,
+  THEME_SKINS,
   setActiveToolId,
   setSettings,
   getState,
@@ -43,10 +49,6 @@ import {
   clearMessages,
   setSessionId,
   addAttachments,
-  pushQueuedPrompt,
-  setPendingQueueCount,
-  removeQueuedPromptAt,
-  moveQueuedPrompt,
   clearQueuedPrompts,
   removeLastMessage,
   setTempChat,
@@ -56,120 +58,62 @@ import {
   restoreMessages,
   getTraySessions,
   removeBranchMessages,
+  realUserMessages,
   clearAllNotifications,
   setModelConfigs,
+  setProviders,
+  locateModelInProviders,
   setAgentConfig,
   getUnreadCount,
+  openRoutedLink,
+  removeAttachment,
 } from "./core/state.js";
 import { Chat, formatAgentLabel, getAgentName } from "./chat/chat.js";
+import { registerQueueSource } from "./chat/queue-panel.js";
 import { initTooltip } from "./ui/tooltip.js";
+import { initScrollbarReveal } from "./ui/scrollbar-reveal.js";
+import { installSelectionActionBar } from "./ui/selection-action-bar.js";
+import { renderCrumbs, type CrumbLevel } from "./ui/crumbs.js";
 import { SplashScreen } from "./ui/splash.js";
 import { Tools } from "./features/tools.js";
 import { Settings, type PanelId } from "./settings/settings.js";
-import { Files, getFileIcon } from "./features/files.js";
+import { Files, getFileIcon, getFolderIcon, getTerminalIcon, attachPlaceholder, buildAttachChip } from "./features/files.js";
 import { Session, showRenameDialogForSession } from "./session/session.js";
 import { ViewManager } from "./ui/viewmanager.js";
 import { Search, commandActions } from "./features/search.js";
 import { Agents } from "./features/agents.js";
+import { Market } from "./features/market.js";
 import { Notifications } from "./ui/notifications.js";
 import { Workspace, WorkspaceManager } from "./session/workspace.js";
-import { Permissions } from "./features/permissions.js";
+import { Permissions } from "./ui/permissions.js";
 import { AutomationPanel } from "./session/iclaw.js";
 import { Automation } from "./session/automation.js";
 import { ModeTransitionManager, type AppMode } from "./chat/mode-transition.js";
 import { SessionInner, TabDef } from "./session/session_inner.js";
-import { renderMarkdown } from "./chat/chat.js";
-import { EALoader } from "./features/ealoader.js";
-import { t, getLocale, onLocaleChange, applyI18n, setLocale, LOCALES, getIntlLocale, ensureLocale } from "./features/i18n.js";
+import { t, getLocale, onLocaleChange, applyI18n, setLocale, initLocale, LOCALES, getIntlLocale, ensureLocale } from "./features/i18n.js";
 import { Dialog } from "./ui/dialog.js";
+import { PERMISSION_MODES, permissionModeGroup, permissionModeLabel, permissionModeIcon, guardPermissionMode, dialogPermissionConfirm } from "./core/permission_mode.js";
+import { closeEphemeralSurfaces, registerSurface, unregisterSurface } from "./core/scope.js";
 import { applyTabTooltip } from "./ui/tab-tooltip.js";
-import { lookupShortcut, augmentTitle, formatShortcut, platformLabel } from "./features/shortcutDisplay.js";
-import type { Message } from "./core/types.js";
-import { SLASH_COMMANDS, matchingSlashCommands, parseSlashInput, type SlashCommand } from "./features/slash_commands.js";
-import { mountNebula } from "./features/easter-egg.js";
-import { clampElLeft, clampIntoViewport, FLOAT_MARGIN, showContextMenu } from "./ui/context-menu.js";
-import { BrowserView } from "./features/browser.js";
-
-type ChildTab = {
-  view: string;
-  label: string;
-  title?: string;
-  favicon?: string;
-  browserView?: BrowserView;
-  _contentEl?: HTMLElement;
-  _nebulaCleanup?: () => void;
-};
-
-/**
- * Child-window views rendered as an in-app jurisdiction-aware legal document
- * (markdown fetched over `getDocumentContent`, with the region switcher shown
- * in the doc toolbar). Must stay in sync with `LEGAL_DOC_FILES` in main.ts —
- * `thanks` has no per-region variants but reuses the same viewer.
- */
-const LEGAL_DOC_VIEWS: ReadonlySet<string> = new Set([
-  "privacy",
-  "terms",
-  "agreement",
-  "content-rules",
-  "minors",
-  "data-rules",
-  "thanks",
-]);
-
-/** Default legal-doc region for a UI locale (used before the user picks one). */
-function defaultDocRegion(locale: string): string {
-  switch (locale) {
-    case "zh": return "cn";
-    case "zh-Hant": return "tw";
-    case "ja": return "jp";
-    case "ko": return "kr";
-    case "de": return "ch";
-    case "tr": return "tr";
-    case "es": return "mx";
-    case "pt": return "br";
-    case "ar": return "ae";
-    case "he": return "il";
-    default: return "us";
-  }
-}
-
-/** Maps a legal region value to its translation-key label. */
-const DOC_REGION_LABEL_KEYS: Record<string, string> = {
-  us: "settings.aboutRegionUs",
-  ca: "settings.aboutRegionCa",
-  mx: "settings.aboutRegionMx",
-  br: "settings.aboutRegionBr",
-  eu: "settings.aboutRegionEu",
-  uk: "settings.aboutRegionUk",
-  ch: "settings.aboutRegionCh",
-  tr: "settings.aboutRegionTr",
-  cn: "settings.aboutRegionCn",
-  jp: "settings.aboutRegionJp",
-  kr: "settings.aboutRegionKr",
-  tw: "settings.aboutRegionTw",
-  hk: "settings.aboutRegionHk",
-  mo: "settings.aboutRegionMo",
-  sg: "settings.aboutRegionSg",
-  in: "settings.aboutRegionIn",
-  ae: "settings.aboutRegionAe",
-  sa: "settings.aboutRegionSa",
-  il: "settings.aboutRegionIl",
-  za: "settings.aboutRegionZa",
-  ng: "settings.aboutRegionNg",
-  ke: "settings.aboutRegionKe",
-  eg: "settings.aboutRegionEg",
-  au: "settings.aboutRegionAu",
-  nz: "settings.aboutRegionNz",
-};
-
-function regionLabelKey(region: string): string {
-  return DOC_REGION_LABEL_KEYS[region] || "settings.aboutRegionUs";
-}
+import { lookupShortcut, augmentTitle, formatShortcut, platformLabel } from "./ui/shortcut-display.js";
+import { scopeAllows } from "./ui/keybind-scope.js";
+import type { Message, PluginStateEntry } from "./core/types.js";
+import { SLASH_COMMANDS, matchingSlashCommands, parseSlashInput, type SlashCommand } from "./ui/slash-commands.js";
+import { pluginStates } from "./core/plugin_info.js";
+import { pluginIconHtml } from "./ui/plugin_assets.js";
+import { clampIntoViewport, FLOAT_MARGIN, showAnchoredDropdown, showContextMenu, renderContextMenuItems, clearContextTargets } from "./ui/context-menu.js";
+import { pluginMenuSpecs } from "./features/plugin_contributions.js";
+import { resetPendingPanel } from "./features/pending-panel.js";
+import { hideAnimated, showAnimated, hideViewAnimated, showViewAnimated } from "./ui/animate.js";
 
 (window as any).__state_setActiveToolId = setActiveToolId;
 (window as any).sendRetry = sendRetry;
 (window as any).sendSwitchBranch = sendSwitchBranch;
 (window as any).sendRollback = sendRollback;
+
+/** Payload of the 「继续」 button on an interrupted turn. It has to read like a
+ *  user message: a bare word, capital C, no trailing punctuation. */
+const CONTINUE_PROMPT = "Continue";
 
 class App {
   private chat: Chat;
@@ -185,6 +129,7 @@ class App {
   private workspaceManager!: WorkspaceManager;
   private automationPanel!: AutomationPanel;
   private automation!: Automation;
+  private market!: Market;
   private modeTransition!: ModeTransitionManager;
   private sessionInner!: SessionInner;
   private search!: Search;
@@ -194,13 +139,24 @@ class App {
   private tokenCountEl: HTMLElement;
   private welcomeScreen: HTMLElement;
   private messageList: HTMLElement;
-  private summaryPanel: HTMLElement;
+  /** Resolved from the DOM on every access rather than cached in the
+   *  constructor: the summary panel is toggled from several places and a
+   *  captured node silently goes stale if it is ever re-created, which leaves
+   *  the toggle reading the visibility of a detached element. */
+  private get summaryPanel(): HTMLElement {
+    return document.getElementById("summary-panel") as HTMLElement;
+  }
   private userToggledSidebar = false;
   private skipNextInput = false;
   private _slashActive = false;
   private _currentChipMode = "";
   private _persistentMode = "";
   private _summaryDoneCollapsed: boolean | null = null;
+  /** Session id the summary panel content currently belongs to. */
+  private _summarySessionId = "";
+  /** Whether the summary panel is showing the context-usage detail page
+   *  instead of the stacked sections (model-picker style subpage). */
+  private _summaryCtxDetail = false;
   /** Per-group collapsed state for summary reference groups. */
   private _refCollapsedState: Map<string, boolean> = new Map();
   /** Active slash *command* (distinct from a mode).  Mirrors the backend
@@ -212,17 +168,17 @@ class App {
   private _modeEnterBound = false;
   /** True once the sidebar mode-entrance listener is attached. */
   private _sidebarEnterBound = false;
-  private _isChild = false;
-  private _childView = "";
-  private _tabs: ChildTab[] = [];
+  /** ?child= view this ESD window was created with, mounted once tabs exist. */
+  private _initialChildView = "";
+  private _initialChildLabel = "";
   /** Origin → permissions the page asked for, refreshed on a short TTL. */
   private _permCache = new Map<string, { list: Array<{ name: string; granted: boolean }>; at: number }>();
-  private _activeTabIndex = -1;
-  private _region = defaultDocRegion(getLocale());
   private _activeAutomationJobId = "";
   private _keybindActions: Record<string, () => void> = {};
   private _inputHistory: string[] = [];
   private _inputHistoryIdx: number = -1;
+  /** Debounce timer for localStorage draft persistence (one write per typing burst). */
+  private _draftPersistTimer: number | null = null;
   /** Per-session unsent input drafts, keyed by session id.  Saved while the
    *  user types and restored when the session becomes active again so that
    *  switching away and back does not lose what was being composed. */
@@ -258,8 +214,6 @@ class App {
   private _inputAreaResizeObs: ResizeObserver | null = null;
   private inputExpandBtn: HTMLButtonElement;
   private inputArea: HTMLElement;
-  /** Cache key of the last queue-card render; skips DOM rebuilds when unchanged. */
-  private _queueRenderKey = "";
 
   constructor() {
     this.input = document.getElementById("prompt-input") as HTMLTextAreaElement;
@@ -270,7 +224,6 @@ class App {
     this.tokenCountEl = document.getElementById("token-count")!;
     this.welcomeScreen = document.getElementById("welcome-screen")!;
     this.messageList = document.getElementById("message-list")!;
-    this.summaryPanel = document.getElementById("summary-panel")!;
 
     // Expose the cleanup function on window so other modules (settings,
     // search, etc.) can request a content-area reset without needing a
@@ -280,6 +233,9 @@ class App {
       this.cleanupContentArea(opts);
     // Expose the app instance on window so stream.ts can update the mode chip
     (window as any).__app = this;
+    // Restore drafts and sent-input history persisted by a previous run so
+    // an app restart does not wipe what the user was composing.
+    this.loadPersistedInputState();
 
     this.splash = new SplashScreen();
     this.chat = new Chat();
@@ -300,6 +256,14 @@ class App {
     // and on viewport width so a genuinely narrow window stays collapsed
     // (the sidebar would only overlay content there anyway).
     (window as any).__appRestoreSidebar = () => this.restoreAppSidebar();
+    // The market's 已安装 button hands over to settings' 插件 panel: installed
+    // management lives there (one list, one set of rules), so the market does
+    // not grow a second copy of it.  Exposed as a window hook because the
+    // market view has no reference to the Settings instance.
+    (window as any).__encreOpenSettings = (panel?: string) => {
+      this.settings.open();
+      if (panel) this.settings.switchPanel(panel as Parameters<Settings["switchPanel"]>[0]);
+    };
     this.tools = new Tools();
 this.settings = new Settings();
     this.permissions = new Permissions();
@@ -314,6 +278,8 @@ this.settings = new Settings();
     this.applyShortcutHints();
     this.initTheme();
     initTooltip();
+    initScrollbarReveal();
+    installSelectionActionBar();
     this.bindResponsiveSidebar();
 
     // Forward workspace mode to tray + refresh dual session list on mode change
@@ -333,10 +299,19 @@ this.settings = new Settings();
         // Tray sessions (normal+iwork) come from the unified sessions_all
         // push — nothing new to fetch on a tray view switch.
       }
-    });
+    }, ["workspaceMode"]);
 
-    // Update stats display when telemetry changes
-    subscribe(() => this.updateStats());
+    // Update stats display when telemetry changes. "messages" changes on
+    // every streamed token, but the token counts it feeds only change at turn
+    // boundaries, so coalesce the O(history) rescan behind a short timer.
+    let statsTimer = 0;
+    subscribe(() => {
+      if (statsTimer) return;
+      statsTimer = window.setTimeout(() => {
+        statsTimer = 0;
+        this.updateStats();
+      }, 250);
+    }, ["messages", "telemetry"]);
 
     // Auto-update send/stop button: show send when input has text,
     // show stop only when running AND input is empty.
@@ -360,7 +335,7 @@ this.settings = new Settings();
       this.btnStop.classList.remove("cancelling");
       this.btnStop.style.pointerEvents = "";
     this.btnSend.disabled = !hasText && !this.effectiveMode() && !this.hasCommandChip() && getState().attachments.length === 0;
-    });
+    }, ["running", "attachments", "inputMode"]);
 
     // Sync inputMode state changes to the input border / chip via the
     // single updateChipState() path.  Previously this wrote data-input-mode
@@ -369,9 +344,6 @@ this.settings = new Settings();
     // funnel through effectiveMode() (chip OR persistent), so the border
     // always reflects the mode that will actually be sent.
     let prevInputMode = "";
-    onLocaleChange(() => {
-      if (!this.summaryPanel.classList.contains("hidden")) this.renderSummaryPanel();
-    });
 
     let prevTheme = "";
     subscribe(() => {
@@ -385,12 +357,27 @@ this.settings = new Settings();
         prevTheme = curTheme;
         this.applyThemeIcons(document.documentElement.getAttribute("data-theme") === "dark");
       }
-    });
+    }, ["inputMode", "themePreference"]);
 
-    // Update session bar name when session changes
-    subscribe(() => this.updateSessionBarName());
-    subscribe(() => this.updatePlaceholder());
-    subscribe(() => this._renderQueueCard());
+    // Update session bar name when session changes. `messages` itself mutates
+    // on every token but the bar only uses its count (empty vs non-empty), so
+    // a token that does not change the count must not re-run the O(sessions)
+    // lookup behind updateSessionBarName().
+    let barMsgCount = getState().messages.length;
+    subscribe((changed) => {
+      const count = getState().messages.length;
+      if (changed && changed.size === 1 && changed.has("messages") && count === barMsgCount) return;
+      barMsgCount = count;
+      this.updateSessionBarName();
+    }, ["messages", "subAgentView", "subAgentBreadcrumb", "tempChat", "sessionsList", "sessionId"]);
+    subscribe(() => this.updatePlaceholder(), ["workspaceMode", "inputMode"]);
+    // The pending panel (floating card above the composer) registers the
+    // submit queue as its first source and subscribes to the state it reads,
+    // so it repaints itself — later sources (background shells, scheduled
+    // runs) just call registerPendingSource() and get a tab.
+    registerQueueSource({
+      loadForEdit: (text, mode) => this.loadQueuedPromptForEdit(text, mode),
+    });
 
     // Sync temp chat button active state
     onLocaleChange(() => {
@@ -402,15 +389,17 @@ this.settings = new Settings();
       if (btn) {
         btn.classList.toggle("active", getState().tempChat);
       }
-    });
+    }, ["tempChat"]);
 
     // Child window mode — detect ?child=VIEW_NAME from URL
     const params = new URLSearchParams(window.location.search);
     const childView = params.get("child");
     if (childView) {
-      this._isChild = true;
-      this._childView = childView;
-      this.initChildMode(childView, params.get("label") || childView);
+      // Stored, not mounted here: the tab area (sessionInner) does not exist
+      // yet during construction; mountInitialChildView opens it once, later.
+      this._initialChildView = childView;
+      this._initialChildLabel = params.get("label") || childView;
+      this.enterChildMode();
     }
 
     // Defer non-critical module initialization (Files, Session, Workspace,
@@ -419,9 +408,34 @@ this.settings = new Settings();
     // init runs AFTER the first paint — the splash is visible immediately
     // and the deferred work happens in the gap while the renderer waits for
     // the backend WS handshake.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => this.initDeferred());
-    });
+    App.onFrames(() => this.initDeferred(), 2, 1000);
+  }
+
+  /**
+   * Run `fn` after `frames` animation frames, but never later than `boundMs`.
+   *
+   * Chromium does not schedule requestAnimationFrame while it considers the
+   * page hidden, and the window is revealed by the main process on
+   * `ready-to-show` — a point at which its occlusion/visibility state has not
+   * necessarily caught up. Anything gated on a bare rAF therefore waits for
+   * the next activation change rather than the next frame, which is how boot
+   * ends up half-initialised with an unresponsive-looking window.
+   */
+  private static onFrames(fn: () => void, frames: number, boundMs: number): void {
+    let fired = false;
+    const run = () => {
+      if (fired) return;
+      fired = true;
+      clearTimeout(bound);
+      fn();
+    };
+    const bound = setTimeout(run, boundMs);
+    let left = frames;
+    const step = () => {
+      if (--left <= 0) run();
+      else requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
   }
 
   private initDeferred(): void {
@@ -446,6 +460,7 @@ this.settings = new Settings();
     this.search = new Search();
     this.registerCommandActions();
     new Agents();
+    this.market = new Market();
     this.notifications = new Notifications();
     // Keep the Encre menu's unread counter in sync (viewing/dismissing changes it).
     this.notifications.onUnreadCountChange = () => this.refreshEncreMenu();
@@ -525,15 +540,27 @@ this.settings = new Settings();
       } else {
         appEl?.classList.remove("workspace-mode");
       }
-    });
+    }, ["workspaceMode"]);
     this.sessionInner = new SessionInner();
     this.chat.onViewChanges = (path: string) => {
       const st = getState();
       const artifact = st.artifacts.find(a => a.path === path);
       this.sessionInner.showReviewTab(path, artifact || undefined);
     };
+    // Files/images the model mentioned open in the in-app file viewer
+    // (content-area tabs) — never the Encre Agent Desktop Subwindow (ESD) sub-app or the system browser.
+    this.chat.onOpenFile = (path: string) => {
+      void this.sessionInner.openFileInEditor(path);
+    };
+    // 「继续」 on an interrupted turn: send the resume prompt as the user would.
+    this.chat.onResume = () => this.resumeInterrupted();
     (window as any).__sessionInner = this.sessionInner;
     (window as any).__workspaceMgr = this.workspaceManager;
+
+    // ESD boot: the tab strip belongs on the title row (ESD · tabs · window
+    // buttons), so the hosted page starts directly below it.
+    this.hostTabStripInHeader();
+    this.mountInitialChildView();
 
     // Mirror sidebar collapse state to body
     const appEl = document.getElementById("app");
@@ -559,7 +586,69 @@ this.settings = new Settings();
           window.electronAPI.browserLanguageUpdate(locale);
         }
       }
-    });
+    }, ["settings"]);
+
+    // Forward the browser credential auto-save flag to the main process so
+    // the encrypted store accepts (or ignores) captured entries. Only a
+    // literal "false" disables it — unset defaults to enabled.
+    let lastAutosave: boolean | null = null;
+    subscribe(() => {
+      const v = getState().settings.browser_autosave_credentials;
+      const on = !(v === "false" || v === false);
+      if (on !== lastAutosave) {
+        lastAutosave = on;
+        window.electronAPI?.browserAutosaveUpdate?.(on);
+      }
+    }, ["settings"]);
+
+    // Forward every browser switch to the main process.  Most are read there
+    // per request / per prompt, so this only has to keep the two copies in
+    // sync; the few Chromium caches per-guest are re-applied by the handler.
+    const browserInt = (v: unknown, d: number): number => {
+      const n = typeof v === "number" ? v : parseInt(String(v ?? ""), 10);
+      return Number.isFinite(n) ? n : d;
+    };
+    let lastBrowserOpts = "";
+    subscribe(() => {
+      const s = getState().settings;
+      const opts = {
+        doNotTrack: isEnabled(s.browser_do_not_track),
+        denyPermissions: isEnabled(s.browser_deny_site_permissions),
+        blockThirdPartyCookies: isEnabled(s.browser_block_third_party_cookies),
+        askBeforeDownload: s.browser_ask_before_download === undefined ? true : isEnabled(s.browser_ask_before_download),
+        downloadDir: typeof s.browser_download_dir === "string" && s.browser_download_dir !== "default"
+          ? s.browser_download_dir : "",
+        forceLightPage: s.browser_force_light_page === undefined ? true : isEnabled(s.browser_force_light_page),
+        mobileIdentity: s.browser_identity === "mobile",
+        historyLimit: browserInt(s.browser_history_limit, 5000),
+        // Omit zoomFactor while the setting has not arrived yet: a freshly
+        // spawned window (the ESD sub-app) starts with an empty local
+        // snapshot, and pushing the fallback here would clobber the global
+        // factor main already applied — resetting every open guest.
+        ...(s.browser_zoom_percent === undefined
+          ? {}
+          : { zoomFactor: browserInt(s.browser_zoom_percent, 75) / 100 }),
+        blockPopups: isEnabled(s.browser_block_popups),
+      };
+      const sig = JSON.stringify(opts);
+      if (sig !== lastBrowserOpts) {
+        lastBrowserOpts = sig;
+        window.electronAPI?.browserOptionsUpdate?.(opts);
+      }
+    }, ["settings"]);
+
+    // "Don't keep me signed in" is a per-launch wipe: the flag is only knowable
+    // once the config snapshot lands, so it runs exactly once and before any
+    // tab the user opens could be cleared out from under it.  Bookmarks and
+    // history are deliberately left alone.
+    let freshSessionChecked = false;
+    subscribe(() => {
+      if (freshSessionChecked) return;
+      const v = getState().settings.browser_fresh_session;
+      if (v === undefined) return;
+      freshSessionChecked = true;
+      if (isEnabled(v)) void window.electronAPI?.browserClearSessionData?.();
+    }, ["settings"]);
 
     // Forward resolved theme to tray popup
     let lastTrayThemePref = "";
@@ -574,7 +663,7 @@ this.settings = new Settings();
           window.electronAPI.trayThemeUpdate(pref);
         }
       }
-    });
+    }, ["themePreference"]);
 
     // Re-fetch models when backend or base_url changes
     let lastBackend = getState().settings.backend;
@@ -591,13 +680,32 @@ this.settings = new Settings();
           this.fetchModels();
         }
       }
-    });
+    }, ["settings", "connected"]);
 
     // Listen for session switch from tray popup
     if (window.electronAPI) {
       window.electronAPI.onSwitchWorkspace((path: string) => {
         this.settings.close();
         void this.workspace.open(path);
+      });
+      // Quit confirmation: main only sends `quit-request` after the BACKEND
+      // confirmed running tasks, so the renderer must always raise the
+      // app-scope dialog here (never re-check locally — the renderer's view
+      // may be stale when the websocket is disconnected).
+      const electronAPI = window.electronAPI;
+      window.electronAPI.onQuitRequest(() => {
+        void Dialog.confirm(
+          t("dialog.quitTitle"),
+          t("dialog.quitBody"),
+          {
+            scope: "app",
+            priority: "critical",
+            primary: t("dialog.quitConfirm"),
+            secondary: t("dialog.cancel"),
+          },
+        ).then((allowed) => {
+          electronAPI.respondQuitConfirm(allowed);
+        });
       });
       window.electronAPI.onSwitchSession((sessionId: string) => {
         this.settings.close();
@@ -638,6 +746,7 @@ this.settings = new Settings();
         } else {
           setSessionId(sessionId);
           send({ type: "resume", session_id: sessionId, request_id: requestId });
+          send({ type: "queue_list", session_id: sessionId });
           delete (window as any).__pendingTrayResume;
           this.chat.render();
         }
@@ -656,7 +765,6 @@ this.settings = new Settings();
       this.automation?.render();
       this.updateStats();
       this.bindInputModelSelector();
-      this.bindInputWorkspaceSelector();
     });
 
     // Apply startup mode
@@ -685,7 +793,7 @@ this.settings = new Settings();
     // Fire once on registration in case config_data already arrived before
     // initDeferred() ran; subsequent changes are covered by the subscription.
     _maybeApplyStartupMode();
-    subscribe(_maybeApplyStartupMode);
+    subscribe(_maybeApplyStartupMode, ["connected", "settings"]);
 
     // Session menu toggle
     document.getElementById("btn-session-menu")?.addEventListener("click", () => {
@@ -700,11 +808,16 @@ this.settings = new Settings();
         app.classList.add("sidebar-collapsed");
         this.sessionInner.renderForce();
         this.sessionInner.saveSidebarVisibility();
+        // Manual restore clears the browser-tool auto-open suppression.
+        this.sessionInner.markUserSidebarCollapsed(false);
       } else {
         this.sessionInner.saveWidth();
         panel.classList.add("hidden");
         mainBody.classList.add("sidebar-hidden");
         this.sessionInner.saveSidebarVisibility();
+        // Manual collapse suppresses browser-tool auto-open until the user
+        // restores the sidebar by hand.
+        this.sessionInner.markUserSidebarCollapsed(true);
         // The inner sidebar's open state collapsed the app sidebar; undo
         // that so closing the inner sidebar re-expands the app sidebar.
         this.restoreAppSidebar();
@@ -725,7 +838,7 @@ this.settings = new Settings();
             const labelEl = chip.querySelector('span:not(.chip-icon)') as HTMLElement | null;
             if (iconEl) iconEl.setAttribute('data-lucide', cmd.icon);
             if (labelEl) labelEl.textContent = cmd.title;
-            if ((window as any).lucide) (window as any).lucide.createIcons();
+            if ((window as any).lucide) (window as any).lucide.createIcons({ root: chip });
           }
         }
       }
@@ -734,702 +847,54 @@ this.settings = new Settings();
     });
   }
 
-  private initChildMode(view: string, label: string): void {
+  /** Turn this window into the Encre Agent Desktop Subwindow (ESD): the
+   *  child-mode class is what hands the window to the subwindow CSS, which
+   *  drops the nav sidebar, the chat column and the composer, and lets the tab
+   *  layer fill it. Without the class the sub-app paints a second copy of the
+   *  main window with its page shoved into a side panel.
+   *
+   *  `#app` carries the class too: the rules that must yield while Settings is
+   *  open (the nav sidebar has to come back) are scoped to
+   *  `#app.child-mode:not(.settings-mode)`, and `settings-mode` lives on `#app`. */
+  private enterChildMode(): void {
     document.title = "ESD";
     document.body.classList.add("child-mode");
-
-    const inputArea = document.getElementById("input-area");
-    if (inputArea) inputArea.style.display = "none";
-    const chatView = document.getElementById("chat-view");
-    if (chatView) chatView.style.display = "none";
-    const searchView = document.getElementById("search-view");
-    if (searchView) searchView.style.display = "none";
-    const agentsView = document.getElementById("agents-view");
-    if (agentsView) agentsView.style.display = "none";
-
-    // Add brand label and tabs container into header bar
-    const header = document.getElementById("header-bar");
-    if (header) {
-      const brand = document.createElement("span");
-      brand.id = "child-header-brand";
-      brand.className = "header-brand";
-      brand.textContent = "ESD";
-
-      const tabsEl = document.createElement("div");
-      tabsEl.id = "child-header-tabs";
-      tabsEl.className = "header-tabs";
-
-      const headerLeft = header.querySelector(".header-left");
-      if (headerLeft) {
-        headerLeft.after(brand);
-        brand.after(tabsEl);
-      } else {
-        header.appendChild(brand);
-        header.appendChild(tabsEl);
-      }
-    }
-
-    this._tabs = [];
-    this._activeTabIndex = -1;
-    this.addTab(view, label);
-
-    if (window.electronAPI) {
-      window.electronAPI.onChildAddTab((v: string, l: string) => {
-        this.addTab(v, l);
-      });
-    }
-
-    window.addEventListener("browser-open-tab", ((e: CustomEvent) => {
-      this.addTab(e.detail.url, e.detail.label);
-    }) as EventListener);
+    document.getElementById("app")?.classList.add("child-mode");
+    // Views opened into an already-running subwindow arrive over IPC.
+    window.electronAPI?.onChildAddTab?.((view: string, label: string) => {
+      this.openChildViewAsTab(view, label);
+    });
   }
 
-  private addTab(view: string, label: string): void {
-    const existing = this._tabs.findIndex(t => t.view === view);
-    if (existing >= 0) {
-      this.switchTab(existing);
-      return;
-    }
-    this._tabs.push({ view, label });
-    this.switchTab(this._tabs.length - 1);
+  /** The subwindow's tab strip is its own header slot (#child-header-tabs),
+   *  not the content area's bar: the tab layer renders its list into the title
+   *  row while the panels stay below. One tab engine, one visible strip. */
+  private hostTabStripInHeader(): void {
+    if (!document.body.classList.contains("child-mode")) return;
+    const slot = document.getElementById("child-header-tabs");
+    if (slot) this.sessionInner.mountTabList(slot);
   }
 
-  private switchTab(index: number): void {
-    if (index < 0 || index >= this._tabs.length) return;
-    if (index === this._activeTabIndex) return;
-    this._activeTabIndex = index;
-    this.renderTabBar();
-    if (this._tabs[index].view.startsWith("http") || this._tabs[index].view.startsWith("file:") || this._tabs[index].view.startsWith("about:")) {
-      // Webview tabs keep their state – just show/hide the childView wrapper
-      // so the webview is never recreated.
-      this._switchWebviewTab(index);
+  /** Route a child-window view request (main-window routed link, legal doc,
+   *  data center, easter egg) into this window's full-UI tab area. */
+  private openChildViewAsTab(view: string, label: string): void {
+    const inner = this.sessionInner;
+    if (!inner) return;
+    if (/^(https?|file):/i.test(view) || view === "about:blank") {
+      void inner.createTab("browser", { startUrl: view === "about:blank" ? "" : view, label });
+    } else if (view.startsWith("mailto:")) {
+      window.location.href = view;
     } else {
-      this.renderTabContent(this._tabs[index]);
+      void inner.createTab(view, { label });
     }
   }
 
-  private _switchWebviewTab(index: number): void {
-    const tab = this._tabs[index];
-    const childViewEl = document.getElementById("child-view");
-    if (!childViewEl) return;
-    childViewEl.classList.remove("hidden");
-    if (tab._contentEl) {
-      this._showTabContent(tab);
-      return;
-    }
-    // renderTabContent() creates the tab content and then calls
-    // _showTabContent(tab), which hides every other tab.
-    this.renderTabContent(tab);
-  }
-
-  // Same tab model as the sidebar (session_inner): every tab container is a
-  // .tab-panel absolutely positioned inside #child-view. Only the active tab
-  // carries .active — browser panels are shown via visibility (see
-  // .tab-panel[data-type="browser"] in styles.css), other panels via
-  // display. Reuses the exact same CSS rules as the sidebar tabs.
-  private _showTabContent(tab: ChildTab): void {
-    for (const t of this._tabs) {
-      if (t._contentEl) {
-        t._contentEl.classList.toggle("active", t === tab);
-      }
-    }
-  }
-
-  private closeTab(index: number): void {
-    const removed = this._tabs[index];
-    if (removed?._nebulaCleanup) {
-      removed._nebulaCleanup();
-    }
-    if (removed?.browserView) {
-      removed.browserView.destroy();
-    }
-    if (removed?._contentEl) {
-      removed._contentEl.remove();
-    }
-    this._tabs.splice(index, 1);
-    if (this._tabs.length === 0) {
-      window.electronAPI?.windowClose();
-      return;
-    }
-    if (this._activeTabIndex >= this._tabs.length) {
-      this._activeTabIndex = this._tabs.length - 1;
-    } else if (index < this._activeTabIndex) {
-      this._activeTabIndex--;
-    }
-    this.renderTabBar();
-    this.renderTabContent(this._tabs[this._activeTabIndex]);
-  }
-
-  private renderTabBar(): void {
-    const tabsEl = document.getElementById("child-header-tabs");
-    if (!tabsEl) return;
-    tabsEl.innerHTML = this._tabs.map((tab, i) => {
-      const displayLabel = tab.title || tab.label;
-      const faviconHtml = tab.favicon
-        ? `<img class="tab-favicon" src="${this.esc(tab.favicon)}" onerror="this.style.display='none';this.nextElementSibling.style.display=''"><i data-lucide="globe" class="lucide lucide-sm" style="display:none"></i>`
-        : `<i data-lucide="globe" class="lucide lucide-sm"></i>`;
-      return `<button class="tab${i === this._activeTabIndex ? " active" : ""}" data-index="${i}" draggable="true">
-        ${faviconHtml}
-        <span class="tab-label">${this.esc(displayLabel)}</span>
-        <span class="tab-close" data-index="${i}" data-tooltip="${t("sessionInner.closeTab")}"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></span>
-      </button>`;
-    }).join("");
-    if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons({ root: tabsEl });
-    }
-    this.refreshTabTooltips();
-
-    let dragSrcIdx: number | null = null;
-    tabsEl.querySelectorAll("button[data-index]").forEach(btn => {
-      const idx = parseInt(btn.getAttribute("data-index")!, 10);
-
-      btn.addEventListener("mousedown", (e: Event) => {
-        const me = e as MouseEvent;
-        if (me.button === 1) me.preventDefault();
-      });
-
-      // Click to switch
-      btn.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).closest(".tab-close")) return;
-        this.switchTab(idx);
-      });
-
-      // Middle-click to close
-      btn.addEventListener("auxclick", (e) => {
-        const ev = e as MouseEvent;
-        if (ev.button === 1) {
-          ev.preventDefault();
-          this.closeTab(idx);
-        }
-      });
-
-      // Close button
-      const closeBtn = btn.querySelector(".tab-close");
-      if (closeBtn) {
-        closeBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const ci = parseInt((closeBtn as HTMLElement).getAttribute("data-index") || "0");
-          this.closeTab(ci);
-        });
-      }
-
-      // Drag-and-drop reorder
-      btn.addEventListener("dragstart", (e) => {
-        const ev = e as DragEvent;
-        dragSrcIdx = idx;
-        ev.dataTransfer?.setData("text/plain", String(idx));
-        btn.classList.add("dragging");
-      });
-      btn.addEventListener("dragend", () => {
-        btn.classList.remove("dragging");
-        dragSrcIdx = null;
-        tabsEl.querySelectorAll(".tab.drop-target").forEach(el => el.classList.remove("drop-target"));
-      });
-      btn.addEventListener("dragover", (e) => {
-        e.preventDefault();
-        if (dragSrcIdx !== null && dragSrcIdx !== idx) {
-          tabsEl.querySelectorAll(".tab.drop-target").forEach(el => el.classList.remove("drop-target"));
-          btn.classList.add("drop-target");
-        }
-      });
-      btn.addEventListener("dragleave", () => {
-        btn.classList.remove("drop-target");
-      });
-      btn.addEventListener("drop", (e) => {
-        e.preventDefault();
-        btn.classList.remove("drop-target");
-        if (dragSrcIdx !== null && dragSrcIdx !== idx) {
-          const [moved] = this._tabs.splice(dragSrcIdx, 1);
-          this._tabs.splice(idx, 0, moved);
-          if (this._activeTabIndex === dragSrcIdx) {
-            this._activeTabIndex = idx;
-          } else if (dragSrcIdx < idx && this._activeTabIndex > dragSrcIdx && this._activeTabIndex <= idx) {
-            this._activeTabIndex--;
-          } else if (dragSrcIdx > idx && this._activeTabIndex >= idx && this._activeTabIndex < dragSrcIdx) {
-            this._activeTabIndex++;
-          }
-          this.renderTabBar();
-          this.renderTabContent(this._tabs[this._activeTabIndex]);
-        }
-        dragSrcIdx = null;
-      });
-    });
-    tabsEl.addEventListener("wheel", (e) => {
-      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
-        e.preventDefault();
-        tabsEl.scrollLeft += e.deltaY;
-      }
-    }, { passive: false });
-  }
-
-  /**
-   * Keep the tab hover tooltips in sync. Deliberately the same shape as the
-   * session-sidebar tooltips (see ui/tab-tooltip.ts): page title, then the
-   * full URL, with the page favicon as the leading icon.
-   */
-  private refreshTabTooltips(): void {
-    const tabsEl = document.getElementById("child-header-tabs");
-    if (!tabsEl) return;
-    this._tabs.forEach((tab, i) => {
-      const el = tabsEl.querySelector<HTMLElement>(`.tab[data-index="${i}"]`);
-      if (!el) return;
-      const bv = tab.browserView;
-      const liveUrl = (bv?.getUrl() || "").trim();
-      const liveTitle = (bv?.getTitle() || "").trim();
-      const isNavigable = /^(https?|file):/i.test(tab.view || "");
-      const url = liveUrl || (isNavigable ? tab.view : "");
-      const title = liveTitle || tab.title || tab.label;
-      applyTabTooltip(el, {
-        title: title || url || tab.label,
-        icon: tab.favicon,
-        location: url,
-        isUrl: /^https?:/i.test(url),
-      }, getIntlLocale());
-      // Permissions arrive asynchronously; the tooltip is repainted once known.
-      void this.attachPermissions(el, url);
-    });
-  }
-
-  /**
-   * Resolve the permissions the page asked for and write them onto the tab
-   * tooltip. Reads `browser:get-site-info`, whose data comes from the main
-   * process permission-request handler — i.e. what the page really used.
-   */
-  private async attachPermissions(el: HTMLElement, url: string): Promise<void> {
-    if (!url || !/^https?:/i.test(url)) return;
-    let origin = "";
-    try { origin = new URL(url).origin; } catch { return; }
-    const hit = this._permCache.get(origin);
-    let list: Array<{ name: string; granted: boolean }>;
-    if (hit && Date.now() - hit.at < 5000) {
-      list = hit.list;
-    } else {
-      try {
-        const info = await window.electronAPI?.getSiteInfo(url);
-        list = info?.permissions || [];
-      } catch {
-        list = [];
-      }
-      this._permCache.set(origin, { list, at: Date.now() });
-      this._permCache.set(url, { list, at: Date.now() });
-    }
-    if (!list.length) return;
-    const idx = Number(el.dataset.index);
-    const tab = this._tabs[idx];
-    if (!tab) return;
-    const bv = tab.browserView;
-    const liveUrl = (bv?.getUrl() || "").trim();
-    const title = (bv?.getTitle() || "").trim() || tab.title || tab.label;
-    applyTabTooltip(el, {
-      title: title || url || tab.label,
-      icon: tab.favicon,
-      location: liveUrl || url,
-      isUrl: /^https?:/i.test(liveUrl || url),
-      permissions: list,
-    }, getIntlLocale());
-  }
-
-  private renderTabContent(tab: ChildTab): void {
-    const childViewEl = document.getElementById("child-view");
-    if (!childViewEl) return;
-    childViewEl.classList.remove("hidden");
-
-    if (tab._contentEl) {
-      this._showTabContent(tab);
-      return;
-    }
-
-    const container = document.createElement("div");
-    // Reuse the exact same tab container as the sidebar: .tab-panel is
-    // position:absolute;inset:0 within #child-view (position:relative) and is
-    // shown/hidden via the .active class (browser panels via visibility,
-    // see styles.css .tab-panel / .tab-panel[data-type="browser"]). This is
-    // the identical mechanism session_inner uses for its browser tabs.
-    container.className = "tab-panel";
-    tab._contentEl = container;
-    childViewEl.appendChild(container);
-
-if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.view.startsWith("file:") || tab.view === "about:blank") {
-      const startUrl = tab.view === "about:blank" ? "" : tab.view;
-      container.dataset.type = "browser";
-      const bv = new BrowserView(container, {
-        startUrl,
-        onFaviconChange: (favicon: string) => {
-          tab.favicon = favicon;
-          this.renderTabBar();
-        },
-        onNewWindow: (newUrl: string) => {
-          this.addTab(newUrl, newUrl);
-        },
-      });
-      // BrowserView overwrites container.style.cssText; restore the overflow
-      // the sidebar browser panels use (panel.style.overflow = "hidden").
-      container.style.overflow = "hidden";
-      tab.browserView = bv;
-      bv.webview.addEventListener("page-title-updated", (e: any) => {
-        tab.title = e.title || "";
-        this.renderTabBar();
-      });
-      // Keep the hover URL fresh across in-page and hard navigations.
-      bv.webview.addEventListener("did-navigate", () => this.refreshTabTooltips());
-      bv.webview.addEventListener("did-navigate-in-page", () => this.refreshTabTooltips());
-    } else if (tab.view === "license") {
-      container.innerHTML = `<div class="child-view-content"><pre class="child-raw-text">${t("common.loading")}</pre></div>`;
-      if (window.electronAPI) {
-        window.electronAPI.getLicenseContent().then((content: string) => {
-          const pre = container.querySelector(".child-raw-text");
-          if (pre) pre.textContent = content;
-        });
-      }
-    } else if (LEGAL_DOC_VIEWS.has(tab.view)) {
-      container.innerHTML = `
-        <div class="child-doc-container">
-          <div class="child-doc-toolbar">
-            <div class="settings-dropdown-wrap" id="child-region-wrap">
-              <button class="settings-dropdown-trigger" id="child-region-trigger" type="button">
-                <span>${t(regionLabelKey(this._region))}</span>
-                <i data-lucide="chevron-down" class="lucide settings-dropdown-chevron"></i>
-              </button>
-              <div class="settings-dropdown" id="child-region-dropdown">
-                ${this.buildRegionDropdownItems()}
-              </div>
-            </div>
-          </div>
-          <div class="child-view-content"><div class="child-view-body msg-text"><p>Loading...</p></div></div>
-        </div>`;
-
-      if (typeof (window as any).lucide !== "undefined") {
-        (window as any).lucide.createIcons({ root: container });
-      }
-
-      const loadDoc = (region: string) => {
-        const body = container.querySelector(".child-view-body");
-        if (body) body.innerHTML = "<p>Loading...</p>";
-        if (window.electronAPI) {
-          window.electronAPI.getDocumentContent(tab.view, region).then((content: string) => {
-            const bodyEl = container.querySelector(".child-view-body");
-            if (bodyEl) bodyEl.innerHTML = renderMarkdown(content);
-          });
-        }
-      };
-
-      this.bindChildRegionDropdown("child-region", (val) => {
-        this._region = val;
-        if (window.electronAPI && window.electronAPI.setDocRegion) {
-          window.electronAPI.setDocRegion(val);
-        }
-        loadDoc(val);
-      });
-
-      if (window.electronAPI && window.electronAPI.getDocRegion) {
-        window.electronAPI
-          .getDocRegion()
-          .then((saved: string) => {
-            if (saved && this.isValidDocRegion(saved)) {
-              this._region = saved;
-              const trigger = document.getElementById("child-region-trigger");
-              const dropdown = document.getElementById("child-region-dropdown");
-              const item = dropdown?.querySelector(`.settings-dropdown-item[data-value="${saved}"]`) as HTMLElement | null;
-              if (trigger && item) {
-                trigger.querySelector("span")!.textContent = item.textContent || "";
-                dropdown!.querySelectorAll(".settings-dropdown-item").forEach((el) => el.classList.remove("selected"));
-                item.classList.add("selected");
-              }
-            }
-          })
-          .catch(() => {})
-          .finally(() => loadDoc(this._region));
-      } else {
-        loadDoc(this._region);
-      }
-    } else if (tab.view === "easter-egg") {
-      container.innerHTML = `<div class="easter-egg-container" style="position:absolute;inset:0;overflow:hidden;background:#000"></div>`;
-      const eggEl = container.querySelector(".easter-egg-container") as HTMLElement;
-      if (eggEl) {
-        tab._nebulaCleanup = mountNebula(eggEl);
-      }
-    } else if (tab.view === "logs") {
-      container.innerHTML = `
-        <div class="log-view">
-          <div class="log-table">
-            <div class="log-table-header">
-              <div class="log-cell log-cell-ts">${t("settings.aboutLogTimestamp")}</div>
-              <div class="log-cell log-cell-lvl">${t("settings.aboutLogLevel")}</div>
-              <div class="log-cell log-cell-src">${t("settings.aboutLogSource")}</div>
-              <div class="log-cell log-cell-msg">${t("settings.aboutLogMessage")}</div>
-            </div>
-            <div class="log-table-body" id="log-table-body">
-              <div class="log-loading">${t("settings.aboutLogLoading")}</div>
-            </div>
-          </div>
-        </div>
-        <div class="context-menu hidden" id="log-context-menu"></div>`;
-      if (typeof (window as any).lucide !== "undefined") {
-        (window as any).lucide.createIcons({ root: container });
-      }
-      this._initLogView(container);
-    } else if (tab.view.startsWith("mailto:")) {
-      window.location.href = tab.view;
-    } else {
-      container.innerHTML = `<div class="si-panel-empty" style="flex:1;gap:14px">
-        <i data-lucide="file-question" class="lucide" style="width:32px;height:32px;color:var(--text-muted)"></i>
-        <div class="si-panel-empty-title">${this.esc(tab.label)}</div>
-        <div class="si-panel-empty-sub" style="font-size:12px;color:var(--text-muted)">${t("app.comingSoon")}</div>
-      </div>`;
-      if (typeof (window as any).lucide !== "undefined") {
-        (window as any).lucide.createIcons({ root: container });
-      }
-    }
-
-    // Show the newly created tab and hide every other one. Must run AFTER
-    // content creation: BrowserView overwrites container.style.cssText with
-    // display:flex, so this is the single place that normalizes visibility
-    // for all tab types (webview / docs / logs / easter-egg …).
-    this._showTabContent(tab);
-  }
-
-  private _initLogView(container: HTMLElement): void {
-    const bodyEl = container.querySelector("#log-table-body") as HTMLElement | null;
-    const ctxMenu = container.querySelector("#log-context-menu") as HTMLElement | null;
-
-    let allEntries: { timestamp: string; level: string; source: string; message: string }[] = [];
-    let ctxEntry: typeof allEntries[0] | null = null;
-
-    const render = () => {
-      if (!bodyEl) return;
-      ctxMenu?.classList.add("hidden");
-      if (allEntries.length === 0) {
-        bodyEl.innerHTML = `<div class="si-empty-center"><i data-lucide="scroll-text" class="lucide"></i><span class="si-empty-title">${t("settings.aboutLogNoLogs")}</span></div>`;
-        if (typeof (window as any).lucide !== "undefined") (window as any).lucide.createIcons({ root: bodyEl });
-        return;
-      }
-      bodyEl.innerHTML = allEntries.map((e) => {
-        const levelClass = "log-lvl-" + e.level.toLowerCase();
-        const ts = e.timestamp.replace(/,\d{3}$/, "");
-        return `<div class="log-row">
-          <div class="log-cell log-cell-ts">${ts}</div>
-          <div class="log-cell log-cell-lvl"><span class="log-level-badge ${levelClass}">${e.level}</span></div>
-          <div class="log-cell log-cell-src">${this.esc(e.source)}</div>
-          <div class="log-cell log-cell-msg"><span class="log-msg-text">${this.esc(e.message)}</span></div>
-        </div>`;
-      }).join("");
-    };
-
-    // ── Context menu on .log-row right-click ────────────────────────
-    const onCtx = (ev: MouseEvent) => {
-      const row = (ev.target as HTMLElement).closest(".log-row") as HTMLElement | null;
-      if (!row || !ctxMenu) return;
-      const idx = Array.from(bodyEl?.querySelectorAll(".log-row") || []).indexOf(row);
-      const entry = allEntries[idx];
-      if (!entry) return;
-      ctxEntry = entry;
-      // Keep the right-clicked row highlighted while the menu is open —
-      // hover alone fades out as soon as the pointer moves onto the menu.
-      container.querySelectorAll(".log-row.ctx-target").forEach((r) => r.classList.remove("ctx-target"));
-      row.classList.add("ctx-target");
-      ctxMenu.innerHTML = `
-        <div class="context-menu-item" data-action="copy-row"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("settings.aboutLogCopyRow")}</div>
-        <div class="context-menu-item" data-action="copy-all"><i data-lucide="files" class="lucide lucide-sm"></i>${t("settings.aboutLogCopyAll")}</div>`;
-      showContextMenu(ctxMenu, ev.clientX, ev.clientY);
-      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: ctxMenu }));
-      ev.preventDefault();
-    };
-    const boundCtx = onCtx.bind(this);
-    document.addEventListener("contextmenu", boundCtx);
-
-    // ── Context menu item clicks ────────────────────────────────────
-    if (ctxMenu) {
-      ctxMenu.addEventListener("click", (ev) => {
-        const item = (ev.target as HTMLElement).closest(".context-menu-item") as HTMLElement | null;
-        if (!item) return;
-        const action = item.getAttribute("data-action");
-        ctxMenu.classList.add("hidden");
-        container.querySelectorAll(".log-row.ctx-target").forEach((r) => r.classList.remove("ctx-target"));
-        if (action === "copy-row" && ctxEntry) {
-          navigator.clipboard.writeText(`[${ctxEntry.timestamp}] [${ctxEntry.level}] ${ctxEntry.source}: ${ctxEntry.message}`).catch(() => {});
-        } else if (action === "copy-all") {
-          const text = allEntries.map(e => `[${e.timestamp}] [${e.level}] ${e.source}: ${e.message}`).join("\n");
-          navigator.clipboard.writeText(text).catch(() => {});
-        }
-      });
-    }
-
-    document.addEventListener("click", () => {
-      ctxMenu?.classList.add("hidden");
-      container.querySelectorAll(".log-row.ctx-target").forEach((r) => r.classList.remove("ctx-target"));
-    }, false);
-
-    // ── Lazy / windowed loading (scroll triggers backend batch fetch) ──
-    const api = window.electronAPI;
-    if (api) {
-      let loadedCount = 0;
-      let total = 0;
-      let loading = false;
-      const BATCH = 500;
-
-      const loadMore = async () => {
-        if (loading) return;
-        if (total > 0 && loadedCount >= total) return;
-        loading = true;
-        try {
-          const result = await api.getLogs({ offset: loadedCount, limit: BATCH });
-          if (result.entries && result.entries.length > 0) {
-            allEntries.push(...result.entries);
-            loadedCount += result.entries.length;
-            total = result.total;
-            render();
-          }
-        } catch {
-          if (loadedCount === 0 && bodyEl) {
-            bodyEl.innerHTML = `<div class="si-empty-center"><i data-lucide="scroll-text" class="lucide"></i><span class="si-empty-title">${t("settings.aboutLogNoLogs")}</span></div>`;
-            if (typeof (window as any).lucide !== "undefined") (window as any).lucide.createIcons({ root: bodyEl });
-          }
-        }
-        loading = false;
-      };
-
-      loadMore();
-
-      if (bodyEl) {
-        bodyEl.addEventListener("scroll", () => {
-          const scrollBottom = bodyEl.scrollTop + bodyEl.clientHeight;
-          if (scrollBottom >= bodyEl.scrollHeight - 200) {
-            loadMore();
-          }
-        });
-      }
-
-      // ── Auto-refresh: poll for new entries every 5 seconds ──────
-      let lastSize = -1;
-      const refreshIntervalId = window.setInterval(async () => {
-        if (!bodyEl || !document.body.contains(bodyEl)) {
-          clearInterval(refreshIntervalId);
-          return;
-        }
-        if (loading) return;
-        try {
-          const info = await api.getLogFileInfo();
-          if (!info.exists) return;
-          if (lastSize >= 0 && info.size === lastSize) return;
-          lastSize = info.size;
-          // File changed — reload from top
-          loading = true;
-          const result = await api.getLogs({ offset: 0, limit: BATCH });
-          if (result && result.entries) {
-            allEntries = result.entries;
-            loadedCount = result.entries.length;
-            total = result.total;
-            render();
-          }
-          loading = false;
-        } catch {
-          loading = false;
-        }
-      }, 5000);
-    }
-  }
-
-  private static readonly DOC_REGION_GROUPS: { labelKey: string; regions: { value: string; labelKey: string }[] }[] = [
-    {
-      labelKey: "settings.aboutRegionGroupAmericas",
-      regions: [
-        { value: "us", labelKey: "settings.aboutRegionUs" },
-        { value: "ca", labelKey: "settings.aboutRegionCa" },
-        { value: "mx", labelKey: "settings.aboutRegionMx" },
-        { value: "br", labelKey: "settings.aboutRegionBr" },
-      ],
-    },
-    {
-      labelKey: "settings.aboutRegionGroupEurope",
-      regions: [
-        { value: "eu", labelKey: "settings.aboutRegionEu" },
-        { value: "uk", labelKey: "settings.aboutRegionUk" },
-        { value: "ch", labelKey: "settings.aboutRegionCh" },
-        { value: "tr", labelKey: "settings.aboutRegionTr" },
-      ],
-    },
-    {
-      labelKey: "settings.aboutRegionGroupAsia",
-      regions: [
-        { value: "cn", labelKey: "settings.aboutRegionCn" },
-        { value: "jp", labelKey: "settings.aboutRegionJp" },
-        { value: "kr", labelKey: "settings.aboutRegionKr" },
-        { value: "tw", labelKey: "settings.aboutRegionTw" },
-        { value: "hk", labelKey: "settings.aboutRegionHk" },
-        { value: "mo", labelKey: "settings.aboutRegionMo" },
-        { value: "sg", labelKey: "settings.aboutRegionSg" },
-        { value: "in", labelKey: "settings.aboutRegionIn" },
-        { value: "ae", labelKey: "settings.aboutRegionAe" },
-        { value: "sa", labelKey: "settings.aboutRegionSa" },
-        { value: "il", labelKey: "settings.aboutRegionIl" },
-      ],
-    },
-    {
-      labelKey: "settings.aboutRegionGroupAfrica",
-      regions: [
-        { value: "za", labelKey: "settings.aboutRegionZa" },
-        { value: "ng", labelKey: "settings.aboutRegionNg" },
-        { value: "ke", labelKey: "settings.aboutRegionKe" },
-        { value: "eg", labelKey: "settings.aboutRegionEg" },
-      ],
-    },
-    {
-      labelKey: "settings.aboutRegionGroupOceania",
-      regions: [
-        { value: "au", labelKey: "settings.aboutRegionAu" },
-        { value: "nz", labelKey: "settings.aboutRegionNz" },
-      ],
-    },
-  ];
-
-  private isValidDocRegion(value: string): boolean {
-    return App.DOC_REGION_GROUPS.some((g) => g.regions.some((r) => r.value === value));
-  }
-
-  private buildRegionDropdownItems(): string {
-    return App.DOC_REGION_GROUPS.map(
-      (group) =>
-        `<div class="settings-dropdown-group">${t(group.labelKey)}</div>` +
-        group.regions
-          .map(
-            (r) =>
-              `<div class="settings-dropdown-item${r.value === this._region ? " selected" : ""}" data-value="${r.value}">${t(r.labelKey)}</div>`
-          )
-          .join("")
-    ).join("");
-  }
-
-  private bindChildRegionDropdown(id: string, onChange: (val: string) => void): void {
-    const wrap = document.getElementById(`${id}-wrap`);
-    const trigger = document.getElementById(`${id}-trigger`);
-    const dropdown = document.getElementById(`${id}-dropdown`);
-    if (!wrap || !trigger || !dropdown) return;
-
-    trigger.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const isOpen = dropdown.classList.contains("open");
-      document.querySelectorAll(".settings-dropdown.open").forEach((dd) => dd.classList.remove("open"));
-      if (!isOpen) dropdown.classList.add("open");
-    });
-
-    dropdown.querySelectorAll(".settings-dropdown-item").forEach((item) => {
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const val = (item as HTMLElement).getAttribute("data-value") || "";
-        const label = (item as HTMLElement).textContent || "";
-        trigger.querySelector("span")!.textContent = label;
-        dropdown.classList.remove("open");
-        dropdown.querySelectorAll(".settings-dropdown-item").forEach((el) => el.classList.remove("selected"));
-        (item as HTMLElement).classList.add("selected");
-        onChange(val);
-      });
-    });
-
-    document.addEventListener("click", (e) => {
-      if (!wrap.contains(e.target as Node)) {
-        dropdown.classList.remove("open");
-      }
-    });
+  /** Open the ?child= view this window was created with (ESD boot), once. */
+  private mountInitialChildView(): void {
+    const view = this._initialChildView;
+    if (!view) return;
+    this._initialChildView = "";
+    this.openChildViewAsTab(view, this._initialChildLabel);
   }
 
   private updateStats(): void {
@@ -1487,7 +952,6 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const sessionMenu = document.getElementById("btn-session-menu");
     const mainContent = document.getElementById("main-content");
     const breadcrumb = s.subAgentBreadcrumb;
-    const _truncate = (s: string, max = 18) => s.length > max ? s.slice(0, max) + "…" : s;
     const isSubAgentView = !!(s.subAgentView || breadcrumb.length > 0);
     // Show/hide the automation back button in the header bar
     const autoBackBtn = document.getElementById("btn-automation-back");
@@ -1529,45 +993,32 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         const rootEntry = s.sessionsList.find((x) => x.session_id === rootCrumbSessionId);
         rootCrumbLabel = rootEntry?.name || rootEntry?.preview || rootCrumbSessionId.slice(0, 8);
       }
-      let crumbsHtml = `<button class="session-crumb session-crumb-root" data-crumb-index="-1" type="button" data-tooltip="${this.esc(rootCrumbLabel)}">${this.esc(_truncate(rootCrumbLabel))}</button>`;
+      const goToRootView = () => (window as any).__goToRootView?.();
+      const navigateToCrumb = (i: number) => (window as any).__navigateToBreadcrumb?.(i);
+      const levels: CrumbLevel[] = [{ label: rootCrumbLabel, onActivate: goToRootView }];
       // Track whether the last breadcrumb entry IS the current sub-agent view
       // to avoid visual duplicates (breadcrumb button + current span for same level).
       let lastBreadcrumbIsCurrent = false;
-      for (let i = 0; i < breadcrumb.length; i++) {
-        const entry = breadcrumb[i];
+      breadcrumb.forEach((entry, i) => {
         const isLast = i === breadcrumb.length - 1;
         const label = formatAgentLabel(entry.name);
-        crumbsHtml += `<span class="session-crumb-sep">/</span>`;
         if (isLast && (!s.subAgentView || entry.toolCallId === s.subAgentView.id)) {
           // Last crumb either has no active sub-agent view (currently at this level),
           // or it IS the active sub-agent view — render as current, not a button.
-          crumbsHtml += `<span class="session-crumb-current" data-tooltip="${this.esc(label)}">${this.esc(_truncate(label))}</span>`;
+          levels.push({ label });
           if (entry.toolCallId === s.subAgentView?.id) {
             lastBreadcrumbIsCurrent = true;
           }
         } else {
-          crumbsHtml += `<button class="session-crumb" data-crumb-index="${i}" type="button" data-tooltip="${this.esc(label)}">${this.esc(_truncate(label))}</button>`;
+          levels.push({ label, onActivate: () => navigateToCrumb(i) });
         }
-      }
+      });
       // If a sub-agent view is active and NOT already shown as the last breadcrumb,
       // show the current agent name.
       if (s.subAgentView && !lastBreadcrumbIsCurrent) {
-        const curLabel = formatAgentLabel(getAgentName(s.subAgentView));
-        crumbsHtml += `<span class="session-crumb-sep">/</span>`;
-        crumbsHtml += `<span class="session-crumb-current" data-tooltip="${this.esc(curLabel)}">${this.esc(_truncate(curLabel))}</span>`;
+        levels.push({ label: formatAgentLabel(getAgentName(s.subAgentView)) });
       }
-      nameEl.innerHTML = crumbsHtml;
-      // Bind click handlers for each breadcrumb level
-      nameEl.querySelectorAll("[data-crumb-index]").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const idx = parseInt((btn as HTMLElement).dataset.crumbIndex || "-1", 10);
-          if (idx < 0) {
-            (window as any).__goToRootView?.();
-          } else {
-            (window as any).__navigateToBreadcrumb?.(idx);
-          }
-        });
-      });
+      renderCrumbs(nameEl, levels);
       if (typeof (window as any).lucide !== "undefined") {
         (window as any).lucide.createIcons({ root: nameEl });
       }
@@ -1585,144 +1036,57 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       if (sessionMenu) sessionMenu.style.display = "";
     }
     if (mainContent) mainContent.classList.remove("sub-agent-active");
-    nameEl.textContent = rootLabel;
+    this.setSessionBarName(nameEl, rootLabel);
   }
 
-  private _renderQueueCard(): void {
-    const s = getState();
-    const card = document.getElementById("queue-card");
-    const body = document.getElementById("queue-card-body");
-    const statusBar = document.getElementById("chat-status-bar");
-    if (!card || !body) return;
-    const active = s.pendingQueueCount > 0 && s.queuedPrompts.length > 0;
-    const key = active
-      ? s.queuedPrompts.map((p) => `${p.mode}\u0000${p.text}`).join("\u0001")
-      : "";
-
-    if (!active) {
-      if (!card.classList.contains("hidden")) card.classList.add("hidden");
-      if (statusBar) statusBar.style.maxWidth = "";
-      this._queueRenderKey = "";
-      return;
-    }
-
-    card.classList.remove("hidden");
-    if (statusBar) statusBar.style.maxWidth = "calc(var(--input-max-w) - 100px)";
-
-    // Streaming emits fire on every token update. Skip rebuilding the DOM
-    // (and re-creating lucide icons) unless the queue actually changed —
-    // this removes the flicker, layout thrash, and the drag-focus breakage
-    // that came from replacing the drag source element mid-drag.
-    if (key === this._queueRenderKey) return;
-    this._queueRenderKey = key;
-
-    body.innerHTML = s.queuedPrompts.map((p, i) =>
-      `<div class="queue-item" draggable="true" data-queue-index="${i}">
-        <span class="queue-item-drag-handle" data-queue-index="${i}">
-          <i data-lucide="grip-vertical" class="lucide"></i>
-        </span>
-        <span class="queue-item-text">${this.esc(p.text)}</span>
-        <button class="queue-item-send" draggable="false" data-queue-index="${i}" title="${t("chat.sendDirectly")}">
-          <i data-lucide="send" class="lucide"></i>
-        </button>
-        <button class="queue-item-remove" draggable="false" data-queue-index="${i}">
-          <i data-lucide="x" class="lucide"></i>
-        </button>
-      </div>`
-    ).join("");
-    if ((window as any).lucide) {
-      (window as any).lucide.createIcons(body);
-    }
-
-    // Drag-and-drop reorder
-    let dragSrcIdx: number | null = null;
-    const items = body.querySelectorAll<HTMLElement>(".queue-item");
-    items.forEach(item => {
-      const idx = parseInt(item.getAttribute("data-queue-index") || "0", 10);
-
-      item.addEventListener("dragstart", (e) => {
-        dragSrcIdx = idx;
-        (e as DragEvent).dataTransfer?.setData("text/plain", String(idx));
-        item.classList.add("dragging");
-      });
-
-      item.addEventListener("dragend", () => {
-        item.classList.remove("dragging");
-        dragSrcIdx = null;
-        items.forEach(el => el.classList.remove("drop-target"));
-      });
-
-      item.addEventListener("dragover", (e) => {
-        e.preventDefault();
-        if (dragSrcIdx !== null && dragSrcIdx !== idx) {
-          items.forEach(el => el.classList.remove("drop-target"));
-          item.classList.add("drop-target");
-        }
-      });
-
-      item.addEventListener("dragleave", () => {
-        item.classList.remove("drop-target");
-      });
-
-      item.addEventListener("drop", (e) => {
-        e.preventDefault();
-        item.classList.remove("drop-target");
-        if (dragSrcIdx !== null && dragSrcIdx !== idx) {
-          moveQueuedPrompt(dragSrcIdx, idx);
-          // Defer the rebuild so the drag source isn't destroyed mid-drop,
-          // which can leave the renderer's pointer/drag state stuck and make
-          // the prompt input un-focusable afterwards.
-          requestAnimationFrame(() => this._renderQueueCard());
-        }
-        dragSrcIdx = null;
-      });
-    });
-
-    // Remove buttons
-    body.querySelectorAll(".queue-item-remove").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const idx = parseInt((btn as HTMLElement).dataset.queueIndex || "0", 10);
-        removeQueuedPromptAt(idx);
-      });
-    });
-
-    // Send-directly buttons: cancel current task & move this item to front
-    body.querySelectorAll(".queue-item-send").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const idx = parseInt((btn as HTMLElement).dataset.queueIndex || "0", 10);
-        const st = getState();
-        // Move this item to front of queue
-        if (idx > 0) {
-          moveQueuedPrompt(idx, 0);
-        }
-        // Cancel current running task so queue drain picks it up
-        if (st.running) {
-          this.btnStop.classList.add("cancelling");
-          this.btnStop.style.pointerEvents = "none";
-          send({ type: "cancel", session_id: st.sessionId });
-        } else {
-          // Nothing running: send directly from queue
-          const qp = getState().queuedPrompts[0];
-          if (qp) {
-            removeQueuedPromptAt(0);
-            addUserMessage(qp.text, qp.mode);
-            startAssistantMessage();
-            setSessionState("running");
-            this.updateUIState(true);
-            const text = typeof qp.text === "string" ? qp.text : "";
-            if (text) {
-              send({ type: "run", prompt: text, session_id: st.sessionId || undefined } as any);
-            }
-          }
-        }
-      });
-    });
+  /**
+   * Write the session-bar label, replaying the shared content enter when —
+   * and only when — the text actually changes.
+   *
+   * Opening or switching a session swaps this label in the same breath as
+   * the transcript, but it used to snap: the new name simply replaced the old
+   * one with no motion anywhere in the header. Going through here means a
+   * session switch reads as one move — tape and title arrive together — while
+   * the many calls that re-assert an unchanged name (every render during a
+   * stream) stay free.
+   *
+   * The class is dropped, the layout re-measured and the class re-added so
+   * the keyframes restart; `encre-content-enter` carries no fill mode, so
+   * nothing survives the 180ms.
+   */
+  private setSessionBarName(el: HTMLElement | null, text: string): void {
+    if (!el || el.textContent === text) return;
+    el.textContent = text;
+    el.classList.remove("session-enter");
+    void el.offsetWidth;
+    el.classList.add("session-enter");
   }
 
   async start(): Promise<void> {
     (window as any).__perfStart = performance.now();
+    // One process-wide safety net: uncaught component/async errors are
+    // recorded by the shared boundary instead of aborting the app.
+    installUiErrorBoundaries();
+
+    // Surface main-thread stalls during startup. A "longtask" entry is any
+    // synchronous block over 50 ms; logging the heavy ones makes the exact
+    // boot regression visible next time instead of being reported as
+    // "everything feels stuck".
+    if (typeof PerformanceObserver !== "undefined") {
+      try {
+        const obs = new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) {
+            if (entry.duration >= 80) {
+              console.warn(`[perf] long task ${Math.round(entry.duration)}ms at ${Math.round(entry.startTime)}ms`);
+            }
+          }
+        });
+        obs.observe({ entryTypes: ["longtask"] });
+        (window as any).__perfLongTaskObserver = obs;
+      } catch {
+        /* longtask not supported */
+      }
+    }
 
     // The main window is shown immediately by the main process; the in-app
     // splash screen covers boot while the startup mode's data is filled, then
@@ -1730,19 +1094,39 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // in the background via stream events after reveal.
     this.splash.show();
 
-    await new Promise<void>(r => requestAnimationFrame(() => r()));
-
     // Lazy locale tables: make sure the selected language's chunk is installed
     // before anything is painted, so a non-zh/en session never flashes the
     // English fallback first. zh/en resolve synchronously (no await cost).
-    await ensureLocale(getLocale());
+    // Kick the import off BEFORE the splash's first-frame wait and only join
+    // it afterwards: the dynamic import overlaps the frame wait instead of
+    // serializing ahead of it.
+    const localeReady = ensureLocale(getLocale());
+
+    await new Promise<void>((r) => App.onFrames(r, 1, 250));
+    await localeReady;
 
     const _connStart = performance.now();
     // Hold back side-panel planes from the moment we connect: the backend
     // pushes the whole snapshot on connect, and applying the non-critical
     // planes during boot only steals main-thread time from the reveal.
     holdNonCriticalPlanes();
+    // Historical transcript blocks render as escaped text until the app is
+    // visible, then upgrade to markdown during idle slices. Session replies
+    // re-assert this for large histories (see the session_ready handler).
+    this.chat.deferMarkdown = true;
+    // While the WS connect retries, watch the service status: once the main
+    // process reports the backend process actually died (a start attempt
+    // failed), stop the retry loop immediately — hammering a dead port just
+    // delays the error screen by many loader cycles.
+    const _statusPoll = setInterval(async () => {
+      if (getState().connected) return;
+      try {
+        const st = await window.electronAPI?.getServiceStatus?.();
+        if (st && st.running === false && st.error) abortConnect();
+      } catch {}
+    }, 1000);
     await connect(handleEvent);
+    clearInterval(_statusPoll);
     if (getState().connected) {
       console.log("[perf] ws open after %dms", Math.round(performance.now() - _connStart));
       // The backend pushes the full snapshot on connect (`_push_all_data`), so
@@ -1768,9 +1152,12 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       // boot-critical planes for the main thread while the splash is covering.
       this.splash.hide();
       releaseNonCriticalPlanes();
+      // The shell is interactive now; upgrade restored answers to markdown
+      // in small idle slices instead of one blocking pass.
+      this.chat.beginMarkdownUpgrade(120);
     } else {
       // Backend never came up: keep the splash showing the error + retry.
-      await this.handleSplashError(t("app.splashNoConnect"));
+      await this.handleSplashError("app.splashNoConnect");
       return;
     }
   }
@@ -1787,16 +1174,19 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     if (!("startup_session_mode" in st.settings)) return false;
     const mode = st.settings.startup_session_mode as string;
     if (mode === "automation") {
-      return this.modeTransition.getCurrentMode() === "automation";
+      return this.automationPanel.isActive;
     }
     if (mode === "iwork") {
-      return st.sessionsList.length > 0 || st.allSessions.length > 0;
+      // "Arrived", not "non-empty": a zero-session user's (empty) session
+      // snapshot is a complete answer, and requiring length > 0 made every
+      // fresh install sit on the splash for the full deadline.
+      return sessionsArrived();
     }
     // normal (通用): general-mode chat needs the session lists.
-    return st.sessionsList.length > 0 || st.allSessions.length > 0;
+    return sessionsArrived();
   }
 
-  private async handleSplashError(message: string): Promise<void> {
+  private async handleSplashError(titleKey: string): Promise<void> {
     // Ensure the splash (with the error/retry UI) is actually visible — it is
     // not shown at boot anymore since the main window reveals the real UI.
     this.splash.show();
@@ -1807,27 +1197,31 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         detail = status.error;
       }
     } catch {}
-    this.splash.showError(message, detail, async () => {
+    // Pass the i18n KEY (not a pre-translated string): the splash locks the
+    // document into English before resolving it.
+    this.splash.showError(titleKey, detail, async () => {
+      // Fade the error out and bring the animated loader back first, then
+      // wait for the current loader loop to finish before judging the result
+      // so the transition never cuts the animation short.
+      this.splash.beginRestart();
       try {
         const result = await window.electronAPI?.restartService?.();
+        await this.splash.awaitLoaderCycle();
         if (result?.success) {
           location.reload();
         } else {
-          this.splash.showError(
-            t("app.splashRestartFailed"),
-            result?.error || "",
-            () => this.handleSplashError(t("app.splashRetry"))
-          );
+          // Slide the error back in but keep the same title so the user
+          // can keep hitting the button to retry continuously.
+          this.splash.showError(titleKey, result?.error || "");
         }
       } catch (err) {
-        this.splash.showError(
-          t("app.splashRestartFailed"),
-          String(err),
-          () => this.handleSplashError(t("app.splashRetry"))
-        );
+        await this.splash.awaitLoaderCycle();
+        this.splash.showError(titleKey, String(err));
       }
     });
-    // Block until the user resolves the error (page reloads or they keep trying)
+    // Block until the user resolves the error (page reloads on success; on
+    // failure the caller keeps the splash open and the restart button stays
+    // clickable so the user can hammer it as often as they want).
     await new Promise<void>(() => {});
   }
 
@@ -1835,23 +1229,21 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     this.btnSend.addEventListener("click", () => this.submit());
     this.btnStop.addEventListener("click", () => this.cancel());
 
-    // Toolbar mode chip X button - exits persistent mode
-    const btnModeClose = document.getElementById("btn-mode-close");
-    if (btnModeClose) {
-      btnModeClose.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const oldMode = this._persistentMode;
-        this._persistentMode = "";
-        this.updateChipState();
-        this.updatePlaceholder();
-        const st = getState();
-        console.log("[mode-close] clearing mode:", oldMode, "sessionId:", st.sessionId);
-        send({ type: "set_mode", mode: "", session_id: st.sessionId || undefined } as any);
-      });
-    }
-
     this.input.addEventListener("keydown", (e) => {
+      // ArrowUp/ArrowDown recall sent-message history when the composer is
+      // empty (no text, no chips). With content present the arrows keep
+      // their native multiline caret-navigation role.
+      if (!e.isComposing && (e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const composerEmpty = !this.getPlainText().trim() && !this.hasModeChip() && !this.hasCommandChip();
+        if (composerEmpty) {
+          const action = e.key === "ArrowUp" ? this._keybindActions["history_prev"] : this._keybindActions["history_next"];
+          if (action) {
+            e.preventDefault();
+            action();
+            return;
+          }
+        }
+      }
       const sendMode = (getState().settings.shortcut_send_mode as string) || "enter";
       const isCtrlEnter = sendMode === "ctrl_enter";
       const isSendKey = isCtrlEnter
@@ -1862,14 +1254,13 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         e.preventDefault();
         const text = this.getPlainText();
 
-        // Don't re-activate slash command when a mode chip is already present
-        if (!this.hasModeChip() && !this.hasCommandChip()) {
-          // Check slash command match (e.g. /plan → activate mode)
-          const parsed = parseSlashInput(text);
-          if (parsed) {
-            this.activateSlashCommand(parsed.command, parsed.rest);
-            return;
-          }
+        // Check slash command match (e.g. /plan → activate mode).  Runs
+        // regardless of active chips — mode and command are independent
+        // channels and may combine in one submit.
+        const parsed = parseSlashInput(text);
+        if (parsed) {
+          this.activateSlashCommand(parsed.command, parsed.rest);
+          return;
         }
 
         // If slash menu is active, check for matched command first
@@ -1886,7 +1277,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
               return;
             }
           }
-          dd?.classList.add("hidden");
+          hideAnimated(dd);
           bm?.classList.remove("active");
           this._slashActive = false;
           this.updatePlaceholder();
@@ -1907,7 +1298,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
           this.input.innerHTML = "";
           const dd = document.getElementById("mention-dropdown");
           const bm = document.getElementById("btn-mention");
-          dd?.classList.add("hidden");
+          hideAnimated(dd);
           bm?.classList.remove("active");
           this.updatePlaceholder();
           this.resizeInput();
@@ -1943,12 +1334,46 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       }
       this.detectSlashCommand();
       this.handleManualSlashCommand();
+      this.repairChips();
       this.updateChipState();
       this.resizeInput();
       this.updateInputExpandButton();
       this.updatePlaceholder();
       this.updateSendButton();
       this.saveCurrentDraft();
+    });
+
+    // Backspacing at a chip boundary lets Chromium natively delete into the
+    // contenteditable=false element, which mangles it (splits it / strips its
+    // icon or label children).  Take over: when the collapsed caret sits
+    // directly before a chip, remove it atomically through its own close path
+    // instead of letting the browser touch its internals.  Deleting the
+    // separator space one caret position earlier stays a normal character
+    // deletion — the guard only fires at the element boundary.
+    this.input.addEventListener("beforeinput", (e) => {
+      if ((e as InputEvent).inputType !== "deleteContentBackward") return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return;
+      const { startContainer, startOffset } = sel.getRangeAt(0);
+      let prev: Node | null = null;
+      if (startContainer.nodeType === Node.TEXT_NODE) {
+        if (startOffset > 0) return; // deleting a normal character
+        prev = startContainer.previousSibling;
+      } else {
+        if (startOffset === 0) return; // start of the composer
+        prev = startContainer.childNodes[startOffset - 1];
+      }
+      const chip = (prev as Element | null)?.closest?.(".mode-chip, .command-chip");
+      if (!chip || !this.input.contains(chip)) return;
+      e.preventDefault();
+      if (chip.classList.contains("command-chip")) {
+        this.deactivateCommandChip();
+      } else if (chip.getAttribute("data-attach") === "true") {
+        const path = chip.getAttribute("data-path");
+        if (path) removeAttachment(path);
+      } else {
+        this.removeInlineModeChip();
+      }
     });
 
     // Composer expand/shrink toggle (top-right inside the input box).
@@ -1999,23 +1424,37 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // Re-apply the overlay padding after viewport changes (the composer
     // itself is observed, so this is mostly belt-and-braces).
     window.addEventListener("resize", () => this.refreshInputNaturalHeight());
+    // Full re-raster hammer on viewport settle: after a drag/resize/DPI
+    // switch the compositor can keep showing tiles rastersed for the old
+    // viewport (stale fragments at the window edges). Toggling a
+    // will-change layer on the root forces every tile to be re-rastered
+    // into the current viewport on the next frame. Debounced: resize fires
+    // continuously in an interactive drag.
+    let rasterHammerTimer: ReturnType<typeof setTimeout> | null = null;
+    window.addEventListener(
+      "resize",
+      () => {
+        if (rasterHammerTimer) clearTimeout(rasterHammerTimer);
+        rasterHammerTimer = setTimeout(() => {
+          rasterHammerTimer = null;
+          const rootStyle = document.documentElement.style;
+          rootStyle.willChange = "transform";
+          requestAnimationFrame(() => {
+            if (rootStyle.willChange === "transform") rootStyle.willChange = "";
+          });
+        }, 150);
+      },
+      { passive: true },
+    );
 
-    // ── Toolbar mode-chip close button ────────────────────────────
-    const closeBtn = document.getElementById("btn-mode-close");
-    if (closeBtn) {
-      closeBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.deactivateModeChip();
-      });
-    }
-    // ── Toolbar command-chip close button ─────────────────────────
-    const cmdCloseBtn = document.getElementById("btn-command-close");
-    if (cmdCloseBtn) {
-      cmdCloseBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.deactivateCommandChip();
-      });
-    }
+    // Toolbar chip close: click the icon to deactivate (icon turns × on hover).
+    // wireChipClose delegates on the chip container — lucide replaces the inner
+    // <i class="chip-icon"> with an <svg>, which would destroy a listener bound
+    // to the icon element.
+    const tbModeChip = document.getElementById("toolbar-mode-chip");
+    if (tbModeChip) wireChipClose(tbModeChip, () => this.deactivateModeChip());
+    const tbCmdChip = document.getElementById("toolbar-command-chip");
+    if (tbCmdChip) wireChipClose(tbCmdChip, () => this.deactivateCommandChip());
   }
 
   private detectSlashCommand(): void {
@@ -2030,17 +1469,23 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // Clear all match highlights
     mentionDropdown.querySelectorAll(".mention-match").forEach(el => el.classList.remove("mention-match"));
 
-    if (text.startsWith("/") && !this.hasModeChip() && !this.hasCommandChip()) {
+    // Open the slash menu on "/" regardless of active chips — a mode chip
+    // must not block picking a slash command (they are independent channels).
+    if (text.startsWith("/")) {
       // Re-render slash dropdown to pick up any custom commands that
       // arrived after initial render (e.g. via slash-commands-updated).
       this.renderSlashDropdown();
       if (mentionDropdown.classList.contains("hidden")) {
-        mentionDropdown.classList.remove("hidden");
+        showAnimated(mentionDropdown);
+        this.ownEphemeral(mentionDropdown);
         btnMention.classList.add("active");
       }
       this._slashActive = true;
+      mentionDropdown.closest(".input-wrapper")?.classList.add("slash-menu-open");
 
       // Slash mode → always show only slash sub-page, never Files/Folder
+      // (and never a resource sub-page left over from a previous visit).
+      mentionDropdown.querySelectorAll('[data-page^="res-"]').forEach((p) => p.classList.add("hidden"));
       mainPage?.classList.add("hidden");
       slashPage?.classList.remove("hidden");
 
@@ -2049,24 +1494,24 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       if (query) {
         mentionDropdown.querySelectorAll('[data-slash]').forEach(el => {
           const name = (el.getAttribute("data-slash") || "").toLowerCase();
-          const aliases = (el.getAttribute("data-aliases") || "").split(",").filter(Boolean);
-          const matched = name.startsWith(query) || aliases.some((a) => a.startsWith(query));
-          if (matched) {
+          if (name.startsWith(query)) {
             el.classList.add("mention-match");
           }
         });
       }
     } else if (this._slashActive) {
-      mentionDropdown.classList.add("hidden");
+      hideAnimated(mentionDropdown);
       btnMention.classList.remove("active");
       this._slashActive = false;
+      mentionDropdown.closest(".input-wrapper")?.classList.remove("slash-menu-open");
     }
   }
 
   private handleManualSlashCommand(): void {
     const text = this.getPlainText();
 
-    if (this.hasModeChip() || this.hasCommandChip()) return;
+    // No chip guard here: a typed "/cmd" must activate even while a mode or
+    // command chip is up — mode and command are independent channels.
     const parsed = parseSlashInput(text);
     if (!parsed) return;
     this.activateSlashCommand(parsed.command, parsed.rest);
@@ -2103,15 +1548,6 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         send({ type: "configure", config: { language: code } });
       };
     }
-    commandActions["new-session"] = () => {
-      this.automationPanel.hide();
-      this.exitTempChat();
-      this.cleanupContentArea({ keepAutomationFlag: false });
-      resetChat();
-      const requestId = crypto.randomUUID();
-      setRequestedSessionId("", requestId);
-      send({ type: "new_session", request_id: requestId });
-    };
     commandActions["keyboard-shortcuts"] = () => {
     };
     commandActions["automation"] = () => { this.automationPanel.show(); };
@@ -2124,22 +1560,21 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       if (!target || !target.closest) return;
       const link = target.closest("a") as HTMLAnchorElement | null;
       if (!link || !link.href) return;
-      const behavior = (getState().settings.default_link_behavior as string) || "system";
-      if (behavior !== "in_app") return;
-      let url = link.href;
-      if (!url) return;
-      const isWeb = /^(https?:\/\/|www\.)/i.test(url);
-      if (!isWeb) return;
-      if (/^www\./i.test(url)) url = "https://" + url;
+      const url = link.href;
+      // file:// links are handled by their own dedicated flows — never routed.
+      if (!url || /^file:/i.test(url)) return;
+      // Only intercept web/mailto URLs; everything else keeps native behavior.
+      if (!/^(https?:\/\/|www\.|mailto:)/i.test(url)) return;
       e.preventDefault();
       e.stopPropagation();
-      const api = (window as any).electronAPI;
-      if (api?.openChildWindow) {
-        api.openChildWindow(url, url);
-      } else {
-        window.open(url, "_blank");
-      }
+      openRoutedLink(url);
     }, true);
+    // Defense in depth: the main process bounces any in-page navigation to a
+    // web URL back here (will-navigate guard) so it goes through the same
+    // routing instead of replacing the app document.
+    (window as any).electronAPI?.onOpenRoutedUrl?.((url: string) => {
+      openRoutedLink(url);
+    });
   }
 
   private bindToolbarButtons(): void {
@@ -2174,12 +1609,9 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         });
       });
       const syncSegFromState = () => {
-        let active: string;
-        if (this.automationPanel.isActive) {
-          active = "automation";
-        } else {
-          active = getState().workspaceMode === "iwork" ? "iwork" : "normal";
-        }
+        // Automation is a page, not a mode: the seg keeps highlighting the
+        // underlying mode (normal / iwork) even while the page is open.
+        const active = getState().workspaceMode === "iwork" ? "iwork" : "normal";
         items.forEach((el) => {
           const isActive = el.getAttribute("data-mode") === active;
           el.classList.toggle("active", isActive);
@@ -2187,9 +1619,30 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         });
       };
       syncSegFromState();
-      subscribe(syncSegFromState);
+      subscribe(syncSegFromState, ["workspaceMode"]);
       this.automationPanel.onHide = syncSegFromState;
     }
+
+    // ── Sidebar entries (automation / plugin market) ──
+    // Automation keeps its original behaviour (mode toggle) — only the entry
+    // point moved here from the header seg switch. The plugin market entry
+    // opens the dedicated content-area market view (features/market.ts).
+    const sidebarAutomationBtn = document.getElementById("btn-sidebar-automation");
+    sidebarAutomationBtn?.addEventListener("click", () => {
+      if (this.market?.active) this.market.close();
+      this.toggleAutomationPage();
+    });
+    const sidebarMarketBtn = document.getElementById("btn-sidebar-market");
+    sidebarMarketBtn?.addEventListener("click", () => {
+      if (this.automationPanel.isActive) {
+        void this.automationPanel.hide();
+      }
+      // Same contract as automation: entering the market from inside a
+      // session exits the session first; closing the market later reveals
+      // the fresh new-task state, not the old transcript.
+      if (!this.market.active) this.exitSessionForOverlay();
+      this.market.toggle();
+    });
 
     const newTaskBtn = document.querySelector('.nav-item[data-view="chat"]');
     newTaskBtn?.addEventListener("click", async () => {
@@ -2227,20 +1680,37 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       this.settings.open();
     });
 
-    // @ button: upward dropdown
+    // + button: upward dropdown
     const btnMention = document.getElementById("btn-mention");
     const mentionDropdown = document.getElementById("mention-dropdown");
     btnMention?.addEventListener("click", (e) => {
       e.stopPropagation();
       const wasHidden = mentionDropdown?.classList.contains("hidden");
-      mentionDropdown?.classList.toggle("hidden");
+      if (mentionDropdown) {
+        // Enter/exit both go through the motion helpers: an exit still in
+        // flight (the dropdown was closed <120ms ago) has to be cancelled,
+        // not raced — otherwise the dropdown finishes fading out first.
+        if (wasHidden) {
+          // Re-render so mode entries reflect the current workspace mode
+          // and any commands that arrived after the last render.
+          this.renderSlashDropdown();
+          showAnimated(mentionDropdown);
+          this.ownEphemeral(mentionDropdown);
+        }
+        else hideAnimated(mentionDropdown);
+      }
       btnMention?.classList.toggle("active");
       this._slashActive = false;
+      // Button-opened menus keep the compact trigger-anchored placement.
+      mentionDropdown?.closest(".input-wrapper")?.classList.remove("slash-menu-open");
       if (wasHidden) {
+        // Reopening always lands on the main page: the slash page and every
+        // resource sub-page are folded back in, whatever was left open.
         const mainPage = mentionDropdown?.querySelector('[data-page="main"]');
-        const slashPage = mentionDropdown?.querySelector('[data-page="slash"]');
+        mentionDropdown?.querySelectorAll(".mention-page").forEach((p) => {
+          if (p !== mainPage) p.classList.add("hidden");
+        });
         if (mainPage) mainPage.classList.remove("hidden");
-        if (slashPage) slashPage.classList.add("hidden");
       }
     });
 
@@ -2249,9 +1719,10 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const target = e.target as HTMLElement;
       if (target.closest("#prompt-input") && this._slashActive) return;
       if (!target.closest("#btn-mention") && !target.closest("#mention-dropdown")) {
-        mentionDropdown?.classList.add("hidden");
+        hideAnimated(mentionDropdown);
         btnMention?.classList.remove("active");
         this._slashActive = false;
+        mentionDropdown?.closest(".input-wrapper")?.classList.remove("slash-menu-open");
       }
     });
 
@@ -2260,6 +1731,17 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const item = (e.target as HTMLElement).closest(".mention-dropdown-item") as HTMLElement | null;
       if (!item) return;
       const action = item.getAttribute("data-action");
+
+      // User-defined resource pick (sub-agent / skill / rule / library
+      // document / plugin): resolved from state and run through the shared
+      // chip pipeline.  Handled before data-action so a name collision with
+      // a slash command id can never hijack the pick.
+      const rKind = item.getAttribute("data-resource-kind");
+      const rName = item.getAttribute("data-resource-name");
+      if (rKind && rName) {
+        this.activateResourceChip(rKind, rName);
+        return;
+      }
 
       // Sub-navigation: Slash Commands (enter sub-page)
       if (action === "sub-slash") {
@@ -2270,20 +1752,44 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         return;
       }
 
-      // Sub-navigation: back to main
+      // Sub-navigation: resource sub-page (agents / skills / connectors /
+      // tools / rules / library).  Same one-page-at-a-time pattern the model
+      // and reasoning pickers use; the target page is filled in on entry so
+      // its list always reflects the latest state.
+      if (action === "sub-res") {
+        const kind = item.getAttribute("data-res-kind") || "";
+        const page = mentionDropdown.querySelector(`[data-page="res-${kind}"]`) as HTMLElement | null;
+        if (page) {
+          mentionDropdown.querySelectorAll(".mention-page").forEach((p) => {
+            if (p.getAttribute("data-page") !== `res-${kind}`) p.classList.add("hidden");
+          });
+          this.renderResPage(page, kind);
+          page.classList.remove("hidden");
+        }
+        return;
+      }
+
+      // Sub-navigation: back to main (from the slash page or any res page)
       if (action === "back-main") {
         const mainPage = mentionDropdown.querySelector('[data-page="main"]');
-        const slashPage = mentionDropdown.querySelector('[data-page="slash"]');
-        slashPage?.classList.add("hidden");
+        mentionDropdown.querySelectorAll(".mention-page").forEach((p) => {
+          if (p !== mainPage) p.classList.add("hidden");
+        });
         mainPage?.classList.remove("hidden");
         return;
       }
 
-      mentionDropdown.classList.add("hidden");
+      hideAnimated(mentionDropdown);
       btnMention?.classList.remove("active");
 
-      // Don't re-activate if a mode chip already exists
-      if (this.hasModeChip()) return;
+      // Only a re-pick of the *same* mode is a no-op.  Everything else
+      // passes: a different mode replaces the chip, and command/action picks
+      // coexist with the mode chip (independent channels).
+      const existingMode = this.getCurrentMode();
+      if (existingMode) {
+        const picked = SLASH_COMMANDS.find(c => c.id === action || c.name === action);
+        if (picked && picked.kind === "mode" && picked.id === existingMode) return;
+      }
 
       const cmd = SLASH_COMMANDS.find(c => c.id === action || c.name === action);
       if (cmd) {
@@ -2307,44 +1813,26 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     });
 
     this.bindInputModelSelector();
-    this.bindInputWorkspaceSelector();
   }
 
   private bindSummaryPanel(): void {
-    const btn = document.getElementById("btn-summary-panel");
     const panel = document.getElementById("summary-panel");
-    if (!btn || !panel) return;
+    if (!panel) return;
 
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const isHidden = panel.classList.contains("hidden");
-      if (isHidden) {
-        panel.classList.remove("hidden");
-        btn.classList.add("active");
-        this.renderSummaryPanel();
-      } else {
-        panel.classList.add("hidden");
-        btn.classList.remove("active");
-      }
-    });
-
-    // Close panel on outside click
+    // Document-level DELEGATED handling instead of per-element listeners: the
+    // toggle button and the panel are looked up on every click, so neither can
+    // go stale between bind time and user input. A captured node that gets
+    // re-created in that window silently swallows clicks -- the toggle looks
+    // painted but the first click does nothing and a second one is required.
     document.addEventListener("click", (e) => {
-      if (panel.classList.contains("hidden")) return;
-      if (!panel.contains(e.target as Node) && !btn.contains(e.target as Node)) {
-        panel.classList.add("hidden");
-        btn.classList.remove("active");
-      }
-    });
+      const btn = document.getElementById("btn-summary-panel");
+      const target = e.target as Node | null;
+      if (!btn || !target) return;
 
-    // "View all" link → open review tab in sidebar
-    const viewAll = document.getElementById("summary-view-all");
-    if (viewAll) {
-      viewAll.addEventListener("click", (e) => {
+      // "View all" link → open review tab in sidebar
+      if ((target as HTMLElement).closest?.("#summary-view-all")) {
         e.preventDefault();
-        e.stopPropagation();
-        panel.classList.add("hidden");
-        btn.classList.remove("active");
+        this.closeSummaryPanel();
         const st = getState();
         const first = st.artifacts?.[0];
         if (st.workspaceMode === "iwork") {
@@ -2352,17 +1840,55 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         } else {
           this.sessionInner.showReviewTab(first?.path || "", first || undefined);
         }
-      });
-    }
+        return;
+      }
+
+      // Context header (usage + chevron) → open the detail subpage. The
+      // back arrow inside the detail view restores the stacked sections.
+      if ((target as HTMLElement).closest?.("#summary-context-header")) {
+        if (!this._summaryCtxDetail) {
+          this._summaryCtxDetail = true;
+          this.renderSummaryPanel();
+        }
+        return;
+      }
+
+      if (btn.contains(target)) {
+        e.stopPropagation();
+        if (this.isSummaryPanelOpen()) this.closeSummaryPanel();
+        else this.showSummaryPanel();
+        return;
+      }
+
+      // Close panel on outside click
+      if (this.isSummaryPanelOpen() && !panel.contains(target)) {
+        this.closeSummaryPanel();
+      }
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key !== "Escape") return;
+      if (this.isSummaryPanelOpen()) this.closeSummaryPanel();
+    });
 
     // Re-render when state changes
     onLocaleChange(() => {
-      if (!this.summaryPanel.classList.contains("hidden")) this.renderSummaryPanel();
+      if (this.isSummaryPanelOpen()) this.renderSummaryPanel();
     });
 
     subscribe(() => {
-      if (!this.summaryPanel.classList.contains("hidden")) this.renderSummaryPanel();
-    });
+      const st = getState();
+      // Session switched: the open panel belongs to the previous session's
+      // context — close it instead of showing stale content. Reopening it
+      // re-renders from the active session's snapshot.
+      if (st.sessionId !== this._summarySessionId) {
+        this._summarySessionId = st.sessionId;
+        this._summaryCtxDetail = false;
+        this.closeSummaryPanel();
+        return;
+      }
+      if (this.isSummaryPanelOpen()) this.renderSummaryPanel();
+    }, ["sessionId", "messages", "contextTokens"]);
 
     // Single delegated listener for the done-section collapse toggle.
     // Set up once during binding so re-renders (which overwrite innerHTML)
@@ -2381,24 +1907,188 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     }
   }
 
+  /** Single source of truth for "is the panel showing" — the `.hidden` class
+   *  on the live node. Every call site reads it through here so no path can
+   *  disagree with another about the panel's visibility. */
+  private isSummaryPanelOpen(): boolean {
+    const panel = this.summaryPanel;
+    return !!panel && !panel.classList.contains("hidden");
+  }
+
+  /** Reveal the panel and (re)render its content. */
+  private showSummaryPanel(): void {
+    const panel = this.summaryPanel;
+    if (!panel) return;
+    panel.classList.remove("hidden");
+    const btn = document.getElementById("btn-summary-panel");
+    if (btn) btn.classList.add("active");
+    this.renderSummaryPanel();
+  }
+
   /** Force-open the summary panel (used when the model first creates todos). */
   openSummaryPanel(): void {
+    if (this.isSummaryPanelOpen()) return;
+    this.showSummaryPanel();
+  }
+
+  /** Hide the summary panel. Called when the active session changes or the
+   *  settings overlay opens — the panel must never outlive its session's
+   *  context and keep showing stale content. */
+  closeSummaryPanel(): void {
+    this.summaryPanel.classList.add("hidden");
     const btn = document.getElementById("btn-summary-panel");
-    if (this.summaryPanel.classList.contains("hidden")) {
-      this.summaryPanel.classList.remove("hidden");
-      if (btn) btn.classList.add("active");
-      this.renderSummaryPanel();
-    }
+    if (btn) btn.classList.remove("active");
   }
 
   private renderSummaryPanel(): void {
     const st = getState();
+    // Context detail mode: the context section takes over the whole card and
+    // the stacked sections hide; the back arrow inside it restores them.
+    this.summaryPanel.classList.toggle("ctx-detail-mode", this._summaryCtxDetail);
+    this.renderSummaryContext(st);
     this.renderSummaryProgress(st);
     this.renderSummaryArtifacts(st);
     this.renderSummaryReferences(st);
     if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons();
+      // Scoped to the panel on purpose. An unscoped createIcons() re-creates
+      // every [data-lucide] node in the document, including the toggle
+      // button's own icon -- and lucide does that by replacing the node. This
+      // render runs on every state change while the panel is open, so a
+      // re-render landing between a mousedown and its mouseup swapped the icon
+      // node out from under the pointer: the browser then dispatched `click`
+      // on the icons' common ancestor instead of the button, so the button's
+      // listener never ran and the first click did nothing. A second click
+      // was needed because by then no re-render intervened. Never re-create
+      // nodes outside the panel that owns them.
+      (window as any).lucide.createIcons({ root: this.summaryPanel });
     }
+  }
+
+  /* ── Summary panel: context usage (section header + detail subpage) ── */
+
+  private spFmtTokens(n: number): string {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+    if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+    return String(n);
+  }
+
+  /** The four display segments of the context composition, in order.
+   *  Numbers come exclusively from the backend's per-request breakdown —
+   *  the char-based gauge estimate is never shown as category data. */
+  private spCtxSegments(st: ReturnType<typeof getState>): Array<{ tokens: number; cls: string }> {
+    const bd = st.contextUsageBreakdown;
+    const tools = bd?.tools_tokens;
+    return [
+      { tokens: Math.max(0, bd?.system_prompt_tokens ?? 0), cls: "si-ctx-seg-system" },
+      { tokens: Math.max(0, bd?.messages_tokens ?? 0), cls: "si-ctx-seg-messages" },
+      { tokens: Math.max(0, tools?.total ?? 0), cls: "si-ctx-seg-tools" },
+      { tokens: Math.max(0, bd?.skills_tokens ?? 0), cls: "si-ctx-seg-skills" },
+    ];
+  }
+
+  private spCtxBarHtml(st: ReturnType<typeof getState>): string {
+    const segs = this.spCtxSegments(st);
+    const base = st.contextWindow > 0
+      ? st.contextWindow
+      : (segs.reduce((s, x) => s + x.tokens, 0) || 1);
+    return segs.map((seg) => {
+      const w = Math.max(0, Math.min(100, Math.round((seg.tokens / base) * 100)));
+      return w > 0 ? `<span class="si-ctx-seg ${seg.cls}" style="width:${w}%"></span>` : "";
+    }).join("");
+  }
+
+  /** Context section of the summary panel. The section header follows the
+   *  exact progress/artifacts/references pattern (static in index.html,
+   *  i18n-driven); the usage figure sits at its right end. The items area
+   *  holds either the composition bar or the full detail subpage. */
+  private renderSummaryContext(st: ReturnType<typeof getState>): void {
+    const el = document.getElementById("summary-context-items");
+    const usageEl = document.getElementById("summary-context-usage");
+    if (!el) return;
+    const bd = st.contextUsageBreakdown;
+    const used = bd ? Math.max(0, bd.total_tokens) : Math.max(0, st.contextTokens || 0);
+    const win = bd?.context_window && bd.context_window > 0 ? bd.context_window : (st.contextWindow || 0);
+
+    if (usageEl) {
+      if (used > 0) {
+        usageEl.classList.remove("is-empty");
+        usageEl.innerHTML = `${this.esc(this.spFmtTokens(used))}${win > 0 ? " / " + this.esc(this.spFmtTokens(win)) : ""}<i data-lucide="chevron-right" class="lucide lucide-xs"></i>`;
+      } else {
+        usageEl.classList.add("is-empty");
+        usageEl.innerHTML = `<i data-lucide="chevron-right" class="lucide lucide-xs"></i>`;
+      }
+    }
+
+    if (this._summaryCtxDetail) {
+      el.innerHTML = this.renderSummaryContextDetail(st, used, win);
+      const back = el.querySelector("#sp-ctx-back") as HTMLElement | null;
+      if (back) {
+        back.addEventListener("click", (e) => {
+          e.stopPropagation();
+          this._summaryCtxDetail = false;
+          this.renderSummaryPanel();
+        });
+      }
+      return;
+    }
+
+    // Collapsed section view: the header line alone (title left, usage +
+    // chevron right). The composition bar belongs to the detail page only.
+    el.innerHTML = "";
+  }
+
+  /** Full context-usage composition page shown inside the summary card. */
+  private renderSummaryContextDetail(st: ReturnType<typeof getState>, used: number, win: number): string {
+    const header = `<div class="si-ctx-detail-header">
+        <button class="btn-icon" id="sp-ctx-back" title="${t("sidebar.back")}"><i data-lucide="arrow-left" class="lucide"></i></button>
+        <span class="si-ctx-detail-title">${t("summary.context")}</span>
+      </div>`;
+
+    const bd = st.contextUsageBreakdown;
+    if (!bd) {
+      // Without a composition there is nothing honest to draw: no bar, no
+      // placeholder rows, no "starts after the first turn" copy — the
+      // header alone.
+      return header;
+    }
+    // Stats line between the header and the composition bar: total
+    // percentage on the left, exact usage on the right — never on the
+    // title row itself.
+    const pctTotal = win > 0 ? Math.round((Math.max(0, used) / win) * 100) : null;
+    const stats = (pctTotal !== null && used > 0)
+      ? `<div class="si-ctx-stats">
+          <span class="si-ctx-stats-pct">${pctTotal}%</span>
+          <span class="si-ctx-stats-usage">${this.esc(`${this.spFmtTokens(used)}${win > 0 ? " / " + this.spFmtTokens(win) : ""}`)}</span>
+        </div>`
+      : "";
+    const barWrap = `<div class="si-ctx-bar-wrap si-ctx-bar-lg"><div class="si-ctx-bar">${this.spCtxBarHtml(st)}</div></div>`;
+
+    const denom = win > 0 ? win : Math.max(1, bd.total_tokens);
+    const pct = (n: number) => `${Math.round((Math.max(0, n) / denom) * 100)}%`;
+    // Detail lines reuse the summary-panel row recipe verbatim (the
+    // sp-artifact-item flex row): colour chip, plain label left, small
+    // right-aligned percentage. No token counts, no per-row bars.
+    const row = (label: string, tokens: number, cls: string, sub = false): string => `
+      <div class="sp-artifact-item${sub ? " si-ctx-line-sub" : ""}">
+        <span class="si-ctx-dot ${cls}"></span>
+        <span class="sp-artifact-name">${label}</span>
+        <span class="sp-artifact-stats">
+          <span class="si-ctx-pct">${pct(tokens)}</span>
+        </span>
+      </div>`;
+
+    const tools = bd.tools_tokens || { total: 0, builtin: 0, mcp: 0, plugin: 0, subagents: 0 };
+    const body = [
+      row(t("sessionInner.ctxSystemPrompt"), bd.system_prompt_tokens, "si-ctx-seg-system"),
+      row(t("sessionInner.ctxMessages"), bd.messages_tokens, "si-ctx-seg-messages"),
+      row(t("sessionInner.ctxTools"), tools.total, "si-ctx-seg-tools"),
+      row(t("sessionInner.ctxToolsBuiltin"), tools.builtin, "si-ctx-seg-tools", true),
+      row(t("sessionInner.ctxToolsSubagents"), tools.subagents, "si-ctx-seg-tools", true),
+      row(t("sessionInner.ctxMcp"), tools.mcp, "si-ctx-seg-tools", true),
+      row(t("sessionInner.ctxPlugins"), tools.plugin, "si-ctx-seg-tools", true),
+      row(t("sessionInner.ctxSkills"), bd.skills_tokens, "si-ctx-seg-skills"),
+    ].join("");
+    return `${header}${stats}${barWrap}<div class="si-ctx-rows">${body}</div>`;
   }
 
   private renderSummaryProgress(st: ReturnType<typeof getState>): void {
@@ -2476,9 +2166,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         e.preventDefault();
         e.stopPropagation();
         const path = (link as HTMLElement).dataset.path!;
-        this.summaryPanel.classList.add("hidden");
-        const sbBtn = document.getElementById("btn-summary-panel");
-        if (sbBtn) sbBtn.classList.remove("active");
+        this.closeSummaryPanel();
         if (this.chat.onViewChanges) this.chat.onViewChanges(path);
       });
     });
@@ -2492,29 +2180,44 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       el.innerHTML = `<div style="padding:6px 0;font-size:12px;color:var(--text-muted)">${t("sessionInner.noRefs")}</div>`;
       return;
     }
-    const shown = refs.slice(-12).reverse();
 
-    // De-duplicate: the same memory file / search may be referenced many
-    // times during a run; showing each repetition under an already-grouped
-    // header is pure noise.
+    // Low-value reference tools that should not clutter the panel:
+    //  - memory_search: the summary is just a search query string; the
+    //    actual results live in the chat transcript, not behind this row.
+    //  - memory_delete: the target file no longer exists, so the row
+    //    cannot be opened and only misleads the user.
+    const LOW_VALUE_REF_TOOLS = new Set(["memory_search", "memory_delete"]);
+
+    // De-duplicate across the ENTIRE session history (not just the last
+    // 12) so that removing noise above doesn't let stale duplicates
+    // slip back into the visible window.  Memory-file references
+    // collapse onto their normalized file name so create/read/update on
+    // the same memory all render as a single row; web-fetch URLs
+    // normalize away protocol/www/trailing-slash differences; web-search
+    // and memory-search queries collapse on whitespace-normalized text;
+    // MCP calls collapse onto the tool name.
     const seen = new Set<string>();
-    const unique = shown.filter((r) => {
-      const key = `${r.tool}\u0000${r.summary}`;
-      if (seen.has(key)) return false;
+    const unique: any[] = [];
+    for (const r of refs) {
+      const toolLc = (r.tool || "").toLowerCase();
+      if (LOW_VALUE_REF_TOOLS.has(toolLc)) continue;
+      const key = refDedupeKey(r);
+      if (seen.has(key)) continue;
       seen.add(key);
-      return true;
-    });
+      unique.push(r);
+    }
+    const shown = unique.slice(-12).reverse();
 
     const groups: { label: string; icon: string; refs: any[] }[] = [
       { label: t("sessionInner.referencesWeb") || "Web", icon: "globe", refs: [] },
       { label: t("sessionInner.referencesMemory") || "Memory", icon: "brain", refs: [] },
       { label: t("sessionInner.referencesMcp") || "MCP", icon: "cable", refs: [] },
     ];
-    for (const r of unique) {
-      const t = r.tool.toLowerCase();
-      if (t.startsWith("mcp__")) {
+    for (const r of shown) {
+      const tl = (r.tool || "").toLowerCase();
+      if (tl.startsWith("mcp__")) {
         groups[2].refs.push(r);
-      } else if (t.includes("memory") || t.includes("profile")) {
+      } else if (tl.includes("memory") || tl.includes("profile")) {
         groups[1].refs.push(r);
       } else {
         groups[0].refs.push(r);
@@ -2523,8 +2226,27 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
     const renderItem = (r: any) => {
       const text = stripRefTypePrefix(r.tool, r.summary);
+      const display = truncateRefText(text);
+      // No per-row icon: the leading space is reserved via CSS padding so the
+      // row text aligns with the group header's label above it.
+      if (refDedupeKey(r).startsWith("memory:")) {
+        const rawName = text.trim();
+        const fileName = rawName.toLowerCase().endsWith(".md") ? rawName : `${rawName}.md`;
+        return `<div class="sp-ref-item sp-ref-item-action" data-memory="${this.esc(fileName)}" title="${this.esc(r.summary)}">
+          <span class="sp-ref-item-text sp-ref-link">${this.esc(display)}</span>
+        </div>`;
+      }
+      // Try URL extraction for ALL non-memory references, not just
+      // web_* tools — an MCP result or unknown tool may legitimately
+      // carry a URL in its summary, and it should be clickable.
+      const url = extractRefUrl(r.summary);
+      if (url) {
+        return `<div class="sp-ref-item">
+          <span class="sp-ref-item-text"><a class="sp-ref-link" href="${this.esc(url)}" title="${this.esc(r.summary)}">${this.esc(display)}</a></span>
+        </div>`;
+      }
       return `<div class="sp-ref-item">
-        <span class="sp-ref-item-text" title="${this.esc(r.summary)}">${this.esc(text)}</span>
+        <span class="sp-ref-item-text" title="${this.esc(r.summary)}">${this.esc(display)}</span>
       </div>`;
     };
 
@@ -2546,6 +2268,26 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     }
 
     el.innerHTML = parts.join("");
+
+    // Interactive reference rows: URL links open in the external browser,
+    // memory rows jump to the settings memory panel with the file's detail
+    // dialog open.
+    el.querySelectorAll<HTMLAnchorElement>("a.sp-ref-link[href]").forEach((a) => {
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const href = a.getAttribute("href") || "";
+        if (href) openRoutedLink(href);
+      });
+    });
+    el.querySelectorAll<HTMLElement>(".sp-ref-item-action[data-memory]").forEach((row) => {
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.closeSummaryPanel();
+        const mem = row.dataset.memory || "";
+        if (mem) this.settings.openMemoryDetail(mem);
+      });
+    });
 
     // Attach event listeners for toggle
     el.querySelectorAll<HTMLElement>(".sp-ref-header").forEach((header) => {
@@ -2570,6 +2312,36 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     return el.innerHTML;
   }
 
+  /**
+   * Hover text for a model entry (switcher dropdown / collapsed label):
+   * names the OWNING provider so two providers that legally expose the same
+   * model id / name stay distinguishable.  Returns "" when the flat index
+   * cannot be mapped (provider snapshot out of sync) — callers then simply
+   * omit the tooltip.
+   */
+  /** Display name of the provider owning the flat-indexed model.  Single
+   *  source of truth for the picker's group headers and the collapsed
+   *  selector's tooltip (openai_compatible providers carry a user-defined
+   *  name; known backend types use the catalog label). */
+  private modelProviderDisplayName(flatIdx: number): string {
+    const loc = locateModelInProviders(flatIdx);
+    if (!loc) return "";
+    const provider = (getState().providers || [])[loc.providerIdx];
+    if (!provider) return "";
+    const catalog = getState().modelCatalog;
+    const catalogLabel = (id: string): string =>
+      catalog?.providers?.find((c) => c.id === id)?.label || id;
+    return provider.backend_type === "openai_compatible"
+      ? (provider.name?.trim() || catalogLabel(provider.backend_type))
+      : catalogLabel(provider.backend_type);
+  }
+
+  private modelProviderTooltipText(flatIdx: number): string {
+    const name = this.modelProviderDisplayName(flatIdx);
+    if (!name) return "";
+    return `${t("common.modelProviderTooltip")}: ${name}`;
+  }
+
   private bindInputModelSelector(): void {
     const selector = document.getElementById("input-model-selector");
     const dropdown = document.getElementById("input-model-dropdown");
@@ -2580,12 +2352,21 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       return lvl.charAt(0).toUpperCase() + lvl.slice(1);
     };
 
+    // Reasoning levels are a live probe result stored per model (verified
+    // against the endpoint at validation time) -- never a hardcoded set.
+    // "default" (thinking on, provider-default effort) is always offered
+    // first; verified levels follow.  An empty list means no level was
+    // accepted (thinking is on/off only for that model).
     const getThinkingLevels = (): string[] => {
-      return ["low", "medium", "high"];
+      const st = getState();
+      const active = st.modelConfigs[st.activeModelIndex];
+      return ["default", ...(active?.reasoning_levels || [])];
     };
 
     const isThinkingSelectable = (m: import("./core/types.js").ModelConfigMeta | undefined): boolean => {
       if (!m) return false;
+      // The endpoint itself reported reasoning as unsupported.
+      if (m.capabilities?.reasoning === "unsupported") return false;
       const tc = m.thinking_config;
       return tc ? tc.selectable === true : false;
     };
@@ -2597,20 +2378,14 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       return lvl || "default";
     };
 
-    // Permission-mode helpers: four user-facing modes; legacy session
-    // values (accept_edits, plan, ...) collapse onto their closest card.
-    const PERMISSION_MODES: Array<{ id: string; labelKey: string; icon: string }> = [
-      { id: "default", labelKey: "permissions.modes.manual", icon: "user-check" },
-      { id: "auto", labelKey: "permissions.modes.auto", icon: "shield-check" },
-      { id: "bypass", labelKey: "permissions.modes.full", icon: "shield-off" },
-      { id: "custom", labelKey: "permissions.modes.custom", icon: "sliders-horizontal" },
-    ];
-    const permissionModeGroup = (m: string): string =>
-      m === "auto" ? "auto" : m === "bypass" ? "bypass" : m === "custom" ? "custom" : "default";
-    const getPermissionModeLabel = (m: string): string => {
-      const id = permissionModeGroup(m);
-      const found = PERMISSION_MODES.find((x) => x.id === id);
-      return found ? t(found.labelKey) : m;
+    // Permission-mode catalogue + guarded switch live in the shared
+    // core/permission_mode module — every surface (model switcher, automation
+    // dialog, ...) renders its own UI but applies switches through one gate.
+    const workspaceLabelSuffix = (): string => {
+      const s = getState();
+      if (s.workspaceMode !== "iwork") return "";
+      const ws = (s.workspaces || []).find((w) => w.path === s.activeWorkspace);
+      return " · " + (ws ? ws.name : t("workspace.selectWorkspace"));
     };
 
     const renderMainPage = (mainPage: HTMLElement) => {
@@ -2621,19 +2396,41 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const enabledModels = allModels.filter((m) => m.enabled !== false);
       // Apply workspace model pool restriction when in iwork mode:
       // only show models that the active workspace has explicitly allowed.
+      // The pool is "on" when explicitly enabled OR when a legacy config
+      // omitted models_enabled but still carries allowed models.  Critically,
+      // an ENABLED pool with an empty selection yields NO usable models
+      // (models=[]), not a fallback to the full list.
       let models = enabledModels;
+      let poolActive = false;
       if (st.workspaceMode === "iwork" && st.activeWorkspace) {
         const wsConfig = st.workspaceConfigs[st.activeWorkspace];
-        if (wsConfig?.models_enabled !== false && wsConfig?.models && wsConfig.models.length > 0) {
-          const allowedSet = new Set(wsConfig.models);
+        const wsModels = Array.isArray(wsConfig?.models) ? wsConfig.models : [];
+        poolActive = wsConfig?.models_enabled === true
+          || (wsConfig?.models_enabled !== false && wsModels.length > 0);
+        if (poolActive) {
+          const allowedSet = new Set(wsModels);
           models = enabledModels.filter((m) => allowedSet.has(m.model_id));
         }
       }
       let isActiveUsable = active && active.enabled !== false;
+      // When a workspace model pool is active, the active model must itself
+      // be inside the pool to count as usable.  An empty pool (enabled with
+      // no selection) thus makes nothing usable and the label falls back to
+      // "Auto" instead of showing a model that isn't actually selectable.
+      if (poolActive) {
+        isActiveUsable = isActiveUsable && models.some((m) => m.model_id === active?.model_id);
+      }
 
       // Auto-fallback: if the active model is disabled or not in the model pool,
-      // pick the first available model and update the backend
-      if (!isActiveUsable || (models.length > 0 && !models.some(m => m.model_id === active?.model_id))) {
+      // pick the first available model and update the backend.
+      //
+      // Never do this while `activeModelIndex` still belongs to the previous
+      // session (`modelIndexSessionId` lags): a conversation that is being
+      // opened has not told us its model yet, and guessing here pushed the
+      // fallback model onto it -- the "switching conversations changes the
+      // model by itself" bug.
+      const modelIndexSynced = !!st.sessionId && st.modelIndexSessionId === st.sessionId;
+      if (modelIndexSynced && (!isActiveUsable || (models.length > 0 && !models.some(m => m.model_id === active?.model_id)))) {
         const fallback = models[0];
         if (fallback) {
           const fallbackIdx = allModels.indexOf(fallback);
@@ -2645,9 +2442,21 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
           }
         }
       }
-      const label = isActiveUsable ? (allModels[activeIdx]?.name || allModels[activeIdx]?.model_id || "NONE") : "NONE";
+      const label = (isActiveUsable ? (allModels[activeIdx]?.name || allModels[activeIdx]?.model_id || "Auto") : "Auto") + workspaceLabelSuffix();
       const labelEl = selector.querySelector(".input-selector-label") as HTMLElement | null;
-      if (labelEl) labelEl.textContent = label;
+      if (labelEl) {
+        labelEl.textContent = label;
+        // Hover tooltip on the collapsed selector as well: tells the user at a
+        // glance WHICH provider the active model belongs to (two different
+        // providers may legally expose the same model id / name).
+        if (isActiveUsable) {
+          const tip = this.modelProviderTooltipText(activeIdx);
+          if (tip) labelEl.dataset.tooltip = tip;
+          else delete labelEl.dataset.tooltip;
+        } else {
+          delete labelEl.dataset.tooltip;
+        }
+      }
 
       // Thinking level entry -- only if active model supports it
       let thinkingEntry = "";
@@ -2667,10 +2476,35 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       );
       const permissionEntry = `
         <button class="mention-dropdown-item" data-action="sub-permission">
+          <i data-lucide="${permissionModeIcon(currentPermGroup)}" class="lucide"></i>
           <span>${t("input.permissionMode")}</span>
-          <span style="margin-inline-start:auto;color:var(--text-muted);font-size:12px">${this.esc(getPermissionModeLabel(currentPermGroup))}</span>
+          <span style="margin-inline-start:auto;color:var(--text-muted);font-size:12px">${this.esc(permissionModeLabel(currentPermGroup))}</span>
           <i data-lucide="chevron-right" class="lucide"></i>
         </button>`;
+
+      // Workspace entry -- only in workspace (iwork) mode, below permission
+      // mode and above add-model.  Switching is a pre-conversation decision:
+      // once a message has been sent the session belongs to its workspace,
+      // so the entry renders muted (greyed out, unclickable) instead of
+      // allowing navigation to the sub-page.
+      let workspaceEntry = "";
+      if (st.workspaceMode === "iwork") {
+        const wsList = st.workspaces || [];
+        const activeWs = wsList.find((w) => w.path === st.activeWorkspace);
+        const wsLabel = activeWs ? activeWs.name : t("workspace.selectWorkspace");
+        const wsLocked = (st.messages?.length ?? 0) > 0;
+        workspaceEntry = wsLocked
+          ? `<button class="mention-dropdown-item" data-action="sub-workspace" disabled title="${t("input.workspaceLocked")}">
+              <span>${t("input.workspace")}</span>
+              <span style="margin-inline-start:auto;color:var(--text-muted);font-size:12px">${this.esc(wsLabel)}</span>
+              <i data-lucide="chevron-right" class="lucide" style="color:var(--text-muted)"></i>
+            </button>`
+          : `<button class="mention-dropdown-item" data-action="sub-workspace">
+              <span>${t("input.workspace")}</span>
+              <span style="margin-inline-start:auto;color:var(--text-muted);font-size:12px">${this.esc(wsLabel)}</span>
+              <i data-lucide="chevron-right" class="lucide"></i>
+            </button>`;
+      }
 
       // Model list — only show CONFIGURED models.  The catalog ("available
       // models") is a settings-side browsing aid for adding new models; it is
@@ -2679,24 +2513,54 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       // unconfigured sample models.
       let modelsHtml = "";
       if (models.length === 0) {
-        modelsHtml = `<button class="mention-dropdown-item muted" disabled>${t("app.noModelsConfigured")}</button>`;
+        const msg = poolActive ? t("app.noModelsInPool") : t("app.noModelsConfigured");
+        modelsHtml = `<button class="mention-dropdown-item muted" disabled>${msg}</button>`;
       } else {
-        modelsHtml = models
-          .map((m) => {
-            const origIdx = allModels.indexOf(m);
-            const sel = origIdx === activeIdx ? " active" : "";
-            return `<button class="mention-dropdown-item${sel}" data-idx="${origIdx}">${this.esc(m.name || m.model_id)}</button>`;
+        // Provider-grouped picker (OpenCode-style, no icons): a small muted
+        // provider header, the models it owns below, selected model keeping
+        // its highlight.  Both levels sort A→Z (provider names, then model
+        // names within each group) via a locale-aware, case-insensitive,
+        // numeric-aware collator ("GLM-4" < "GLM-10").  The per-row provider
+        // tooltip is gone — the header shows it.
+        const groups = new Map<string, Array<{ label: string; origIdx: number }>>();
+        for (const m of models) {
+          const origIdx = allModels.indexOf(m);
+          const pname = this.modelProviderDisplayName(origIdx) || t("app.model");
+          let list = groups.get(pname);
+          if (!list) {
+            list = [];
+            groups.set(pname, list);
+          }
+          list.push({ label: m.name || m.model_id || "", origIdx });
+        }
+        const coll = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+        modelsHtml = [...groups.entries()]
+          .sort((a, b) => coll.compare(a[0], b[0]))
+          .map(([pname, items]) => {
+            items.sort((a, b) => coll.compare(a.label, b.label));
+            return `<div class="model-picker-group-label">${this.esc(pname)}</div>`
+              + items.map(({ label, origIdx }) => {
+                const sel = origIdx === activeIdx ? " active" : "";
+                return `<button class="mention-dropdown-item${sel}" data-idx="${origIdx}">${this.esc(label)}</button>`;
+              }).join("");
           })
           .join("");
       }
 
       const divider = models.length > 0 ? `<div class="mention-dropdown-divider"></div>` : "";
 
-      mainPage.innerHTML = modelsHtml + divider + thinkingEntry + permissionEntry + `
-        <button class="mention-dropdown-item add-model-btn" data-action="add-model">
-          <i data-lucide="plus" class="lucide"></i>
-          <span>${t("settings.addModel")}</span>
-        </button>`;
+      // Two regions, one scroll: the model list scrolls, while reasoning
+      // level / permission mode / add-model live in a footer pinned under it.
+      // Previously everything shared one flat list, so a long model set pushed
+      // the three actions out of reach (and past the bottom of the screen).
+      mainPage.innerHTML = `
+        <div class="model-picker-list">${modelsHtml}</div>
+        <div class="model-picker-actions">${divider}${thinkingEntry}${permissionEntry}${workspaceEntry}
+          <button class="mention-dropdown-item add-model-btn" data-action="add-model">
+            <span>${t("settings.addModel")}</span>
+            <i data-lucide="plus" class="lucide" style="margin-inline-start:auto"></i>
+          </button>
+        </div>`;
 
       if (typeof (window as any).lucide !== "undefined") {
         (window as any).lucide.createIcons({ root: mainPage });
@@ -2709,8 +2573,8 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
           const idx = parseInt((item as HTMLElement).dataset.idx || "0");
           send({ type: "set_active_model", model_index: idx });
           const lbl = selector.querySelector(".input-selector-label") as HTMLElement | null;
-          if (lbl) lbl.textContent = allModels[idx]?.name || allModels[idx]?.model_id || t("app.model");
-          dropdown.classList.add("hidden");
+          if (lbl) lbl.textContent = (allModels[idx]?.name || allModels[idx]?.model_id || t("app.model")) + workspaceLabelSuffix();
+          hideAnimated(dropdown);
         });
       });
 
@@ -2742,12 +2606,27 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         });
       }
 
+      // Workspace entry -> navigate to workspace page.  The locked variant
+      // carries the disabled attribute, so it never reaches this handler.
+      const workspaceBtn = mainPage.querySelector('[data-action="sub-workspace"]:not([disabled])') as HTMLElement | null;
+      if (workspaceBtn) {
+        workspaceBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          mainPage.classList.add("hidden");
+          const wsPage = dropdown.querySelector('[data-page="workspace"]') as HTMLElement;
+          if (wsPage) {
+            renderWorkspacePage(wsPage);
+            wsPage.classList.remove("hidden");
+          }
+        });
+      }
+
       // Add model
       const addBtn = mainPage.querySelector('[data-action="add-model"]') as HTMLElement | null;
       if (addBtn) {
         addBtn.addEventListener("click", (e) => {
           e.stopPropagation();
-          dropdown.classList.add("hidden");
+          hideAnimated(dropdown);
           this.settings.openModelCreate();
         });
       }
@@ -2792,18 +2671,23 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       thinkingPage.querySelectorAll(".mention-dropdown-item[data-level]").forEach((lvlItem) => {
         lvlItem.addEventListener("click", (ev) => {
           ev.stopPropagation();
-          const lvl = (lvlItem as HTMLElement).dataset.level || "medium";
+          const lvl = (lvlItem as HTMLElement).dataset.level === "default" ? "" : ((lvlItem as HTMLElement).dataset.level || "");
           const currentState = getState();
           const idx = currentState.activeModelIndex;
-          const modelsCopy = [...currentState.modelConfigs];
-          if (idx < 0 || idx >= modelsCopy.length) return;
-          const updated: import("./core/types.js").ModelConfigMeta = {
-            ...modelsCopy[idx],
+          const loc = locateModelInProviders(idx);
+          const providers = [...(currentState.providers || [])];
+          if (!loc || loc.providerIdx >= providers.length) return;
+          const prov = { ...providers[loc.providerIdx] };
+          const provModels = [...(prov.models || [])];
+          if (loc.modelIdx >= provModels.length) return;
+          provModels[loc.modelIdx] = {
+            ...provModels[loc.modelIdx],
             thinking_config: { type: "enabled", enabled: true, level: lvl, selectable: true },
           };
-          modelsCopy[idx] = updated;
-          setModelConfigs(modelsCopy, currentState.activeModelIndex);
-          send({ type: "update_models", models: modelsCopy, active_model_index: currentState.activeModelIndex });
+          prov.models = provModels;
+          providers[loc.providerIdx] = prov;
+          setProviders(providers);
+          send({ type: "update_providers", providers, active_model_index: currentState.activeModelIndex });
           // Go back to main page
           thinkingPage.classList.add("hidden");
           const mainPage = dropdown.querySelector('[data-page="main"]') as HTMLElement;
@@ -2856,25 +2740,119 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         });
       }
 
-      // Mode selection: persists via update_agent; agent_updated refreshes
+      // Mode selection: the switch goes through the shared guarded path —
+      // "bypass" needs an explicit danger confirmation, rejection keeps the
+      // current mode.  Persists via update_agent; agent_updated refreshes
       // the store, but re-render immediately for snappy feedback.
       permissionPage.querySelectorAll(".mention-dropdown-item[data-perm-mode]").forEach((item) => {
         item.addEventListener("click", (ev) => {
           ev.stopPropagation();
-          const mode = (item as HTMLElement).dataset.permMode || "default";
-          const cfg = (getState() as any).agentConfig;
-          if (cfg) setAgentConfig({ ...cfg, permission_mode: mode });
-          send({ type: "update_agent", permission_mode: mode });
-          renderPermissionPage(permissionPage);
+          void (async () => {
+            const mode = await guardPermissionMode(
+              (item as HTMLElement).dataset.permMode || "default",
+              dialogPermissionConfirm,
+            );
+            if (mode === null) { renderPermissionPage(permissionPage); return; }
+            const cfg = (getState() as any).agentConfig;
+            if (cfg) setAgentConfig({ ...cfg, permission_mode: mode });
+            send({ type: "update_agent", permission_mode: mode });
+            renderPermissionPage(permissionPage);
+          })();
         });
       });
     };
 
-    const render = () => {
+    const renderWorkspacePage = (wsPage: HTMLElement) => {
+      const st = getState();
+      const wsList = st.workspaces || [];
+      const activePath = st.activeWorkspace;
+
+      const backBtn = `<button class="mention-dropdown-item" data-action="back-model-main">
+        <i data-lucide="arrow-left" class="lucide"></i>
+        <span>${t("workspace.selectWorkspace")}</span>
+      </button>`;
+
+      let items: string;
+      if (wsList.length === 0) {
+        items = `<button class="mention-dropdown-item muted" disabled>${t("workspace.noWorkspaces")}</button>`;
+      } else {
+        items = wsList
+          .map((w) => {
+            const sel = w.path === activePath ? " active" : "";
+            return `<button class="mention-dropdown-item${sel}" data-ws-path="${this.esc(w.path)}">
+              <span>${this.esc(w.name)}</span>
+            </button>`;
+          })
+          .join("");
+      }
+
+      wsPage.innerHTML = backBtn + `<div class="mention-dropdown-divider"></div>` + items;
+
+      if (typeof (window as any).lucide !== "undefined") {
+        (window as any).lucide.createIcons({ root: wsPage });
+      }
+
+      // Back button
+      const backEl = wsPage.querySelector('[data-action="back-model-main"]') as HTMLElement | null;
+      if (backEl) {
+        backEl.addEventListener("click", (e) => {
+          e.stopPropagation();
+          wsPage.classList.add("hidden");
+          const mainPage = dropdown.querySelector('[data-page="main"]') as HTMLElement;
+          if (mainPage) {
+            renderMainPage(mainPage);
+            mainPage.classList.remove("hidden");
+          }
+        });
+      }
+
+      // Workspace selection: same behavior the standalone selector had --
+      // open the workspace and close the dropdown.  Picking the already
+      // active workspace just closes.
+      wsPage.querySelectorAll(".mention-dropdown-item[data-ws-path]").forEach((item) => {
+        item.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const path = (item as HTMLElement).dataset.wsPath || "";
+          hideAnimated(dropdown);
+          if (!path || path === getState().activeWorkspace) return;
+          void this.workspace.open(path);
+        });
+      });
+    };
+
+    /** Keep the collapsed trigger in sync without rebuilding the menu. */
+    const updateCollapsedLabel = () => {
+      const s = getState();
+      const list = s.modelConfigs || [];
+      const idx = Math.min(Math.max(s.activeModelIndex || 0, 0), Math.max(list.length - 1, 0));
+      const active = list[idx];
+      const usable = !!active;
+      const label = (usable ? (active.name || active.model_id || "Auto") : "Auto") + workspaceLabelSuffix();
+      const labelEl = selector.querySelector(".input-selector-label") as HTMLElement | null;
+      if (!labelEl) return;
+      labelEl.textContent = label;
+      if (usable) {
+        const tip = this.modelProviderTooltipText(idx);
+        if (tip) labelEl.dataset.tooltip = tip;
+        else delete labelEl.dataset.tooltip;
+      } else {
+        delete labelEl.dataset.tooltip;
+      }
+    };
+
+    const render = (force = false) => {
+      // While the menu is closed only the collapsed trigger is visible.
+      // Rebuilding the whole model page on every config/model push was a
+      // measurable boot long task; the open handler calls render(true).
+      if (!force && dropdown.classList.contains("hidden")) {
+        updateCollapsedLabel();
+        return;
+      }
       // Ensure page structure exists
       let mainPage = dropdown.querySelector('[data-page="main"]') as HTMLElement | null;
       let thinkingPage = dropdown.querySelector('[data-page="thinking"]') as HTMLElement | null;
       let permissionPage = dropdown.querySelector('[data-page="permission"]') as HTMLElement | null;
+      let wsPage = dropdown.querySelector('[data-page="workspace"]') as HTMLElement | null;
 
       if (!mainPage) {
         mainPage = document.createElement("div");
@@ -2894,6 +2872,12 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         permissionPage.setAttribute("data-page", "permission");
         dropdown.appendChild(permissionPage);
       }
+      if (!wsPage) {
+        wsPage = document.createElement("div");
+        wsPage.className = "mention-page hidden";
+        wsPage.setAttribute("data-page", "workspace");
+        dropdown.appendChild(wsPage);
+      }
 
       // Preserve whichever sub-page is currently open.  Store updates
       // (streaming stats, model list refresh, agent_updated, ...) arrive
@@ -2903,18 +2887,28 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         renderThinkingPage(thinkingPage);
         mainPage.classList.add("hidden");
         permissionPage.classList.add("hidden");
+        wsPage.classList.add("hidden");
         return;
       }
       if (!permissionPage.classList.contains("hidden")) {
         renderPermissionPage(permissionPage);
         mainPage.classList.add("hidden");
         thinkingPage.classList.add("hidden");
+        wsPage.classList.add("hidden");
+        return;
+      }
+      if (!wsPage.classList.contains("hidden")) {
+        renderWorkspacePage(wsPage);
+        mainPage.classList.add("hidden");
+        thinkingPage.classList.add("hidden");
+        permissionPage.classList.add("hidden");
         return;
       }
 
       // No sub-page open: show the main page.
       thinkingPage.classList.add("hidden");
       permissionPage.classList.add("hidden");
+      wsPage.classList.add("hidden");
       mainPage.classList.remove("hidden");
       renderMainPage(mainPage);
     };
@@ -2928,28 +2922,26 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
     selector.addEventListener("click", (e) => {
       e.stopPropagation();
-      // The model and workspace dropdowns must never be open at the same time.
-      const wsDropdown = document.getElementById("input-workspace-dropdown");
-      if (wsDropdown) wsDropdown.classList.add("hidden");
       if (dropdown.classList.contains("hidden")) {
         // Reopening always starts from the main page, even if a sub-page was
         // left open the last time the dropdown was visible.
         dropdown
-          .querySelectorAll('.mention-page[data-page="thinking"], .mention-page[data-page="permission"]')
+          .querySelectorAll('.mention-page[data-page="thinking"], .mention-page[data-page="permission"], .mention-page[data-page="workspace"]')
           .forEach((page) => page.classList.add("hidden"));
-        render();
-        dropdown.classList.remove("hidden");
+        runScheduledRenderNow("model-menu", () => render(true), 40);
+        showAnimated(dropdown);
+        this.ownEphemeral(dropdown);
         // CSS anchors it with `inset-inline-end: 0`, so under rtl it grows
         // towards the window edge — pull it back when it would overflow.
         clampIntoViewport(dropdown);
       } else {
-        dropdown.classList.add("hidden");
+        hideAnimated(dropdown);
       }
     });
 
     document.addEventListener("click", (e) => {
       if (!selector.contains(e.target as Node) && !dropdown.contains(e.target as Node)) {
-        dropdown.classList.add("hidden");
+        hideAnimated(dropdown);
       }
     });
 
@@ -2957,117 +2949,82 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       if (!this.summaryPanel.classList.contains("hidden")) this.renderSummaryPanel();
     });
 
+    // Deliberately NOT subscribed to "messages": streaming text changes that
+    // field many times per second, and rebuilding the model list on each one
+    // competed with the chat render for the same main thread.
     subscribe(() => {
       try {
-        render();
-        if (!dropdown.classList.contains("hidden")) {
-          render();
+        // Closed menu: only the collapsed label is visible. Open menu: the
+        // rebuild goes through the same scheduler as every other surface.
+        if (dropdown.classList.contains("hidden")) {
+          updateCollapsedLabel();
+          return;
         }
+        scheduleRender("model-menu", () => render(), 40);
       } catch (e) {
-        console.error("[model-selector] subscribe render failed:", e);
+        reportUiFault("model-menu", "subscribe", e);
       }
-    });
+    }, ["modelConfigs", "activeModelIndex", "workspaceMode", "activeWorkspace", "workspaceConfigs", "workspaces"]);
 
     render();
   }
 
   /**
-   * Workspace selector in the input toolbar (left of the model selector).
-   * Mirrors the model selector's UI exactly; only visible in workspace
-   * (iwork) mode. Selecting an entry opens that workspace directly.
+   * Workspace selection lives inside the model selector as a sub-page
+   * (renderWorkspacePage) -- the standalone workspace indicator was merged
+   * into it and is gone.
    */
-  private bindInputWorkspaceSelector(): void {
-    const wrap = document.getElementById("input-workspace-selector-wrap");
-    const selector = document.getElementById("input-workspace-selector");
-    const dropdown = document.getElementById("input-workspace-dropdown");
-    if (!wrap || !selector || !dropdown) return;
-
-    const render = () => {
-      const st = getState();
-      const wsList = st.workspaces || [];
-      const activePath = st.activeWorkspace;
-      const active = wsList.find((w) => w.path === activePath);
-
-      // Only visible on the welcome screen (no messages yet) in workspace
-      // mode, for picking which workspace the new session belongs to.
-      // After the first send it disappears and the workspace is auto-matched.
-      const showWsSelector = st.workspaceMode === "iwork" && (st.messages?.length ?? 0) === 0;
-      wrap.classList.toggle("hidden", !showWsSelector);
-
-      const labelEl = selector.querySelector(".input-selector-label") as HTMLElement | null;
-      if (labelEl) labelEl.textContent = active ? active.name : t("workspace.selectWorkspace");
-
-      let html: string;
-      if (wsList.length === 0) {
-        html = `<button class="mention-dropdown-item muted" disabled>${t("workspace.noWorkspaces")}</button>`;
-      } else {
-        html = wsList
-          .map((w) => {
-            const sel = w.path === activePath ? " active" : "";
-            return `<button class="mention-dropdown-item${sel}" data-ws-path="${this.esc(w.path)}">
-              <span>${this.esc(w.name)}</span>
-            </button>`;
-          })
-          .join("");
-      }
-      dropdown.innerHTML = html;
-
-      dropdown.querySelectorAll(".mention-dropdown-item[data-ws-path]").forEach((item) => {
-        item.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const path = (item as HTMLElement).dataset.wsPath || "";
-          dropdown.classList.add("hidden");
-          if (!path || path === getState().activeWorkspace) return;
-          void this.workspace.open(path);
-        });
-      });
-    };
-
-    // Only bind event listeners once
-    if (selector.dataset.wsSelectorBound === "true") {
-      render();
-      return;
-    }
-    selector.dataset.wsSelectorBound = "true";
-
-    selector.addEventListener("click", (e) => {
-      e.stopPropagation();
-      // The model and workspace dropdowns must never be open at the same time.
-      const modelDropdown = document.getElementById("input-model-dropdown");
-      if (modelDropdown) modelDropdown.classList.add("hidden");
-      if (dropdown.classList.contains("hidden")) {
-        render();
-        dropdown.classList.remove("hidden");
-      } else {
-        dropdown.classList.add("hidden");
-      }
-    });
-
-    document.addEventListener("click", (e) => {
-      if (!selector.contains(e.target as Node) && !dropdown.contains(e.target as Node)) {
-        dropdown.classList.add("hidden");
-      }
-    });
-
-    subscribe(() => {
-      try {
-        render();
-      } catch (e) {
-        console.error("[workspace-selector] subscribe render failed:", e);
-      }
-    });
-
-    render();
-  }
-
   private activateSlashCommand(cmd: SlashCommand, restText?: string): void {
     this.skipNextInput = true;
+    const slashWasActive = this._slashActive;
     const dd = document.getElementById("mention-dropdown");
     const bm = document.getElementById("btn-mention");
-    dd?.classList.add("hidden");
+    hideAnimated(dd);
     bm?.classList.remove("active");
     this._slashActive = false;
-    this.input.innerHTML = "";
+    dd?.closest(".input-wrapper")?.classList.remove("slash-menu-open");
+
+    // A new slash activation replaces any active command chip first (one
+    // command slot); the mode chip is preserved below — mode and command are
+    // independent channels (payload.mode vs backend set_command).
+    if (this.hasCommandChip()) this.deactivateCommandChip();
+
+    // The composer may already hold a draft (dropdown activation) — never
+    // wipe it. A typed invocation ("/plan rest") replaces only its own slash
+    // token; a draft that never resolved to a command is kept verbatim and
+    // the chip lands in front of it. Non-editable children (attachment chips)
+    // are preserved in every branch because we never touch the DOM wholesale
+    // unless the input genuinely was a slash command.  The mode chip survives
+    // the wipe so a mode + command combination stays intact.
+    const savedModeChip = this.input.querySelector('.mode-chip[data-mode]') as HTMLElement | null;
+    const savedSep = savedModeChip ? savedModeChip.nextSibling : null;
+    const savedSepIsSpace = !!savedSep && savedSep.nodeType === Node.TEXT_NODE && savedSep.textContent === " ";
+    const wipeKeepModeChip = () => {
+      savedModeChip?.remove();
+      if (savedSepIsSpace && savedSep) savedSep.remove();
+      this.input.innerHTML = "";
+      if (savedModeChip) {
+        this.input.appendChild(savedModeChip);
+        this.input.appendChild(document.createTextNode(" "));
+      }
+    };
+
+    let prepend = false;
+    if (restText === undefined) {
+      const plain = this.getPlainText();
+      const parsed = plain ? parseSlashInput(plain) : null;
+      if (parsed) {
+        restText = parsed.rest;
+        wipeKeepModeChip();
+      } else if (slashWasActive && plain.startsWith("/")) {
+        restText = plain.replace(/^\/[^\s]*\s*/, "");
+        wipeKeepModeChip();
+      } else {
+        prepend = true;
+      }
+    } else {
+      wipeKeepModeChip();
+    }
 
     if (cmd.kind === "mode") {
       this.insertModeChip(cmd.id, restText);
@@ -3085,27 +3042,44 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       this.resizeInput();
       this.updateSendButton();
     }
+
+    if (prepend) {
+      const chip = this.input.querySelector('.mode-chip[data-mode], .command-chip[data-command]');
+      if (chip) moveChipToFront(this.input, chip);
+      this.input.focus();
+      this.placeCursorAtEnd();
+    }
   }
 
   private executeSlashAction(cmd: SlashCommand, restText?: string): void {
     switch (cmd.id) {
-      case "new-session":
-      case "clear-session":
-        this.automationPanel.hide();
-        this.exitTempChat();
-        this.cleanupContentArea({ keepAutomationFlag: false });
-        resetChat();
-        {
-          const requestId = crypto.randomUUID();
-          setRequestedSessionId("", requestId);
-          send({ type: "new_session", request_id: requestId });
-        }
-        return;
       case "steer":
         // steer is a one-shot mid-run injection, not a sticky command.
         this.insertModeChip(cmd.id, restText);
         this._currentChipMode = "steer";
         this.updateChipState();
+        this.input.focus();
+        return;
+      case "help":
+        // Gateway/CLI command -- desktop users get pointed at the UI.
+        showToast(t("slashCommands.helpDesktopHint"), "", "info");
+        this.input.focus();
+        return;
+      case "model":
+        showToast(t("slashCommands.modelDesktopHint"), "", "info");
+        this.input.focus();
+        return;
+      case "sessions":
+      case "resume":
+        showToast(t("slashCommands.sessionsDesktopHint"), "", "info");
+        this.input.focus();
+        return;
+      case "approve":
+      case "deny":
+      case "stop":
+      case "compact":
+      case "status":
+        showToast(t("slashCommands.uiFeatureHint"), "", "info");
         this.input.focus();
         return;
       default:
@@ -3119,7 +3093,9 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       this.sendSetCommand(cmd, restText);
     } else {
       this.insertCommandChip(cmd, restText);
-      this._currentChipMode = cmd.id;
+      // Keep the mode slot when a mode chip is present — the command chip
+      // must not overwrite the active mode bookkeeping.
+      if (!this.hasModeChip()) this._currentChipMode = cmd.id;
       this.updateChipState();
       this.input.focus();
     }
@@ -3140,7 +3116,8 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // Optimistically render; command_changed will confirm/correct.
     this._activeCommand = { name: cmd.id, prompt: rendered, icon: cmd.icon, title: cmd.title };
     this.insertCommandChip(cmd, restText);
-    this._currentChipMode = cmd.id;
+    // Keep the mode slot when a mode chip is present — see executeSlashAction.
+    if (!this.hasModeChip()) this._currentChipMode = cmd.id;
     this.updateChipState();
     this.input.focus();
   }
@@ -3187,13 +3164,21 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
   /** Walk DOM nodes recursively, inserting newlines for block-level elements
    *  and `<br>` so that Enter-key and paste line breaks are both preserved
-   *  in the serialized text.  Skips `[contenteditable="false"]` chips. */
+   *  in the serialized text.  Attachment chips serialize to an inline
+   *  `<attach n="name" />` placeholder at their exact position, so a chip
+   *  added mid-sentence renders mid-sentence in the bubble and comes back
+   *  to the same spot on rollback edit.  Other non-editable chips are
+   *  skipped. */
   private _collectText(node: Node, out: string[]): void {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
         out.push(child.textContent || '');
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         const el = child as Element;
+        if (el.hasAttribute('data-attach')) {
+          out.push(attachPlaceholder(el.getAttribute('data-name') || ''));
+          continue;
+        }
         if (el.getAttribute('contenteditable') === 'false') continue;
         const tag = el.tagName.toLowerCase();
         if (tag === 'br') {
@@ -3230,9 +3215,66 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const html = this.input.innerHTML;
     if (html && html.trim()) {
       this._drafts.set(sid, html);
+      this.persistDraftsSoon();
     } else {
+      // Removals are written through immediately: a debounced write could
+      // be skipped by an app close, resurrecting an already-sent draft on
+      // the next start.
       this._drafts.delete(sid);
+      this.persistDrafts();
     }
+  }
+
+  /** Restores drafts and sent-input history persisted by a previous run
+   *  (localStorage). Corrupted or missing entries are silently ignored. */
+  private loadPersistedInputState(): void {
+    try {
+      const rawDrafts = localStorage.getItem("encre.drafts.v1");
+      if (rawDrafts) {
+        const entries = JSON.parse(rawDrafts);
+        if (Array.isArray(entries)) {
+          for (const entry of entries) {
+            if (Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "string") {
+              this._drafts.set(entry[0], entry[1]);
+            }
+          }
+        }
+      }
+      const rawHistory = localStorage.getItem("encre.inputHistory.v1");
+      if (rawHistory) {
+        const history = JSON.parse(rawHistory);
+        if (Array.isArray(history)) {
+          this._inputHistory = history.filter((t) => typeof t === "string").slice(-100);
+          this._inputHistoryIdx = this._inputHistory.length;
+        }
+      }
+    } catch { /* corrupted storage must not break startup */ }
+  }
+
+  /** Debounced localStorage write for the draft map. */
+  private persistDraftsSoon(): void {
+    if (this._draftPersistTimer !== null) return;
+    this._draftPersistTimer = window.setTimeout(() => {
+      this._draftPersistTimer = null;
+      this.persistDrafts();
+    }, 300);
+  }
+
+  /** Immediately writes the draft map to localStorage. */
+  private persistDrafts(): void {
+    try { localStorage.setItem("encre.drafts.v1", JSON.stringify([...this._drafts])); } catch { /* quota or unavailable */ }
+  }
+
+  /** Persists the sent-input history (capped at 100 entries). */
+  private persistInputHistory(): void {
+    try { localStorage.setItem("encre.inputHistory.v1", JSON.stringify(this._inputHistory.slice(-100))); } catch { /* quota or unavailable */ }
+  }
+
+  /** Removes a session's draft from the map and the persisted store
+   *  (immediate write: removals must never be lost to a pending debounce). */
+  private deleteDraft(sid: string): void {
+    this._drafts.delete(sid);
+    this.persistDrafts();
   }
 
   /**
@@ -3257,6 +3299,30 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     this.updateInputExpandButton();
   }
 
+  /**
+   * Put a queued prompt back into the composer for another pass.  The queue
+   * entry itself is dropped by the caller (server-side), and whatever was
+   * already typed is saved as this session's draft first — editing must never
+   * eat text that was there before the click.
+   */
+  private loadQueuedPromptForEdit(text: string, mode?: string): void {
+    this.saveCurrentDraft();
+    this.input.innerHTML = "";
+    if (mode) {
+      this.insertModeChip(mode, text);
+      this._currentChipMode = mode;
+    } else {
+      this.input.textContent = text;
+    }
+    this.updateChipState();
+    this.updatePlaceholder();
+    this.updateSendButton();
+    this.resizeInput();
+    this.updateInputExpandButton();
+    this.input.focus();
+    this.placeCursorAtEnd();
+  }
+
   private insertModeChip(mode: string, restText?: string): void {
     this.removeModeChip();
     const chip = document.createElement("span");
@@ -3266,29 +3332,20 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const cmd = SLASH_COMMANDS.find(c => c.id === mode);
     const label = cmd ? cmd.title : mode;
     const icon = this.resolveIcon(cmd ? cmd.icon : "list-checks");
-    chip.innerHTML = `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i><span>${label}</span>`;
-    this.input.appendChild(chip);
-
-    if (restText) {
-      this.input.appendChild(document.createTextNode(restText));
-    }
-
-    // Cursor after chip — typing inserts text after the chip
-    const sel = window.getSelection();
-    if (sel) {
-      const range = document.createRange();
-      range.setStartAfter(chip);
-      range.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(range);
-    }
-
-    this.refreshIcons();
+    chip.innerHTML = `${icon ? `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i>` : ""}<span>${label}</span>`;
+    // Draft-level close: the inline chip only exists pre-send; ending the
+    // persistent mode globally is the toolbar chip ×'s job.
+    wireChipClose(chip, () => this.removeInlineModeChip());
+    // Appends the chip + separator space and places the caret after it so
+    // typing continues off the chip border (see ui/chip.ts).
+    appendChipWithCaret(this.input, chip, restText);
+    this.refreshIcons(this.input);
   }
 
   private removeModeChip(): void {
     const chip = this.input.querySelector('.mode-chip[data-mode]');
-    if (chip) chip.remove();
+    if (!chip) return;
+    removeChipWithSeparator(chip);
   }
 
   /* ── Command chip (sticky slash command, NOT a mode) ─────────── */
@@ -3310,35 +3367,28 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     chip.className = "command-chip";
     chip.setAttribute("data-command", cmd.id);
     const icon = this.resolveIcon(cmd.icon);
-    chip.innerHTML = `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i><span>${cmd.title}</span>`;
-    this.input.appendChild(chip);
-
-    if (restText) {
-      this.input.appendChild(document.createTextNode(restText));
-    }
-
-    const sel = window.getSelection();
-    if (sel) {
-      const range = document.createRange();
-      range.setStartAfter(chip);
-      range.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(range);
-    }
-    this.refreshIcons();
+    chip.innerHTML = `${icon ? `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i>` : ""}<span>${cmd.title}</span>`;
+    wireChipClose(chip, () => this.deactivateCommandChip());
+    // Chip + separator space + caret after the separator — see ui/chip.ts.
+    appendChipWithCaret(this.input, chip, restText);
+    this.refreshIcons(this.input);
   }
 
   private removeCommandChip(): void {
     const chip = this.input.querySelector('.command-chip[data-command]');
-    if (chip) chip.remove();
+    if (!chip) return;
+    removeChipWithSeparator(chip);
   }
 
-  /** Resolve a Lucide icon name, falling back to the app-wide skills glyph
-   *  (``wand-2``) when unknown.  lucide's icon registry is keyed by PascalCase
+  /** Resolve a Lucide icon name to something the bundled icon set actually
+   *  has, or to the empty string.  lucide's registry is keyed by PascalCase
    *  (e.g. ``ListChecks``), while commands store kebab-case names — normalize
-   *  before checking.  ``command`` (macOS ⌘) is intentionally never used. */
+   *  before checking.  ``command`` (macOS ⌘) is a legacy stored value and is
+   *  normalized to the skills glyph.  A command that declares no icon — or one
+   *  we cannot resolve — gets no glyph: the app does not pick an identity for
+   *  somebody else's command.  Callers skip the icon element when this is empty. */
   private resolveIcon(name: string): string {
-    const candidateRaw = (name && name.trim()) || "wand-2";
+    const candidateRaw = (name && name.trim()) || "";
     // ``command`` is the macOS ⌘ glyph — legacy default stored in old
     // configs.  Normalize it to the app-wide skills glyph.
     const candidate = candidateRaw === "command" ? "wand-2" : candidateRaw;
@@ -3348,15 +3398,23 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
         .split("-")
         .map(p => p.charAt(0).toUpperCase() + p.slice(1))
         .join("");
-      if (!(candidate in known) && !(pascal in known)) return "wand-2";
+      if (!(candidate in known) && !(pascal in known)) return "";
     }
     return candidate;
   }
 
-  /** Re-run Lucide createIcons. */
-  private refreshIcons(): void {
+  /**
+   * Re-run Lucide inside `root` only.
+   *
+   * `root` is required on purpose — an unscoped `createIcons()` walks the whole
+   * document and replaces every `[data-lucide]` node, which during streaming
+   * swallows clicks (the node under the cursor changes between mousedown and
+   * mouseup), resets open UI back to its default state and thrashes layout.
+   */
+  private refreshIcons(root: HTMLElement | null | undefined): void {
+    if (!root) return;
     if (!(window as any).lucide) return;
-    (window as any).lucide.createIcons();
+    (window as any).lucide.createIcons({ root });
   }
 
   /** Clear the active sticky command (Esc / chip close). Notifies backend. */
@@ -3392,9 +3450,13 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const icon = chip.querySelector(".chip-icon") as HTMLElement;
     const label = chip.querySelector(".toolbar-command-label") as HTMLElement;
     const def = SLASH_COMMANDS.find((c) => c.id === cmd.name);
-    if (icon) icon.setAttribute("data-lucide", this.resolveIcon(def?.icon || cmd.icon || "wand-2"));
+    if (icon) {
+      const resolved = this.resolveIcon(def?.icon || cmd.icon || "");
+      icon.setAttribute("data-lucide", resolved);
+      icon.classList.toggle("hidden", !resolved);
+    }
     if (label) label.textContent = def?.title || cmd.title || cmd.name;
-    this.refreshIcons();
+    this.refreshIcons(chip);
   }
 
   private handleModeEnd(): void {
@@ -3403,6 +3465,82 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     setInputMode("");
     this.updateChipState();
     this.updatePlaceholder();
+  }
+
+  /** Draft-level close for the inline chip ×: removes the chip only.
+   *
+   *  The persistent mode (toolbar chip + border) is intentionally left
+   *  alone — ending the mode globally (clear _persistentMode + notify the
+   *  backend) is the toolbar chip ×'s job (deactivateModeChip).  When no
+   *  persistent mode exists the border simply drops back to neutral, which
+   *  is visually identical to a full close. */
+  public removeInlineModeChip(): void {
+    this.removeModeChip();
+    // The chipObserver clears _currentChipMode on removal; updateChipState is
+    // idempotent so run it here too for the case the observer skips.
+    this._currentChipMode = this.getCurrentMode() || "";
+    this.updateChipState();
+    this.updatePlaceholder();
+    this.resizeInput();
+    this.updateSendButton();
+  }
+
+  /** Rebuild chips mangled by native editing.
+   *
+   *  Chromium can split or strip contenteditable=false elements when the
+   *  user backspaces at (or inside) their boundary — the chip loses its icon
+   *  or label children and renders broken (see the "Plan Mode" corruption
+   *  report).  The beforeinput guard prevents the common case; this pass is
+   *  the safety net: any chip whose icon or label is missing is rebuilt from
+   *  its data attributes (mode/command id, attachment path). */
+  private repairChips(): void {
+    const chips = this.input.querySelectorAll<HTMLElement>(".mode-chip, .command-chip");
+    chips.forEach((chip) => {
+      if (chip.querySelector(".chip-icon") && chip.querySelector("span")) return; // intact
+
+      // ── Attachment chip: rebuild from state, or drop if unresolvable.
+      if (chip.getAttribute("data-attach") === "true") {
+        const path = chip.getAttribute("data-path");
+        const att = path ? getState().attachments.find((a) => a.path === path) : undefined;
+        if (!att) { removeChipWithSeparator(chip); return; }
+        const fresh = buildAttachChip(att);
+        chip.replaceWith(fresh);
+        this.refreshIcons(this.input);
+        return;
+      }
+
+      // ── Command chip: rebuild from the command catalog.
+      if (chip.classList.contains("command-chip")) {
+        const cmd = SLASH_COMMANDS.find((c) => c.id === chip.getAttribute("data-command"));
+        if (!cmd) { removeChipWithSeparator(chip); return; }
+        const fresh = this.buildChipElement("command-chip", cmd.id, cmd.title, this.resolveIcon(cmd.icon), () => this.deactivateCommandChip());
+        chip.replaceWith(fresh);
+        this.refreshIcons(this.input);
+        return;
+      }
+
+      // ── Mode chip: rebuild from the command catalog (steer included).
+      const mode = chip.getAttribute("data-mode") ?? "";
+      const cmd = SLASH_COMMANDS.find((c) => c.id === mode);
+      const fresh = this.buildChipElement("mode-chip", mode, cmd ? cmd.title : mode, this.resolveIcon(cmd ? cmd.icon : "list-checks"), () => this.removeInlineModeChip());
+      chip.replaceWith(fresh);
+      this.refreshIcons(this.input);
+    });
+  }
+
+  /** Shared DOM builder for chip rebuilds: creates the span, wires the close
+   *  affordance and guarantees a separator space after the chip so the caret
+   *  stays off the border (re-inserts one if the mangled chip lost it). */
+  private buildChipElement(cls: string, key: string, label: string, icon: string, onClose: () => void): HTMLElement {
+    const chip = document.createElement("span");
+    chip.contentEditable = "false";
+    chip.className = cls;
+    if (cls === "mode-chip") chip.setAttribute("data-mode", key);
+    else chip.setAttribute("data-command", key);
+    chip.innerHTML = `${icon ? `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i>` : ""}<span>${label}</span>`;
+    wireChipClose(chip, onClose);
+    if (!isChipSeparator(chip.nextSibling)) chip.after(document.createTextNode(" "));
+    return chip;
   }
 
   /** Resolve the currently effective mode (single source of truth).
@@ -3460,7 +3598,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     if (icon) icon.setAttribute("data-lucide", this.resolveIcon(cmd?.icon || "list-checks"));
     if (label) label.textContent = cmd?.title || mode;
     if ((window as any).lucide) {
-      (window as any).lucide.createIcons();
+      (window as any).lucide.createIcons({ root: chip });
     }
   }
 
@@ -3509,8 +3647,10 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
    * and `#session-list.mode-in-forward/back`); this only picks the class.
    * Only the changing content moves — the nav row, "All tasks" heading,
    * batch button, input area and disclaimer stay static. The direction is a
-   * real full-width push: entering iWork slides in from the inline-end edge
-   * (forward), returning to normal from the inline-start edge (back). The two
+   * small vertical settle rather than a horizontal push: entering iWork
+   * drops in from above, returning to normal rises from below — the same
+   * language every other surface uses when it appears, so a mode switch
+   * reads as content arriving instead of a page sliding past. The two
    * class names carry distinct animation-names because re-adding the one
    * already running would be a no-op — the browser sees no change and never
    * restarts. The class is dropped on animationend, so an interrupted or
@@ -3553,9 +3693,9 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
   /** Set the welcome title text for the current mode.
    *
-   *  The motion is already carried by the chat-container slide
-   *  (`#chat-container.mode-in-forward/back`), so no separate title swap runs
-   *  here — stacking a second animation on the title made it look like it
+   *  The motion is already carried by the chat-container entrance
+   *  (`#chat-container.mode-in-forward/back`), so no separate title animation
+   *  runs here — stacking a second animation on the title made it look like it
    *  moved twice. */
   private animateWelcomeTitle(mode: string): void {
     this._welcomeTitleAnimating = false;
@@ -3592,7 +3732,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
    * Re-initialize the main content area to its default "fresh chat" state.
    * Called AFTER cleanupContentArea() on session/mode switches so the user
    * sees a clean welcome screen with empty input, no sub-agent header, no
-   * queue card, no status bar, and no leftover dropdowns — exactly like
+   * pending panel, no status bar, and no leftover dropdowns — exactly like
    * the app's first launch.
    */
   private enterChatMode(): void {
@@ -3610,8 +3750,6 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const title = document.querySelector(".welcome-title") as HTMLElement | null;
     if (title) {
       title.textContent = t("welcome.title");
-      // Drop a swap left mid-flight so the next one starts from rest.
-      title.classList.remove("is-swapping");
     }
     // Show placeholder, hide mode chip.
     const placeholder = document.getElementById("prompt-placeholder");
@@ -3632,6 +3770,18 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
   }
 
   /**
+   * Declare a transient popup to the scope host so any view switch dismisses
+   * it. Registration happens on show; the host's dismiss path just hides the
+   * node, which is what the click-away handlers do anyway.
+   */
+  private ownEphemeral(el: HTMLElement): void {
+    registerSurface(el, {
+      scope: "ephemeral",
+      onClose: () => hideAnimated(el),
+    });
+  }
+
+  /**
    * Tear down all transient UI artifacts from the content area so the next
    * render starts from a clean slate.  Called BEFORE enterChatMode() on
    * session/mode switches.
@@ -3645,6 +3795,10 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // onLeaveAutomation before the panel slides away; this is the safety
     // net for every other caller (tray switch, new session, temp chat…).
     if (this.automation.isDetailVisible()) this.automation.hideDetail();
+
+    // Plugin market occupies the same content slot — close it so a session
+    // switch / new task never repaints "underneath" the open market view.
+    this.market?.close();
 
     // ── 1. Sub-agent view + breadcrumb ──────────────────────────────
     // These gate the inline "sub-agent" overlay in #message-list and the
@@ -3684,7 +3838,8 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // ── 4. Mention / @ dropdown (above the prompt input) ───────────
     const mentionDropdown = document.getElementById("mention-dropdown");
     if (mentionDropdown) {
-      mentionDropdown.classList.add("hidden");
+      hideAnimated(mentionDropdown);
+      mentionDropdown.closest(".input-wrapper")?.classList.remove("slash-menu-open");
       // Also reset to the main page so the next open shows Files/Folder,
       // not a stale "back" state from the slash-commands sub-page.
       const mainPage = mentionDropdown.querySelector('[data-page="main"]');
@@ -3698,30 +3853,27 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
     // ── 5. Model selector dropdown (in input toolbar) ──────────────
     const modelDropdown = document.getElementById("input-model-dropdown");
-    if (modelDropdown) modelDropdown.classList.add("hidden");
-    // Keep the two input dropdowns mutually exclusive here as well.
-    const wsDropdownCleanup = document.getElementById("input-workspace-dropdown");
-    if (wsDropdownCleanup) wsDropdownCleanup.classList.add("hidden");
+    if (modelDropdown) hideAnimated(modelDropdown);
 
-    // ── 6. Chat status bar + queue card ────────────────────────────
+    // ── 6. Chat status bar + pending panel ─────────────────────────
     const statusBar = document.getElementById("chat-status-bar");
     if (statusBar) {
       statusBar.classList.add("hidden");
       statusBar.innerHTML = "";
       statusBar.style.maxWidth = "";
     }
-    const queueCard = document.getElementById("queue-card");
-    if (queueCard) {
-      queueCard.classList.add("hidden");
-      const qBody = document.getElementById("queue-card-body");
-      if (qBody) qBody.innerHTML = "";
-    }
+    resetPendingPanel();
 
     // ── 7. Input area — clear leftover text/chip/attachments ───────
     // Capture the current composer content against the *outgoing* session
     // before it is wiped, so restoreDraft() can bring it back when the user
     // returns to this session.
     this.saveCurrentDraft();
+    // Snap the composer back out of its expanded overlay before the next
+    // session's draft is restored: the flag survived every switch, so a
+    // conversation entered after an expand kept the vacated-slot placeholder
+    // and the floating input box of the previous one.
+    this.setInputExpanded(false);
     if (this.input) {
       this.input.innerHTML = "";
       this.input.style.height = "56px";
@@ -3730,8 +3882,9 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     this._persistentMode = "";  // Clear — the new session's mode_changed will set the correct value
     setInputMode("");
     clearAttachments();
+    // Clear the local queue mirror; the freshly selected session's
+    // authoritative snapshot arrives via queue_list → queued_submits.
     clearQueuedPrompts();
-    setPendingQueueCount(0);
 
     // ── 8. Restore mode chip + border via the single updateChipState() path ──
     // updateChipState() checks effectiveMode() (chip OR _persistentMode)
@@ -3755,13 +3908,13 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // ── 9. Search overlay (Ctrl/Cmd+K) ─────────────────────────────
     if (this.search) this.search.close();
 
-    // ── 10. Floating dropdowns that may be left open ───────────────
-    // The settings-search overlay, the input-area "model" dropdown, any
-    // inline tab-add dropdowns in #session-inner-sidebar, etc.  Anything
-    // with `.open` or `.visible` is a transient popup — close it.
-    document.querySelectorAll(".settings-dropdown.open").forEach((dd) => dd.classList.remove("open"));
-    document.querySelectorAll(".tab-add-dropdown:not(.hidden)").forEach((dd) => dd.classList.add("hidden"));
-    document.querySelectorAll(".context-menu:not(.hidden)").forEach((m) => m.classList.add("hidden"));
+    // ── 10. Floating popups ─────────────────────────────────────────
+    // Every click-away surface declared itself to the scope host when it
+    // opened (context menus, dropdowns, the tab-add popups), so one call
+    // dismisses them all — including any popup added later that nobody
+    // remembered to list here. Tooltips are a hover artefact of the view that
+    // is being repainted, so they are simply un-marked.
+    closeEphemeralSurfaces();
     document.querySelectorAll(".tooltip:not(.hidden), [data-tooltip-visible]").forEach((t) => {
       t.classList.add("hidden");
       t.removeAttribute("data-tooltip-visible");
@@ -3793,27 +3946,10 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // ``_welcomeTitleAnimating=true`` and the title text never updates.
     this._welcomeTitleAnimating = false;
 
-    // ── 14. Force-reset #message-list + welcome screen ─────────────
+    // ── 14. Leave #message-list + welcome screen alone ──────
     // chat.render() will repaint #message-list, but it does not always
     // run synchronously with this cleanup.  Clear it eagerly so we never
     // show a stale message bubble for one frame after switching modes.
-    if (this.messageList) {
-      this.messageList.innerHTML = "";
-      this.messageList.classList.add("hidden");
-    }
-    if (this.welcomeScreen) {
-      this.welcomeScreen.classList.remove("hidden");
-      // Reset the welcome title text so animateWelcomeTitle() can always
-      // detect a text change and play the slide-in animation on every
-      // mode switch.  Use an empty string so it never matches any mode text.
-      const title = this.welcomeScreen.querySelector(".welcome-title") as HTMLElement | null;
-      if (title) {
-        title.textContent = "";
-        // Drop a swap left mid-flight so animateWelcomeTitle() always sees a
-        // text change and can play a clean entrance.
-        title.classList.remove("is-swapping");
-      }
-    }
 
     // ── 15. Force-reset #placeholder visibility ────────────────────
     // The placeholder is hidden while the user types or has a chip; the
@@ -3852,7 +3988,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // running in the background — that wastes GPU and is a security smell.
     const childView = document.getElementById("child-view");
     if (childView) {
-      childView.classList.add("hidden");
+      hideViewAnimated(childView);
       childView.innerHTML = "";
     }
 
@@ -3861,7 +3997,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // trail; after cleanup we want the plain "New Session" label back.
     const sessionBarName = document.getElementById("session-bar-name");
     if (sessionBarName) {
-      sessionBarName.textContent = t("session.newSession");
+      this.setSessionBarName(sessionBarName, t("session.newSession"));
       sessionBarName.removeAttribute("title");
     }
 
@@ -3888,18 +4024,15 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const chatContainer = document.getElementById("chat-container");
     if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
 
-    // ── 22. Scroll-track / scroll-thumb reset ─────────────────────
-    // The right-side scroll progress indicator is built by ChatScrollIndicator.
-    // Reset its DOM so it does not show a stale position for one frame.
-    const scrollTrack = document.getElementById("chat-scroll-track");
-    if (scrollTrack) scrollTrack.innerHTML = "";
-    const scrollThumb = document.getElementById("chat-scroll-thumb");
-    if (scrollThumb) {
-      scrollThumb.classList.add("hidden");
-      scrollThumb.style.top = "";
-    }
-    const scrollIndicator = document.getElementById("chat-scroll-indicator");
-    if (scrollIndicator) scrollIndicator.classList.add("hidden");
+    // ── 22. Scroll progress indicator reset ────────────────────────
+    // The right-edge turn ruler is owned by ChatScrollIndicator. This step
+    // used to empty `.chat-scroll-track` and put `.hidden` on the progress
+    // thumb from the outside, which left the indicator's own bookkeeping
+    // stale: the next update() saw an unchanged turn signature and skipped
+    // the rebuild, so the ruler stayed blank until a new user turn arrived,
+    // and the thumb -- `.hidden` is `display:none !important` -- never came
+    // back at all. Hand the reset to the component instead.
+    this.chat.resetScrollIndicator();
     this.chat.resetScrollButton();
 
     // ── 23. Reset temp-chat button + clear any temp flags ─────────
@@ -3953,10 +4086,61 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       this.input.style.maxHeight = "none";
       const contentH = this.input.scrollHeight;
       this.input.style.maxHeight = "";
-      const h = Math.min(Math.max(contentH, 56), 320);
+      // 5-line cap — must match the CSS `max-height: 121px` on .prompt-input
+      // (5 × 14.5px × 1.55 line-height + 8px vertical padding).
+      const h = Math.min(Math.max(contentH, 56), 121);
       this.input.style.height = `${h}px`;
       this.updateInputExpandButton();
+      // Second frame: pin the caret line AFTER the browser's own caret
+      // scroll-into-view pass has run against the committed height. Doing it
+      // in the same frame lost the race — Chrome's selection scrolling fires
+      // after this rAF's layout and reset the offset back, which is why line
+      // 6 stayed hidden while typing. By the next frame the height is real,
+      // the browser has done whatever it wanted to scrollTop, and this final
+      // correction is the last word before paint.
+      requestAnimationFrame(() => this.scrollCaretIntoView());
     });
+  }
+
+  /**
+   * Keeps the line the caret is on visible inside the composer once the box
+   * is height-capped and internally scrollable.  Only corrects the offset by
+   * the actual overshoot, so a user scrolling around a long draft with the
+   * mouse is left alone until they type again.
+   */
+  private scrollCaretIntoView(): void {
+    if (this._inputExpanded) return; // expanded mode pins to the end instead
+    const box = this.input;
+    if (box.scrollHeight <= box.clientHeight) return; // nothing overflows yet
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return;
+    const range = sel.getRangeAt(0).cloneRange();
+    if (!box.contains(range.startContainer)) return;
+    // The collapsed range's own rect IS the caret position — regardless of
+    // how the line was produced (typed <div> vs soft-wrapped bare text).  The
+    // previous parentElement approach returned the whole input box for bare
+    // text nodes, whose rect equals the viewport box, so the overshoot was
+    // always 0 and the caret line never scrolled into view.
+    let caret = range.getBoundingClientRect();
+    if (!caret || (caret.top === 0 && caret.bottom === 0)) {
+      // Some engines return a zero rect for collapsed ranges at line starts;
+      // fall back to the caret's containing element.
+      const node = range.startContainer;
+      const el = node.nodeType === Node.TEXT_NODE
+        ? node.parentElement
+        : (node as Element);
+      if (!el || !box.contains(el)) return;
+      caret = el.getBoundingClientRect();
+    }
+    const view = box.getBoundingClientRect();
+    // Half a visual line of headroom (14.5px × 1.55) so the caret line sits
+    // fully inside the box instead of hugging its very edge.
+    const headroom = 11;
+    if (caret.bottom > view.bottom) {
+      box.scrollTop += caret.bottom - view.bottom + headroom;
+    } else if (caret.top < view.top) {
+      box.scrollTop -= view.top - caret.top + headroom;
+    }
   }
 
   private countLines(): number {
@@ -4007,9 +4191,9 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       // BEFORE the `input-expanded` class turns it into an absolute overlay.
       // Reading offsetHeight here forces a synchronous layout, so the value
       // is exact for the slot being vacated — including any status bar /
-      // queue card that is visible this very instant.  Trusting the
+      // pending panel that is visible this very instant.  Trusting the
       // ResizeObserver cache instead is racy: the callback only runs at the
-      // END of a frame, so a status-bar/queue-card that just appeared or
+      // END of a frame, so a status-bar/pending-panel that just appeared or
       // disappeared leaves a stale height there.  A stale value makes the
       // padding-bottom placeholder larger/smaller than the real slot, the
       // chat container's height shifts by the difference, and the next
@@ -4115,7 +4299,8 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
 
   /**
    * Height the composer collapses back to — the content height clamped to the
-   * same `[56, 320]` window `resizeInput()` uses for the non-expanded state.
+   * same `[56, 121]` window `resizeInput()` uses for the non-expanded state
+   * (5-line cap, see the CSS on .prompt-input).
    * Measured with the transition OFF so the probe height never animates.
    */
   private collapsedInputHeight(): number {
@@ -4129,7 +4314,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     this.input.style.height = prevH;
     this.input.style.maxHeight = prevMax;
     if (hadAnim) this.input.classList.add("input-anim");
-    return Math.min(Math.max(contentH, 56), 320);
+    return Math.min(Math.max(contentH, 56), 121);
   }
 
   /**
@@ -4247,18 +4432,186 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     </button>`;
 
     const mode = getState().workspaceMode;
-    const items = matchingSlashCommands("", mode).map(cmd => {
-      const aliases = (cmd.aliases && cmd.aliases.length) ? cmd.aliases.join(",") : "";
+    const visible = matchingSlashCommands("", mode);
+
+    // Mode commands (Plan / Spec) live on the dropdown's main page as
+    // first-class entries; the slash sub-page only lists actions and
+    // user/project commands.  Palette labels are resolved at render time —
+    // freezing them at module load would bake in one locale.  The chip and
+    // the payload keep the command's own title / id, so only what the
+    // palette shows changes here.
+    const paletteModeLabel = (cmd: SlashCommand): string => {
+      if (cmd.id === "plan") return t("slashCommands.planEntry");
+      if (cmd.id === "spec") return t("slashCommands.specEntry");
+      return cmd.title;
+    };
+    const modesPage = document.getElementById("mention-modes");
+    if (modesPage) {
+      modesPage.innerHTML = visible.filter(c => c.kind === "mode").map(cmd => `
+        <button class="mention-dropdown-item" data-action="${cmd.id}">
+          ${this.resolveIcon(cmd.icon) ? `<i data-lucide="${this.resolveIcon(cmd.icon)}" class="lucide mention-icon-${cmd.id}"></i>` : ""}
+          <span>${this.esc(paletteModeLabel(cmd))}</span>
+        </button>`).join("");
+      this.refreshIcons(modesPage);
+    }
+
+    const items = visible.filter(c => c.kind !== "mode").map(cmd => {
       return `
-      <button class="mention-dropdown-item" data-action="${cmd.id}" data-slash="${cmd.name}" data-kind="${cmd.kind}"${aliases ? ` data-aliases="${aliases}"` : ""}>
-        <i data-lucide="${this.resolveIcon(cmd.icon)}" class="lucide mention-icon-${cmd.id}"></i>
+      <button class="mention-dropdown-item" data-action="${cmd.id}" data-slash="${cmd.name}" data-kind="${cmd.kind}">
+        ${this.resolveIcon(cmd.icon) ? `<i data-lucide="${this.resolveIcon(cmd.icon)}" class="lucide mention-icon-${cmd.id}"></i>` : ""}
         <span>${cmd.title}  <span class="mention-hint">/${cmd.name}</span></span>
       </button>`;
     }).join("");
 
     slashPage.innerHTML = backBtn + items;
 
-    this.refreshIcons();
+    this.refreshIcons(slashPage as HTMLElement);
+  }
+
+  /** Fills one resource sub-page of the "+" dropdown.  Pages mirror the
+   *  plugin-market naming (智能体 / 技能 / 连接器 / 工具) plus rules and
+   *  library documents, and are always rendered — an empty group shows a
+   *  muted empty row instead of hiding the page.  Plugin rows render the
+   *  plugin's own declared icon through pluginIconHtml (the market's one
+   *  icon path); no generic substitute glyph is ever invented here. */
+  private renderResPage(page: HTMLElement, kind: string): void {
+    const st = getState();
+
+    const hint = (s: string | undefined, max = 26): string => {
+      const v = (s || "").replace(/\s+/g, " ").trim();
+      if (!v) return "";
+      return v.length > max ? `${v.slice(0, max)}…` : v;
+    };
+    const lucide = (name: string) => `<i data-lucide="${name}" class="lucide"></i>`;
+    const entry = (resKind: string, name: string, title: string, iconHtml: string, h = "") => `
+      <button class="mention-dropdown-item" data-resource-kind="${resKind}" data-resource-name="${this.esc(name)}">
+        ${iconHtml}
+        <span>${this.esc(title)}${h ? ` <span class="mention-hint">${this.esc(h)}</span>` : ""}</span>
+      </button>`;
+    const empty = `<button class="mention-dropdown-item muted" disabled>${this.esc(t("mention.emptyGroup"))}</button>`;
+
+    const enabledPlugins = (pluginStates() || []).filter(p => p.enabled && p.state !== "failed");
+    // The app-wide sub-agent glyph is the settled sa-loader chevron (settings
+    // sidebar, agent panel, chat strip) — mirrored here, not a second icon.
+    const saAgentGlyph = '<span class="sa-loader" data-running="false"><i></i><i></i><i class="sa-chevron"></i><i></i><i class="sa-chevron"></i><i></i><i></i><i></i><i class="sa-chevron"></i></span>';
+    // Library node glyphs mirror the settings library tree's per-type icons.
+    const libIcon = (type: string): string =>
+      type === "md" ? "file-code"
+      : type === "sheet" ? "table"
+      : type === "clip" ? "globe"
+      : type === "attachment" ? "paperclip"
+      : "file-text";
+    let items = "";
+    if (kind === "agents") {
+      const list = (st.subAgents || []).filter(a => !a.hidden);
+      items = list.length
+        ? list.map(a => entry("subagent", a.name, a.name, saAgentGlyph, hint(a.description))).join("")
+        : empty;
+    } else if (kind === "skills") {
+      // The exact list the settings skills panel shows — every registered
+      // skill, including the ones shipped by installed plugins and the ones
+      // the user installed by hand. No extra filter: a skill is a skill.
+      const list = st.skillsList || [];
+      items = list.length
+        ? list.map(s => entry("skill", s.name, s.name, lucide("wand-2"), hint(s.description))).join("")
+        : empty;
+    } else if (kind === "connectors") {
+      // Only plugins that actually provide an MCP server are connectors;
+      // a plugin's skills surface as skills, its agents as agents — the
+      // plugin itself is never filed as a "tool" here.
+      const isConnector = (p: PluginStateEntry): boolean => ((p.provides || {}).mcp || []).length > 0;
+      const list = enabledPlugins.filter(isConnector);
+      items = list.length
+        ? list.map(p => entry("plugin", p.name, p.display_name || p.name, pluginIconHtml(p.icon, p.name), hint(p.description))).join("")
+        : empty;
+    } else if (kind === "rules") {
+      const list = [...(st.globalRules || []), ...(st.projectRules || [])];
+      items = list.length
+        ? list.map(r => entry("rule", r.name, r.name, lucide("list-checks"))).join("")
+        : empty;
+    } else if (kind === "library") {
+      const docTypes = new Set(["doc", "sheet", "clip", "md", "attachment"]);
+      const list = (st.libraryTree || []).filter(n => docTypes.has(n.type));
+      items = list.length
+        ? list.map(n => entry("doc", n.name, n.name, lucide(libIcon(n.type)))).join("")
+        : empty;
+    } else if (kind === "attach") {
+      // The merged attachment entry hosts the two native pickers; their
+      // buttons reuse the existing upload-file / select-folder actions.
+      items = `
+        <button class="mention-dropdown-item" data-action="upload-file">
+          ${lucide("file")}
+          <span>${this.esc(t("mention.uploadFile"))}</span>
+        </button>
+        <button class="mention-dropdown-item" data-action="select-folder">
+          ${lucide("folder")}
+          <span>${this.esc(t("mention.selectFolder"))}</span>
+        </button>`;
+    } else {
+      return;
+    }
+
+    // Sub-page titles reuse the app's own terminology keys — sidebar and
+    // market already name these surfaces, so this menu never coins a second
+    // word for the same thing.
+    const title: Record<string, string> = {
+      agents: t("sidebar.agent"),
+      skills: t("market.surfaceSkills"),
+      connectors: t("market.surfaceMcp"),
+      rules: t("sidebar.rules"),
+      library: t("sidebar.library"),
+      attach: t("mention.addAttachment"),
+    };
+    page.innerHTML = `
+      <button class="mention-dropdown-item" data-action="back-main">
+        ${lucide("arrow-left")}
+        <span>${this.esc(title[kind] || "")}</span>
+      </button>
+      <div class="mention-dropdown-divider"></div>
+      ${items}`;
+
+    this.refreshIcons(page);
+  }
+
+  /** Activates a user-defined resource through the shared chip pipeline.
+   *  Skills and sub-agents carry a prompt body, so they persist on the
+   *  backend via set_command (sticky, re-injected every turn); rules,
+   *  library documents and plugins have no prompt body and render a
+   *  local-only chip whose `<command>` tag reaches the model on submit. */
+  private activateResourceChip(kind: string, name: string): void {
+    const st = getState();
+    // Chip icons follow the mention entries' unified mapping (settings
+    // sidebar / library tree). Chips render through resolveIcon, which only
+    // accepts lucide names, so the sub-agent keeps the app's lucide agent
+    // glyph instead of the sa-loader span.
+    const libIcon = (type: string): string =>
+      type === "md" ? "file-code"
+      : type === "sheet" ? "table"
+      : type === "clip" ? "globe"
+      : type === "attachment" ? "paperclip"
+      : "file-text";
+    let cmd: SlashCommand | undefined;
+    if (kind === "skill") {
+      const skill = (st.skillsList || []).find(s => s.name === name);
+      if (!skill) return;
+      cmd = { id: `skill:${skill.name}`, name: skill.name, title: skill.name, description: skill.description, icon: "wand-2", kind: "action", prompt: skill.body || undefined };
+    } else if (kind === "subagent") {
+      const agent = (st.subAgents || []).find(a => a.name === name);
+      if (!agent) return;
+      cmd = { id: `subagent:${agent.name}`, name: agent.name, title: agent.name, description: agent.description, icon: "bot", kind: "action", prompt: agent.description || agent.system_prompt || undefined };
+    } else if (kind === "plugin") {
+      const plugin = (pluginStates() || []).find(p => p.name === name);
+      if (!plugin) return;
+      // Only connector plugins are reachable here (see renderResPage), so the
+      // chip carries the connector glyph throughout.
+      cmd = { id: `plugin:${plugin.name}`, name: plugin.name, title: plugin.display_name || plugin.name, description: plugin.description || "", icon: "cable", kind: "action" };
+    } else if (kind === "rule") {
+      cmd = { id: `rule:${name}`, name, title: name, description: "", icon: "list-checks", kind: "action" };
+    } else if (kind === "doc") {
+      const node = (st.libraryTree || []).find(n => n.name === name);
+      cmd = { id: `doc:${name}`, name, title: name, description: "", icon: node ? libIcon(node.type) : "file-text", kind: "action" };
+    }
+    if (cmd) this.activateSlashCommand(cmd);
   }
 
   private fetchModels(): void {
@@ -4386,28 +4739,13 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       }
     }
 
-    const fileRefs = st.attachments.length > 0 ? st.attachments.map(a => ({ name: a.name, size: a.size, icon: a.mime_type === "text/x-terminal" ? "terminal" : a.mime_type === "text/x-directory" ? "folder" : getFileIcon(a.name), path: a.path, mime_type: a.mime_type })) : undefined;
-
-    if (isQueued) {
-      pushQueuedPrompt(text, sendMode);
-      clearAttachments();
-      this._drafts.delete(st.sessionId || "");
-      this.input.innerHTML = "";
-      this.input.style.height = "56px";
-      this.setInputExpanded(false);
-      this._currentChipMode = "";
-      setInputMode("");
-      this.updateChipState();
-      this.updatePlaceholder();
-      this.updateSendButton();
-      return;
-    }
+    const fileRefs = st.attachments.length > 0 ? st.attachments.map(a => ({ name: a.name, size: a.size, icon: a.mime_type === "text/x-terminal" ? getTerminalIcon() : a.mime_type === "text/x-directory" ? getFolderIcon(a.name) : getFileIcon(a.name), path: a.path, mime_type: a.mime_type })) : undefined;
 
     // /steer: mid-run injection - don't add a user message or start a new turn
     if (this._currentChipMode === "steer") {
       if (!text.trim()) return;
       send({ type: "steer", session_id: st.sessionId || undefined, prompt: text } as any);
-      this._drafts.delete(st.sessionId || "");
+      this.deleteDraft(st.sessionId || "");
       this.input.innerHTML = "";
       this.input.style.height = "56px";
       this.setInputExpanded(false);
@@ -4419,10 +4757,16 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       return;
     }
 
-    addUserMessage(text, sendMode, fileRefs);
-    startAssistantMessage();
-    setSessionState("running");
-    this.updateUIState(true);
+    // Busy sessions send immediately: the backend queues the prompt behind
+    // the running turn (persisted, auto-drained FIFO) and mirrors it back
+    // via the queued_submits broadcast.  No local bubble here — the
+    // queued_run_started event renders it when the queued turn starts.
+    if (!isQueued) {
+      addUserMessage(text, sendMode, fileRefs);
+      startAssistantMessage();
+      setSessionState("running");
+      this.updateUIState(true);
+    }
 
     const activeModel = st.modelConfigs.length > 0 ? st.modelConfigs[Math.min(st.activeModelIndex, st.modelConfigs.length - 1)] : undefined;
     const multimodal = activeModel?.multimodal === true;
@@ -4459,8 +4803,14 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     }
     send(payload as import("./core/types.js").ClientMessage);
     clearAttachments();
-    this._inputHistory.push(text);
+    // Record the sent prompt in the recall history (dedup consecutive
+    // duplicates, cap at 100) and persist it so it survives app restarts.
+    if (text.trim() && text !== this._inputHistory[this._inputHistory.length - 1]) {
+      this._inputHistory.push(text);
+      if (this._inputHistory.length > 100) this._inputHistory.splice(0, this._inputHistory.length - 100);
+    }
     this._inputHistoryIdx = this._inputHistory.length;
+    this.persistInputHistory();
     // Force scroll to bottom so the user immediately sees the message they sent
     const _chatContainer = document.getElementById("chat-container");
     if (_chatContainer) _chatContainer.scrollTop = _chatContainer.scrollHeight;
@@ -4470,7 +4820,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // and then is cleared.  Unlike plan/spec it does NOT persist across
     // turns in the input chip (the backend re-injects its instructions
     // every turn until the next message).
-    this._drafts.delete(st.sessionId || "");
+    this.deleteDraft(st.sessionId || "");
     this.input.innerHTML = "";
     this.input.style.height = "56px";
     this.setInputExpanded(false);
@@ -4500,12 +4850,38 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     this.chat.render();
   }
 
+  /** 「继续」 on an interrupted turn: sends the resume prompt exactly as if the
+   *  user had typed it and pressed send — same mode/chip resolution and the
+   *  same run payload as submit(), but without touching whatever the composer
+   *  holds. The timeline stops rendering the button as soon as this lands. */
+  private resumeInterrupted(): void {
+    const st = getState();
+    if (st.running) return;
+    const sendMode = this.effectiveMode() || undefined;
+    const payload: Record<string, any> = {
+      type: "run",
+      prompt: CONTINUE_PROMPT,
+      session_id: st.sessionId || undefined,
+      temp_chat: st.tempChat || undefined,
+    };
+    if (sendMode) {
+      payload.mode = sendMode;
+      const cmd = SLASH_COMMANDS.find(c => c.id === sendMode);
+      if (cmd?.prompt) payload.mode_prompt = cmd.prompt;
+    }
+    addUserMessage(CONTINUE_PROMPT, sendMode);
+    startAssistantMessage();
+    setSessionState("running");
+    this.updateUIState(true);
+    send(payload as import("./core/types.js").ClientMessage);
+  }
+
   private cancel(): void {
     // Close @ dropdown if open
     const dd = document.getElementById("mention-dropdown");
     const bm = document.getElementById("btn-mention");
     if (dd && !dd.classList.contains("hidden")) {
-      dd.classList.add("hidden");
+      hideAnimated(dd);
       bm?.classList.remove("active");
       this._slashActive = false;
     }
@@ -4533,6 +4909,38 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const requestId = crypto.randomUUID();
     setRequestedSessionId(sid, requestId);
     send({ type: "resume", session_id: sid, request_id: requestId });
+    // Pull the freshly selected session's queue snapshot for the panel.
+    send({ type: "queue_list", session_id: sid });
+  }
+
+  /**
+   * Exits the currently open session (if any) exactly like the "New task"
+   * button does, so the automation page / plugin market never opens on top
+   * of a live session and closing them later lands on the fresh new-task
+   * state. No-op when the welcome screen is already up (not inside a
+   * session) — that also avoids firing redundant `new_session` round-trips.
+   */
+  private exitSessionForOverlay(): void {
+    const welcome = document.getElementById("welcome-screen");
+    if (!welcome || !welcome.classList.contains("hidden")) return;
+    this.exitTempChat();
+    this.cleanupContentArea({ keepAutomationFlag: false });
+    resetChat();
+    const requestId = crypto.randomUUID();
+    setRequestedSessionId("", requestId);
+    send({ type: "new_session", request_id: requestId });
+  }
+
+  /**
+   * Single entry for opening/closing the automation PAGE (sidebar entry,
+   * keyboard shortcuts, tray). Exits an open session first so the page —
+   * like the plugin market — always reveals the new-task state on close.
+   * NOT used by the startup-session restore path, which must not kill an
+   * existing session.
+   */
+  private toggleAutomationPage(): void {
+    if (!this.automationPanel.isActive) this.exitSessionForOverlay();
+    this.modeTransition.toggleAutomation();
   }
 
   private initKeybindActions(): void {
@@ -4562,7 +4970,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       this.automationPanel.hide();
       this.exitTempChat();
       // Clear all residual content-area widgets (sub-agent view, tool
-      // detail panel, queue card, model dropdown, …) before requesting
+      // detail panel, pending panel, model dropdown, …) before requesting
       // a brand-new session.  resetChat() below wipes the state slice
       // but does not touch the DOM directly.
       this.cleanupContentArea({ keepAutomationFlag: false });
@@ -4617,7 +5025,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const sessions = getState().sessionsList;
       const s = sessions?.find(x => x.session_id === sid);
       const name = s?.name || s?.preview || sid.slice(0, 8);
-      const ok = await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { container: document.getElementById("app") ?? undefined });
+      const ok = await Dialog.confirm(t("session.confirmDeleteTitle"), t("session.confirmDelete", { name }), { scope: "app" });
       if (ok) {
         send({ type: "delete_session", session_id: sid });
         resetChat();
@@ -4658,10 +5066,10 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const msgs = getState().messages;
       const lastAssistantIdx = msgs.length - 1;
       if (lastAssistantIdx < 0 || msgs[lastAssistantIdx].role !== "assistant") return;
-      let userMsgIdx = -1;
-      for (let i = 0; i < lastAssistantIdx; i++) {
-        if (msgs[i].role === "user" && msgs[i].mode !== "compact_marker") userMsgIdx++;
-      }
+      // 0-based among REAL user turns: the notice modes (compact_marker /
+      // compact_notice / model_switch) are user-role but consume no
+      // data-user-idx, so counting them drifted the retry one turn early.
+      const userMsgIdx = realUserMessages(msgs.slice(0, lastAssistantIdx)).length - 1;
       if (userMsgIdx < 0) return;
       const removed = new Set<string>();
       for (let i = lastAssistantIdx; i < msgs.length; i++) removed.add(msgs[i].id);
@@ -4696,11 +5104,25 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     a["settings_skills"] = () => openSetting("skills");
     a["settings_mcp"] = () => openSetting("mcp");
     a["settings_agent"] = () => openSetting("agent");
-    a["settings_index"] = () => openSetting("index");
-    a["settings_rules"] = () => openSetting("rules");
+    a["settings_library"] = () => openSetting("library");
+    // The four auxiliary surfaces merged into the 辅助面板 settings page;
+    // the dedicated keybind actions land there too.
+    a["settings_terminal"] = () => openSetting("assist");
+    a["settings_editor"] = () => openSetting("assist");
+    a["settings_review"] = () => openSetting("assist");
+    a["settings_browser"] = () => openSetting("assist");
     a["settings_memory"] = () => openSetting("memory");
     a["settings_usage"] = () => openSetting("usage");
     a["settings_about"] = () => openSetting("about");
+    a["settings_gateway"] = () => openSetting("gateway");
+    a["settings_plugins"] = () => openSetting("plugins");
+    a["settings_shortcuts"] = () => openSetting("shortcuts");
+    a["settings_storage"] = () => openSetting("storage");
+    a["settings_developer"] = () => {
+      // The developer nav entry only exists in dev mode.
+      if (!document.getElementById("settings-nav-developer")?.offsetParent) return;
+      openSetting("developer");
+    };
 
     // ── Navigation / Sidebar ─────────────────────────────────────────
     a["toggle_sidebar"] = () => {
@@ -4708,7 +5130,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       document.getElementById("app")?.classList.toggle("sidebar-collapsed");
     };
     a["view_chat"] = () => this.viewManager.switchTo("chat");
-    a["view_automation"] = () => this.modeTransition.toggleAutomation();
+    a["view_automation"] = () => this.toggleAutomationPage();
 
     // ── Input Area ───────────────────────────────────────────────────
     a["attach_file"] = () => { this.files.promptForFiles(); };
@@ -4782,7 +5204,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     a["toggle_theme"] = () => {
       const current = getState().themePreference || "system";
       const next = current === "dark" ? "light" : current === "light" ? "system" : "dark";
-      Dialog.confirm(t("theme.switchTitle"), t("theme.switchConfirm", { label: t(`theme.${next}`) }), { priority: "low", container: document.getElementById("app") ?? undefined }).then(ok => {
+      Dialog.confirm(t("theme.switchTitle"), t("theme.switchConfirm", { label: t(`theme.${next}`) }), { priority: "low", scope: "app" }).then(ok => {
         if (!ok) return;
         setThemePreference(next);
         if (next === "system") {
@@ -4799,7 +5221,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const current = (getState().settings.language as string) || getLocale();
       const idx = Math.max(0, (LOCALES as readonly string[]).indexOf(current));
       const next = LOCALES[(idx + 1) % LOCALES.length];
-      Dialog.confirm(t("language.switchTitle"), t("language.switchConfirm", { label: t(`language.${next}`) }), { priority: "low", container: document.getElementById("app") ?? undefined }).then(ok => {
+      Dialog.confirm(t("language.switchTitle"), t("language.switchConfirm", { label: t(`language.${next}`) }), { priority: "low", scope: "app" }).then(ok => {
         if (!ok) return;
         const settings = { ...getState().settings, language: next };
         setSettings(settings);
@@ -4808,7 +5230,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       });
     };
     // ── Automation ───────────────────────────────────────────────────
-    a["automation_open"] = () => this.modeTransition.toggleAutomation();
+    a["automation_open"] = () => this.toggleAutomationPage();
     a["automation_new"] = () => {
       document.getElementById("automation-create-btn")?.click();
     };
@@ -4830,10 +5252,6 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     // ── Workspace ────────────────────────────────────────────────────
     a["workspace_open"] = () => this.workspace.openFolder();
     a["workspace_close"] = () => this.workspace.forceExit();
-    a["workspace_reindex"] = () => {
-      send({ type: "reindex_workspace" } as any);
-    };
-
     // ── Notifications ────────────────────────────────────────────────
     a["notifications_open"] = () => {
       if (!document.getElementById("encre-menu-dropdown")) this.openEncreMenu();
@@ -4849,7 +5267,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const cfg = (getState().settings.keybinds as any);
     const binds: any[] = cfg?.keybinds || [];
     if (binds.length === 0) {
-      if (!this._shortcutSub) this._shortcutSub = subscribe(() => this.applyShortcutHints());
+      if (!this._shortcutSub) this._shortcutSub = subscribe(() => this.applyShortcutHints(), ["settings"]);
       return;
     }
     this._shortcutsApplied = true;
@@ -4878,20 +5296,6 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     const grid = document.createElement("div");
     grid.className = "shortcuts-grid";
 
-    const colDesc = document.createElement("div");
-    colDesc.className = "sc-col sc-col-desc";
-    colDesc.textContent = "Description";
-    grid.appendChild(colDesc);
-
-    const colKey = document.createElement("div");
-    colKey.className = "sc-col sc-col-key";
-    colKey.textContent = "Shortcut";
-    grid.appendChild(colKey);
-
-    const divider = document.createElement("div");
-    divider.className = "sc-divider";
-    grid.appendChild(divider);
-
     const categories = new Map<string, Array<{ id: string; keys: string[]; desc: string }>>();
     for (const b of binds) {
       const cat = b.category || "general";
@@ -4899,27 +5303,11 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       categories.get(cat)!.push({ id: b.id, keys: b.keys, desc: b.description || b.id });
     }
 
-    const CAT_LABELS: Record<string, string> = {
-      application: "Application",
-      session: "Session",
-      messages: "Messages",
-      input: "Input",
-      modes: "Modes",
-      navigation: "Navigation",
-      search: "Search",
-      settings: "Settings",
-      panels: "Panels",
-      automation: "Automation",
-      workspace: "Workspace",
-      notifications: "Notifications",
-      appearance: "Appearance",
-      general: "General",
-    };
-
     for (const [cat, items] of categories) {
       const cell = document.createElement("div");
       cell.className = "sc-category";
-      cell.textContent = CAT_LABELS[cat] || cat.charAt(0).toUpperCase() + cat.slice(1);
+      const catKey = "settings.shortcutCategory" + cat.charAt(0).toUpperCase() + cat.slice(1);
+      cell.textContent = t(catKey) || cat.charAt(0).toUpperCase() + cat.slice(1);
       grid.appendChild(cell);
 
       for (const item of items) {
@@ -4939,7 +5327,7 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     }
 
     scroll.appendChild(grid);
-    Dialog.showHtmlDialog("Keyboard Shortcuts", scroll, { priority: "low", container: document.getElementById("app") ?? undefined });
+    Dialog.showHtmlDialog(t("settings.keyboardShortcuts"), scroll, { priority: "low", scope: "app" });
   }
 
   private bindKeyboardShortcuts(): void {
@@ -4983,10 +5371,20 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const pattern = parts.join("+");
 
       if (pattern === "escape") {
+        // Escape has two roles: dismiss an open overlay (settings / search),
+        // or — when nothing is open — fall through to the keybind table so
+        // the `cancel` action can stop generation.  Previously this branch
+        // always returned, which made the `cancel` binding dead code.
+        const wasSettingsOpen = document.getElementById("app")?.classList.contains("settings-mode") ?? false;
+        const wasSearchOpen = !document.getElementById("search-overlay")?.classList.contains("hidden");
+
         this.settings.close();
         setActiveToolId(null);
         this.search.close();
-        return;
+
+        if (wasSettingsOpen || wasSearchOpen) return;
+        // Otherwise fall through — the dispatch loop below will fire
+        // `cancel` (bound to `escape`) if its scope is satisfied.
       }
 
       // Never intercept Shift-only + printable character (e.g. shift+? = typing ?)
@@ -4997,9 +5395,11 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       const keybindsCfg = (getState().settings.keybinds as any);
       const binds: any[] = keybindsCfg?.keybinds || [];
 
-      // Block native browser handling for any key that's in the keybinds list
-      // and for function keys (F1-F12) that are commonly used as shortcuts
-      if (mappedKey.match(/^f(1[0-2]|[1-9])$/) || binds.some((kb) => kb.keys && kb.keys.includes(pattern))) {
+      // Block native browser handling only for keys that will actually fire.
+      // A key whose scope is unsatisfied (e.g. `Ctrl+Z` pressed while the
+      // settings panel is foregrounded) must fall through to the browser's
+      // own handler so a settings form field can still undo.
+      if (mappedKey.match(/^f(1[0-2]|[1-9])$/) || binds.some((kb) => kb.keys && kb.keys.includes(pattern) && scopeAllows(kb.id))) {
         // Don't intercept Ctrl+Z when the composer is focused — let the
         // browser handle the native undo for the contenteditable.
         if (!(mappedKey === 'z' && mod && this.input.contains(document.activeElement))) {
@@ -5008,21 +5408,16 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       }
 
       for (const kb of binds) {
-        if (kb.keys && kb.keys.includes(pattern)) {
-          // Skip undo_message when the composer is focused (native browser undo)
-          if (kb.id === "undo_message" && this.input.contains(document.activeElement)) {
-            return;
-          }
-          if (kb.id === "search_settings") {
-            const app = document.getElementById("app");
-            if (!app?.classList.contains("settings-mode")) return;
-          }
-          const action = this._keybindActions[kb.id];
-          if (action) {
-            e.preventDefault();
-            action();
-            return;
-          }
+        if (!kb.keys || !kb.keys.includes(pattern) || !scopeAllows(kb.id)) continue;
+        // Skip undo_message when the composer is focused (native browser undo)
+        if (kb.id === "undo_message" && this.input.contains(document.activeElement)) {
+          return;
+        }
+        const action = this._keybindActions[kb.id];
+        if (action) {
+          e.preventDefault();
+          action();
+          return;
         }
       }
     });
@@ -5066,12 +5461,15 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       (window as any).lucide.createIcons({ root: menu });
     }
 
-    const rect = btn.getBoundingClientRect();
-    menu.style.top = `${rect.bottom + 6}px`;
-    // Clamp horizontally into the viewport. Under rtl the anchor button
-    // sits at the far right edge and the 240px menu would open mostly
-    // off-window (left is a physical offset, it never mirrors).
-    menu.style.left = `${clampElLeft(menu, rect.left)}px`;
+    showAnchoredDropdown(menu, btn);
+    // Body-level portal: it belongs to no conversation, so a view switch has
+    // to dismiss it through the scope host rather than be remembered here.
+    registerSurface(menu, { scope: "ephemeral", onClose: () => this.closeEncreMenu() });
+
+    const backdrop = document.createElement("div");
+    backdrop.id = "encre-menu-backdrop";
+    document.body.appendChild(backdrop);
+    backdrop.addEventListener("click", () => this.closeEncreMenu());
 
     menu.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -5102,8 +5500,17 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
   private closeEncreMenu(): void {
     const menu = document.getElementById("encre-menu-dropdown");
     if (!menu) return;
-    this.notifications.detach();
-    menu.remove();
+    const backdrop = document.getElementById("encre-menu-backdrop");
+    const cleanup = (): void => {
+      this.notifications.detach();
+      menu.remove();
+      backdrop?.remove();
+    };
+    menu.classList.add("closing");
+    backdrop?.classList.add("closing");
+    menu.addEventListener("animationend", cleanup, { once: true });
+    // Safety timeout in case animationend never fires
+    setTimeout(cleanup, 600);
   }
 
   /** Switches the menu to the notifications sub-view inside the dropdown. */
@@ -5137,8 +5544,8 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     return `
       <button type="button" class="encre-menu-item-row encre-menu-action-row" data-action="notifications">
         <div class="encre-menu-item-info">
-          <div class="encre-menu-item-title" style="display:flex;align-items:center;gap:8px">
-            <i data-lucide="bell" class="lucide" style="width:14px;height:14px;color:var(--text-secondary)"></i>
+          <div class="encre-menu-item-title">
+            <i data-lucide="bell" class="lucide"></i>
             ${t("header.notifications")}
           </div>
         </div>
@@ -5149,8 +5556,8 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
       <div class="encre-menu-item-divider"></div>
       <button type="button" class="encre-menu-item-row encre-menu-action-row" data-action="settings">
         <div class="encre-menu-item-info">
-          <div class="encre-menu-item-title" style="display:flex;align-items:center;gap:8px">
-            <i data-lucide="settings" class="lucide" style="width:14px;height:14px;color:var(--text-secondary)"></i>
+          <div class="encre-menu-item-title">
+            <i data-lucide="settings" class="lucide"></i>
             ${t("header.settings")}
           </div>
         </div>
@@ -5162,6 +5569,13 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
     if (stored === "dark" || stored === "light" || stored === "system") {
       setThemePreference(stored);
       setSettings({ ...getState().settings, theme: stored });
+    }
+    // Colour skin: the pre-paint script in index.html already put the
+    // stored skin on <html>; sync the state field so the settings panel
+    // shows the active one. Unknown/missing values keep the ink default.
+    const storedSkin = localStorage.getItem("encre-theme-skin");
+    if (storedSkin && (THEME_SKINS as readonly string[]).includes(storedSkin)) {
+      setThemeSkin(storedSkin);
     }
     const pref = getState().themePreference;
     const applySystemTheme = () => {
@@ -5207,8 +5621,96 @@ if (tab.view.startsWith("http://") || tab.view.startsWith("https://") || tab.vie
   }
 }
 
-const app = new App();
-app.start();
+/** Last-resort screen: boot failed before the UI existed. */
+function showFatalBootError(error: unknown): void {
+  try {
+    const target = document.getElementById("splash-screen") || document.body;
+    target.innerHTML = `
+      <div style="display:flex;height:100vh;align-items:center;justify-content:center;
+                  font-family:system-ui,sans-serif;color:var(--text-primary,#222);padding:24px;text-align:center">
+        <div>
+          <div style="font-size:16px;font-weight:600;margin-bottom:8px">Encre Agent failed to start</div>
+          <div style="font-size:12px;opacity:.7">${String((error as Error)?.message || error).slice(0, 300)}</div>
+        </div>
+      </div>`;
+  } catch {
+    /* nothing else we can do */
+  }
+}
+
+installUiErrorBoundaries();
+try {
+  const app = new App();
+  void app.start().catch((e) => {
+    reportUiFault("app", "start", e);
+    showFatalBootError(e);
+  });
+} catch (e) {
+  reportUiFault("app", "construct", e);
+  showFatalBootError(e);
+}
+
+/** Normalized dedupe key for a summary-panel reference.  Memory-file
+ *  references collapse onto their file name so create/read/update/delete on
+ *  the same memory render as a single row.  Web-fetch URLs are normalized
+ *  (protocol/www/trailing-slash stripped) so the same page fetched via
+ *  slightly different URLs still collapses.  Web-search and memory-search
+ *  queries are whitespace-normalized so repeated identical queries dedupe.
+ *  MCP calls collapse onto the tool name so the same MCP tool invoked
+ *  repeatedly renders as a single row. */
+function refDedupeKey(r: { tool: string; summary: string }): string {
+  const t = (r.tool || "").toLowerCase();
+  if (t.startsWith("memory_") && t !== "memory_search" && t !== "memory_profile") {
+    const text = stripRefTypePrefix(r.tool, r.summary).trim().toLowerCase();
+    if (text) return "memory:" + (text.endsWith(".md") ? text : text + ".md");
+  }
+  if (t === "web_fetch") {
+    const url = extractRefUrl(r.summary);
+    if (url) return "url:" + normalizeUrlForDedup(url);
+  }
+  if (t === "web_search" || t === "memory_search") {
+    const q = stripRefTypePrefix(r.tool, r.summary).trim().toLowerCase().replace(/\s+/g, " ");
+    if (q) return (t === "web_search" ? "search:" : "memsearch:") + q;
+  }
+  if (t.startsWith("mcp__")) return "mcp:" + t;
+  return `${r.tool}\u0000${r.summary}`;
+}
+
+/** Normalize a URL for deduplication: strip protocol, leading www, and
+ *  trailing slash so near-identical URLs collapse onto the same key. */
+function normalizeUrlForDedup(url: string): string {
+  try {
+    const u = new URL(url);
+    return (
+      u.hostname.toLowerCase().replace(/^www\./, "") +
+      u.pathname.replace(/\/+$/, "") +
+      u.search
+    );
+  } catch {
+    return url
+      .toLowerCase()
+      .replace(/^https?:\/\/(www\.)?/, "")
+      .replace(/\/+$/, "");
+  }
+}
+
+/** Truncate reference display text for single-line display.  The full text
+ *  stays available via the element's title attribute. */
+function truncateRefText(text: string, max = 64): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1) + "\u2026";
+}
+
+/** Extract the first http(s) URL from a reference summary (e.g. a
+ *  "Fetched: https://..." web-fetch reference).  Returns "" when the summary
+ *  carries no URL (e.g. a web-search query), in which case the row stays
+ *  non-interactive text. */
+function extractRefUrl(summary: string): string {
+  const m = (summary || "").match(/https?:\/\/[^\s"'<>]+/);
+  if (!m) return "";
+  // Strip trailing punctuation that likely belongs to the sentence.
+  return m[0].replace(/[.,;:!)\]}\u3002\uff0c\uff09\uff1b\uff1a]+$/, "");
+}
 
 /** Strip the type prefix that backend `_extract_ref_summary` prepends to a
  *  reference summary (e.g. "Memory:", "Web search:", "Fetched:").  The

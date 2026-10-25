@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -54,6 +53,7 @@ class JobState(Enum):
 @dataclass
 class CronSchedule:
     """5-field cron expression: minute hour dom month dow"""
+
     minute: str = "*"
     hour: str = "*"
     day_of_month: str = "*"
@@ -96,14 +96,13 @@ class CronSchedule:
                     if int(part) == value:
                         return True
                 except ValueError:
-                    pass
+                    logger.debug("exception suppressed", exc_info=True)
         return False
 
     @staticmethod
     def _normalize_dow(field: str) -> str:
         """Convert named days to numbers. Cron: 0=Sun, 1=Mon, ..., 6=Sat, 7=Sun."""
-        _dow_map = {"sun": "0", "mon": "1", "tue": "2", "wed": "3",
-                     "thu": "4", "fri": "5", "sat": "6"}
+        _dow_map = {"sun": "0", "mon": "1", "tue": "2", "wed": "3", "thu": "4", "fri": "5", "sat": "6"}
         result = field.lower()
         for name, num in _dow_map.items():
             result = result.replace(name, num)
@@ -113,6 +112,7 @@ class CronSchedule:
     def _weekday_cron(year: int, month: int, day: int) -> int:
         """Return cron-style weekday (0=Sun, 1=Mon, ..., 6=Sat)."""
         from datetime import datetime
+
         py_wday = datetime(year, month, day).weekday()  # 0=Mon, 6=Sun
         return (py_wday + 1) % 7  # Convert to 0=Sun
 
@@ -139,8 +139,20 @@ class CronSchedule:
             if hour >= 24:
                 hour = 0
                 day += 1
-            days_in_month = [31, 29 if (year % 400 == 0 or (year % 4 == 0 and year % 100 != 0)) else 28,
-                             31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            days_in_month = [
+                31,
+                29 if (year % 400 == 0 or (year % 4 == 0 and year % 100 != 0)) else 28,
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ]
             if day > days_in_month[month - 1]:
                 day = 1
                 month += 1
@@ -150,15 +162,18 @@ class CronSchedule:
 
             current = [year, month, day, hour, minute]
 
-            if (self._match_field(minute, self.minute) and
-                self._match_field(hour, self.hour) and
-                self._match_field(day, self.day_of_month) and
-                self._match_field(month, self.month) and
-                self._match_field(
+            if (
+                self._match_field(minute, self.minute)
+                and self._match_field(hour, self.hour)
+                and self._match_field(day, self.day_of_month)
+                and self._match_field(month, self.month)
+                and self._match_field(
                     self._weekday_cron(year, month, day),
                     normalized_dow,
-                )):
+                )
+            ):
                 from datetime import datetime
+
                 dt = datetime(year, month, day, hour, minute)
                 return dt.timestamp()
 
@@ -178,6 +193,7 @@ class JobExecution:
     snapshot must be loaded from the sub-agent session on demand via
     :func:`EncreSession.load_from_dir`.
     """
+
     time: float
     state: str
     result: str
@@ -219,6 +235,7 @@ class ScheduledJob:
     :class:`encre.dag.executor.DagExecutor` to run the workflow
     instead of submitting the prompt directly to the agent.
     """
+
     id: str
     name: str
     prompt: str
@@ -292,11 +309,212 @@ class ScheduledJob:
         # Executions are now stored in a separate global history file.
         # The legacy ``executions`` field is only used for one-time migration
         # when _load() detects it.
-        job.executions = [
-            JobExecution.from_dict(execution)
-            for execution in (data.get("executions") or [])
-        ]
+        job.executions = [JobExecution.from_dict(execution) for execution in (data.get("executions") or [])]
         return job
+
+
+@dataclass
+class WakeIntent:
+    """Core -> Harness contract for a commitment wake.
+
+    The Core layer (resident runtime) detects a due commitment in the memory
+    graph and emits one intent per notification. The envelope is fully
+    self-contained: everything the executor needs rides in ``prompt`` -- the
+    harness reads no global state, runs once, and keeps nothing afterwards.
+    When the scheduler sinks into Rust, this is the exact shape the native
+    watcher will emit.
+    """
+
+    commitment_id: str
+    content: str
+    deadline_ts: float
+    notify_stage: int
+    max_reminds: int
+    prompt: str
+    push_gateways: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "commitment_id": self.commitment_id,
+            "content": self.content,
+            "deadline_ts": self.deadline_ts,
+            "notify_stage": self.notify_stage,
+            "max_reminds": self.max_reminds,
+            "push_gateways": list(self.push_gateways),
+        }
+
+
+def _build_wake_prompt(
+    commitment_id: str,
+    content: str,
+    deadline_ts: float,
+    notify_stage: int,
+    max_reminds: int,
+) -> str:
+    """Assemble the self-contained wake prompt for one commitment notification.
+
+    Stage 1 is the pre-deadline warning; later stages are at/after the
+    deadline. The prompt instructs the executor to verify the outcome, close
+    the node when done, and report concisely -- in the user's language.
+    """
+    deadline_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(deadline_ts))
+    stage_text = "pre-deadline warning" if notify_stage <= 1 else "deadline reached or overdue"
+    return (
+        "You were woken by the resident commitment watcher. A commitment has "
+        "reached its notification point.\n\n"
+        f"Commitment (id: {commitment_id}): {content}\n"
+        f"Deadline: {deadline_text}\n"
+        f"Notification: {notify_stage}/{max_reminds} ({stage_text})\n\n"
+        "Tasks:\n"
+        "1. Verify whether this commitment has been fulfilled "
+        "(use memory_search and any relevant tools to check).\n"
+        "2. If it is fulfilled, close it: "
+        f'memory_update(ref="{commitment_id}", commitment_status="done").\n'
+        "3. If it is not fulfilled, do whatever is practical to help right "
+        "now (gather what is missing, draft the next step, prepare a "
+        "concrete plan), then report what the user must know and do next.\n\n"
+        "Report concisely, in the user's language."
+    )
+
+
+class CommitmentWatcher:
+    """Resident watcher that wakes the agent when commitments fall due.
+
+    Core-layer component (the resident side): it runs no model calls of its
+    own. Due/expired commitments are decided by the pure-math
+    :func:`encre.memdir.layers.iter_due_commitments`; each due node becomes a
+    :class:`WakeIntent` dispatched through the scheduler's standard one-shot
+    pipeline, so execution, history, progress streaming and gateway push all
+    reuse the existing automation path unchanged.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        scheduler: "EncreScheduler",
+        push_gateways: "list[str] | Callable[[], list[str]] | None" = None,
+        agent_config: dict[str, Any] | None = None,
+        check_interval_seconds: float = 60.0,
+    ) -> None:
+        self._store = store
+        self._scheduler = scheduler
+        # Static list or a provider callable -- a callable lets the Core
+        # resolve the currently-connected gateways at dispatch time, so
+        # adapters that come online later still receive wakes.
+        if callable(push_gateways):
+            self._push_gateways_fn = push_gateways
+        else:
+            resolved = list(push_gateways or [])
+            self._push_gateways_fn = lambda: resolved
+        self._agent_config = agent_config
+        self._check_interval = max(5.0, float(check_interval_seconds))
+        self._running = False
+        self._task: asyncio.Task[Any] | None = None
+
+    async def start(self) -> None:
+        """Start the background scan loop."""
+        self._running = True
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        """Stop the background scan loop."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def _loop(self) -> None:
+        """Periodically scan the memory graph for due commitments."""
+        while self._running:
+            try:
+                self.scan()
+            except Exception as e:
+                logger.exception("[commitment_watcher] scan crashed: {}", e)
+            await asyncio.sleep(self._check_interval)
+
+    def scan(self) -> list[WakeIntent]:
+        """One scan pass: dispatch due wakes, expire drained commitments.
+
+        Stage metadata is written BEFORE dispatch so a crash between the two
+        can only skip one wake, never spam duplicates.
+        """
+        from encre.memdir.layers import (
+            COMMITMENT_STAGE_KEY,
+            COMMITMENT_STATUS_EXPIRED,
+            COMMITMENT_STATUS_KEY,
+            iter_due_commitments,
+        )
+
+        now = time.time()
+        entries = self._store.long_term() + self._store.buffer()
+        due, expired = iter_due_commitments(entries, now)
+
+        intents: list[WakeIntent] = []
+        for entry, next_stage in due:
+            intent = self._build_intent(entry, next_stage)
+            if intent is None:
+                continue
+            self._store.update_metadata(entry.id, {COMMITMENT_STAGE_KEY: next_stage})
+            self._dispatch(intent)
+            intents.append(intent)
+            logger.info(
+                "[commitment_watcher] wake dispatched: commitment={} stage={}/{}",
+                entry.id,
+                next_stage,
+                intent.max_reminds,
+            )
+        for entry_id in expired:
+            self._store.update_metadata(entry_id, {COMMITMENT_STATUS_KEY: COMMITMENT_STATUS_EXPIRED})
+            logger.info("[commitment_watcher] commitment={} expired", entry_id)
+        return intents
+
+    def _build_intent(self, entry: Any, next_stage: int) -> WakeIntent | None:
+        """Wrap one due memory node into a WakeIntent (the Harness contract)."""
+        meta = entry.metadata or {}
+        try:
+            deadline_ts = float(meta.get("deadline_ts") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if deadline_ts <= 0.0:
+            return None
+        try:
+            max_reminds = max(1, int(meta.get("max_reminds") or 2))
+        except (TypeError, ValueError):
+            max_reminds = 2
+        return WakeIntent(
+            commitment_id=str(entry.id),
+            content=str(entry.content or ""),
+            deadline_ts=deadline_ts,
+            notify_stage=next_stage,
+            max_reminds=max_reminds,
+            prompt=_build_wake_prompt(
+                str(entry.id),
+                str(entry.content or ""),
+                deadline_ts,
+                next_stage,
+                max_reminds,
+            ),
+            push_gateways=list(self._push_gateways_fn() or []),
+        )
+
+    def _dispatch(self, intent: WakeIntent) -> None:
+        """Hand the intent to the scheduler's standard one-shot pipeline."""
+        self._scheduler.schedule(
+            name=f"commitment wake {intent.commitment_id[:8]}",
+            prompt=intent.prompt,
+            fire_at=time.time() + 1.0,
+            max_failures=1,
+            metadata={
+                "origin": "commitment_wake",
+                "commitment_id": intent.commitment_id,
+                "notify_stage": intent.notify_stage,
+                "wake": intent.to_dict(),
+            },
+            agent_config=self._agent_config,
+            push_gateways=list(intent.push_gateways),
+        )
 
 
 class EncreScheduler:
@@ -323,6 +541,7 @@ class EncreScheduler:
         self._jobs: dict[str, ScheduledJob] = {}
         if not durable_path:
             from encre.config import get_data_dir
+
             durable_path = str(get_data_dir() / "jobs.json")
         self._durable_path = Path(durable_path)
         self._history_path = self._durable_path.with_name("automation_history.json")
@@ -359,6 +578,7 @@ class EncreScheduler:
     ) -> str:
         """Schedule a new job. Returns the job ID."""
         import uuid
+
         job_id = uuid.uuid4().hex[:12]
 
         if cron:
@@ -416,6 +636,7 @@ class EncreScheduler:
             The newly-created job ID.
         """
         import uuid
+
         job_id = uuid.uuid4().hex[:12]
 
         if cron:
@@ -465,7 +686,18 @@ class EncreScheduler:
             self._save()
         return not job.suspended
 
-    def update_job(self, job_id: str, *, name: str, prompt: str, cron: str, tag: str, model_index: int = -1, agent_config: dict[str, Any] | None = None, push_gateways: list[str] | None = None) -> bool:
+    def update_job(
+        self,
+        job_id: str,
+        *,
+        name: str,
+        prompt: str,
+        cron: str,
+        tag: str,
+        model_index: int = -1,
+        agent_config: dict[str, Any] | None = None,
+        push_gateways: list[str] | None = None,
+    ) -> bool:
         """Update a job's properties. Returns True on success."""
         job = self._jobs.get(job_id)
         if job is None:
@@ -518,11 +750,7 @@ class EncreScheduler:
         except (ValueError, IndexError):
             return None
         for i, exec_entry in enumerate(self._executions):
-            if (
-                exec_entry.job_id == job_id
-                and exec_entry.time is not None
-                and abs(exec_entry.time - exec_time) < 0.001
-            ):
+            if exec_entry.job_id == job_id and exec_entry.time is not None and abs(exec_entry.time - exec_time) < 0.001:
                 sid = exec_entry.session_id
                 del self._executions[i]
                 if self._durable_path:
@@ -541,11 +769,7 @@ class EncreScheduler:
         except (ValueError, IndexError):
             return False
         for exec_entry in self._executions:
-            if (
-                exec_entry.job_id == job_id
-                and exec_entry.time is not None
-                and abs(exec_entry.time - exec_time) < 0.001
-            ):
+            if exec_entry.job_id == job_id and exec_entry.time is not None and abs(exec_entry.time - exec_time) < 0.001:
                 exec_entry.name = new_name.strip()[:64]
                 if self._durable_path:
                     self._save_history()
@@ -581,7 +805,8 @@ class EncreScheduler:
             jobs = [j for j in jobs if j.state == state]
         elif not include_finished:
             jobs = [
-                j for j in jobs
+                j
+                for j in jobs
                 if j.state != JobState.CANCELLED
                 and not (j.schedule_type == ScheduleType.ONE_SHOT and j.state in (JobState.COMPLETED, JobState.FAILED))
             ]
@@ -646,17 +871,14 @@ class EncreScheduler:
                         else:
                             pass
                     elif job.schedule_type == ScheduleType.RECURRING and job.cron:
-                        if job.last_fired is None:
-                            # First time: compute next_fire from the fixed
-                            # creation timestamp so the result is stable
-                            # across poll cycles.  Using the current poll
-                            # time (now) would make next_fire keep shifting
-                            # forward (e.g. "every minute" would return
-                            # now+60s on every call, making now >= next_fire
-                            # *always* false 鈥?the job would never fire).
-                            next_fire = job.cron.next_fire(job.created_at)
-                        else:
-                            next_fire = job.cron.next_fire(job.last_fired)
+                        # First occurrence: compute next_fire from the fixed
+                        # creation timestamp so the result is stable across
+                        # poll cycles.  Using the current poll time (now)
+                        # would make next_fire keep shifting forward (e.g.
+                        # "every minute" would return now+60s on every call,
+                        # making now >= next_fire *always* false -- the job
+                        # would never fire).
+                        next_fire = job.cron.next_fire(job.created_at) if job.last_fired is None else job.cron.next_fire(job.last_fired)
                         if next_fire and now >= next_fire:
                             if next_fire >= self._started_at:
                                 # The scheduled occurrence fell within this
@@ -673,14 +895,22 @@ class EncreScheduler:
                                 # last_fired past it so the job is armed for
                                 # the next future occurrence instead.
                                 logger.info(
-                                    "[scheduler] recurring job {} (name={}) skipped a missed occurrence at {} (scheduler was offline); will wait for the next scheduled time",
-                                    job.id, job.name,
+                                    "[scheduler] recurring job {} (name={}) skipped a missed"
+                                    " occurrence at {} (scheduler was offline);"
+                                    " will wait for the next scheduled time",
+                                    job.id,
+                                    job.name,
                                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_fire)),
                                 )
                                 job.last_fired = next_fire
                         else:
-                            logger.debug("[scheduler] recurring job {} not due yet: next_fire={} now={} last_fired={}",
-                                          job.id, next_fire, now, job.last_fired)
+                            logger.debug(
+                                "[scheduler] recurring job {} not due yet: next_fire={} now={} last_fired={}",
+                                job.id,
+                                next_fire,
+                                now,
+                                job.last_fired,
+                            )
                     else:
                         logger.debug("[scheduler] job {} skipped: type={} cron={}", job.id, job.schedule_type, job.cron)
 
@@ -744,8 +974,14 @@ class EncreScheduler:
             logger.warning("[scheduler] _agent_factory is None, cannot execute job {}", job.id)
             return
 
-        logger.debug("[scheduler] _execute_job {} (name={}) starting, state={}, cron={}, last_fired={}",
-                     job.id, job.name, job.state, job.cron.to_expression() if job.cron else None, job.last_fired)
+        logger.debug(
+            "[scheduler] _execute_job {} (name={}) starting, state={}, cron={}, last_fired={}",
+            job.id,
+            job.name,
+            job.state,
+            job.cron.to_expression() if job.cron else None,
+            job.last_fired,
+        )
 
         job.state = JobState.RUNNING
         job.last_fired = time.time()
@@ -768,7 +1004,7 @@ class EncreScheduler:
             self._save_history()
 
         # Notify frontend immediately that the job is now RUNNING so the
-        # automation panel can update its state (status 鈫?RUNNING, history
+        # automation panel can update its state (status → RUNNING, history
         # entry appears) without waiting for execution to finish.
         if self._on_complete:
             try:
@@ -790,6 +1026,7 @@ class EncreScheduler:
                 ToolProgress,
                 ToolResult,
             )
+
             event_data: dict[str, Any] = {}
             event_name = ""
             if isinstance(event, TextDelta):
@@ -847,19 +1084,25 @@ class EncreScheduler:
             # filled in once the sub-agent is created.
             if self._on_progress:
                 try:
-                    await self._on_progress(job, "start", {
-                        "id": job.id,
-                        "name": job.name,
-                        "prompt": job.prompt,
-                        "session_id": exec_entry.session_id,
-                    })
+                    await self._on_progress(
+                        job,
+                        "start",
+                        {
+                            "id": job.id,
+                            "name": job.name,
+                            "prompt": job.prompt,
+                            "session_id": exec_entry.session_id,
+                        },
+                    )
                 except Exception:
                     logger.warning("[scheduler] progress callback failed for 'start' event", exc_info=True)
 
             if job.dag_definition:
                 # DAG path: each node is a sub-agent run.
                 node_session_ids = await self._execute_dag_job(
-                    job, parent_agent, _translate_event,
+                    job,
+                    parent_agent,
+                    _translate_event,
                 )
                 exec_entry.session_id = node_session_ids[0] if node_session_ids else None
                 # The wrapper session is the first node; remaining nodes
@@ -881,7 +1124,9 @@ class EncreScheduler:
                     system_prompt=None,
                     tool_policy="all",
                     progress_callback=lambda messages: self._emit_execution_snapshot(
-                        job, exec_entry, messages,
+                        job,
+                        exec_entry,
+                        messages,
                     ),
                     event_callback=_translate_event,
                     session_id=exec_entry.session_id,
@@ -898,8 +1143,9 @@ class EncreScheduler:
                 # surface it as a real FAILED execution instead.
                 sub_failed = bool(sub_result.get("error")) or final_content.startswith("Error:")
                 if sub_failed:
-                    logger.warning("[scheduler] sub-agent reported failure: job={} name={} result={:.200s}",
-                                   job.id, job.name, final_content)
+                    logger.warning(
+                        "[scheduler] sub-agent reported failure: job={} name={} result={:.200s}", job.id, job.name, final_content
+                    )
                     job.fail_count += 1
                     job.last_result = final_content[:2000]
                     exec_entry.state = "FAILED"
@@ -913,7 +1159,7 @@ class EncreScheduler:
                     job.last_result = final_content[:2000]
                     job.state = JobState.COMPLETED
                     job.fail_count = 0
-                    job.last_fired = time.time()          # 鈫?mark successful execution
+                    job.last_fired = time.time()  # → mark successful execution
                     exec_entry.state = "COMPLETED"
                     exec_entry.result = final_content[:5000]
 
@@ -941,14 +1187,19 @@ class EncreScheduler:
                 if exec_entry.state == "FAILED":
                     try:
                         from encre.errors import classify_error_code
+
                         err_code = classify_error_code(job.last_result or "").value
                     except Exception:
                         err_code = "AUTOMATION_EXECUTION_FAILED"
-                await self._on_progress(job, "finish", {
-                    "state": exec_entry.state,
-                    "result": (job.last_result or "")[:2000],
-                    "error_code": err_code,
-                })
+                await self._on_progress(
+                    job,
+                    "finish",
+                    {
+                        "state": exec_entry.state,
+                        "result": (job.last_result or "")[:2000],
+                        "error_code": err_code,
+                    },
+                )
             except Exception:
                 logger.warning("[scheduler] progress callback failed for 'finish' event", exc_info=True)
 
@@ -974,10 +1225,14 @@ class EncreScheduler:
         """Publish the current canonical sub-agent transcript to clients."""
         if self._on_progress is None:
             return
-        await self._on_progress(job, "snapshot", {
-            "session_id": execution.session_id,
-            "messages": messages,
-        })
+        await self._on_progress(
+            job,
+            "snapshot",
+            {
+                "session_id": execution.session_id,
+                "messages": messages,
+            },
+        )
 
     async def _execute_dag_job(
         self,
@@ -1033,9 +1288,7 @@ class EncreScheduler:
             if session_id:
                 node_session_ids.append(session_id)
             context[node.id] = content
-            node_summaries.append(
-                f"[{node.name}] session={session_id or '-'} text_len={len(content)}"
-            )
+            node_summaries.append(f"[{node.name}] session={session_id or '-'} text_len={len(content)}")
             node.result = content
             return content
 
@@ -1057,10 +1310,7 @@ class EncreScheduler:
             f"Sub-agent sessions: {len(node_session_ids)}",
         ]
         for _nid, nr in dag_result.node_results.items():
-            summary_lines.append(
-                f"  [{nr.status}] {nr.node_name} ({nr.attempts} attempt(s), "
-                f"{nr.finished_at - nr.started_at:.1f}s)"
-            )
+            summary_lines.append(f"  [{nr.status}] {nr.node_name} ({nr.attempts} attempt(s), {nr.finished_at - nr.started_at:.1f}s)")
             if nr.error:
                 summary_lines.append(f"    error: {nr.error}")
 
@@ -1103,8 +1353,12 @@ class EncreScheduler:
         self._durable_path.parent.mkdir(parents=True, exist_ok=True)
         data = [j.to_dict() for j in self._jobs.values()]
         payload = json.dumps(data, indent=2, ensure_ascii=False)
-        with contextlib.suppress(Exception):
+        try:
             payload = encrypt(payload)
+        except Exception:
+            # Fail-closed: skip the durable save rather than write plaintext.
+            logger.error("scheduler: encryption failed; skipping jobs save", exc_info=True)
+            return
         # Atomic write: write to temp file then rename
         tmp_path = self._durable_path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -1117,8 +1371,12 @@ class EncreScheduler:
         self._history_path.parent.mkdir(parents=True, exist_ok=True)
         data = [e.to_dict() for e in self._executions]
         payload = json.dumps(data, indent=2, ensure_ascii=False)
-        with contextlib.suppress(Exception):
+        try:
             payload = encrypt(payload)
+        except Exception:
+            # Fail-closed: skip the durable save rather than write plaintext.
+            logger.error("scheduler: encryption failed; skipping history save", exc_info=True)
+            return
         tmp_path = self._history_path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(payload)

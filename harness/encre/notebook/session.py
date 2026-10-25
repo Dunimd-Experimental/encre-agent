@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Notebook session: execute code cells in a persistent Python kernel.
 
 :class:`EncreNotebookSession` spawns a hidden Python subprocess that speaks
@@ -31,6 +33,7 @@ by id and can be created, edited, executed, inspected and deleted.
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -109,7 +112,12 @@ class EncreNotebookSession:
         """Start the kernel subprocess if it is not already running."""
         if self._started and self._process is not None and self._process.poll() is None:
             return
-        python_exe = self.kernel_name if self.kernel_name else sys.executable
+        # ``kernel_name`` is only a real interpreter path when it points at
+        # an existing file; the conventional aliases ("python3"/"python")
+        # and Windows setups must resolve to the running interpreter, since
+        # this kernel is a plain Python subprocess, not a Jupyter kernelspec.
+        name = self.kernel_name or ""
+        python_exe = name if name and os.path.isfile(name) else sys.executable
         from encre.capabilities.process import hidden_subprocess_kwargs
         popen_kwargs = hidden_subprocess_kwargs()
         self._process = subprocess.Popen(

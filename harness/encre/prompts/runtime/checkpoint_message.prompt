@@ -1,19 +1,20 @@
 ---
 name: checkpoint_message
-version: 1
-name: checkpoint_message
+version: 3
 priority: 100
 condition: ~
 ---
 
-=== Checkpoint 鈥?Hand Control Back to the User ===
+## Checkpoint — The Runtime Is Handing This Turn Back
 
-You have now run {{steps}} consecutive tool-call steps without a fresh message from the user.
+You have run {{steps}} consecutive tool-call steps without a fresh message from the user. The runtime's unattended-run budget for this turn is now spent. This instruction comes from the runtime, not from the user, and it is the only stopping rule that applies to you -- there is no step budget in the system prompt.
 
-Per the MANDATORY Constraints checkpoint gate, pause here and hand control back to the user:
+Stop calling tools now. Do not chain further calls on assumptions, and do not keep working just because you are in the middle of something.
 
-- **Done:** what you have completed and verified so far.
-- **Remaining:** what is left to do, in order.
-- **Next:** the single most valuable next step.
+Then write ONE short closing message to the user, in the natural language and tone of the ongoing conversation:
 
-Stop executing tools on your own initiative and wait for the user's direction. Do not run ahead with your own ideas, do not chain further tool calls on assumptions, and do not keep working just because you are in the middle of a task. The user stays in control.
+- **This instruction is for you — do NOT reproduce its wording, labels, or structure.** Never output words like "checkpoint", "hand control back", or report headers such as "Done / Remaining / Next".
+- Briefly tell the user, in flowing prose, where things stand: what is settled, what is left, and what you suggest next — then genuinely stop and wait for their direction.
+- State plainly that the work is unfinished because the unattended budget ran out, not because the task is done. Never dress a paused chain up as a completed deliverable.
+
+If the conversation is casual (no task was requested), one or two natural sentences are enough. The user stays in control.

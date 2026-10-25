@@ -20,7 +20,10 @@
  * Non-compliance may result in service termination or legal liability.
  */
 
-import { renderMarkdown } from "./chat_markdown.js";
+import { renderMarkdown, handleMarkdownContentClick, normalizeMarkdownWinPaths } from "./chat_markdown.js";
+import { createLucideIcons, flashCopyButton } from "./chat_tool_display.js";
+import { showToast } from "../core/state.js";
+import { t } from "../features/i18n.js";
 
 export interface MarkdownPreviewOptions {
   onOpenLink?: (url: string) => void;
@@ -57,9 +60,18 @@ export class MarkdownPreviewView {
     if (!this._basePath) return html;
     const dir = this._basePath.replace(/\\/g, "/").replace(/\/?$/, "/");
     return html.replace(/<img\s+[^>]*src="([^"]+)"[^>]*>/gi, (match, src: string) => {
-      if (/^(https?:|data:|local:\/\/\/|file:\/\/|\/)/.test(src)) return match;
+      if (/^(https?:|data:|local:\/\/\/|file:\/\/|\/|#)/i.test(src)) return match;
+      // markdown-it percent-encodes non-ASCII srcs (CJK file names) -- decode
+      // before resolving, Chromium re-encodes on the wire and the local
+      // protocol handler decodes again.
+      let rel = src.replace(/\\/g, "/");
+      try { rel = decodeURIComponent(rel); } catch { /* keep encoded */ }
+      // Absolute Windows path (D:/...) -- a full filesystem location, never
+      // join it onto the document's base directory.
+      if (/^[a-zA-Z]:\//.test(rel)) {
+        return match.replace(`src="${src}"`, `src="local:///${rel}"`);
+      }
       const parts = dir.split("/").filter(Boolean);
-      const rel = src.replace(/\\/g, "/");
       for (const seg of rel.split("/")) {
         if (seg === "..") { if (parts.length > 1) parts.pop(); }
         else if (seg !== "." && seg) parts.push(seg);
@@ -69,20 +81,35 @@ export class MarkdownPreviewView {
   }
 
   private _onClick(e: MouseEvent): void {
-    const a = (e.target as HTMLElement).closest("a");
-    if (!a || !a.href) return;
-    const href = a.getAttribute("href") || "";
-    if (href.startsWith("#")) return;
-    e.preventDefault();
-    if (this._onOpenLink) {
-      this._onOpenLink(href);
+    // Fenced code blocks render the same icon-button copy affordance as the
+    // chat transcript; outside the chat view no delegate handles it, so the
+    // preview copies (and flashes) on its own.
+    const codeCopyBtn = (e.target as HTMLElement).closest(".code-copy") as HTMLElement | null;
+    if (codeCopyBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      navigator.clipboard
+        .writeText(codeCopyBtn.getAttribute("data-code") || "")
+        .then(() => flashCopyButton(codeCopyBtn))
+        .catch(() => showToast(t("chat.copyFailed"), "", "error", "Chat"));
+      return;
     }
+    // Unified link handling: "#section" anchors scroll in-place (the old code
+    // explicitly ignored them, so TOC links did nothing), relative paths and
+    // external URLs are routed to the owner via onOpenLink.
+    handleMarkdownContentClick(this._body, e, {
+      onOpenFile: (href) => this._onOpenLink?.(href),
+      onOpenExternal: (href) => this._onOpenLink?.(href),
+    });
   }
 
   private _render(): void {
     if (this._destroyed) return;
-    this._body.innerHTML = renderMarkdown(this._raw);
+    this._body.innerHTML = renderMarkdown(normalizeMarkdownWinPaths(this._raw));
     this._body.innerHTML = this._resolveImages(this._body.innerHTML);
+    // Lucide only swaps `[data-lucide]` placeholders it is pointed at; without
+    // this pass the code-block copy buttons stay empty 0x0 shells.
+    createLucideIcons(this._body);
   }
 
   destroy(): void {

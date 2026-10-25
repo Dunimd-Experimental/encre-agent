@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,8 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for the SSRF guard URL validation and hostname blocking."""
+"""Tests for EncreSSRFGuard URL validation, hostname blocking, and DNS caching.
 
+The guard is the SSRF prevention layer that decides whether an outbound URL
+may be fetched at all. These tests cover construction and default blocklists,
+URL parsing and classification, hostname-to-blocklist lookup, safe hostname
+extraction, DNS result memoization, and cache eviction.
+"""
 
 
 class TestEncreSSRFGuardCreation:
@@ -37,6 +42,7 @@ class TestEncreSSRFGuardCreation:
     defaults so that any guard instance denies internal-network access immediately
     upon creation without requiring explicit configuration.
     """
+
     def test_verify_guard_creation(self):
         """Validate that EncreSSRFGuard instantiates with correct default fields.
 
@@ -54,7 +60,7 @@ class TestEncreSSRFGuardCreation:
 
         The test asserts both _blocked_v4 and _blocked_v6 contain entries, because
         the SSRF guard must deny all RFC 1918, RFC 4193, RFC 3927, RFC 5735,
-        RFC 6598, and other reserved ranges by default 鈥?no empty blocklist is
+        RFC 6598, and other reserved ranges by default -- no empty blocklist is
         acceptable for a security primitive.
         """
         from encre.ssrf import EncreSSRFGuard
@@ -77,13 +83,14 @@ class TestEncreSSRFGuardCreation:
 class TestValidateUrl:
     """Engineered to validate the URL parsing and classification pipeline.
 
-    This test class exercises validate_url across 11 scenarios 鈥?public IPs,
+    This test class exercises validate_url across 11 scenarios -- public IPs,
     localhost, private ranges, IPv6 loopback, zero addresses, link-local,
-    non-HTTP schemes, malformed input, and missing hostnames 鈥?to ensure the
+    non-HTTP schemes, malformed input, and missing hostnames -- to ensure the
     SSRF guard correctly distinguishes safe outbound requests from probes that
     target internal infrastructure. The design gates on scheme (http/https only)
     and IP-classification before any network I/O occurs.
     """
+
     def test_verify_public_ip_urls_are_safe(self):
         """Validate that publicly routable IPs pass SSRF validation.
 
@@ -110,7 +117,7 @@ class TestValidateUrl:
         """Validate that localhost and 127.0.0.1 URLs are rejected.
 
         The test asserts False for both http and https to 127.0.0.1 because
-        localhost addresses are the primary SSRF vector 鈥?an attacker can force
+        localhost addresses are the primary SSRF vector -- an attacker can force
         the host to fetch internal services via 127.0.0.1.
         """
         from encre.ssrf import EncreSSRFGuard
@@ -167,7 +174,7 @@ class TestValidateUrl:
 
         The test submits URLs with ftp://, file://, and ssh:// schemes and
         asserts False for each because the SSRF guard only permits http and
-        https 鈥?any other scheme is an unacceptable protocol for outbound I/O.
+        https -- any other scheme is an unacceptable protocol for outbound I/O.
         """
         from encre.ssrf import EncreSSRFGuard
         guard = EncreSSRFGuard()
@@ -202,12 +209,13 @@ class TestValidateUrl:
 class TestIsBlockedHostname:
     """Engineered to validate the hostname-to-blocklist lookup path.
 
-    This test class exercises is_blocked_hostname across 4 scenarios 鈥?empty
-    strings, localhost aliases, private IPs, and public IPs 鈥?to ensure the
+    This test class exercises is_blocked_hostname across 4 scenarios -- empty
+    strings, localhost aliases, private IPs, and public IPs -- to ensure the
     hostname classifier correctly maps hostnames to their IP-classification
     before performing any DNS lookup. The design short-circuits on empty input
     and known-safe public addresses.
     """
+
     def test_verify_empty_hostname_is_not_blocked(self):
         """Validate that an empty hostname string returns False.
 
@@ -259,12 +267,13 @@ class TestIsBlockedHostname:
 class TestExtractSafeHostname:
     """Engineered to validate the hostname extraction from parsed URLs.
 
-    This test class exercises extract_safe_hostname across 4 scenarios 鈥?safe
-    URLs, blocked URLs, invalid URLs, and URLs with explicit ports 鈥?to ensure
+    This test class exercises extract_safe_hostname across 4 scenarios -- safe
+    URLs, blocked URLs, invalid URLs, and URLs with explicit ports -- to ensure
     the guard returns the canonical hostname and None when the URL would be
     blocked. The design parses the URL, classifies the host, and either
     returns the raw hostname or None to signal rejection upstream.
     """
+
     def test_verify_safe_url_returns_extracted_hostname(self):
         """Validate that a safe URL yields its IP hostname component.
 
@@ -280,7 +289,7 @@ class TestExtractSafeHostname:
         """Validate that a blocked URL yields None instead of a hostname.
 
         The test asserts None because the guard rejects 127.0.0.1 and callers
-        must not receive a hostname to attempt resolution against 鈥?returning
+        must not receive a hostname to attempt resolution against -- returning
         None signals immediate rejection at the extraction stage.
         """
         from encre.ssrf import EncreSSRFGuard
@@ -316,12 +325,14 @@ class TestExtractSafeHostname:
 class TestDNSResolution:
     """Engineered to validate the DNS caching layer inside the SSRF guard.
 
-    This test class exercises DNS resolution behavior across 2 scenarios 鈥?    hostname classification that triggers caching, and cache population
-    verification 鈥?to ensure the guard memoizes resolved addresses and avoids
+    This test class exercises DNS resolution behavior across 2 scenarios --
+    hostname classification that triggers caching, and cache population
+    verification -- to ensure the guard memoizes resolved addresses and avoids
     redundant lookups on repeated hostname checks. The design stores IPs in
     _dns_cache keyed by hostname so that subsequent blocked/allowed decisions
     reuse the cached result within the TTL window.
     """
+
     def test_verify_hostname_classification_populates_cache(self):
         """Validate that is_blocked_hostname caches resolved IP addresses.
 
@@ -349,18 +360,19 @@ class TestDNSResolution:
 class TestClearDNSCache:
     """Engineered to validate the DNS cache eviction mechanism.
 
-    This test class exercises clear_dns_cache across 2 scenarios 鈥?cache
-    emptying after population and idempotent double-clear 鈥?to ensure the
+    This test class exercises clear_dns_cache across 2 scenarios -- cache
+    emptying after population and idempotent double-clear -- to ensure the
     guard can be forced to forget all cached resolutions without crashing.
     The design supports operational resets (e.g. after blocklist updates)
     so that stale cached decisions do not outlive their intended validity.
     """
+
     def test_verify_clear_dns_cache_removes_all_entries(self):
         """Validate that clear_dns_cache empties the cache completely.
 
         The test populates the cache via a hostname lookup, asserts at least
         one entry exists, calls clear_dns_cache, and then asserts the cache
-        is empty 鈥?confirming the eviction path removes every stored entry.
+        is empty -- confirming the eviction path removes every stored entry.
         """
         from encre.ssrf import EncreSSRFGuard
         guard = EncreSSRFGuard()

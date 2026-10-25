@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,8 +49,8 @@ Covered invariants:
    and the loop still builds when no feedback learner is present.
 
 The data root is redirected to ``tmp_path`` (``ENCRE_DATA_DIR``) and the
-reflow's default storage path is monkeypatched onto ``tmp_path`` as well, so
-the real user data directory is never touched.
+reflow's default storage path is resolved through the production
+``get_data_dir`` helper, so the real user data directory is never touched.
 """
 
 import json
@@ -59,7 +59,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from encre import safety_policy as _safety_policy
 from encre.config import EncreConfig
 from encre.improve.feedback.learner import EncreFeedbackLearner
 from encre.loop import EncreLoop
@@ -105,22 +104,18 @@ def learner(tmp_path) -> EncreFeedbackLearner:
 
 @pytest.fixture
 def policy_path(tmp_path, monkeypatch):
-    """Point the reflow's default storage path at ``tmp_path``.
+    """Return the policy path the *real* data-dir resolver produces under ``tmp_path``.
 
     The wiring constructs the reflow without an explicit ``storage_path``, so
-    the module-level resolver is redirected here.  This keeps the real user
-    data directory untouched while still exercising the production constructor
-    path.
+    only the data root is redirected (``ENCRE_DATA_DIR``) -- the resolver
+    itself is left in place so a regression in how the storage path is
+    *computed* fails here instead of being masked by a patched-out resolver.
 
     Returns:
         The path the wired reflow must persist its policy document to.
     """
-    monkeypatch.setattr(
-        _safety_policy,
-        "get_data_dir",
-        lambda *parts, **_kwargs: tmp_path.joinpath(*parts),
-    )
-    return tmp_path / "safety" / "learned_policies.json"
+    monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "data"))
+    return tmp_path / "data" / "safety" / "learned_policies.json"
 
 
 def _config() -> EncreConfig:
@@ -248,12 +243,18 @@ def _boom_reflow(
     """
     if stage == "compile":
         class _CompileBoom(EncreSafetyPolicyReflow):
-            def compile(self):  # noqa: D102 - test double
+            """Reflow test double whose ``compile`` stage always raises."""
+
+            def compile(self):
+                """Raise instead of compiling, simulating a failing compile stage."""
                 raise RuntimeError("compile boom")
         return _CompileBoom(learner, storage_path=storage_path)
 
     class _SyncBoom(EncreSafetyPolicyReflow):
-        def sync_to_native(self, entries=None):  # noqa: D102 - test double
+        """Reflow test double whose ``sync_to_native`` stage always raises."""
+
+        def sync_to_native(self, entries=None):
+            """Raise instead of syncing, simulating a failing native-sync stage."""
             raise RuntimeError("sync boom")
     return _SyncBoom(learner, storage_path=storage_path)
 

@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,10 +21,12 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """
 Vision-Language-Model driven computer use.
 
-This module powers the ``vlm_computer_use`` tool.  It builds on top
+This module powers the ``computer`` tool's ``delegate`` action.  It builds on top
 of :class:`encre.computer.desktop.EncreDesktopSession` (which
 produces screenshots and lets the agent click / type) by adding a
 **visual perception + decision** layer: an external VLM is shown
@@ -34,7 +36,7 @@ that the desktop session can act on.
 
 Why a dedicated module?
 -----------------------
-``computer_use`` style tasks (browser/desktop automation driven by
+``computer`` style tasks (browser/desktop automation driven by
 a multimodal LLM) are a flagship capability of Manus, Claude Code
 and Codex.  Implementing it in a single tool would mix three
 concerns -- screen capture, visual prompting, and action dispatch --
@@ -114,7 +116,7 @@ class VLMDecision:
 
 @dataclass
 class VLMUseResult:
-    """Aggregate result of a ``vlm_computer_use`` call."""
+    """Aggregate result of a ``computer`` delegate call."""
 
     success: bool
     steps_taken: int = 0
@@ -683,7 +685,7 @@ class VLMComputerUseSession:
             try:
                 status = self._dispatch(decision)
             except Exception as exc:
-                logger.warning("[vlm_computer_use] dispatch error: %s", exc)
+                logger.warning("[computer] dispatch error: %s", exc)
                 status = f"error: {exc}"
             history.append(
                 f"{decision.action} -> {status}"
@@ -716,7 +718,7 @@ class VLMComputerUseSession:
             template = get_task_template(template_name)
         except KeyError:
             logger.warning(
-                "[vlm_computer_use] unknown template %r; using generic prompt",
+                "[computer] unknown template %r; using generic prompt",
                 template_name,
             )
             return self.run(goal)
@@ -788,7 +790,7 @@ class VLMComputerUseSession:
             try:
                 status = self._dispatch(decision)
             except Exception as exc:
-                logger.warning("[vlm_computer_use] dispatch error: %s", exc)
+                logger.warning("[computer] dispatch error: %s", exc)
                 status = f"error: {exc}"
             history.append(
                 f"{decision.action} -> {status}"

@@ -1,5 +1,9 @@
 You are initializing a project workspace for future Encre coding agents. Your job is to survey this codebase and create (or improve) an `AGENTS.md` file at the **workspace root** (the same directory that holds the project manifest, next to where `CLAUDE.md` would live). `AGENTS.md` is the industry-standard agent instruction file: it is recognized by Encre (via its Codex-compatibility rules loader) and by virtually every other AI coding agent, so it must be `<workspace-root>/AGENTS.md` — never `.encre/AGENTS.md` or any other custom name (which other agents would not recognize).
 
+If an `AGENTS.md` already exists, that is the normal case, not a blocker: **never stop, never ask for permission, and never just propose changes** — directly supplement, optimize, and refine the existing file in place (fix outdated content, fill missing sections, remove stale or generic text), then report what you changed when you are done.
+
+Resolve ambiguities yourself from code evidence wherever possible. Only when a decision genuinely blocks the work (e.g. the existing AGENTS.md contradicts verified code behavior, or two mutually exclusive scopes both match the user's request), do **not** end the turn with a plain-text question — call the `question` tool with concrete options, wait for the answers, and continue the same run with them. Stopping to ask in plain text wastes the whole survey; the `question` tool keeps the run alive and resumes automatically.
+
 Follow the phases below carefully. Be thorough — a high-quality AGENTS.md saves every future agent hours of ramp-up time. Do not rush: an agent that skips a section of this prompt produces an incomplete AGENTS.md.
 
 ## Phase 1: Survey the Codebase
@@ -179,9 +183,11 @@ client/server boundaries, module dependencies, async/job flows, state management
 
 **When updating an existing AGENTS.md:**
 - Read the current file first
-- Propose specific changes rather than silently overwriting
-- Preserve valuable content the previous author added
-- Add a note about what was updated and why
+- Directly edit the file in place — do not stop to ask for confirmation, and do not present a proposal and wait. If input is truly unavoidable, use the `question` tool (never a plain-text question that ends the run)
+- Supplement it: add missing sections (using the template below) that contain real, verified project knowledge
+- Optimize and refine it: correct outdated commands/paths, tighten vague wording, and remove generic filler that violates the quality rules
+- Preserve valuable content the previous author added — merge new knowledge around it instead of replacing it
+- After finishing, briefly report what you added, fixed, or removed
 
 **For projects with multiple subdirectories (monorepos, multi-module):**
 - Note which modules exist and where they live

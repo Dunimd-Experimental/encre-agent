@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,14 @@
 
 from __future__ import annotations
 
-"""Tests for failover and router backends."""
+"""Tests for the failover and routing backend layers.
+
+Covers :class:`BackendHealth` failure accounting, the :class:`FailoverBackend`
+primary/fallback chain, :class:`Route` category matching, the
+:class:`RouterBackend` wrapper (construction, capability delegation, cost
+tracking, connection-health monitoring and auth exposure), and the
+:class:`CostTracker` and :class:`TaskCategory` supporting types.
+"""
 
 import asyncio
 
@@ -38,7 +45,7 @@ from encre.utils.types import BackendFinish
 
 
 # ===========================================================================
-# MockBackend 鈥?minimal concrete backend for integration tests
+# MockBackend: minimal concrete backend for integration tests
 # ===========================================================================
 
 class MockBackend(BaseBackend):
@@ -97,101 +104,65 @@ class MockBackend(BaseBackend):
 # ===========================================================================
 
 class TestBackendHealth:
-    """Engineered to validate the BackendHealth failure-tracking state machine.
+    """Validates the BackendHealth failure-tracking state machine.
 
-    This test class exercises :class:`BackendHealth` across initialization,
-    failure recording, success-based reset, threshold-based cutover, and manual
-    recovery scenarios to ensure the health monitor exposes a reliable signal
-    for the failover and router components that gate traffic on it.
+    Exercises initialisation, failure recording, success-based reset,
+    threshold-based cutover, and manual recovery. The health monitor is the
+    signal the failover and router components gate traffic on.
     """
 
     def test_verify_initial_health_is_healthy(self):
-        """Validate that a new BackendHealth starts in a healthy state.
-
-        The test constructs a fresh :class:`BackendHealth` and asserts the
-        initial counters and healthy flag because the health monitor must
-        report healthy before any traffic has flowed through the backend.
-        """
+        """A new BackendHealth starts healthy with all counters at zero."""
         bh = BackendHealth(name="openai")
-        # healthy must default to True so new backends accept traffic immediately.
+        # A fresh backend must accept traffic immediately.
         assert bh.healthy is True
-        # consecutive_failures must start at zero to avoid false cutover.
+        # Starting at zero avoids a spurious cutover on the first failure.
         assert bh.consecutive_failures == 0
-        # total_failures and total_requests must start at zero.
         assert bh.total_failures == 0
         assert bh.total_requests == 0
 
     def test_verify_record_failure_updates_counters(self):
-        """Validate that record_failure increments failure counters.
-
-        The test records a single timeout failure and asserts the consecutive
-        and total failure counters rise, the request counter rises, and the
-        last_error string is preserved because the router reads these fields
-        to decide whether to flag the backend as degraded.
-        """
+        """record_failure increments the failure and request counters and stores last_error."""
         bh = BackendHealth(name="openai")
         bh.record_failure("timeout")
-        # Consecutive failures must increment on each recorded failure.
+        # The streak counter drives the degradation decision.
         assert bh.consecutive_failures == 1
-        # Total failures must also increment and never decrease.
+        # The lifetime total only ever grows.
         assert bh.total_failures == 1
-        # Total requests must increment to track throughput.
         assert bh.total_requests == 1
-        # last_error must preserve the most recent error message.
         assert bh.last_error == "timeout"
 
     def test_verify_record_success_resets_consecutive_failures(self):
-        """Validate that record_success resets consecutive failures without masking totals.
-
-        The test records two failures followed by a success and asserts the
-        consecutive counter drops to zero while total_requests has accumulated
-        all three events because the failover logic uses consecutive failures
-        as the primary degradation signal while retaining total counters for
-        observability.
-        """
+        """record_success breaks the failure streak without masking lifetime totals."""
         bh = BackendHealth(name="openai")
         bh.record_failure("err1")
         bh.record_failure("err2")
         bh.record_success()
         # Consecutive failures must reset after a success.
         assert bh.consecutive_failures == 0
-        # Total requests must reflect all events including the success.
+        # Total requests counts successes as well as failures.
         assert bh.total_requests == 3
-        # Backend must remain healthy after recovery.
         assert bh.healthy is True
 
     def test_verify_consecutive_failures_trigger_unhealthy(self):
-        """Validate that exceeding the failure threshold flips healthy to False.
-
-        The test records three consecutive failures and asserts healthy becomes
-        False because the backend is considered degraded once the consecutive
-        failure threshold is crossed, which triggers failover bypass.
-        """
+        """Crossing the failure threshold flips healthy to False."""
         bh = BackendHealth(name="openai")
         for i in range(3):
             bh.record_failure(f"error {i}")
-        # healthy must flip to False once the threshold is exceeded.
         assert bh.healthy is False
 
     def test_verify_manual_recovery_resets_state(self):
-        """Validate that manual recovery clears failures and restores health.
-
-        The test drives the backend unhealthy, rewinds last_checked into the
-        past, manually sets healthy=True and consecutive_failures=0, then
-        asserts the recovery took effect because operators may inject manual
-        probes after a known outage window.
-        """
+        """Manual recovery via direct field writes restores healthy status."""
         import time
         bh = BackendHealth(name="openai")
         for _ in range(3):
             bh.record_failure("timeout")
         # Confirm unhealthy before manual intervention.
         assert bh.healthy is False
-        # Simulate grace period passing and probe
+        # Rewind last_checked past the retry grace period, then clear the streak.
         bh.last_checked = time.time() - 400
         bh.healthy = True
         bh.consecutive_failures = 0
-        # Manual recovery must restore healthy status.
         assert bh.healthy is True
 
 
@@ -200,23 +171,15 @@ class TestBackendHealth:
 # ===========================================================================
 
 class TestFailoverBackend:
-    """Engineered to validate the FailoverBackend primary/fallback chain.
+    """Validates the FailoverBackend primary/fallback chain.
 
-    This test class exercises :class:`FailoverBackend` across creation,
-    active-backend selection, health reporting, capability delegation,
-    multi-backend chains, empty-input rejection, token counting, and
-    async teardown scenarios to ensure the failover wrapper satisfies the
-    BaseBackend contract regardless of the underlying backend stack.
+    Covers construction, active-backend selection, health reporting, capability
+    delegation, multi-backend chains, empty-input rejection, token counting, and
+    async teardown, so the wrapper always satisfies the BaseBackend contract.
     """
 
     def test_verify_failover_backend_creation(self):
-        """Validate that FailoverBackend accepts a primary/fallback pair.
-
-        The test creates two real backends and wraps them in a
-        :class:`FailoverBackend`, asserting the wrapper is instantiable and
-        itself a BaseBackend because the router must be able to pass the
-        wrapper through the same interface as a plain backend.
-        """
+        """FailoverBackend wraps a primary/fallback pair and stays a BaseBackend."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         fb = FailoverBackend(backends=[("primary", be1), ("fallback", be2)])
@@ -224,126 +187,73 @@ class TestFailoverBackend:
         assert isinstance(fb, BaseBackend)
 
     def test_verify_active_backend_starts_as_primary(self):
-        """Validate that the first backend in the chain is selected as active.
-
-        The test constructs a failover wrapper with openai first and asserts
-        active_backend_name equals 'openai' because the primary must serve
-        traffic initially until a failure triggers cutover.
-        """
+        """The first backend in the chain is elected active on construction."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         fb = FailoverBackend(backends=[("openai", be1), ("anthropic", be2)])
-        # Primary backend must be elected on construction.
         assert fb.active_backend_name == "openai"
 
     def test_verify_get_health_reports_all_backends(self):
-        """Validate that get_health exposes every registered backend's status.
-
-        The test builds a two-backend failover chain and asserts both names
-        appear in the health map and that the primary reports healthy because
-        the health endpoint is the primary observability contract for SRE tooling.
-        """
+        """get_health reports every registered backend, with the primary healthy."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         fb = FailoverBackend(backends=[("openai", be1), ("anthropic", be2)])
         health = fb.get_health()
-        # Both backends must appear in the health report.
         assert "openai" in health
         assert "anthropic" in health
-        # Primary must report healthy on a fresh chain.
+        # A fresh chain has no failures, so the primary must report healthy.
         assert health["openai"]["healthy"] is True
 
     def test_verify_context_window_size_delegates_correctly(self):
-        """Validate that context_window_size returns a positive integer.
-
-        The test delegates to :meth:`FailoverBackend.context_window_size` and
-        asserts the result is greater than zero because the router uses this
-        value to cap prompt size before dispatch.
-        """
+        """context_window_size delegates to a backend and returns a positive size."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         fb = FailoverBackend(backends=[("p", be1), ("f", be2)])
-        # Delegated window size must be a meaningful positive integer.
         assert fb.context_window_size() > 0
 
     def test_verify_supports_tool_calling_delegation(self):
-        """Validate that supports_tool_calling returns a strict bool.
-
-        The test delegates to :meth:`FailoverBackend.supports_tool_calling`
-        and asserts a bool is returned because the router branches on this
-        flag when constructing tool-use prompts.
-        """
+        """supports_tool_calling delegates and returns a strict bool."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         fb = FailoverBackend(backends=[("p", be1), ("f", be2)])
         assert isinstance(fb.supports_tool_calling(), bool)
 
     def test_verify_supports_thinking_delegation(self):
-        """Validate that supports_thinking returns a strict bool.
-
-        The test delegates to :meth:`FailoverBackend.supports_thinking` and
-        asserts a bool because the agent loop gates extended-reasoning
-        payloads on this capability flag.
-        """
+        """supports_thinking delegates and returns a strict bool."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         fb = FailoverBackend(backends=[("p", be1), ("f", be2)])
         assert isinstance(fb.supports_thinking(), bool)
 
     def test_verify_supports_prompt_caching_delegation(self):
-        """Validate that supports_prompt_caching returns a strict bool.
-
-        The test delegates to :meth:`FailoverBackend.supports_prompt_caching`
-        and asserts a bool because prompt-caching eligibility affects cost
-        estimation and request shaping.
-        """
+        """supports_prompt_caching delegates and returns a strict bool."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         fb = FailoverBackend(backends=[("p", be1), ("f", be2)])
         assert isinstance(fb.supports_prompt_caching(), bool)
 
     def test_verify_three_backend_chain(self):
-        """Validate that a three-backend chain reports all members healthy.
-
-        The test constructs a primary/fallback/third chain and asserts the
-        primary is elected and the health map contains all three entries
-        because linear chains are a common production deployment pattern.
-        """
+        """A three-backend chain elects the first backend and reports all three."""
         be1 = create_backend("openai", api_key="sk-fake")
         be2 = create_backend("anthropic", api_key="sk-ant-fake")
         be3 = create_backend("deepseek", api_key="sk-fake")
         fb = FailoverBackend(backends=[("a", be1), ("b", be2), ("c", be3)])
-        # Primary must be elected on construction.
         assert fb.active_backend_name == "a"
-        # Health report must cover every registered backend.
         assert len(fb.get_health()) == 3
 
     def test_verify_empty_backends_raises(self):
-        """Validate that FailoverBackend rejects an empty backend list.
-
-        The test passes an empty list and asserts a ValueError is raised
-        because a failover wrapper without at least one backend is meaningless
-        and must fail loudly at construction time.
-        """
+        """An empty backend list is rejected with ValueError."""
         with pytest.raises(ValueError, match="At least one backend"):
             FailoverBackend(backends=[])
 
     def test_verify_count_tokens_delegates(self):
-        """Validate that count_tokens delegates to the active backend.
-
-        The test wraps a single backend and asserts the token-count result is
-        an integer because the router feeds this value into budget checks.
-        """
+        """count_tokens delegates to the active backend and returns an int."""
         be1 = create_backend("openai", api_key="sk-fake")
         fb = FailoverBackend(backends=[("p", be1)])
         assert isinstance(fb.count_tokens("hello"), int)
 
     def test_verify_aclose_teardown(self):
-        """Validate that aclose completes without error.
-
-        The test invokes :meth:`FailoverBackend.aclose` and asserts it finishes
-        because the gateway must be able to drain backends cleanly on shutdown.
-        """
+        """aclose drains the backends without raising."""
         be1 = create_backend("openai", api_key="sk-fake")
         fb = FailoverBackend(backends=[("p", be1)])
         asyncio.run(fb.aclose())
@@ -354,56 +264,35 @@ class TestFailoverBackend:
 # ===========================================================================
 
 class TestRoute:
-    """Engineered to validate the Route category-matching behavior.
+    """Validates the Route category-matching behaviour.
 
-    This test class exercises :class:`Route` across construction, coding-prompt
-    matching, research-prompt matching, and no-match scenarios to ensure the
-    route classifier produces sensible confidence scores for the router backend.
+    Covers construction, coding-prompt matches, research-prompt matches, and
+    no-match cases, producing the confidence scores the router ranks routes by.
     """
 
     def test_verify_route_creation(self):
-        """Validate that Route stores category and defaults priority to zero.
-
-        The test constructs a :class:`Route` bound to CODING and asserts the
-        category matches and priority defaults to zero because routes are
-        sorted by priority before matching.
-        """
+        """Route stores its category and defaults priority to zero."""
         backend = create_backend("openai", api_key="sk-fake")
         route = Route(category=TaskCategory.CODING, backend=backend)
         assert route.category == TaskCategory.CODING
         assert route.priority == 0
 
     def test_verify_route_matches_coding_prompt(self):
-        """Validate that a CODING route yields positive confidence for code prompts.
-
-        The test feeds a coding-oriented prompt into :meth:`Route.matches` and
-        asserts the confidence is greater than zero because the router uses
-        this score to select the most appropriate backend for a task.
-        """
+        """A CODING route gives code-generation prompts positive confidence."""
         backend = create_backend("openai", api_key="sk-fake")
         route = Route(category=TaskCategory.CODING, backend=backend)
         confidence = route.matches("write a python function to sort a list")
         assert confidence > 0.0
 
     def test_verify_route_matches_research_prompt(self):
-        """Validate that a RESEARCH route yields positive confidence for research prompts.
-
-        The test feeds a research-oriented prompt into :meth:`Route.matches`
-        and asserts the confidence is greater than zero because the router
-        must distinguish research queries from code-generation queries.
-        """
+        """A RESEARCH route gives research prompts positive confidence."""
         backend = create_backend("openai", api_key="sk-fake")
         route = Route(category=TaskCategory.RESEARCH, backend=backend)
         confidence = route.matches("research the best database for microservices")
         assert confidence > 0.0
 
     def test_verify_route_no_match_for_unrelated_prompt(self):
-        """Validate that a CODING route scores unrelated chit-chat as zero.
-
-        The test feeds a casual greeting into a CODING route and asserts
-        confidence equals zero because the router should not route generic
-        conversational input into code-specialist backends.
-        """
+        """A CODING route scores unrelated chit-chat as zero."""
         backend = create_backend("openai", api_key="sk-fake")
         route = Route(category=TaskCategory.CODING, backend=backend)
         confidence = route.matches("hello how are you")
@@ -415,99 +304,59 @@ class TestRoute:
 # ===========================================================================
 
 class TestRouterBackend:
-    """Engineered to validate the RouterBackend construction and basic contracts.
+    """Validates the RouterBackend construction and basic contracts.
 
-    This test class exercises :class:`RouterBackend` across creation, last-route
-    defaults, capability delegation, cost-tracking toggle, and stats structure
-    scenarios to ensure the router wrapper satisfies the BaseBackend contract
-    regardless of whether per-category routing or cost observation is enabled.
+    Covers creation, last-route defaults, capability delegation, the cost
+    tracking toggle, and the stats structure, so the wrapper satisfies the
+    BaseBackend contract with or without category routes or cost observation.
     """
 
     def test_verify_router_backend_creation(self):
-        """Validate that RouterBackend is instantiable and satisfies BaseBackend.
-
-        The test constructs a router with one CODING route and a default
-        backend, then asserts the wrapper passes isinstance checks because
-        downstream code must be able to swap RouterBackend in place of a plain
-        backend without refactoring call sites.
-        """
+        """RouterBackend is instantiable and satisfies the BaseBackend interface."""
         routes = {TaskCategory.CODING: create_backend("openai", api_key="sk-fake")}
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes=routes, default=default)
         assert isinstance(rb, BaseBackend)
 
     def test_verify_last_route_defaults_to_default_label(self):
-        """Validate that last_route starts as 'default' before any chat call.
-
-        The test asserts rb.last_route == 'default' because the router must
-        expose a stable label for observability even before the first request.
-        """
+        """last_route is 'default' before any chat call."""
         routes = {TaskCategory.CODING: create_backend("openai", api_key="sk-fake")}
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes=routes, default=default)
         assert rb.last_route == "default"
 
     def test_verify_context_window_size_delegation(self):
-        """Validate that context_window_size delegates to the default backend.
-
-        The test constructs a router with no category routes and asserts the
-        delegated window size is positive because the router must always
-        expose a sensible upper bound even when no routing rules apply.
-        """
+        """context_window_size delegates to the default backend and stays positive."""
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes={}, default=default)
         assert rb.context_window_size() > 0
 
     def test_verify_supports_tool_calling_delegation(self):
-        """Validate that supports_tool_calling returns a bool from the default backend.
-
-        The test asserts a bool because the caller branches on this flag when
-        building tool-use prompts and must not receive None or a non-bool.
-        """
+        """supports_tool_calling returns a bool from the default backend."""
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes={}, default=default)
         assert isinstance(rb.supports_tool_calling(), bool)
 
     def test_verify_supports_thinking_delegation(self):
-        """Validate that supports_thinking returns a bool from the default backend.
-
-        The test asserts a bool because the agent loop gates reasoning-mode
-        payloads on this capability flag.
-        """
+        """supports_thinking returns a bool from the default backend."""
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes={}, default=default)
         assert isinstance(rb.supports_thinking(), bool)
 
     def test_verify_cost_tracker_enabled_flag(self):
-        """Validate that track_costs=True attaches a CostTracker instance.
-
-        The test constructs a router with cost tracking enabled and asserts
-        cost_tracker is not None because the router exposes per-request cost
-        data to callers only when tracking is explicitly enabled.
-        """
+        """track_costs=True attaches a CostTracker instance."""
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes={}, default=default, track_costs=True)
         assert rb.cost_tracker is not None
 
     def test_verify_cost_tracker_disabled_flag(self):
-        """Validate that track_costs=False leaves cost_tracker unset.
-
-        The test constructs a router with cost tracking disabled and asserts
-        cost_tracker is None because disabling the feature must avoid
-        allocating tracking overhead.
-        """
+        """track_costs=False leaves cost_tracker unset to avoid allocation overhead."""
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes={}, default=default, track_costs=False)
         assert rb.cost_tracker is None
 
     def test_verify_route_stats_contains_all_keys(self):
-        """Validate that route_stats exposes both the default and category entries.
-
-        The test constructs a router with one CODING route and asserts the
-        stats dict contains 'default' and TaskCategory.CODING because the
-        stats contract is used by dashboards and logs to render per-route
-        request counts.
-        """
+        """route_stats contains both the default entry and each category route."""
         routes = {TaskCategory.CODING: create_backend("openai", api_key="sk-fake")}
         default = create_backend("openai", api_key="sk-fake")
         rb = RouterBackend(routes=routes, default=default)
@@ -518,28 +367,21 @@ class TestRouterBackend:
 
 
 # ===========================================================================
-# RouterBackend 鈥?Connection monitor & Auth integration
+# RouterBackend: connection monitor and auth integration
 # ===========================================================================
 
 class TestRouterBackendIntegration:
-    """Engineered to validate connection-health monitoring and auth exposure.
+    """Validates connection-health monitoring and auth exposure.
 
-    This test class exercises :class:`RouterBackend` against :class:`MockBackend`
-    instances that simulate failures, combined with an :class:`AuthManager`, to
-    ensure the connection monitor records failures, surface health correctly,
-    and that degraded routes trigger fallback while preserving the original
-    selection when every route is degraded.
+    Drives :class:`RouterBackend` against failing :class:`MockBackend` instances
+    plus an :class:`AuthManager`, checking that failures are recorded, health is
+    surfaced, degraded routes fall back to the default, and the original
+    selection is preserved when every route is degraded.
     """
 
     @pytest.mark.asyncio
     async def test_verify_get_health_exposes_connection_and_auth(self):
-        """Validate that get_health returns connection and auth sections.
-
-        The test asserts the health map contains 'connection', 'auth', and
-        'last_route' keys because the gateway health endpoint must expose all
-        three dimensions so operators can inspect routing health independently
-        of auth state.
-        """
+        """get_health exposes connection, auth, and last_route sections."""
         coding = MockBackend(name="coding")
         default = MockBackend(name="default")
         rb = RouterBackend(routes={TaskCategory.CODING: coding}, default=default)
@@ -552,12 +394,7 @@ class TestRouterBackendIntegration:
 
     @pytest.mark.asyncio
     async def test_verify_auth_manager_visible_in_health(self):
-        """Validate that an attached AuthManager appears in the health report.
-
-        The test attaches an :class:`AuthManager` and asserts health['auth'] is
-        not None and exposes the provider name and a primary-key flag because
-        auth visibility is required for on-call diagnosis of credential issues.
-        """
+        """An attached AuthManager is reported with its provider and key state."""
         auth = AuthManager(provider="test", api_key="sk-test")
         coding = MockBackend(name="coding")
         default = MockBackend(name="default")
@@ -572,13 +409,7 @@ class TestRouterBackendIntegration:
 
     @pytest.mark.asyncio
     async def test_verify_connection_failure_is_recorded(self):
-        """Validate that a chat-time connection error increments failure counters.
-
-        The test sends a coding prompt through a failing MockBackend and asserts
-        the connection monitor recorded at least one consecutive and total
-        failure on the CODING route because the router must mark degraded
-        routes so subsequent requests can be routed around them.
-        """
+        """A chat-time connection error increments the route failure counters."""
         coding = MockBackend(name="coding", fail_on_call=True)
         default = MockBackend(name="default")
         rb = RouterBackend(routes={TaskCategory.CODING: coding}, default=default)
@@ -589,7 +420,7 @@ class TestRouterBackendIntegration:
             ):
                 pass
 
-        # Verify the coding route got a failure recorded.
+        # The coding route must have picked up the failure.
         rh = rb._connection_monitor.get_health(TaskCategory.CODING)
         assert rh is not None
         assert rh.consecutive_failures >= 1
@@ -597,13 +428,7 @@ class TestRouterBackendIntegration:
 
     @pytest.mark.asyncio
     async def test_verify_successful_call_resets_consecutive_failures(self):
-        """Validate that a successful call clears consecutive failures.
-
-        The test pre-records a failure on the CODING route, confirms the
-        counter is one, then runs a successful chat and asserts the counter
-        drops back to zero because success must erase the streak even if
-        total_failures remains elevated for observability.
-        """
+        """A successful call clears the consecutive-failure streak."""
         coding = MockBackend(name="coding")
         default = MockBackend(name="default")
         rb = RouterBackend(routes={TaskCategory.CODING: coding}, default=default)
@@ -625,23 +450,17 @@ class TestRouterBackendIntegration:
 
     @pytest.mark.asyncio
     async def test_verify_degraded_route_falls_back_to_default(self):
-        """Validate that a degraded CODING route causes fallback to the default.
-
-        The test drives three consecutive failures on the CODING route to push
-        it into a degraded state, then sends a coding prompt and asserts
-        last_route switches to 'default' because the router must redirect away
-        from degraded routes to maintain service availability.
-        """
+        """A degraded CODING route causes fallback to the default backend."""
         coding = MockBackend(name="coding")
         default = MockBackend(name="default")
         rb = RouterBackend(routes={TaskCategory.CODING: coding}, default=default)
 
-        # Degrade the coding route.
+        # Push the coding route past the degradation threshold.
         for _ in range(3):
             rb._connection_monitor.record_failure(TaskCategory.CODING, "timeout")
         assert rb._connection_monitor.is_degraded(TaskCategory.CODING)
 
-        # Chat with a coding prompt 鈥?should fall back to default.
+        # Coding prompt, but the degraded route should fall back to default.
         async for _ in rb.chat(
             messages=[{"role": "user", "content": "write a python function"}]
         ):
@@ -651,14 +470,7 @@ class TestRouterBackendIntegration:
 
     @pytest.mark.asyncio
     async def test_verify_all_routes_degraded_preserves_original_selection(self):
-        """Validate that the router keeps the original selection when every route is degraded.
-
-        The test drives both the CODING route and the default route into a
-        degraded state, then sends a coding prompt and asserts the router
-        still attempts the originally selected route ('coding') instead of
-        silently collapsing to default, because fallback should only apply
-        when at least one non-degraded alternative exists.
-        """
+        """When every route is degraded the router keeps its original selection."""
         coding = MockBackend(name="coding", fail_on_call=True)
         default = MockBackend(name="default", fail_on_call=True)
         rb = RouterBackend(routes={TaskCategory.CODING: coding}, default=default)
@@ -670,7 +482,7 @@ class TestRouterBackendIntegration:
         assert rb._connection_monitor.is_degraded(TaskCategory.CODING)
         assert rb._connection_monitor.is_degraded("default")
 
-        # All degraded 鈥?should use original selection (coding) despite degradation.
+        # All degraded: use the original selection (coding) despite degradation.
         with pytest.raises(httpx.ConnectError):
             async for _ in rb.chat(
                 messages=[{"role": "user", "content": "write a python function"}]
@@ -681,13 +493,7 @@ class TestRouterBackendIntegration:
 
     @pytest.mark.asyncio
     async def test_verify_non_connection_error_is_still_recorded(self):
-        """Validate that non-connection errors (e.g. ValueError) are recorded too.
-
-        The test configures a MockBackend that raises ValueError on call and
-        asserts the connection monitor still records a failure because any
-        persistent error class should contribute to the degradation signal,
-        not just network-level exceptions.
-        """
+        """Non-connection errors such as ValueError still count as failures."""
         coding = MockBackend(
             name="coding", fail_on_call=True,
             fail_error=ValueError("bad request"),
@@ -711,21 +517,15 @@ class TestRouterBackendIntegration:
 # ===========================================================================
 
 class TestCostTracker:
-    """Engineered to validate the CostTracker accumulation and serialization.
+    """Validates CostTracker accumulation and serialisation.
 
-    This test class exercises :class:`CostTracker` across initialization,
-    single-model recording, multi-model aggregation, cache-aware recording,
-    and dict export scenarios to ensure cost accounting remains accurate
+    Covers initial state, single-model recording, multi-model aggregation,
+    cache-aware recording, and dict export so cost accounting stays accurate
     across heterogeneous backend usage.
     """
 
     def test_verify_cost_tracker_initial_state(self):
-        """Validate that a fresh CostTracker starts at zero for every counter.
-
-        The test asserts total_cost_usd, input/output tokens, and cache tokens
-        are all zero because the tracker must begin from a clean slate each
-        time a new router instance is constructed.
-        """
+        """A fresh CostTracker starts at zero for every counter."""
         ct = CostTracker()
         assert ct.total_cost_usd == 0.0
         assert ct.total_input_tokens == 0
@@ -733,12 +533,7 @@ class TestCostTracker:
         assert ct.cache_hit_tokens == 0
 
     def test_verify_record_usage_accumulates_correctly(self):
-        """Validate that record() accumulates tokens and cost for one model.
-
-        The test records a single usage event and asserts the counters and
-        the per-model request tally because cost dashboards render these
-        figures per model and in aggregate.
-        """
+        """record() accumulates tokens, cost, and the per-model request tally."""
         ct = CostTracker()
         ct.record(model="gpt-5.6", input_tokens=100, output_tokens=50, cost_usd=0.0005)
         assert ct.total_input_tokens == 100
@@ -747,13 +542,7 @@ class TestCostTracker:
         assert ct.requests_by_model["gpt-5.6"] == 1
 
     def test_verify_multiple_models_aggregate_correctly(self):
-        """Validate that recording across models produces correct totals.
-
-        The test records two events for different models and asserts the
-        aggregated token counts, total cost, per-model cost map size, and
-        per-model request tallies because billing reports must sum across
-        all models while preserving per-model breakdowns.
-        """
+        """Recording across models sums the totals while keeping per-model maps."""
         ct = CostTracker()
         ct.record(model="gpt-5.6", input_tokens=100, output_tokens=50, cost_usd=0.0005)
         ct.record(model="claude-sonnet-5", input_tokens=200, output_tokens=100, cost_usd=0.003)  # noqa: E501
@@ -765,12 +554,7 @@ class TestCostTracker:
         assert ct.requests_by_model["claude-sonnet-5"] == 1
 
     def test_verify_cache_hit_tokens_and_savings_are_recorded(self):
-        """Validate that cache-hit fields are recorded when present.
-
-        The test records a usage event carrying cache_hit and cache_savings
-        and asserts those fields appear in the tracker because prompt-cache
-        reporting requires separate counters from the raw token totals.
-        """
+        """Cache-hit tokens and savings are tracked separately from raw totals."""
         ct = CostTracker()
         ct.record(model="claude-sonnet-5", input_tokens=1000, output_tokens=50,
                   cost_usd=0.01, cache_hit=500, cache_savings=0.005)
@@ -778,13 +562,7 @@ class TestCostTracker:
         assert ct.cache_savings_usd == 0.005
 
     def test_verify_to_dict_exports_accumulated_state(self):
-        """Validate that to_dict returns the full accumulated cost report.
-
-        The test records one event, calls :meth:`CostTracker.to_dict`, and
-        asserts the output contains the top-level token/cost fields plus
-        the nested per-model maps because the exported dict is consumed by
-        logging, metrics endpoints, and billing exporters.
-        """
+        """to_dict exports the top-level totals plus the nested per-model maps."""
         ct = CostTracker()
         ct.record(model="gpt-5.6", input_tokens=100, output_tokens=50, cost_usd=0.0005)
         d = ct.to_dict()
@@ -799,20 +577,14 @@ class TestCostTracker:
 # ===========================================================================
 
 class TestTaskCategory:
-    """Engineered to validate the TaskCategory string constants.
+    """Validates the TaskCategory string constants.
 
-    This test class asserts that every expected category constant maps to its
-    canonical string value because the router performs string comparison on
-    these constants when selecting routes and reporting stats.
+    Asserts every category constant maps to its canonical string, since the
+    router compares these strings when selecting routes and reporting stats.
     """
 
     def test_verify_all_category_constants_are_defined(self):
-        """Validate that every TaskCategory constant matches its canonical string.
-
-        The test asserts each constant against its expected value because the
-        router and the front-end dashboard share these strings and must stay
-        in sync to avoid silent misrouting.
-        """
+        """Every TaskCategory constant matches its canonical string value."""
         assert TaskCategory.CLASSIFICATION == "classification"
         assert TaskCategory.REASONING == "reasoning"
         assert TaskCategory.CODING == "coding"

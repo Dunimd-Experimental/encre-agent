@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Semantic, pattern-aware context compaction utilities.
 
@@ -56,7 +58,7 @@ _TOOL_OUTPUT_HINTS: dict[str, str] = {
     "file_read": "preserve function signatures and docstrings only",
     "web_fetch": "extract title, key facts, and links",
     "web_search": "extract result titles and URLs only",
-    "task_list": "preserve task IDs, subjects, and statuses",
+    "task": "preserve task IDs, subjects, and statuses",
 }
 
 
@@ -131,7 +133,7 @@ class SemanticToolOutputCompactor:
             return self._compact_file_read(output)
         if tool_name in ("web_fetch",):
             return self._compact_web_fetch(output)
-        if tool_name in ("task_list", "task_get"):
+        if tool_name in ("task",):
             return self._compact_task_output(output)
 
         # Default: keep first and last chunks

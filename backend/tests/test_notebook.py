@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,23 +23,30 @@
 
 from __future__ import annotations
 
-"""Tests for encre.notebook.session -- EncreNotebookSession."""
+"""Tests for encre.notebook.session -- EncreNotebookSession.
+
+Covers session construction (default and custom kernel names, UUID
+session IDs, initial stopped state, empty cell map, and the kernel
+bootstrap script markers), cell lifecycle management (creation, editing,
+deletion, output/error lookups, and ordered multi-cell notebooks),
+state serialisation via get_state, and idempotent shutdown through close.
+"""
 
 import uuid
 
-# ===========================================================================
-# EncreNotebookSession construction
-# ===========================================================================
+
+# ---- EncreNotebookSession construction ----
+
 
 class TestEncreNotebookSessionConstruction:
-    """Engineered to validate EncreNotebookSession initialisation invariants.
+    """Validate EncreNotebookSession construction invariants.
 
-The class confirms that sessions default to the python3 kernel,
-accept arbitrary kernel names, generate unique UUID session IDs per
-instance, start in a stopped state with an empty cell map, and
-generate a kernel bootstrap script containing the required
-import sys / exec( / __SHUTDOWN__ markers.
-"""
+    The class confirms that sessions default to the python3 kernel,
+    accept arbitrary kernel names, generate a unique UUID session ID per
+    instance, start in a stopped state with an empty cell map, and
+    generate a kernel bootstrap script containing the required
+    import sys / exec( / __SHUTDOWN__ markers.
+    """
 
     def test_verify_session_construction_default_kernel(self):
         """Validate that EncreNotebookSession defaults to the python3 kernel."""
@@ -66,7 +73,7 @@ import sys / exec( / __SHUTDOWN__ markers.
         from encre.notebook.session import EncreNotebookSession
         sess = EncreNotebookSession()
         assert isinstance(sess.session_id, str)
-        # Should be a valid UUID
+        # Parsing must not raise; a malformed ID would fail here.
         uuid.UUID(sess.session_id)
 
     def test_verify_session_each_has_unique_id(self):
@@ -99,19 +106,18 @@ import sys / exec( / __SHUTDOWN__ markers.
         assert "__SHUTDOWN__" in sess._kernel_script
 
 
-# ===========================================================================
-# EncreNotebookSession cell management
-# ===========================================================================
+# ---- EncreNotebookSession cell management ----
+
 
 class TestEncreNotebookSessionCells:
-    """Engineered to validate cell lifecycle operations on EncreNotebookSession.
+    """Validate cell lifecycle operations on EncreNotebookSession.
 
-Tests cover cell creation (ID generation, default code type, explicit
-markdown type), ordered multi-cell creation, cell editing (code
-update and status/output reset), cell deletion (including preservation
-of sibling order), and non-existent-cell error handling (return False
-or empty string rather than raising).
-"""
+    Tests cover cell creation (ID generation, default code type, explicit
+    markdown type), ordered multi-cell creation, cell editing (code
+    update and status/output reset), cell deletion (including preservation
+    of sibling order), and non-existent-cell error handling (return False
+    or empty string rather than raising).
+    """
 
     def test_verify_cell_create_returns_id(self):
         """Validate that create_cell returns an 8-character string ID."""
@@ -228,23 +234,22 @@ or empty string rather than raising).
         from encre.notebook.session import EncreNotebookSession
         sess = EncreNotebookSession()
         cell_id = sess.create_cell(code="x = 1")
-        # Cell hasn't been executed, so output is empty
+        # The cell has not been executed yet, so there is no output.
         assert sess.get_output(cell_id) == ""
 
 
-# ===========================================================================
-# EncreNotebookSession state
-# ===========================================================================
+# ---- EncreNotebookSession state ----
+
 
 class TestEncreNotebookSessionState:
-    """Engineered to validate the session state serialisation contract.
+    """Validate the session state serialisation contract.
 
-Tests confirm that get_state returns a dict with the required keys
-(session_id, kernel_name, cells, cell_count), that cell entries
-contain all expected fields (id, code, cell_type, output, error,
-status, execution_time), and that newly-created cells start in idle
-status with zero execution time.
-"""
+    Tests confirm that get_state returns a dict with the required keys
+    (session_id, kernel_name, cells, cell_count), that cell entries
+    contain all expected fields (id, code, cell_type, output, error,
+    status, execution_time), and that newly-created cells start in idle
+    status with zero execution time.
+    """
 
     def test_verify_state_get_state_initial(self):
         """Validate that get_state returns correct initial values."""
@@ -296,17 +301,16 @@ status with zero execution time.
         assert state["cells"][0]["execution_time"] == 0.0
 
 
-# ===========================================================================
-# EncreNotebookSession close
-# ===========================================================================
+# ---- EncreNotebookSession close ----
+
 
 class TestEncreNotebookSessionClose:
-    """Engineered to validate session shutdown behaviour.
+    """Validate session shutdown behaviour.
 
-Tests assert that calling close before the kernel is started is safe
-(no exception, state remains stopped), and that repeated calls are
-idempotent -- a second close must not re-raise or corrupt state.
-"""
+    Tests assert that calling close before the kernel is started is safe
+    (no exception, state remains stopped), and that repeated calls are
+    idempotent -- a second close must not re-raise or corrupt state.
+    """
 
     def test_verify_close_before_kernel_started_does_not_raise(self):
         """Validate that close before kernel start is safe and idempotent."""

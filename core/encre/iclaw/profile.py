@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,19 +23,34 @@
 
 from __future__ import annotations
 
-"""iClaw launcher profile: self-improvement add-ons over the core server.
+"""iClaw launcher profile: self-improvement add-ons layered over the server.
 
-The former ``IClawEngine`` re-assembled the entire runtime (sessions,
-router, WS transport, scheduler, hooks, safety, plugins) that
-:class:`encre.server.app.EncreServer` already provides.  That duplication
-is gone: the daemon now boots through the core server launcher and this
-profile layers only what is unique to iClaw:
+The core server launcher already owns the runtime -- sessions, router, WS
+transport, scheduler, hooks, safety, plugins. This profile deliberately does
+not re-create any of that; it layers only what is unique to iClaw on top of
+:class:`encre.server.app.EncreServer`:
 
 - learning / evolution / reflex / metacognition / feedback subsystems
 - memory consolidator and goal runner
 - the post-run self-improvement pipeline
 - housekeeping loops (cleanup, heartbeat, reflex scan)
 - the channel submit pipeline (hooks + compaction + learning feed)
+
+Data flow: a channel prompt arrives at :meth:`IclawProfile.submit` or
+:meth:`IclawProfile.submit_stream`, which delegates execution to
+:class:`encre.protocol.session_router.EventRouter` (the same router the
+gateway and desktop path use), observes the event stream for tool activity,
+and then feeds a :class:`encre.iclaw.post_run.PostRunPipeline` so the run is
+reflected back into the agent's memory, evolution, and feedback state.
+
+Public API (mirrors the established iClaw engine surface so callers are
+unchanged):
+
+- :meth:`IclawProfile.start` / :meth:`IclawProfile.stop`
+- :meth:`IclawProfile.submit` / :meth:`IclawProfile.submit_stream`
+- :meth:`IclawProfile.run_goal` / :meth:`IclawProfile.run_swarm`
+- :meth:`IclawProfile.schedule_job` / :meth:`IclawProfile.cancel_job`
+- :meth:`IclawProfile.get_stats` / :meth:`IclawProfile.get_health`
 """
 
 import asyncio
@@ -49,7 +64,7 @@ from typing import Any
 
 from encre.agent import EncreAgent
 from encre.compact.engine import EncreCompactEngine
-from encre.compact.strategies import EncreMultiStagePipeline
+from encre.compact.engine import EncreMultiStagePipeline
 from encre.config import EncreConfig, get_data_dir
 from encre.goal import (
     EncreGoalRunner,
@@ -69,8 +84,6 @@ from encre.improve.learning.engine import LearningEngine
 from encre.protocol.session_router import EventRouter
 from encre.scheduler import EncreScheduler, ScheduledJob
 from encre.swarm.blackboard import EncreBlackboard
-from encre.swarm.consensus import EncreConsensus
-from encre.swarm.orchestrator import EncreOrchestrator  # noqa: F401  (swarm surface)
 from encre.swarm.planner import EncreTaskPlanner
 from encre.swarm.roles import AgentRole, RoleRegistry  # noqa: F401  (AgentRole re-exported)
 from encre.swarm.session import EncreSwarmSession
@@ -85,6 +98,32 @@ logger = logging.getLogger("encre.iclaw")
 
 @dataclass
 class DaemonStats:
+    """Counters collected while the iClaw profile is running.
+
+    Every field is monotonically increasing except ``started_at``, which is a
+    timestamp. Values are mutated from the event loop only, and
+    :meth:`IclawProfile.get_stats` returns a fresh dict each call so a caller
+    can never observe a half-updated snapshot.
+
+    Attributes:
+        started_at: Epoch seconds when :meth:`IclawProfile.start` ran; ``0.0``
+            means the profile has never been started.
+        sessions_created: Submissions accepted by the profile, whether they
+            finished or not.
+        sessions_completed: Submissions that yielded a :class:`Finish` event.
+        jobs_executed: Scheduled jobs registered (not executions).
+        skills_generated: Skills written by the learning stage of the
+            post-run pipeline.
+        consolidation_runs: Memory consolidation cycles completed.
+        swarm_tasks_executed: Swarm executions started.
+        compact_runs: Context compactions actually applied to a prompt.
+        evolution_observations: Tool results observed by the evolution
+            learner during a run.
+        reflex_evaluations: Cycles the reflex scan loop completed.
+        feedback_records: User corrections recorded by the feedback learner.
+        errors: Count of failures caught inside the background loops.
+    """
+
     started_at: float = 0.0
     sessions_created: int = 0
     sessions_completed: int = 0
@@ -103,9 +142,54 @@ class IclawProfile:
     """iClaw add-on profile attached to a running :class:`EncreServer`.
 
     Owns only the self-improvement and autonomy subsystems; transport,
-    sessions, and scheduling come from the server.  Mirrors the public
-    surface of the former ``IClawEngine`` (submit / run_goal / run_swarm /
-    schedule_job / stats) so callers keep working unchanged.
+    sessions, and scheduling come from the server. Presents the same public
+    surface callers already rely on (submit / run_goal / run_swarm /
+    schedule_job / stats), so existing call sites keep working unchanged.
+
+    Invariants:
+
+    - All subsystem attributes are ``None`` until :meth:`start` has run, and
+      every accessor therefore checks for ``None`` before delegating. A
+      profile built but never started degrades to unavailable rather than
+      raising.
+    - ``_running`` is the single authority on liveness. Background loops test
+      it and exit, so :meth:`stop` never has to wait for a loop to finish a
+      full interval.
+    - Subsystem state is created once in :meth:`start` and released once in
+      :meth:`stop`; calling :meth:`start` twice is a no-op.
+
+    Lifecycle: construct with the server's agent, router, and scheduler ->
+    :meth:`start` (assemble subsystems, spawn background loops) -> serve ->
+    :meth:`stop` (cancel loops, stop the consolidator and learning engine).
+
+    Attributes:
+        stats: Live :class:`DaemonStats` counters; read through
+            :meth:`get_stats` rather than directly so uptime is computed.
+        agent: The server's agent; the post-run pipeline and analyze callable
+            read its backend and registries.
+        router: The :class:`encre.protocol.session_router.EventRouter` that
+            actually executes prompts.
+        scheduler: The :class:`encre.scheduler.EncreScheduler` used for
+            scheduled jobs.
+        is_running: Whether the profile has been started.
+        session_manager: The server-owned session manager, exposed for
+            compatibility with callers expecting a direct attribute.
+
+    Args:
+        agent: The server agent that subsystems improve.
+        router: Router used for prompt submission.
+        scheduler: Scheduler used for job operations.
+        max_concurrent: Cap on concurrent sessions; also bounds swarm width.
+        consolidation_interval: Seconds between memory consolidations. A value
+            of ``0`` disables the consolidator.
+        enable_compact: Build a context compaction engine.
+        enable_evolution: Build the evolution learner.
+        enable_reflex: Build the reflex loop and its scan task.
+        enable_metacognition: Build the metacognition module.
+        enable_feedback: Build the feedback learner.
+        enable_swarm: Build the swarm session and blackboard.
+        enable_hooks: Emit turn-start/turn-end events to the agent's hook
+            system from :meth:`submit_stream`.
     """
 
     def __init__(
@@ -122,7 +206,41 @@ class IclawProfile:
         enable_metacognition: bool = True,
         enable_feedback: bool = True,
         enable_swarm: bool = True,
+        enable_hooks: bool = True,
     ) -> None:
+        """Capture server collaborators and pre-allocate every subsystem slot.
+
+        Construction allocates no subsystems and spawns no tasks; it only stores
+        the injected collaborators, records the feature toggles, and sets every
+        subsystem attribute to ``None``. Pre-allocating the ``None`` slots is
+        what lets the public accessors degrade to "unavailable" instead of
+        raising ``AttributeError`` before :meth:`start` runs, and it means
+        :meth:`stop` can walk the same slots without an ``if hasattr`` guard.
+
+        Args:
+            agent: The server's :class:`encre.agent.EncreAgent`; subsystems
+                build against its registries and backend.
+            router: The :class:`encre.protocol.session_router.EventRouter`
+                that executes prompts and owns the session manager.
+            scheduler: The :class:`encre.scheduler.EncreScheduler` used by
+                :meth:`schedule_job`.
+            max_concurrent: Cap on concurrent sessions; swarm fan-out is
+                bounded by the same value.
+            consolidation_interval: Seconds between memory consolidations. A
+                value of ``0`` or below suppresses the consolidator entirely.
+            enable_compact: Build the context compaction engine.
+            enable_evolution: Build the evolution learner.
+            enable_reflex: Build the reflex loop and its scan task.
+            enable_metacognition: Build the metacognition module.
+            enable_feedback: Build the feedback learner.
+            enable_swarm: Build the swarm session, blackboard, and planner.
+            enable_hooks: Emit turn-start/turn-end events to the agent's hook
+                system from :meth:`submit_stream`.
+
+        Invariant:
+            On return ``self._running`` is ``False``, ``self.stats`` is a fresh
+            :class:`DaemonStats`, and every subsystem attribute is ``None``.
+        """
         self._agent = agent
         self._router = router
         self._scheduler = scheduler
@@ -130,12 +248,15 @@ class IclawProfile:
         self._consolidation_interval = consolidation_interval
         self._running = False
 
-        # 鈹€鈹€ Compact engine 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Compact engine -------------------------------------------------
         self._compact_engine: EncreCompactEngine | None = None
         self._enable_compact = enable_compact
         self._compact_max_tokens = 128000
 
-        # 鈹€鈹€ Learning subsystems 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Hook pipeline --------------------------------------------------
+        self._enable_hooks = enable_hooks
+
+        # -- Learning subsystems --------------------------------------------
         self._learning_engine: LearningEngine | None = None
         self._consolidator: MemoryConsolidator | None = None
         self._evolution_learner: EncreEvolutionLearner | None = None
@@ -143,44 +264,67 @@ class IclawProfile:
         self._meta_cognition: EncreMetaCognition | None = None
         self._feedback_learner: EncreFeedbackLearner | None = None
 
-        # 鈹€鈹€ Swarm / multi-agent subsystems 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Swarm / multi-agent subsystems ---------------------------------
         self._swarm_session: EncreSwarmSession | None = None
-        self._consensus: EncreConsensus | None = None
         self._blackboard: EncreBlackboard | None = None
         self._task_planner: EncreTaskPlanner | None = None
         self._role_registry: RoleRegistry | None = None
 
-        # 鈹€鈹€ Goal runner 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Goal runner ----------------------------------------------------
         self._goal_runner: EncreGoalRunner | None = None
 
-        # 鈹€鈹€ Lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Lifecycle ------------------------------------------------------
         self._cleanup_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._reflex_scan_task: asyncio.Task[None] | None = None
 
-        # 鈹€鈹€ Stats 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Stats ----------------------------------------------------------
         self.stats = DaemonStats()
 
-        # 鈹€鈹€ Post-run pipeline 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Post-run pipeline ----------------------------------------------
         self._post_run: PostRunOrchestrator | None = None
 
     @property
     def is_running(self) -> bool:
-        """Return ``True`` while the profile is running."""
+        """Return ``True`` while the profile is running.
+
+        Returns:
+            Whether :meth:`start` has completed and :meth:`stop` has not.
+        """
         return self._running
 
     @property
     def session_manager(self):
-        """The server-owned session manager (compat accessor)."""
+        """Return the server-owned session manager (compat accessor).
+
+        The profile does not own sessions; it forwards to the router's
+        manager so callers that read the attribute directly keep
+        working.
+
+        Returns:
+            The :class:`encre.server.session_manager.SessionManager`.
+        """
         return self._router.session_manager
 
-    # 鈹€鈹€ Start / Stop 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Start / Stop -------------------------------------------------------
 
     async def start(self) -> None:
         """Initialise the iClaw-unique subsystems and background loops.
 
         Transport, sessions, and scheduler come from the server launcher;
         only the self-improvement add-ons are assembled here.
+
+        Idempotent: a second call while already running returns immediately.
+        Subsystems that need a file store create their parent directories
+        with ``exist_ok=True`` so a fresh install and an existing install
+        both work. The reflex scan, cleanup, and heartbeat loops are spawned
+        with ``asyncio.create_task`` rather than awaited, because they run
+        for the lifetime of the daemon.
+
+        Raises:
+            Exception: Any subsystem constructor error propagates; a failed
+                :meth:`start` leaves the profile in a half-initialised state,
+                so the caller should not serve traffic afterwards.
         """
         if self._running:
             return
@@ -189,34 +333,38 @@ class IclawProfile:
         agent = self._agent
         data_dir = get_data_dir()
 
-        # 鈹€鈹€ Compact engine 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Compact engine -------------------------------------------------
         if self._enable_compact:
             self._compact_engine = EncreCompactEngine(
                 strategy=EncreMultiStagePipeline(),
             )
 
-        # 鈹€鈹€ Learning engine 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Learning engine ------------------------------------------------
         self._learning_engine = LearningEngine(agent)
         await self._learning_engine.start()
 
-        # 鈹€鈹€ Evolution learner 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Evolution learner ----------------------------------------------
+        # Persistence is file-based JSON under the data dir; the learner is the
+        # only writer of that file.
         evo_path = data_dir / "evolution" / "state.json"
         evo_path.parent.mkdir(parents=True, exist_ok=True)
         self._evolution_learner = EncreEvolutionLearner(storage_path=str(evo_path))
 
-        # 鈹€鈹€ Reflex loop 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Reflex loop ----------------------------------------------------
         self._reflex_loop = EncreReflexLoop(enabled=True)
         self._reflex_scan_task = asyncio.create_task(self._reflex_scan_loop())
 
-        # 鈹€鈹€ Metacognition 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Metacognition --------------------------------------------------
         self._meta_cognition = EncreMetaCognition()
 
-        # 鈹€鈹€ Feedback learner 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Feedback learner -----------------------------------------------
         fb_path = data_dir / "feedback" / "corrections.json"
         fb_path.parent.mkdir(parents=True, exist_ok=True)
         self._feedback_learner = EncreFeedbackLearner(storage_path=str(fb_path))
 
-        # 鈹€鈹€ Memory consolidator 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Memory consolidator --------------------------------------------
+        # A non-positive interval disables consolidation entirely, which is how
+        # an operator turns off periodic memory rewriting.
         if self._consolidation_interval > 0:
             self._consolidator = MemoryConsolidator(
                 agent,
@@ -224,7 +372,9 @@ class IclawProfile:
             )
             await self._consolidator.start()
 
-        # 鈹€鈹€ Goal runner 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Goal runner ----------------------------------------------------
+        # Optional collaborators are read with getattr so an agent built without
+        # memory or skills still gets a working goal runner.
         self._goal_runner = EncreGoalRunner(
             config=agent.config,
             tool_registry=agent.tool_registry,
@@ -235,9 +385,10 @@ class IclawProfile:
             telemetry=getattr(agent, "telemetry", None),
         )
 
-        # 鈹€鈹€ Swarm subsystems 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Swarm subsystems -----------------------------------------------
+        # Swarm width is capped below the session cap so a swarm cannot consume
+        # every concurrency slot the gateway also needs.
         self._blackboard = EncreBlackboard()
-        self._consensus = EncreConsensus()
         self._task_planner = EncreTaskPlanner()
         self._role_registry = RoleRegistry()
         self._swarm_session = EncreSwarmSession(
@@ -245,7 +396,7 @@ class IclawProfile:
             max_concurrent=min(10, self._max_concurrent),
         )
 
-        # 鈹€鈹€ Post-run self-improvement pipeline 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Post-run self-improvement pipeline -----------------------------
         soul_system = getattr(agent, "soul_system", None)
         pipeline = PostRunPipeline(
             agent,
@@ -258,7 +409,7 @@ class IclawProfile:
         )
         self._post_run = PostRunOrchestrator(pipeline)
 
-        # 鈹€鈹€ Background housekeeping 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Background housekeeping ----------------------------------------
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
@@ -274,7 +425,21 @@ class IclawProfile:
         )
 
     async def stop(self) -> None:
-        """Shut down the profile's subsystems and background tasks."""
+        """Shut down the profile's subsystems and background tasks.
+
+        Cancel the loops first and await them so no cleanup callback runs
+        after the flag is cleared, then stop the long-lived subsystems in
+        reverse of their start order. Clearing ``_running`` before cancelling
+        means a loop that wakes up concurrently observes the flag and exits
+        by itself instead of racing the cancel.
+
+        Subsystem handles are cleared so a subsequent :meth:`start` rebuilds
+        them instead of reusing a stopped object.
+
+        Raises:
+            Exception: Nothing is re-raised; a subsystem that refuses to stop
+                is left for process exit to clean up.
+        """
         if not self._running:
             return
         self._running = False
@@ -295,7 +460,7 @@ class IclawProfile:
 
         logger.info("iClaw profile stopped")
 
-    # 鈹€鈹€ Submit pipeline 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Submit pipeline ------------------------------------------------------
 
     async def submit(
         self,
@@ -305,7 +470,22 @@ class IclawProfile:
         session_id: str | None = None,
         system_prompt: str | None = None,
     ) -> str:
-        """Submit a one-shot prompt to a channel and return a session id."""
+        """Submit a one-shot prompt to a channel and return the full text.
+
+        Thin delegation to the router: no hooks, compaction, or post-run
+        pipeline are applied here. Callers that want the full self-improvement
+        treatment should use :meth:`submit_stream` instead.
+
+        Args:
+            channel_name: Originating channel; recorded on the session so the
+                session list can badge its source.
+            prompt: The user prompt.
+            session_id: Existing session to resume, or ``None`` for a new one.
+            system_prompt: Optional system-prompt override.
+
+        Returns:
+            The concatenated assistant text for the turn.
+        """
         result = await self._router.submit(
             channel_name, prompt,
             session_id=session_id,
@@ -322,17 +502,44 @@ class IclawProfile:
         session_id: str | None = None,
         system_prompt: str | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
-        """Stream an agent run, wrapped with the self-improvement pipeline."""
+        """Stream an agent run, wrapped with the self-improvement pipeline.
+
+        Wraps the router stream with four additions: a pre-turn hook, prompt
+        compaction for oversized inputs, in-stream observation of tool and
+        finish events, and a post-run pipeline invocation after the stream is
+        exhausted.
+
+        Everything added is best-effort and swallows its own errors, so the
+        caller always sees the agent's real events and a real terminal event.
+
+        Args:
+            channel_name: Originating channel.
+            prompt: The user prompt.
+            session_id: Existing session to resume, or ``None`` for a new one.
+            system_prompt: Optional system-prompt override.
+
+        Yields:
+            The :class:`encre.utils.types.AgentEvent` values from the agent,
+            in order and unmodified.
+
+        Raises:
+            Exception: Not caught; an error from the router propagates so the
+                caller can report it.
+        """
         self.stats.sessions_created += 1
 
-        # 鈹€鈹€ Hook: pre-turn 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-        # Fire the pre-turn hook (best effort) before any model work.
-        hook_system = getattr(self._agent, "hook_system", None)
+        # -- Hook: pre-turn -------------------------------------------------
+        # Fired before any model work so a hook can veto or rewrite the turn.
+        # Gated on the profile toggle so enable_hooks=False really suppresses
+        # hook emission instead of only being accepted as a dead argument.
+        hook_system = getattr(self._agent, "hook_system", None) if self._enable_hooks else None
         if hook_system:
             with contextlib.suppress(Exception):
                 await hook_system.emit_turn_start(turn=0, prompt=prompt)
 
-        # 鈹€鈹€ Compact: check if context needs compaction 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Compact: check if context needs compaction ---------------------
+        # Only very long prompts are compacted; short prompts would pay for a
+        # compaction round trip they do not need.
         if self._compact_engine and len(prompt) > 50000:
             try:
                 messages = [{"role": "user", "content": prompt}]
@@ -366,7 +573,9 @@ class IclawProfile:
 
         stream_duration = time.monotonic() - stream_start
 
-        # 鈹€鈹€ Post-run self-improvement pipeline 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Post-run self-improvement pipeline -----------------------------
+        # Runs after the terminal event so the caller has already received the
+        # answer; failures here must not surface as an error to the user.
         if self._post_run is not None:
             try:
                 pr_result = await self._post_run.collect_and_process(
@@ -380,12 +589,12 @@ class IclawProfile:
             except Exception:
                 pass
 
-        # 鈹€鈹€ Hook: post-turn 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # -- Hook: post-turn ------------------------------------------------
         if hook_system:
             with contextlib.suppress(Exception):
                 await hook_system.emit_turn_end(turn=0, event_count=len(tool_names))
 
-    # 鈹€鈹€ Goal execution 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Goal execution -------------------------------------------------------
 
     async def run_goal(
         self,
@@ -396,7 +605,23 @@ class IclawProfile:
         timeout_seconds: int = 3600,
         on_progress: Callable[[GoalEvent], None] | None = None,
     ) -> GoalResult:
-        """Run a goal-driven autonomous session via the goal runner."""
+        """Run a goal-driven autonomous session via the goal runner.
+
+        Degrades to a failed :class:`GoalResult` rather than raising when the
+        goal runner was never built, so a caller can always treat the return
+        value as the outcome.
+
+        Args:
+            description: What the agent should accomplish.
+            success_criteria: How the runner judges completion.
+            max_attempts: Upper bound on execution attempts.
+            timeout_seconds: Wall-clock budget for the whole goal.
+            on_progress: Optional callback receiving each
+                :class:`encre.goal.GoalEvent`.
+
+        Returns:
+            The :class:`encre.goal.GoalResult` describing the outcome.
+        """
         if self._goal_runner is None:
             return GoalResult(
                 status=GoalStatus.FAILED,
@@ -410,7 +635,7 @@ class IclawProfile:
         )
         return await self._goal_runner.run(goal, on_attempt=on_progress)
 
-    # 鈹€鈹€ Swarm / multi-agent operations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Swarm / multi-agent operations ---------------------------------------
 
     async def run_swarm(
         self,
@@ -421,7 +646,19 @@ class IclawProfile:
         _timeout_seconds: float = 3600.0,
         on_event: Callable[[Any], None] | None = None,
     ) -> Any:
-        """Execute a goal across the swarm, returning its result dict."""
+        """Execute a goal across the swarm, returning its result dict.
+
+        Args:
+            goal: The goal description handed to the planner.
+            max_concurrent: Upper bound on parallel worker agents.
+            _enable_reviewer: Reserved for a reviewer stage.
+            _timeout_seconds: Reserved for a per-swarm timeout.
+            on_event: Optional callback for swarm progress events.
+
+        Returns:
+            The swarm result dict, or an ``{"error": ...}`` dict when the
+            swarm session is unavailable.
+        """
         if self._swarm_session is None:
             return {"error": "Swarm session not available"}
         result = await self._swarm_session.execute(
@@ -436,33 +673,53 @@ class IclawProfile:
         self,
         goal: str,
     ) -> AsyncGenerator[Any, None]:
-        """Stream a swarm goal execution, yielding swarm events."""
+        """Stream a swarm goal execution, yielding swarm events.
+
+        Yields nothing at all when the swarm session is unavailable, so a
+        caller can iterate unconditionally.
+
+        Args:
+            goal: The goal description handed to the planner.
+
+        Yields:
+            Swarm progress events.
+        """
         if self._swarm_session is None:
             return
         async for event in self._swarm_session.execute_streaming(goal=goal):
             yield event
             self.stats.swarm_tasks_executed += 1
 
-    def create_consensus_proposal(
-        self,
-        title: str,
-        description: str,
-        options: list[str],
-        proposed_by: str = "",
-    ) -> Any:
-        """Create a swarm consensus proposal."""
-        if self._consensus is None:
-            return None
-        return self._consensus.create_proposal(title, description, options, proposed_by)
-
     def blackboard_put(self, namespace: str, key: str, value: Any, owner: str = "") -> int | None:
-        """Write a value to the swarm blackboard; return its slot id."""
+        """Write a value to the swarm blackboard; return its slot id.
+
+        Args:
+            namespace: Logical partition for the entry.
+            key: Entry key inside the namespace.
+            value: The value to store.
+            owner: Optional owner tag for conflict handling.
+
+        Returns:
+            The blackboard slot id, or ``None`` when no blackboard exists.
+        """
         if self._blackboard is None:
             return None
         return self._blackboard.put(namespace, key, value, owner)
 
     def blackboard_get(self, namespace: str, key: str) -> Any:
-        """Read the first value stored for a blackboard key, or ``None``."""
+        """Read the first value stored for a blackboard key, or ``None``.
+
+        The blackboard stores every write per key, so only the first entry is
+        returned: callers treat the first writer as authoritative.
+
+        Args:
+            namespace: Logical partition to read from.
+            key: Entry key to read.
+
+        Returns:
+            The first value for the key, or ``None`` when absent or when no
+            blackboard exists.
+        """
         if self._blackboard is None:
             return None
         result = self._blackboard.get(namespace, key)
@@ -470,7 +727,7 @@ class IclawProfile:
             return result[0]
         return None
 
-    # 鈹€鈹€ Scheduled job operations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Scheduled job operations ---------------------------------------------
 
     def schedule_job(
         self,
@@ -481,7 +738,19 @@ class IclawProfile:
         max_failures: int = 3,
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        """Schedule a recurring/one-shot job via the server scheduler."""
+        """Schedule a recurring/one-shot job via the server scheduler.
+
+        Args:
+            name: Job name, used as its identifier.
+            prompt: The prompt the job submits when it fires.
+            cron: Cron expression for recurring jobs; empty for one-shots.
+            fire_at: Epoch seconds for a one-shot fire time.
+            max_failures: Failures tolerated before the job is disabled.
+            metadata: Arbitrary per-job metadata.
+
+        Returns:
+            The scheduled job id.
+        """
         job_id = self._scheduler.schedule(
             name=name,
             prompt=prompt,
@@ -494,17 +763,36 @@ class IclawProfile:
         return job_id
 
     def cancel_job(self, job_id: str) -> bool:
-        """Cancel a scheduled job by id."""
+        """Cancel a scheduled job by id.
+
+        Args:
+            job_id: The job id returned by :meth:`schedule_job`.
+
+        Returns:
+            ``True`` when a job with that id was removed.
+        """
         return self._scheduler.cancel(job_id)
 
     def list_jobs(self) -> list[ScheduledJob]:
-        """Return all currently scheduled jobs."""
+        """Return all currently scheduled jobs.
+
+        Returns:
+            The list of :class:`encre.scheduler.ScheduledJob` entries.
+        """
         return self._scheduler.list_jobs()
 
-    # 鈹€鈹€ Stats / Health 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Stats / Health -------------------------------------------------------
 
     def get_stats(self) -> dict[str, Any]:
-        """Return a snapshot of running counters and uptime stats."""
+        """Return a snapshot of running counters and uptime stats.
+
+        Builds a fresh dict each call, so it is safe to pass to a WebSocket
+        frame without holding a reference into the live counters.
+
+        Returns:
+            A dict of counter values plus computed ``uptime_seconds``,
+            ``uptime_human``, and the router's ``active_sessions``.
+        """
         now = time.time()
         uptime = now - self.stats.started_at if self.stats.started_at > 0 else 0
         return {
@@ -525,7 +813,16 @@ class IclawProfile:
         }
 
     def get_health(self) -> dict[str, Any]:
-        """Return a lightweight health/status summary of the profile."""
+        """Return a lightweight health/status summary of the profile.
+
+        Cheap enough to call from a health endpoint on every poll: it touches
+        only in-memory flags and counter attributes.
+
+        Returns:
+            A dict with ``status``, ``running``, ``uptime_seconds``,
+            ``active_sessions``, ``scheduled_jobs``, and a ``subsystems`` map
+            of boolean availability flags.
+        """
         return {
             "status": "ok" if self._running else "stopped",
             "running": self._running,
@@ -545,10 +842,15 @@ class IclawProfile:
             },
         }
 
-    # 鈹€鈹€ Internal loops 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Internal loops -------------------------------------------------------
 
     async def _reflex_scan_loop(self) -> None:
-        """Background loop that periodically marks reflex evaluation runs."""
+        """Background loop that periodically marks reflex evaluation runs.
+
+        Sleeps first so a freshly started profile does not burn a reflex cycle
+        before any session has happened, and re-checks ``_running`` after the
+        sleep so :meth:`stop` can interrupt it immediately.
+        """
         while self._running and self._reflex_loop:
             await asyncio.sleep(900)
             if not self._running:
@@ -557,7 +859,16 @@ class IclawProfile:
                 self.stats.reflex_evaluations += 1
 
     async def _cleanup_loop(self, session_manager=None) -> None:
-        """Background loop that periodically evicts idle sessions."""
+        """Background loop that periodically evicts idle sessions.
+
+        Re-checks ``_running`` after every sleep so shutdown is responsive,
+        and counts an evict failure as an error rather than dying: a single
+        bad session must not kill the whole daemon.
+
+        Args:
+            session_manager: Optional manager override, mainly for tests;
+                defaults to the router's session manager.
+        """
         mgr = session_manager or self._router.session_manager
         while self._running:
             await asyncio.sleep(600)
@@ -571,7 +882,11 @@ class IclawProfile:
                 self.stats.errors += 1
 
     async def _heartbeat_loop(self) -> None:
-        """Background loop that logs periodic daemon heartbeat stats."""
+        """Background loop that logs periodic daemon heartbeat stats.
+
+        Debug-level only, so a production deploy stays quiet while an operator
+        who needs liveness detail can turn logging down.
+        """
         while self._running:
             await asyncio.sleep(300)
             if not self._running:
@@ -585,7 +900,17 @@ class IclawProfile:
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
-        """Format a duration in seconds as a compact ``Nh Mm Ss`` string."""
+        """Format a duration in seconds as a compact ``Nh Mm Ss`` string.
+
+        Zero-valued high-order units are omitted so short durations render as
+        ``42s`` rather than ``0h 0m 42s``.
+
+        Args:
+            seconds: Duration to format.
+
+        Returns:
+            The formatted string.
+        """
         hours, remainder = divmod(int(seconds), 3600)
         minutes, secs = divmod(remainder, 60)
         parts = []
@@ -596,13 +921,98 @@ class IclawProfile:
         parts.append(f"{secs}s")
         return " ".join(parts)
 
-    # 鈹€鈹€ LLM-powered run analysis 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    @staticmethod
+    def _extract_json_object(text: str) -> str | None:
+        """Return the first brace-balanced ``{...}`` slice of ``text``.
+
+        Scans from the first ``{`` and tracks brace depth while skipping over
+        string literals and their escapes, so a brace that appears inside a
+        string value cannot unbalance the count, and a second object appended
+        after the first is never folded into the slice the way a
+        first-open/last-close pair would. This is what lets a model reply that
+        wraps its JSON in prose -- or emits two objects -- still yield the
+        intended payload.
+
+        Args:
+            text: The raw model reply, which may contain prose, code fences,
+                and one or more JSON-looking objects.
+
+        Returns:
+            The substring from the first ``{`` to its matching ``}``
+            inclusive, or ``None`` when no balanced object exists.
+        """
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                # Inside a string literal only the closing quote (or an
+                # escape) is significant; braces are ordinary characters.
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:index + 1]
+        return None
+
+    # -- LLM-powered run analysis ---------------------------------------------
 
     def _make_analyze_fn(self) -> Callable[[RunSummary], Awaitable[dict[str, Any]]]:
-        """Build the LLM-powered run-analysis callable for the post-run pipeline."""
+        """Build the LLM-powered run-analysis callable for the post-run pipeline.
+
+        The returned coroutine asks the agent's own backend to read a finished
+        run and return structured learnings. Every failure mode -- no tool
+        calls at all, no backend attached, a model reply without JSON, or a
+        malformed payload -- degrades to an empty dict, because analysis is a
+        nice-to-have and must never fail the run it reflects on.
+
+        Returns:
+            The analyze callable passed into :class:`PostRunPipeline`.
+        """
         agent = self._agent
 
         async def _analyze(summary: RunSummary) -> dict[str, Any]:
+            """Summarise one finished run by asking the agent's own backend.
+
+            Runs a single LLM turn over the truncated run digest and parses the
+            reply into the four learning fields the post-run pipeline consumes.
+            Every degenerate input -- no tool calls, no backend attached, a
+            reply with no JSON object, or a parse failure -- yields ``{}``, so a
+            bad analysis can never be reported as a failed run.
+
+            Args:
+                summary: The :class:`RunSummary` digest of the completed run;
+                    only its prompt, tool set, repeated patterns, and text
+                    preview reach the model, each truncated to bound prompt
+                    size.
+
+            Returns:
+                A dict with                 ``task_summary``, ``user_preferences``,
+                ``skill_candidates``, and ``key_insights``, or an empty dict when
+                nothing could be extracted.
+
+            Note:
+                The payload is recovered by scanning for the first
+                brace-balanced object rather than decoding the whole reply,
+                because models routinely wrap JSON in prose or code fences.
+                Braces inside string values and any trailing second object are
+                handled by :meth:`_extract_json_object`, so a naive
+                first-open/last-close slice can no longer truncate the payload.
+            """
             if not summary.tool_calls:
                 return {}
             prompt_for_llm = (
@@ -629,10 +1039,12 @@ class IclawProfile:
                 async for part in result:
                     if hasattr(part, "text") and part.text:
                         text += part.text
-                start = text.find("{")
-                end = text.rfind("}")
-                if start >= 0 and end > start:
-                    parsed = json.loads(text[start:end + 1])
+                # Models frequently wrap the JSON in prose or code fences, so
+                # the first balanced object is sliced out rather than parsing
+                # the whole reply.
+                snippet = self._extract_json_object(text)
+                if snippet is not None:
+                    parsed = json.loads(snippet)
                     return {
                         "task_summary": parsed.get("task_summary", ""),
                         "user_preferences": parsed.get("user_preferences", []),
@@ -651,10 +1063,45 @@ def _make_agent_factory(main_agent: EncreAgent) -> Callable[[dict[str, Any] | No
 
     Shared registries (tools/hooks/memory/safety/plugins) come from the
     main agent; per-job model overrides are applied from ``agent_config``.
+
+    Sharing rather than duplicating the registries is what keeps spawned
+    workers consistent with the parent: a skill or tool the parent learned is
+    immediately visible to any worker created afterwards.
+
+    Args:
+        main_agent: The parent agent whose registries are reused.
+
+    Returns:
+        A factory taking an optional per-agent config override dict.
     """
     def _factory(agent_config: dict[str, Any] | None = None) -> EncreAgent:
+        """Materialise one worker agent from the parent's registries.
+
+        Starts from a dataclasses copy of the parent config, applies only the
+        whitelisted overrides, and reuses the parent's registry objects by
+        reference. Sharing by reference -- rather than cloning -- is what keeps
+        a worker created after the parent learns a new skill or tool already
+        able to see it.
+
+        Args:
+            agent_config: Optional override dict. Only ``backend_type``,
+                ``api_key``, ``base_url``, ``model_id``, ``max_tokens``,
+                ``workspace``, and ``permission_mode`` are honoured; any other
+                key is ignored so a caller cannot wholesale replace the config
+                object.
+
+        Returns:
+            A new :class:`encre.agent.EncreAgent` bound to the parent's tool,
+            hook, memory, safety, and plugin registries.
+
+        Note:
+            ``model_id`` updates both ``config.model`` and
+            ``config.target_model_ids`` so routing and selection agree.
+        """
         config = replace(main_agent.config)
         if agent_config:
+            # Only whitelisted overrides are applied so a caller cannot
+            # accidentally replace the whole config object.
             if agent_config.get("backend_type"):
                 config.backend_type = agent_config["backend_type"]
             if agent_config.get("api_key"):
@@ -668,6 +1115,10 @@ def _make_agent_factory(main_agent: EncreAgent) -> Callable[[dict[str, Any] | No
                 config.max_tokens = agent_config["max_tokens"]
             if agent_config.get("workspace"):
                 config.workspace = agent_config["workspace"]
+            # Same permission preset the safety engine dispatches on for the
+            # regular modes; absent key keeps the parent's permission mode.
+            if agent_config.get("permission_mode"):
+                config.permission_mode = agent_config["permission_mode"]
         return EncreAgent(
             config=config,
             tool_registry=main_agent.tool_registry,

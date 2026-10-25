@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,10 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
+
+from encre.logging_config import get_logger
 
 """Chrome DevTools Protocol (CDP) transport layer.
 
@@ -41,7 +45,7 @@ from typing import Any
 
 import websockets
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # CDP Transport
@@ -150,7 +154,7 @@ class CDPTransport:
         except websockets.exceptions.ConnectionClosed:
             logger.info("CDP: connection closed")
         except asyncio.CancelledError:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
         except Exception:
             logger.exception("CDP: reader error")
         finally:
@@ -352,7 +356,7 @@ async def _discover_or_launch_browser(port: int = 9222) -> tuple[str, subprocess
                 logger.info("Connected to existing browser at %s", ws_url)
                 return ws_url, None
     except Exception:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
 
     # Launch a new browser instance
     browser_path = _find_browser_executable()

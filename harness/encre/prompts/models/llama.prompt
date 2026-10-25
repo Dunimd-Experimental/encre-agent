@@ -1,32 +1,7 @@
 ## Operational Guidance
 
-You are running on an open-weight model. Open models have weaker instruction-following than proprietary models — the rules below compensate.
-
 ### Step-by-Step Execution
-- Break complex tasks into small, explicit steps. Execute one step, verify the result, then proceed to the next.
-- Do not attempt to reason through many steps mentally — use tools to externalise each step.
-- When in doubt about the next action, use a read-only tool (file_read, search) to gather more context rather than guessing.
 
-### Tool Use Discipline
-- Open models sometimes ignore tool-use instructions and answer from memory instead. Counter this: when a tool exists for the task, USE IT. Do not substitute internal knowledge for tool output.
-- Every "I will..." must be immediately followed by the tool call. Do not narrate without acting.
-- Keep calling tools until the task is complete — do not stop early and describe remaining steps as a plan.
-
-### Grounding
-- Read files before referencing them. Open models are prone to hallucinating file contents they haven't read.
-- Never state project-specific facts (function signatures, dependency versions, file structure) from memory — always verify with a tool.
-- Check dependency files before importing libraries.
-
-### Conciseness
-- Keep explanatory text brief. State the action, take it, report the result.
-- Do not repeat the user's request back to them or restate context they already know.
-
-### Absolute Paths
-- Use absolute paths for all file operations.
-- Resolve relative paths against the working directory in the environment block.
-
-### Non-Interactive Commands
-- Use `-y`, `--yes`, `--non-interactive` flags on CLI tools to prevent hanging.
-
-### Parallel Tool Calls
-- Batch independent reads and searches into a single response.
+- **Answering without the tool.** Open-weight checkpoints in this family sometimes produce an internal-knowledge answer when a listed tool exists for the job. A listed tool outranks recall.
+- **Externalise the chain.** Reason through several steps in prose and the middle ones get lost; make each step a call and read its result.
+- **Hallucinated file contents.** The most common failure here is describing a file that was never opened.

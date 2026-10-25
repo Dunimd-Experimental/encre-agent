@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -21,18 +20,20 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from encre.logging_config import get_logger
 import asyncio
+import copy
 import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# 鈹€鈹€ Recovery limits 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- Recovery limits ---
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 ESCALATED_MAX_TOKENS = 64_000
 REACTIVE_COMPACT_MAX_RETRIES = 3
 
-# 鈹€鈹€ Context overflow detection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- Context overflow detection ---
 
 _CONTEXT_OVERFLOW_PATTERNS = [
     "prompt is too long",
@@ -57,10 +58,11 @@ def is_context_overflow(exc: Exception) -> bool:
 def is_withheld_max_output_tokens(event: Any) -> bool:
     try:
         from encre.utils.types import BackendFinish
+
         if isinstance(event, BackendFinish):
             return event.reason in ("max_tokens", "length")
     except Exception:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
     return False
 
 
@@ -83,9 +85,16 @@ def is_prompt_too_long_error(error_msg: str) -> bool:
 def is_rate_limit_or_overload(exc: Exception) -> bool:
     msg = str(exc).lower()
     patterns = [
-        "rate limit", "too many requests", "overloaded",
-        "capacity", "throttl", "too many", "429",
-        "503", "service unavailable", "high demand",
+        "rate limit",
+        "too many requests",
+        "overloaded",
+        "capacity",
+        "throttl",
+        "too many",
+        "429",
+        "503",
+        "service unavailable",
+        "high demand",
     ]
     return any(p in msg for p in patterns)
 
@@ -97,38 +106,58 @@ async def reactive_compact_with_retry(
     max_retries: int = REACTIVE_COMPACT_MAX_RETRIES,
     *,
     has_attempted: bool = False,
+    retry_budget: Any = None,
 ) -> bool:
     if has_attempted:
-        logger.warning("[reactive] already attempted 鈥?skipping")
+        logger.warning("[reactive] already attempted — skipping")
         return False
 
     for attempt in range(max_retries):
+        if retry_budget is not None and not retry_budget.try_spend("compact"):
+            logger.error(
+                "[reactive] compact retry budget exhausted before attempt %d/%d",
+                attempt + 1,
+                max_retries,
+            )
+            return False
         try:
             context_msgs = session.get_context_messages()
-            session.set_compact_archive(context_msgs)
             from encre.compact.engine import COMPACT_MAX_OUTPUT_TOKENS
-            budget = COMPACT_MAX_OUTPUT_TOKENS // (2 ** attempt)
+
+            budget = COMPACT_MAX_OUTPUT_TOKENS // (2**attempt)
             compacted = await compact_engine.compact(
-                context_msgs, backend=backend,
+                copy.deepcopy(context_msgs),
+                backend=backend,
                 turn_count=session.turn_count,
                 system_prompt=session.messages[0].get("content", "") if session.messages else "",
                 session_id=session.id or "",
                 force=True,
             )
             if compacted is not None:
-                session.replace_branch_messages(session.active_branch_id, compacted)
+                # View overlay, not branch replacement: the persisted history
+                # stays append-only and intact; only the model's view shrinks.
+                _upto = max(
+                    (m.get("seq_in_branch", -1) for m in context_msgs),
+                    default=-1,
+                )
+                session.apply_compacted_view(session.active_branch_id, compacted, _upto)
                 logger.info(
                     "[reactive] compact succeeded attempt=%d/%d turn=%d budget=%d",
-                    attempt + 1, max_retries, session.turn_count, budget,
+                    attempt + 1,
+                    max_retries,
+                    session.turn_count,
+                    budget,
                 )
                 return True
         except Exception as e:
             logger.warning(
                 "[reactive] compact attempt %d/%d failed: %s",
-                attempt + 1, max_retries, e,
+                attempt + 1,
+                max_retries,
+                e,
             )
             if attempt < max_retries - 1:
-                backoff = 1.0 * (2 ** attempt)
+                backoff = 1.0 * (2**attempt)
                 await asyncio.sleep(backoff)
 
     logger.error("[reactive] all %d compact attempts failed", max_retries)
@@ -157,16 +186,13 @@ def yield_missing_tool_result_blocks(
 
 def build_max_tokens_recovery_message() -> str:
     return (
-        "Output token limit hit. Resume directly 鈥?no apology, no recap of what you were doing. "
+        "Output token limit hit. Resume directly — no apology, no recap of what you were doing. "
         "Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
     )
 
 
 def build_slot_escalation_message() -> str:
-    return (
-        "[Output limit reached. Please continue from where you left off. "
-        "Be concise 鈥?your full output budget is now available.]"
-    )
+    return "[Output limit reached. Please continue from where you left off. Be concise — your full output budget is now available.]"
 
 
 def can_fallback(config: Any) -> bool:
@@ -176,10 +202,7 @@ def can_fallback(config: Any) -> bool:
     config has at least two enabled models (indicator + at least one other),
     or when an explicit target model list is set.
     """
-    legacy = bool(
-        getattr(config, "fallback_model", "")
-        and getattr(config, "fallback_model", "") != getattr(config, "model", "")
-    )
+    legacy = bool(getattr(config, "fallback_model", "") and getattr(config, "fallback_model", "") != getattr(config, "model", ""))
     if legacy:
         return True
     if getattr(config, "target_model_ids", None):
@@ -198,6 +221,4 @@ def can_fallback(config: Any) -> bool:
 
 
 def build_fallback_system_message(original_model: str, fallback_model: str) -> str:
-    return (
-        f"Switched to {fallback_model} due to high demand for {original_model}"
-    )
+    return f"Switched to {fallback_model} due to high demand for {original_model}"

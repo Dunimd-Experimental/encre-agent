@@ -21,13 +21,16 @@
  * Non-compliance may result in service termination or legal liability.
  */
 
-import { getState, setSettings, setCustomCommands, setTheme, setThemePreference, setPermissionPolicies, subscribe, showToast, isEnabled } from "../core/state.js";
+import { setSettings, setCustomCommands, setTheme, setThemePreference, setPermissionPolicies, subscribe, showToast, isEnabled } from "../core/state.js";
 import { send } from "../core/ws.js";
-import { waitForModelValidation, onWechatScanResult, refreshAllData } from "../core/stream.js";
+import { waitForModelValidation, onWechatScanResult } from "../core/stream.js";
 import { setModelConfigs, setMcpServers, setSkillsList, setSubAgents } from "../core/state.js";
 import type { ModelConfigMeta, MCPServerConfig, SkillInfo, ModelCatalog, McpCatalog, McpProviderEntry, ProviderEntry, ProfileData, CustomCommand, UsageStatsSessionEntry } from "../core/types.js";
 import { defaultSearchFilter } from "../core/types.js";
+import { guardRender, guardAsync } from "../core/ui_boundary.js";
+import { scheduleRender } from "../core/render_scheduler.js";
 import { Dialog } from "../ui/dialog.js";
+import { setSurfacePanel, swapPanel as swapSurfacePanel } from "../core/scope.js";
 import {
   bindTargetModelSelection,
   parseTargetModelSelection,
@@ -36,10 +39,11 @@ import {
   serializeTargetModelSelection,
 } from "./model-selection.js";
 import { t, initLocale, setLocale, getLocale, getIntlLocale, clearLocaleCache, onLocaleChange, LOCALES, type Locale } from "../features/i18n.js";
-import { applyServerCommands } from "../features/slash_commands.js";
+import { applyServerCommands } from "../ui/slash-commands.js";
+import { hideViewAnimated, showViewAnimated } from "../ui/animate.js";
 import { renderMarkdown } from "../chat/chat.js";
 import { platformIconHtml, searchEngineIconSrc } from "../ui/icons.js";
-import { formatShortcut } from "../features/shortcutDisplay.js";
+import { formatShortcut } from "../ui/shortcut-display.js";
 // Chart.js is lazy-loaded on first render of the usage panel (see
 // _renderUsageSection) so it no longer blocks startup parsing.
 import { showTooltipAt, hideTooltip } from "../ui/tooltip.js";
@@ -146,17 +150,37 @@ export function handleDesktopTapImpl(this: any): void {
 }
 
 export function openImpl(this: any): void {
+  // Floating session overlays must not outlive the chat view: close the
+  // summary panel so it never renders above settings or leaks stale content.
+  document.getElementById("summary-panel")?.classList.add("hidden");
+  document.getElementById("btn-summary-panel")?.classList.remove("active");
   this.modelCreateActive = false;
   if (this.searchInput) this.searchInput.value = "";
   this.filterNavItems("");
-  // Unified entry: one snapshot refresh covers every settings panel.
-  refreshAllData();
+  // No refreshAllData() here: every settings plane is filled by the unified
+  // backend snapshot (boot push + pushes on config/mode/workspace changes +
+  // per-mutation broadcasts), and each panel renders from the state store —
+  // opening settings must never fire a 15-request refill sweep.
   this.renderAll();
   this.updateSidebarNav();
   this.switchPanel(this.currentPanel);
   // Don't highlight any nav item on initial open — only when user clicks one
   this.nav.querySelectorAll(".settings-nav-item").forEach(item => item.classList.remove("active"));
   document.getElementById("app")?.classList.add("settings-mode");
+  // A close that was still fading out has to be cancelled first, otherwise
+  // its finish() would land after the reopen. `.hidden` stays: settings is
+  // shown purely by `#app.settings-mode`.
+  showViewAnimated(document.getElementById("settings-view"), false);
+  // `#settings-view` is a pre-existing element (in the HTML from
+  // first paint), so `@starting-style` never fires for it.
+  // Animate the enter via inline style instead of relying on
+  // the cascade.
+  const _sv = document.getElementById("settings-view");
+  if (_sv) {
+    (_sv as HTMLElement).style.opacity = "0";
+    void (_sv as HTMLElement).offsetWidth;
+    (_sv as HTMLElement).style.opacity = "";
+  }
   // Entering settings should reveal the app-level sidebar (which carries
   // the settings nav). If it was auto-collapsed by the inner sidebar or a
   // narrow viewport snap, undo that so the settings nav is immediately
@@ -171,23 +195,23 @@ export function openImpl(this: any): void {
 export function openModelCreateImpl(this: any): void {
   this.open();
   this.switchPanel("model");
-  this.showModelCreate();
+  this.showProviderCreate();
 }
 
 export function updateSidebarNavImpl(this: any): void {
   const labelMap: Record<string, string> = {
     general: t("sidebar.general"),
+    flow: t("sidebar.flow"),
     usage: t("sidebar.usage"),
     shortcuts: t("sidebar.shortcuts"),
     storage: t("sidebar.storage"),
     model: t("sidebar.models"),
     gateway: t("sidebar.gateway"),
-    browser: t("sidebar.browser"),
+    assist: t("sidebar.assist"),
     agent: t("sidebar.agent"),
     mcp: t("sidebar.mcp"),
-    index: t("sidebar.document"),
+    library: t("sidebar.library"),
     skills: t("sidebar.skills"),
-    rules: t("sidebar.rules"),
     memory: t("sidebar.memory"),
     developer: t("sidebar.developer"),
     about: t("sidebar.about"),
@@ -195,7 +219,10 @@ export function updateSidebarNavImpl(this: any): void {
   this.nav.querySelectorAll<HTMLElement>(".settings-nav-item").forEach((item) => {
     const panel = item.getAttribute("data-panel");
     if (panel && labelMap[panel]) {
-      const span = item.querySelector("span");
+      // The agent nav item leads with a `.sa-loader` glyph span — target the
+      // label span explicitly or the glyph grid gets overwritten with text
+      // (CJK then wraps one char per 4px grid row: vertical 子/智/能/体).
+      const span = item.querySelector("span:not(.sa-loader)");
       if (span) span.textContent = labelMap[panel];
     }
   });
@@ -205,13 +232,23 @@ export function updateSidebarNavImpl(this: any): void {
   }
 }
 
-export function closeImpl(this: any): void {
+export async function closeImpl(this: any): Promise<void> {
+  // A panel may still hold an unsaved inline editor draft.  Leaving settings
+  // destroys it, so ask first — same contract as the code editor's unsaved-tab
+  // prompt.  Cancelling keeps the settings view (and the draft) exactly as-is.
+  if (typeof this._confirmDiscardEditors === "function" && !(await this._confirmDiscardEditors())) {
+    return;
+  }
   // Suppress the #main-content margin transition while settings-mode is
   // removed: the !important margin override (0) and the sidebar-hidden
   // negative margin differ, and without this the container visibly slides
   // its right edge on exit. Freezing the transition for one frame makes the
   // margin snap instantly, so the content surface stays put.
   const mc = document.getElementById("main-content");
+  // The panel leaves through the shared exit motion instead of vanishing:
+  // it is lifted out of the flow so the chat can take the slot on this very
+  // same frame, and dissolves above it (see `.view-exit` in styles.css).
+  const settingsView = document.getElementById("settings-view");
   if (mc) {
     const prev = mc.style.transition;
     mc.style.transition = "none";
@@ -221,6 +258,14 @@ export function closeImpl(this: any): void {
   } else {
     document.getElementById("app")?.classList.remove("settings-mode");
   }
+  hideViewAnimated(settingsView);
+  // Leaving settings: shelf everything that belongs to the panel the user was
+  // on (an unanswered unbind confirm, a form draft) so it reappears when
+  // settings is reopened on that same panel — instead of floating above the
+  // chat, which is what happened while these were merely DOM children of
+  // #main-content.
+  swapSurfacePanel(this.currentPanel as string, "");
+  setSurfacePanel(null);
   delete document.documentElement.dataset.shortcutPanelActive;
   delete document.documentElement.dataset.shortcutRecording;
   (window as any).electronAPI?.setWinKeyCapture?.(false);
@@ -238,6 +283,11 @@ export function closeImpl(this: any): void {
   } else if (typeof (window as any).__chatRender === "function") {
     (window as any).__chatRender();
   }
+  // Bring back the unsent draft of the active session: cleanupContentArea()
+  // wiped the composer (after saving it into the draft map), and unlike
+  // mode switches the settings-return path has no session_ready event that
+  // would trigger restoreDraft() on its own.
+  (window as any).__app?.restoreDraft?.();
   // Returning from settings is a reveal, not a mode switch: the content
   // surface (with its own background) is a permanent fixture, so it must
   // appear in place immediately. Replaying the mode-switch entrance here
@@ -252,29 +302,13 @@ export function closeImpl(this: any): void {
  * to remove (the settings view is already hidden at this point).
  */
 export function _cleanupTransientOverlaysImpl(this: any): void {
-  // Floating dialogs/overlays created by settings panels:
-  //   - skill-detail overlay
-  //   - command-create overlay
-  //   - doc-name / doc-url dialog
-  //   - rule-edit overlay
-  //   - agent-edit overlay
-  //   - memory-edit overlay
-  // Each is appended to document.body with a unique class.
-  const transientClasses = [
-    "skill-detail-overlay",
-    "command-create-overlay",
-    "doc-name-dialog",
-    "doc-url-dialog",
-    "rule-edit-overlay",
-    "agent-edit-overlay",
-    "memory-edit-overlay",
-  ];
-  for (const cls of transientClasses) {
-    document.querySelectorAll(`.${cls}`).forEach((el) => el.remove());
-  }
   // Close any still-open dropdown menus so they don't pop up the
   // moment the user moves the mouse.
   document.querySelectorAll(".settings-dropdown.open").forEach((dd) => dd.classList.remove("open"));
+  // Panel-owned surfaces (inline editors, full-screen forms, pending confirms)
+  // are NOT swept here any more: the scope host shelved them when settings
+  // closed, and a draft editor leaves through its own exit motion rather than
+  // being yanked out of #main-content.
   // Drop inline form nodes that were inserted into #settings-content-wrap
   // by a settings panel's edit-mode flow (rare but possible).
   document.querySelectorAll("#settings-content-wrap .inline-form, #settings-content-wrap .edit-form").forEach((el) => el.remove());
@@ -410,6 +444,28 @@ export function refreshCurrentPanelImpl(this: any): void {
 }
 
 export function switchPanelImpl(this: any, id: PanelId): void {
+  // Cancel any active shortcut recording before switching panels — the
+  // capture handler is document-level and would otherwise keep recording
+  // from the wrong panel.
+  if (this._recordingShortcutId) {
+    if (this._captureHandler) {
+      document.removeEventListener("keydown", this._captureHandler, true);
+    }
+    this._stopShortcutCountdown();
+    this._recordingShortcutId = null;
+    delete document.documentElement.dataset.shortcutRecording;
+    this.renderShortcuts();
+  }
+
+  // Every floating surface that belongs to a settings panel — an unanswered
+  // unbind confirm, an inline editor draft, a full-screen form — is shelved
+  // and restored by the scope host, exactly like session surfaces follow their
+  // conversation. Must run BEFORE currentPanel is overwritten: it doubles as
+  // the outgoing panel key. Re-entering the same panel passes "" so the
+  // restore path still runs.
+  const prevPanel = (this.currentPanel as string) || "";
+  setSurfacePanel(id);
+  swapSurfacePanel(prevPanel === id ? "" : prevPanel, id);
   this.currentPanel = id;
   this.modelCreateActive = false;
   delete document.documentElement.dataset.shortcutPanelActive;
@@ -424,18 +480,24 @@ export function switchPanelImpl(this: any, id: PanelId): void {
   });
 
   if (id === "skills") {
-    console.log("[DEBUG switchPanel] skills panel, skillsList:", getState().skillsList.length, "items");
     this.panels.skills.classList.add("active");
     this.renderSkills();
+  } else if (id === "flow") {
+    this.panels.flow.classList.add("active");
+    this.renderFlow();
   } else if (id === "model") {
     this.panels.model.classList.add("active");
     this.renderModel();
   } else if (id === "gateway") {
     this.panels.gateway.classList.add("active");
     this.renderGateway();
-  } else if (id === "browser") {
-    this.panels.browser.classList.add("active");
-    this.renderBrowser();
+  } else if (id === "assist") {
+    // Assist Panels: one landing page lists every auxiliary surface
+    // (Terminal / Explorer / Review / Browser) as storage-page "Data Center"
+    // controls; the top-right arrow drills into its editor card. The render
+    // is skipped while a card is open so the draft survives panel hops.
+    this.panels.assist.classList.add("active");
+    this.renderAssistPanel();
   } else if (id === "mcp") {
     this.panels.mcp.classList.add("active");
     this.renderMcpList();
@@ -443,6 +505,8 @@ export function switchPanelImpl(this: any, id: PanelId): void {
     this.panels.agent.classList.add("active");
     this.renderAgent();
   } else if (id === "memory") {
+    // 记忆: the relationship graph owns the whole panel; a node opens its
+    // reader as a sub-page card.
     this.panels.memory.classList.add("active");
     this.renderMemory();
   } else if (id === "usage") {
@@ -456,29 +520,24 @@ export function switchPanelImpl(this: any, id: PanelId): void {
   } else if (id === "storage") {
     this.panels.storage.classList.add("active");
     this.renderStorage();
-  } else if (id === "index") {
-    console.log("[DEBUG switchPanel] index panel, docsList:", getState().docsList.length, "items");
-    this.panels.index.classList.add("active");
-    this.renderIndex();
-  } else if (id === "rules") {
-    this.panels.rules.classList.add("active");
-    this.renderRules();
-  } else if (id === "permissions") {
-    this.panels.permissions.classList.add("active");
-    this.renderPermissions();
+  } else if (id === "library") {
+    this.panels.library.classList.add("active");
+    this.renderLibrary();
   } else if (id === "developer") {
     this.panels.developer.classList.add("active");
     this.renderDeveloper();
-  } else if (id === "search") {
-    this.panels.search.classList.add("active");
-    this.renderSearchFilter();
+  } else if (id === "plugins") {
+    this.panels.plugins.classList.add("active");
+    this.renderPlugins();
   } else {
-    this.panels[id].classList.add("active");
+    // Plugin-contributed panels are not part of the constructor-time
+    // `panels` snapshot; resolve them from the DOM by id.
+    const el = this.panels[id as PanelId] || document.getElementById(`panel-${id}`);
+    el?.classList.add("active");
   }
 }
 
 export function showSkillDetailImpl(this: any, skillName: string, isEdit = false): void {
-  console.log("[DEBUG showSkillDetail] called with:", skillName, "isEdit:", isEdit);
   this._renderSkillDetailDialog(skillName, isEdit);
 }
 
@@ -505,30 +564,37 @@ export function showAgentListImpl(this: any): void {
   this.renderAgent();
 }
 
-export function showModelCreateImpl(this: any): void {
+export function showProviderCreateImpl(this: any): void {
   this.modelCreateActive = true;
-  this._renderModelCreateDialog();
+  this._renderProviderDialog();
 }
 
-export function showModelEditImpl(this: any, idx: number): void {
+export function showProviderEditImpl(this: any, idx: number): void {
   this.modelCreateActive = true;
-  this._renderModelCreateDialog(idx);
+  this._renderProviderDialog(idx);
 }
 
 export function renderAllImpl(this: any): void {
-  this.renderGeneral();
-  void this._renderUsageSection();
-  this.renderShortcuts();
-  this.renderModel();
-  this.renderGateway();
-  this.renderBrowser();
-  this.renderIndex();
-  this.renderSkills();
-  this.renderRules();
-  this.renderPermissions();
-  this.renderMcp();
-  this.renderAgent();
-  this.renderAbout();
-  this.renderSearchFilter();
-  if (isDevModeEnabled()) this.renderDeveloper();
+  // Per-panel boundaries AND per-panel scheduler keys: a broken settings
+  // panel keeps its old DOM, never prevents the remaining panels from
+  // rendering, and repeated calls in one frame coalesce like every other
+  // surface.
+  const run = (id: string, fn: () => void) =>
+    scheduleRender(`settings:${id}`, () => guardRender("settings-panel", id, fn), 60);
+  run("general", () => this.renderGeneral());
+  run("flow", () => this.renderFlow());
+  scheduleRender("settings:usage", () => {
+    void guardAsync("settings-panel", "usage", () => this._renderUsageSection());
+  }, 60);
+  run("shortcuts", () => this.renderShortcuts());
+  run("model", () => this.renderModel());
+  run("gateway", () => this.renderGateway());
+  run("assist", () => this.renderAssistPanel());
+  run("library", () => this.renderLibrary());
+  run("skills", () => this.renderSkills());
+  run("memory", () => this.renderMemory());
+  run("mcp", () => this.renderMcp());
+  run("agent", () => this.renderAgent());
+  run("about", () => this.renderAbout());
+  if (isDevModeEnabled()) run("developer", () => this.renderDeveloper());
 }

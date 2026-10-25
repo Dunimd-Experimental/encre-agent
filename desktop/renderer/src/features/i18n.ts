@@ -65,9 +65,12 @@ export function getIntlLocale(): string {
 // Only the eagerly bundled tables (zh + en) start out populated.  Every other
 // locale is installed by ensureLocale() when it is selected — see
 // LAZY_LOCALE_LOADERS for why the rest are not in the entry chunk.
-const translations: Partial<Record<Locale, LocaleMessages>> = { ...LOCALE_REGISTRY };
+// `var`, not `const`: a circular module-init window can call t() before this
+// module body runs.  `var` bindings exist as undefined there, so t() can
+// detect the not-ready state instead of tripping a TDZ ReferenceError.
+var translations: Partial<Record<Locale, LocaleMessages>> = { ...LOCALE_REGISTRY };
 
-let currentLocale: Locale = "zh";
+var currentLocale: Locale = "zh";
 
 type LocaleChangeCallback = (locale: Locale) => void;
 const localeChangeCallbacks: Set<LocaleChangeCallback> = new Set();
@@ -153,8 +156,9 @@ export function initLocale(): void {
       return;
     }
   } catch {}
-  // Fall back to browser language
-  setLocale(localeFromBrowser(navigator.language ?? ""));
+  // App default is English; only use browser language when the user has
+  // never explicitly chosen anything.
+  setLocale("en");
 }
 
 /** Maps a browser language tag to the closest supported UI locale. */
@@ -177,7 +181,7 @@ export function localeFromBrowser(tag: string): Locale {
 type StringGetter = () => string;
 
 const pendingSubscribers: Set<StringGetter> = new Set();
-const stringCache: Map<string, string> = new Map();
+var stringCache: Map<string, string> = new Map();
 
 /**
  * Translates a dotted key (e.g. `chat.send`) with optional `{param}` interpolation.
@@ -187,14 +191,20 @@ const stringCache: Map<string, string> = new Map();
  * @returns The translated string, or the key itself when no translation exists.
  */
 export function t(key: string, params?: Record<string, string | number>): string {
+  // This function is reachable during a circular module-init window (one
+  // module calls t() while the i18n body has not executed yet).  In that
+  // window the cache/table bindings are not initialized; returning the key is
+  // correct and, crucially, cannot throw and abort the importing module.
+  const cache = typeof stringCache === "undefined" ? null : stringCache;
+  if (!cache) return key;
   const cacheKey = params ? `${currentLocale}:${key}:${JSON.stringify(params)}` : `${currentLocale}:${key}`;
-  if (stringCache.has(cacheKey)) {
-    return stringCache.get(cacheKey)!;
+  if (cache.has(cacheKey)) {
+    return cache.get(cacheKey)!;
   }
 
   const keys = key.split(".");
   const lookup = (locale: Locale): unknown => {
-    let value: unknown = translations[locale];
+    let value: unknown = typeof translations === "undefined" ? undefined : translations[locale];
     for (const k of keys) {
       if (value && typeof value === "object" && k in value) {
         value = (value as LocaleMessages)[k];
@@ -218,7 +228,7 @@ export function t(key: string, params?: Record<string, string | number>): string
     }
   }
 
-  stringCache.set(cacheKey, result);
+  cache.set(cacheKey, result);
   return result;
 }
 

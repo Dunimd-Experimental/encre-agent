@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,20 +21,23 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Encre cryptographic layer -- provides encrypt/decrypt for all sensitive data.
 
 Architecture
 ============
 
-All encryption uses **AES-256-GCM** (32鈥慴yte key, 12鈥慴yte random nonce,
-16鈥慴yte authentication tag).
+All encryption uses **AES-256-GCM** (32‑byte key, 12‑byte random nonce,
+16‑byte authentication tag).
 
 Master key
-    On first use a 256鈥慴it master key is generated from ``os.urandom(32)`` and
-    stored in ``<data_dir>/keys/keyfile`` (mode ``0o600``).  The on鈥慸isk
-    representation is the master key itself wrapped with a *machine鈥慴inding*
-    key derived via HKDF鈥慡HA256 from the host's ``/etc/machine鈥慽d`` content +
-    hostname.
+    On first use a 256‑bit master key is generated from ``os.urandom(32)`` and
+    stored in ``<data_dir>/keys/keyfile`` (mode ``0o600``).  The on-disk
+    representation is the master key itself wrapped with a *machine-binding*
+    key derived via HKDF-SHA256 (RFC 5869: Extract + Expand) from a
+    multi-source host fingerprint (Windows MachineGuid / /etc/machine-id /
+    DMI product UUID + hostname + username).
 
     This means even if ``keyfile`` is exfiltrated it cannot be unwrapped on
     any other machine.
@@ -44,23 +47,33 @@ Master key
         encrypt(plain_bytes)  ->  base64(nonce || ciphertext || tag)
         decrypt(b64_ciphertext) -> plain_bytes
 
-No environment variables are consulted for key material.
+Key material never lives in source or config files: the vendor application
+secret is injected at build time (GitHub Actions) into the native module, with
+an ``ENCRE_EA_SECRET`` runtime fallback for development.
 """
 
-from __future__ import annotations
 
 import base64
 import contextlib
+import getpass
 import hashlib
+import hmac
 import os
 import pathlib
 import platform
 import secrets
 import shutil
 import stat
+import sys
 import typing as _t
 
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
+
 __all__ = [
+    "DecryptionError",
     "decrypt",
     "decrypt_bytes",
     "encrypt",
@@ -88,11 +101,29 @@ _NONCE_LENGTH = 12     # GCM standard
 _TAG_LENGTH = 16       # GCM 128-bit auth tag
 _GCM_IV_LENGTH = 12
 
-# HKDF constants for deriving the machine-binding wrapping key
-_HKDF_SALT = b"encre-crypto-hkdf-v1"
+# HKDF constants for deriving the machine-binding wrapping key (scheme v3).
+# v3 mixes a vendor-supplied application secret (build-time injected via
+# GitHub Actions into the native module, or provided at runtime through the
+# ``ENCRE_EA_SECRET`` environment variable) into the IKM, so the wrapping key
+# depends on BOTH the machine fingerprint AND the distribution secret.
+_HKDF_SALT = b"encre-crypto-hkdf-v3"
 _HKDF_SALT_SHA256 = hashlib.sha256(_HKDF_SALT).digest()[:32]
 
 _WRAP_CTX_AAD = b"encre-keywrap-v1"
+
+#: Keyfile wire format: ``b"\x03" + nonce(12) || ciphertext(32) || tag(16)``.
+#: The version byte identifies the derivation scheme; unknown versions are
+#: refused (fail-closed) instead of silently regenerating a key.
+_KEYFILE_VERSION = 3
+_KEYFILE_HEADER = bytes([_KEYFILE_VERSION])
+
+#: Public development fallback used ONLY when neither the native module nor
+#: the ``ENCRE_EA_SECRET`` environment variable provides the vendor secret.
+#: Release builds never fall through here.
+_DEV_APP_SECRET = b"encre-dev-app-secret-public-dev-fallback"
+
+#: Environment variable carrying the vendor application secret.
+_APP_SECRET_ENV = "ENCRE_EA_SECRET"
 
 # Cached master key (module lifetime) -- avoid reading keyfile on every call
 _master_key_cache: bytes | None = None
@@ -103,46 +134,173 @@ _master_key_cache: bytes | None = None
 # ---------------------------------------------------------------------------
 
 def _read_machine_id() -> bytes:
-    """Return a stable machine鈥慽dentifier blob for key鈥憌rapping.
+    """Return a stable machine-identifier blob for key-wrapping.
 
-    Reads ``/etc/machine-id`` and falls back to ``gethostname()``.
+    Mixes **every** fingerprint source available on this host into a single
+    IKM (framed ``source=value`` lines), so the wrapping key does not depend
+    on a single mutable or missing attribute:
+
+    * Windows: ``HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid``
+    * Linux:   ``/etc/machine-id`` and ``/sys/class/dmi/id/product_uuid``
+    * hostname and current username (round out hosts without hardware ids)
+
+    Raises:
+        RuntimeError: If no fingerprint source yields a value -- key
+            derivation must fail closed rather than silently bind to a
+            constant.
     """
+    parts: list[bytes] = []
+
+    def _add(source: str, value: bytes | None) -> None:
+        if value:
+            stripped = value.strip()
+            if stripped:
+                parts.append(source.encode("utf-8") + b"=" + stripped)
+
+    # Windows: registry machine GUID (stable across reboots and renames)
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+            ) as key:
+                guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+                _add("win-machineguid", str(guid).encode("utf-8"))
+        except OSError:
+            logger.debug("exception suppressed", exc_info=True)
+
+    for path, source in (
+        ("/etc/machine-id", "machine-id"),
+        ("/sys/class/dmi/id/product_uuid", "dmi-product-uuid"),
+    ):
+        try:
+            mid = pathlib.Path(path).read_text(encoding="utf-8")
+            if mid and mid.strip() != "uninitialized":
+                _add(source, mid.encode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            logger.debug("exception suppressed", exc_info=True)
+
+    _add("hostname", platform.node().encode("utf-8"))
     try:
-        mid = pathlib.Path("/etc/machine-id").read_text(encoding="utf-8").strip()
-        if mid and mid != "uninitialized":
-            return mid.encode("utf-8")
-    except (OSError, UnicodeDecodeError):
-        pass
-    # Fallback: hash of hostname (still provides binding, just weaker)
-    return platform.node().encode("utf-8")
+        _add("username", getpass.getuser().encode("utf-8"))
+    except Exception:
+        logger.debug("exception suppressed", exc_info=True)
+
+    if not parts:
+        raise RuntimeError(
+            "No machine fingerprint source available; cannot derive the "
+            "machine-binding key (fail-closed)."
+        )
+    return b"\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# HKDF-SHA256 helper (implemented with hashlib -- no third鈥憄arty required
-# for this single鈥憇tep usage)
+# HKDF-SHA256 (RFC 5869) -- implemented with hmac/hashlib, no third party
 # ---------------------------------------------------------------------------
 
 def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
-    return hashlib.sha256(salt + ikm).digest()
+    """RFC 5869 Extract step: ``PRK = HMAC-Hash(salt, IKM)``."""
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def _hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
+    """RFC 5869 Expand step: derive ``length`` output bytes from the PRK."""
+    if length <= 0:
+        raise ValueError("HKDF-Expand length must be positive")
+    okm = b""
+    block = b""
+    counter = 1
+    while len(okm) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        okm += block
+        counter += 1
+    return okm[:length]
+
+
+_HKDF_INFO = b"encre-machine-binding-wrapping-key-v3"
+
+
+def _read_app_secret() -> bytes:
+    """Return the vendor application secret (scheme v3 IKM component).
+
+    Resolution order:
+
+    1. Native build-time injection -- GitHub Actions compiles the secret into
+       the native module (``ea_build_secret``), so packaged releases carry it
+       without any file or environment dependency.
+    2. The ``ENCRE_EA_SECRET`` runtime environment variable.
+    3. Windows registry fallback (Machine, then User scope) -- covers processes
+       started before the variable was set system-wide.
+    4. Public development fallback (dev machines only).
+    """
+    try:
+        from encre import _native  # type: ignore[attr-defined]
+
+        getter = getattr(_native, "ea_build_secret", None)
+        if getter is not None:
+            injected = getter()
+            if injected:
+                return injected.encode("utf-8")
+    except Exception:
+        logger.debug("exception suppressed", exc_info=True)
+
+    value = os.environ.get(_APP_SECRET_ENV)
+    if value and value.strip():
+        return value.strip().encode("utf-8")
+
+    if sys.platform == "win32":
+        try:
+            import winreg
+
+            hives = (
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                (winreg.HKEY_CURRENT_USER, "Environment"),
+            )
+            for hive, path in hives:
+                try:
+                    with winreg.OpenKey(hive, path) as key:
+                        reg_value, _ = winreg.QueryValueEx(key, _APP_SECRET_ENV)
+                        if reg_value and str(reg_value).strip():
+                            return str(reg_value).strip().encode("utf-8")
+                except OSError:
+                    continue
+        except Exception:
+            logger.debug("exception suppressed", exc_info=True)
+
+    return _DEV_APP_SECRET
 
 
 def _derive_wrapping_key() -> bytes:
-    """Derive the AES鈥?56 key used to wrap/unwrap the master鈥慿ey file."""
-    ikm = _read_machine_id()
-    return _hkdf_extract(_HKDF_SALT_SHA256, ikm)
+    """Derive the AES-256 key used to wrap/unwrap the master-key file.
+
+    Scheme v3: the machine fingerprint and the vendor application secret are
+    both folded into the HKDF input key material with length-prefix framing
+    (unambiguous concatenation), then run through the standard RFC 5869
+    Extract + Expand steps.
+    """
+    machine = _read_machine_id()
+    secret = _read_app_secret()
+    ikm = (
+        len(machine).to_bytes(4, "big") + machine
+        + len(secret).to_bytes(4, "big") + secret
+    )
+    prk = _hkdf_extract(_HKDF_SALT_SHA256, ikm)
+    return _hkdf_expand(prk, _HKDF_INFO, 32)
 
 
 # ---------------------------------------------------------------------------
-# Master鈥慿ey management (AES鈥慓CM wrap/unwrap with machine鈥慴inding key)
+# Master‑key management (AES‑GCM wrap/unwrap with machine‑binding key)
 # ---------------------------------------------------------------------------
 
 def _generate_master_key() -> bytes:
-    """Return a fresh 256鈥慴it master key."""
+    """Return a fresh 256‑bit master key."""
     return secrets.token_bytes(_KEY_LENGTH)
 
 
 def _wrap_master_key(master_key: bytes) -> bytes:
-    """Wrap *master_key* with the machine鈥慴inding key via AES鈥?56鈥慓CM.
+    """Wrap *master_key* with the machine‑binding key via AES‑256‑GCM.
 
     Returns
     -------
@@ -156,7 +314,7 @@ def _wrap_master_key(master_key: bytes) -> bytes:
     nonce = secrets.token_bytes(_NONCE_LENGTH)
     aesgcm = AESGCM(wrapping_key)
     ciphertext = aesgcm.encrypt(nonce, master_key, _WRAP_CTX_AAD)
-    # ciphertext already includes the 16鈥慴yte tag appended
+    # ciphertext already includes the 16‑byte tag appended
     return nonce + ciphertext
 
 
@@ -225,7 +383,7 @@ def _create_keyfile() -> bytes:
         keyfile_dir.chmod(stat.S_IRWXU)
 
     master_key = _generate_master_key()
-    wrapped = _wrap_master_key(master_key)
+    wrapped = _KEYFILE_HEADER + _wrap_master_key(master_key)
 
     # Atomic write via temp file + rename
     tmp = path.with_suffix(".tmp")
@@ -241,6 +399,10 @@ def _create_keyfile() -> bytes:
 def _load_keyfile() -> bytes | None:
     """Read the wrapped master key from disk and unwrap it.
 
+    Wire format: ``version byte || nonce || ciphertext || tag``.  A keyfile
+    with an unknown or missing version byte is refused (fail-closed) rather
+    than silently replaced -- the caller decides whether to regenerate.
+
     Tries the canonical location first, then the legacy ``~/.encre`` one so
     an install that has not been migrated yet still starts.
 
@@ -251,9 +413,12 @@ def _load_keyfile() -> bytes | None:
             continue
         try:
             raw = path.read_bytes()
-            if len(raw) < _NONCE_LENGTH + _KEY_LENGTH + _TAG_LENGTH:
+            if not raw.startswith(_KEYFILE_HEADER):
                 continue
-            return _unwrap_master_key(raw)
+            body = raw[len(_KEYFILE_HEADER):]
+            if len(body) < _NONCE_LENGTH + _KEY_LENGTH + _TAG_LENGTH:
+                continue
+            return _unwrap_master_key(body)
         except Exception:
             continue
     return None
@@ -262,7 +427,7 @@ def _load_keyfile() -> bytes | None:
 def ensure_keyfile() -> bytes:
     """Return the active master key, creating the keyfile if missing.
 
-    This is the primary entry鈥憄oint -- call once at startup.
+    This is the primary entry‑point -- call once at startup.
     """
     global _master_key_cache
     if _master_key_cache is not None:
@@ -290,20 +455,20 @@ def _get_aesgcm() -> AESGCM:
 
 
 def encrypt(plaintext: str) -> str:
-    """Encrypt a UTF鈥? string with AES鈥?56鈥慓CM.
+    """Encrypt a UTF‑8 string with AES‑256‑GCM.
 
-    Returns a base64鈥慹ncoded ciphertext (nonce || ct || tag).
+    Returns a base64‑encoded ciphertext (nonce || ct || tag).
     """
     return encrypt_bytes(plaintext.encode("utf-8"))
 
 
 def decrypt(ciphertext: str) -> str:
-    """Decrypt a base64 ciphertext back to the original UTF鈥? string."""
+    """Decrypt a base64 ciphertext back to the original UTF‑8 string."""
     return decrypt_bytes(ciphertext).decode("utf-8")
 
 
 def encrypt_bytes(plaintext: str | bytes) -> str:
-    """Encrypt bytes (or a string treated as UTF鈥?) -> base64 string."""
+    """Encrypt bytes (or a string treated as UTF‑8) -> base64 string."""
     if isinstance(plaintext, str):
         plaintext = plaintext.encode("utf-8")
     aesgcm = _get_aesgcm()
@@ -312,13 +477,32 @@ def encrypt_bytes(plaintext: str | bytes) -> str:
     return base64.b64encode(nonce + ct).decode("ascii")
 
 
+class DecryptionError(ValueError):
+    """Raised when ciphertext cannot be authenticated or decrypted.
+
+    Typical causes: the blob was produced under a different machine-binding
+    key (copied from another host, or written before the key-derivation
+    scheme changed) or the data is corrupted.  Callers should surface this
+    as an actionable error, not a crash.
+    """
+
+
 def decrypt_bytes(ciphertext: str) -> bytes:
     """Decrypt a base64 ciphertext -> raw bytes."""
-    raw = base64.b64decode(ciphertext)
-    nonce = raw[:_NONCE_LENGTH]
-    ct = raw[_NONCE_LENGTH:]
-    aesgcm = _get_aesgcm()
-    return aesgcm.decrypt(nonce, ct, None)
+    try:
+        raw = base64.b64decode(ciphertext)
+        nonce = raw[:_NONCE_LENGTH]
+        ct = raw[_NONCE_LENGTH:]
+        aesgcm = _get_aesgcm()
+        return aesgcm.decrypt(nonce, ct, None)
+    except DecryptionError:
+        raise
+    except Exception as exc:
+        raise DecryptionError(
+            "Decryption failed: the data was not encrypted with this "
+            "machine's key (wrong machine, reinstalled OS/user, or an older "
+            "key-derivation scheme) or the ciphertext is corrupted."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +518,16 @@ def encrypt_raw(plain_bytes: bytes) -> bytes:
 
 def decrypt_raw(packed: bytes) -> bytes:
     """Decrypt nonce || ciphertext || tag -> raw bytes."""
-    nonce = packed[:_NONCE_LENGTH]
-    ct = packed[_NONCE_LENGTH:]
-    aesgcm = _get_aesgcm()
-    return aesgcm.decrypt(nonce, ct, None)
+    try:
+        nonce = packed[:_NONCE_LENGTH]
+        ct = packed[_NONCE_LENGTH:]
+        aesgcm = _get_aesgcm()
+        return aesgcm.decrypt(nonce, ct, None)
+    except DecryptionError:
+        raise
+    except Exception as exc:
+        raise DecryptionError(
+            "Decryption failed: the data was not encrypted with this "
+            "machine's key (wrong machine, reinstalled OS/user, or an older "
+            "key-derivation scheme) or the ciphertext is corrupted."
+        ) from exc

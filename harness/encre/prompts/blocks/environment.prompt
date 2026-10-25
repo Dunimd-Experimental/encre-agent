@@ -1,13 +1,12 @@
 ---
 name: environment
-version: 1
+version: 2
 priority: 8
 condition: ~
 ---
 
 ## Environment
-Working directory: {{cwd}}
-Is directory a git repo: {{is_git}}
+{{environment_lines}}
 
 ## Operating System
 **{{os_name}}** -- {{details}}

@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Learns from explicit user corrections to tool errors.
 
 :class:`EncreFeedbackLearner` stores :class:`CorrectionRecord` entries
@@ -30,11 +32,14 @@ corrections most similar to the current error context.  Records decay and
 become stale over time so outdated advice is eventually dropped.
 """
 
+import contextlib
 import json
 import os
 import re
 import time
 from dataclasses import dataclass, field
+
+from encre.crypto import decrypt, encrypt
 
 
 @dataclass
@@ -235,14 +240,21 @@ class EncreFeedbackLearner:
             self._rebuild_index()
 
     def save(self) -> None:
-        """Persist records to disk (applying decay first)."""
+        """Persist records to disk, encrypted (applying decay first)."""
         if self._storage_path is None:
             return
         self._apply_decay()
         data = [rec.to_dict() for rec in self._records]
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        try:
+            payload = encrypt(payload)
+        except Exception:
+            # Fail-closed: records hold user free-text; never persist
+            # them as plaintext.
+            raise
         os.makedirs(os.path.dirname(self._storage_path), exist_ok=True)
         with open(self._storage_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write(payload)
 
     def load(self) -> bool:
         """Load persisted records; returns ``True`` on success."""
@@ -252,7 +264,11 @@ class EncreFeedbackLearner:
             return False
         try:
             with open(self._storage_path, encoding="utf-8") as f:
-                data = json.load(f)
+                raw = f.read().strip()
+            if raw and not raw.startswith("["):
+                with contextlib.suppress(Exception):
+                    raw = decrypt(raw)
+            data = json.loads(raw)
             self._records = [CorrectionRecord.from_dict(d) for d in data]
             self._rebuild_index()
             self._apply_decay()

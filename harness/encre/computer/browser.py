@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -28,10 +27,12 @@ Chrome DevTools Protocol (CDP) communication.  Supports Chrome,
 Edge, and other Chromium-based browsers.
 """
 
+from encre.logging_config import get_logger
 import asyncio
 import contextlib
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -44,7 +45,7 @@ from encre.computer.cdp import (
     _get_page_websocket_url,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _module_launched_process: Any | None = None
 
@@ -148,6 +149,9 @@ class EncreBrowserSession:
         self._current_target_index: int = -1
         self._connected: bool = False
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Last logical pointer position, kept so consecutive gestures form
+        # one continuous trajectory instead of a series of teleports.
+        self._mouse_pos: tuple[float, float] = (0.0, 0.0)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -209,7 +213,7 @@ class EncreBrowserSession:
         self._page_ws_url = ws_url
         self._proc = None
         self._tick()
-        # Don't override viewport for internal webview 鈥?it uses its own size
+        # Don't override viewport for internal webview — it uses its own size
         await self._enable_domains()
 
     async def _enable_domains(self) -> None:
@@ -610,7 +614,7 @@ class EncreBrowserSession:
             self._state.url = await self.get_url()
             self._state.title = await self.get_title()
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
         # html and text are expensive; only fetch if empty
         if not self._state.html:
             with contextlib.suppress(Exception):
@@ -624,13 +628,126 @@ class EncreBrowserSession:
     # Mouse actions (coordinate-based)
     # ------------------------------------------------------------------
 
+    # Human-like input dynamics. Pure math: bezier paths, smoothstep easing
+    # and randomized pacing. The point is that every synthesized gesture
+    # carries the statistical signature of a real hand — curved approach,
+    # non-constant speed, sub-pixel jitter, occasional overshoot — so bot
+    # heuristics that flag teleporting pointers, laser-straight lines or
+    # metronome-regular wheel deltas find nothing to match on.
+
+    _MOVE_FRAME_MS = (6, 14)  # pointer sampling interval, min/max
+    _SCROLL_FRAME_MS = (12, 26)  # wheel frame interval, min/max
+
+    @staticmethod
+    def _smoothstep(t: float) -> float:
+        """S-curve easing (3t^2 - 2t^3): slow start, fast middle, soft stop."""
+        return t * t * (3.0 - 2.0 * t)
+
+    async def _human_move_to(self, x: float, y: float, button: str | None = None) -> None:
+        """Move the virtual pointer to (x, y) along a human-like trajectory.
+
+        Quadratic bezier with a random perpendicular bow (never a straight
+        laser line), smoothstep velocity profile, randomized frame pacing,
+        sub-pixel hand jitter and a ~20% chance of overshoot-then-correct.
+        """
+        x0, y0 = self._mouse_pos
+        dx, dy = x - x0, y - y0
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < 2:
+            ev: dict[str, Any] = {"type": "mouseMoved", "x": x, "y": y}
+            if button:
+                ev["button"] = button
+            await self._transport.send("Input.dispatchMouseEvent", ev)
+            self._mouse_pos = (x, y)
+            return
+
+        steps = max(6, min(28, int(dist / 22)))
+        # Control point: midpoint nudged along the perpendicular; the bow
+        # scales with distance (capped) and flips side at random.
+        bow = random.uniform(-0.18, 0.18) * min(dist, 600)
+        ux, uy = -dy / dist, dx / dist
+        cx = (x0 + x) / 2.0 + ux * bow
+        cy = (y0 + y) / 2.0 + uy * bow
+
+        overshoot = random.random() < 0.2
+        tx, ty = x, y
+        if overshoot:
+            tx = x + dx / dist * random.uniform(2.0, 6.0)
+            ty = y + dy / dist * random.uniform(2.0, 6.0)
+
+        for i in range(1, steps + 1):
+            e = self._smoothstep(i / steps)
+            u = 1.0 - e
+            # Hand jitter on every frame except the final one: the pointer
+            # must settle exactly on the target (no 0.5px edge-hover misses).
+            jx = 0.0 if i == steps else random.uniform(-0.6, 0.6)
+            jy = 0.0 if i == steps else random.uniform(-0.6, 0.6)
+            px = u * u * x0 + 2.0 * u * e * cx + e * e * tx + jx
+            py = u * u * y0 + 2.0 * u * e * cy + e * e * ty + jy
+            ev = {"type": "mouseMoved", "x": px, "y": py}
+            if button:
+                ev["button"] = button
+            await self._transport.send("Input.dispatchMouseEvent", ev)
+            await asyncio.sleep(random.uniform(*self._MOVE_FRAME_MS) / 1000.0)
+
+        if overshoot:
+            ev: dict[str, Any] = {"type": "mouseMoved", "x": x, "y": y}
+            if button:
+                ev["button"] = button
+            await self._transport.send("Input.dispatchMouseEvent", ev)
+            await asyncio.sleep(random.uniform(0.02, 0.05))
+
+        self._mouse_pos = (float(x), float(y))
+
+    async def _human_scroll(self, delta_x: float, delta_y: float) -> None:
+        """Send a wheel gesture for the given total delta.
+
+        Split into frames with an ease-out velocity profile — a real fling
+        starts fast and bleeds off — with randomized frame deltas and pacing
+        so the series never looks metronome-regular.
+        """
+        if abs(delta_x) < 1 and abs(delta_y) < 1:
+            return
+        total = abs(delta_y) + abs(delta_x)
+        frames = max(2, min(14, int(total / 110) + 2))
+        px, py = self._mouse_pos
+        for i in range(frames):
+            prev = (1.0 - i / frames) ** 1.6
+            cur = (1.0 - (i + 1) / frames) ** 1.6
+            frac = prev - cur
+            fx = delta_x * frac + (random.uniform(-6, 6) if abs(delta_x) > 30 else 0.0)
+            fy = delta_y * frac + (random.uniform(-6, 6) if abs(delta_y) > 30 else 0.0)
+            await self._transport.send("Input.dispatchMouseEvent", {
+                "type": "mouseWheel", "x": px, "y": py,
+                "deltaX": fx, "deltaY": fy,
+            })
+            await asyncio.sleep(random.uniform(*self._SCROLL_FRAME_MS) / 1000.0)
+
+    async def agent_control_request(self, request: str) -> dict[str, Any]:
+        """Ask the user (via the takeover pill) for a control change.
+
+        ``user_takeover`` requests that the USER operate the page (logins,
+        CAPTCHAs, payments — anything the user must do by hand and the Agent
+        must never see); ``agent_control`` requests that the user hand
+        control back to the Agent. The host relay intercepts this method —
+        it is not a real CDP command — surfaces the request on the pill and
+        answers ``{"granted": bool, "reason": str}`` after the user responds
+        (a timeout counts as denied). A request never changes control by
+        itself: only the user's answer does.
+        """
+        await self._ensure_browser()
+        try:
+            result = await self._transport.send("Encre.agentControlRequest", {"request": request})
+        except Exception:
+            return {"granted": False, "reason": "unavailable"}
+        return result if isinstance(result, dict) else {"granted": False, "reason": "unsupported"}
+
     async def _mouse_event(self, x: int, y: int, action: str = "click", button: str = "left", click_count: int = 1) -> None:
-        """Send mouse events to the page."""
-        await self._transport.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved",
-            "x": x,
-            "y": y,
-        })
+        """Send mouse events to the page, approaching the target with a
+        human-like pointer trajectory and an aiming pause before pressing."""
+        await self._human_move_to(x, y)
+        # Aiming pause: a hand stops before it presses.
+        await asyncio.sleep(random.uniform(0.04, 0.12))
         if action == "double":
             for _ in range(2):
                 await self._transport.send("Input.dispatchMouseEvent", {
@@ -691,14 +808,10 @@ class EncreBrowserSession:
             return False
 
     async def move_mouse(self, x: int, y: int) -> bool:
-        """Move the mouse to (x, y)."""
+        """Move the mouse to (x, y) along a human-like trajectory."""
         try:
             await self._ensure_browser()
-            await self._transport.send("Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": x,
-                "y": y,
-            })
+            await self._human_move_to(x, y)
             self._tick()
             return True
         except Exception:
@@ -709,25 +822,19 @@ class EncreBrowserSession:
         return await self.move_mouse(x, y)
 
     async def drag(self, x1: int, y1: int, x2: int, y2: int) -> bool:
-        """Drag from (x1, y1) to (x2, y2)."""
+        """Drag from (x1, y1) to (x2, y2) along a human-like trajectory."""
         try:
             await self._ensure_browser()
-            await self._transport.send("Input.dispatchMouseEvent", {
-                "type": "mouseMoved", "x": x1, "y": y1,
-            })
+            await self._human_move_to(x1, y1)
+            # Grip pause before the press, then drag along a curved, eased
+            # path with the button held, then a small settle before release.
+            await asyncio.sleep(random.uniform(0.04, 0.1))
             await self._transport.send("Input.dispatchMouseEvent", {
                 "type": "mousePressed", "x": x1, "y": y1,
                 "button": "left", "clickCount": 1,
             })
-            steps = 10
-            for i in range(1, steps + 1):
-                cx = x1 + (x2 - x1) * i // steps
-                cy = y1 + (y2 - y1) * i // steps
-                await self._transport.send("Input.dispatchMouseEvent", {
-                    "type": "mouseMoved", "x": cx, "y": cy,
-                    "button": "left",
-                })
-                await asyncio.sleep(0.01)
+            await self._human_move_to(x2, y2, button="left")
+            await asyncio.sleep(random.uniform(0.03, 0.08))
             await self._transport.send("Input.dispatchMouseEvent", {
                 "type": "mouseReleased", "x": x2, "y": y2,
                 "button": "left", "clickCount": 1,
@@ -966,16 +1073,37 @@ class EncreBrowserSession:
                 if rect is not None:
                     return True
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
             await asyncio.sleep(0.2)
         return False
 
     async def scroll_to(self, x: int = 0, y: int = 0) -> None:
-        """Scroll the page to (x, y)."""
+        """Scroll the page to absolute position (x, y) with a human-like
+        wheel gesture.
+
+        A real user cannot ``window.scrollTo`` — wheel events must fire in a
+        fast-start/slow-stop series. If the gesture undershoots (wheel deltas
+        can be clamped at the document edge), one programmatic correction
+        finishes the remaining gap so the functional contract holds.
+        """
         await self._ensure_browser()
-        await self._transport.send("Runtime.evaluate", {
-            "expression": f"window.scrollTo({x}, {y})",
-        })
+        vp = await self.get_viewport()
+        cur_x = float(getattr(vp, "scroll_x", 0) or 0)
+        cur_y = float(getattr(vp, "scroll_y", 0) or 0)
+        dx = float(x) - cur_x
+        dy = float(y) - cur_y
+        if abs(dx) >= 1 or abs(dy) >= 1:
+            await self._human_scroll(dx, dy)
+            try:
+                vp2 = await self.get_viewport()
+                gap_x = float(x) - float(getattr(vp2, "scroll_x", 0) or 0)
+                gap_y = float(y) - float(getattr(vp2, "scroll_y", 0) or 0)
+                if abs(gap_x) > 1 or abs(gap_y) > 1:
+                    await self._transport.send("Runtime.evaluate", {
+                        "expression": f"window.scrollTo({x}, {y})",
+                    })
+            except Exception:
+                logger.debug("exception suppressed", exc_info=True)
         self._tick()
 
     # ------------------------------------------------------------------
@@ -1285,7 +1413,9 @@ class EncreBrowserSession:
         """Get all interactive elements with bounding boxes."""
         await self._ensure_browser()
         js = """(() => {
-            const tags = ['a', 'button', 'input', 'select', 'textarea', 'details', 'summary', '[tabindex]', '[contenteditable]', '[onclick]', '[role=button]', '[role=link]', '[role=checkbox]', '[role=radio]', '[role=tab]', '[role=menuitem]'];
+            const tags = ['a', 'button', 'input', 'select', 'textarea', 'details', 'summary',
+                '[tabindex]', '[contenteditable]', '[onclick]', '[role=button]', '[role=link]',
+                '[role=checkbox]', '[role=radio]', '[role=tab]', '[role=menuitem]'];
             const seen = new Set();
             const result = [];
             document.querySelectorAll(tags.join(',')).forEach(el => {

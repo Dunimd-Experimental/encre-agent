@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 Abstract base class for all LLM backends.
@@ -56,7 +58,7 @@ from encre.utils.types import (
     BatchObject,
     BatchRequest,
     EmbeddingResponse,
-    FileContent,
+    ProviderFileContent,
     FileListResponse,
     FileObject,
     FineTuneEvent,
@@ -171,6 +173,67 @@ def format_backend_error(exc: BaseException, prefix: str = "") -> str:
     return rendered
 
 
+def normalize_usage(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize provider-specific usage fields to the standard key set.
+
+    This is the single canonical usage normalizer for ALL backends.  It maps
+    both naming conventions to the standard ``input_tokens`` /
+    ``output_tokens`` / ``total_tokens`` triplet and unifies prompt-cache hit
+    reporting under ``cache_read_input_tokens`` so the router's cost tracker
+    and telemetry can compute cache hit ratios without provider-specific
+    branches:
+
+    * OpenAI reports ``prompt_tokens`` / ``completion_tokens`` and cache hits
+      under ``prompt_tokens_details.cached_tokens`` (a subset of
+      ``prompt_tokens``).
+    * DeepSeek reports cache hits under ``prompt_cache_hit_tokens``.
+    * Gemini reports ``promptTokenCount`` / ``candidatesTokenCount`` and
+      implicit-cache hits under ``cachedContentTokenCount``.
+    * Anthropic already uses ``input_tokens`` / ``output_tokens`` and reports
+      ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+      separately; ``cache_deleted_input_tokens`` is passed through when
+      present.
+
+    Args:
+        raw: The provider usage payload (or None).
+
+    Returns:
+        A dict with standardized keys; empty when ``raw`` is not a dict.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_deleted_input_tokens",
+    ):
+        if key in raw:
+            out[key] = raw[key]
+    # OpenAI-style naming -> standard triplet.
+    if "prompt_tokens" in raw:
+        out.setdefault("input_tokens", raw["prompt_tokens"])
+    if "completion_tokens" in raw:
+        out.setdefault("output_tokens", raw["completion_tokens"])
+    if "total_tokens" in raw:
+        out.setdefault("total_tokens", raw["total_tokens"])
+    cached = 0
+    # OpenAI: prompt_tokens_details.cached_tokens
+    details = raw.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached += details.get("cached_tokens", 0) or 0
+    # DeepSeek: prompt_cache_hit_tokens
+    cached += raw.get("prompt_cache_hit_tokens", 0) or 0
+    # Gemini: cachedContentTokenCount (subset of promptTokenCount)
+    cached += raw.get("cachedContentTokenCount", 0) or 0
+    if cached > 0:
+        out["cache_read_input_tokens"] = cached + (out.get("cache_read_input_tokens", 0) or 0)
+    return out
+
+
 class BaseBackend(ABC):
     """Abstract base class for LLM provider backends.
 
@@ -198,6 +261,29 @@ class BaseBackend(ABC):
     | OpenAICompatibleBackend| vLLM, SGLang, LiteLLM, llama.cpp, etc.       |
     +-----------------------+-----------------------------------------------+
     """
+
+    # User-configured sampling overrides (provider "advanced config").
+    # Populated generically by ``create_backend``; request builders merge
+    # these into the outgoing payload when non-empty.
+    sampling_overrides: dict[str, Any] = {}
+
+    def _merge_sampling_overrides(
+        self, data: dict[str, Any], mapping: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Overlay user-configured sampling params onto a request body.
+
+        Args:
+            data: The request body (mutated in place).
+            mapping: Optional provider-specific key renames, e.g.
+                ``{"top_p": "topP"}`` for Gemini-style bodies.  Keys absent
+                from the mapping are copied verbatim.
+
+        Returns:
+            The same *data* dict for call-site convenience.
+        """
+        for key, value in (self.sampling_overrides or {}).items():
+            data[(mapping or {}).get(key, key)] = value
+        return data
 
     @abstractmethod
     async def chat(
@@ -313,7 +399,7 @@ class BaseBackend(ABC):
         """
         pass
 
-    # 鈹€鈹€ Capability flags 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Capability flags ────────────────────────────────────────────────
     # Subclasses override the corresponding ``supports_*`` flag to advertise
     # multimodal / extended capabilities.  The router and registry inspect
     # these flags to decide whether a backend can satisfy a request without
@@ -363,7 +449,7 @@ class BaseBackend(ABC):
         """Return True if the chat() method can accept image inputs."""
         return True
 
-    # 鈹€鈹€ Image generation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Image generation ────────────────────────────────────────────────
 
     async def generate_image(
         self,
@@ -467,7 +553,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Audio 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Audio ────────────────────────────────────────────────────────────
 
     async def translate_audio(
         self,
@@ -497,7 +583,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Embeddings 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Embeddings ───────────────────────────────────────────────────────
 
     async def create_embeddings(
         self,
@@ -529,7 +615,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Moderation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Moderation ───────────────────────────────────────────────────────
 
     async def create_moderation(
         self,
@@ -553,7 +639,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Files 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Files ────────────────────────────────────────────────────────────
 
     async def upload_file(
         self,
@@ -639,14 +725,14 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    async def download_file(self, _file_id: str) -> FileContent:
+    async def download_file(self, _file_id: str) -> ProviderFileContent:
         """Download the raw content of an uploaded file.
 
         Args:
             file_id: Provider-assigned file id.
 
         Returns:
-            A :class:`FileContent` with the file bytes base64-encoded.
+            A :class:`ProviderFileContent` with the file bytes base64-encoded.
         """
         if not self.supports_files():
             raise NotImplementedError(
@@ -654,7 +740,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Batch 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Batch ────────────────────────────────────────────────────────────
 
     async def create_batch(
         self,
@@ -742,7 +828,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Fine-tuning 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Fine-tuning ──────────────────────────────────────────────────────
 
     async def create_fine_tuning_job(
         self,
@@ -816,7 +902,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Realtime 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Realtime ─────────────────────────────────────────────────────────
 
     async def create_realtime_session(
         self,
@@ -846,7 +932,7 @@ class BaseBackend(ABC):
             )
         raise NotImplementedError
 
-    # 鈹€鈹€ Responses API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Responses API ────────────────────────────────────────────────────
 
     async def create_response(
         self,

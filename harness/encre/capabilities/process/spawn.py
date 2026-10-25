@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -30,6 +30,12 @@ codebase goes through this module so platform-specific window suppression
 (``CREATE_NO_WINDOW`` + ``SW_HIDE`` on Windows, ``setsid`` on Unix) is
 applied exactly once, in one place.
 
+Confinement-capable spawns (model-driven tool shells) do NOT go through
+this module: they use :func:`encre.capabilities.process.sandbox.spawn_confined`,
+which applies the OS-level isolation inside the Rust core.  This module
+stays a pure window-suppression seam for internal, short-lived helper
+processes (rg, file watchers, ...).
+
 Usage::
 
     from encre.capabilities.process import create_subprocess_exec
@@ -38,10 +44,17 @@ Usage::
     stdout, stderr = await proc.communicate()
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 import subprocess
 from typing import Any
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 def hidden_subprocess_kwargs() -> dict[str, Any]:
@@ -125,4 +138,4 @@ def kill_process_tree(pid: int, force: bool = False) -> None:
         sig = signal.SIGKILL if force else signal.SIGTERM
         os.killpg(pgid, sig)
     except ProcessLookupError:
-        pass
+        logger.debug("exception suppressed", exc_info=True)

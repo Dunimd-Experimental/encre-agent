@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Learning subsystem for Encre.
 
@@ -42,7 +44,7 @@ classes above are re-exported through ``__all__``. Downstream code should
 import them from this package rather than from their concrete modules.
 """
 
-from encre.improve.learning.consolidator import MemoryConsolidator
+from encre.improve.learning.consolidator import LearningConsolidator
 from encre.improve.learning.engine import LearningEngine
 from encre.improve.learning.skill_generator import SkillGenerator
 

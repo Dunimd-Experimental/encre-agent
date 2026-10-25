@@ -131,7 +131,7 @@ export class Notifications {
     this.anchor = document.getElementById("btn-encre-menu");
 
     this.ensureToastContainer();
-    subscribe(() => this.render());
+    subscribe(() => this.render(), ["notifications"]);
 
     for (const n of getState().notifications) {
       this.lastNotificationIds.add(n.id);

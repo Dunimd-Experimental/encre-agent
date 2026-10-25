@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,18 +23,24 @@
 
 from __future__ import annotations
 
-"""系统级验收：可回放（Task 10.1）与可替换（Task 10.2）。
+"""System-level acceptance: replayable (Task 10.1) and replaceable (Task 10.2).
 
-本模块不是新功能测试，而是证明 Encre 0.5.0 基座的两条性质成立：
+This module is not a test of new features; it demonstrates that two properties of
+the Encre 0.5.0 base layer hold:
 
-* **可回放**：真实 :class:`~encre.events.ledger.EventSourcedBus` 落盘的事件，在
-  新实例中 ``replay`` 后逐条一致、幂等、且**无重复副作用**（回放绝不重新执行
-  工具、绝不重复写入记忆），并能在"进程崩溃"后从盘上恢复。
-* **可替换**：替换 backend / 记忆后端 / 工具集后，能力规划与调用链仍自洽。
+* **Replayable**: events persisted to disk by a real
+  :class:`~encre.events.ledger.EventSourcedBus` match entry by entry after
+  ``replay`` in a fresh instance, are idempotent, and have **no duplicate side
+  effects** (replay never re-executes a tool and never re-writes memory), and
+  survive a simulated process crash by being recovered from disk.
+* **Replaceable**: after swapping the backend, the memory backend, or the tool
+  set, capability planning and the whole call chain remain self-consistent.
 
-硬性约束（与 spec 对齐）：被验收的能力一律使用真实组件——真实 bus、真实文件
-I/O、真实 :class:`~encre.memdir.layers.MemoryLayerStore`、真实
-:class:`~encre.tools.registry.ToolRegistry`、真实 backend 实例；不使用 mock 冒充。
+Hard constraint (aligned with the spec): every accepted capability uses real
+components -- a real bus, real file I/O, a real
+:class:`~encre.memdir.layers.MemoryLayerStore`, a real
+:class:`~encre.tools.registry.ToolRegistry`, real backend instances; no mocks are
+passed off as stand-ins.
 """
 
 import pytest
@@ -61,19 +67,20 @@ from encre.tools.registry import ToolRegistry
 
 
 # ---------------------------------------------------------------------------
-# 测试隔离：数据目录一律指向 tmp_path，绝不污染真实用户数据目录。
+# Test isolation: the data directory always points at tmp_path and never
+# pollutes the real user data directory.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
 def _isolated_data_dir(tmp_path, monkeypatch):
-    """把 ENCRE_DATA_DIR 指向临时目录，保证测试互不干扰、无顺序依赖。"""
+    """Point ENCRE_DATA_DIR at a temporary directory so tests are isolated and order-independent."""
     monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "encre-data"))
     return tmp_path
 
 
 def _snapshot(event: LedgerEvent) -> tuple:
-    """抽取事件中用于"逐条一致"比对的可观察字段。"""
+    """Extract the observable fields of an event used for entry-by-entry comparison."""
     return (
         event.seq,
         event.kind,
@@ -85,37 +92,37 @@ def _snapshot(event: LedgerEvent) -> tuple:
 
 
 # ===========================================================================
-# SubTask 10.1 —— 可回放验收
+# SubTask 10.1 -- replayable acceptance
 # ===========================================================================
 
 
 class TestReplayRoundTrip:
-    """落盘 -> 回放一致，且回放幂等、无副作用、跨 session 隔离。"""
+    """Persist -> replay matches, and replay is idempotent, side-effect-free, and session-isolated."""
 
     def test_persisted_events_replay_identically(self, tmp_path):
-        """真实落盘后，新 bus 实例回放的序列与写入序列逐条一致。"""
+        """After real persistence, the sequence replayed by a fresh bus instance matches the written sequence entry by entry."""
         path = tmp_path / "events" / "round_trip.jsonl"
         sid = "sess-round-trip"
         bus = EventSourcedBus("events", ledger_path=path)
 
         published = [
-            # lifecycle 事件（phase 语义）
+            # lifecycle events (phase semantics)
             bus.publish("phase:session_start", session_id=sid, payload={"model": "gpt-4.1"}),
             bus.publish("turn_started", session_id=sid, payload={"turn": 1}),
-            # 自定义 kind + 嵌套 payload
+            # custom kind + nested payload
             bus.publish(
                 "state_changed",
                 session_id=sid,
                 payload={"nested": {"a": [1, 2, 3]}, "flag": True, "none": None, "ratio": 0.25},
             ),
-            # 工具调用事件（带 refs）
+            # tool call event (with refs)
             bus.publish(
                 "tool_call",
                 session_id=sid,
                 payload={"name": "file_read", "arguments": {"file_path": "x.py"}},
                 refs=["call_1", "call_2"],
             ),
-            # 记忆候选事件（真实 memory_candidate payload 形状）
+            # memory candidate event (real memory_candidate payload shape)
             bus.publish(
                 "memory_candidate",
                 session_id=sid,
@@ -123,7 +130,7 @@ class TestReplayRoundTrip:
                     content="用户偏好使用中文注释", significance=0.9, session_id=sid,
                 ).to_dict(),
             ),
-            # 空 session 的全局事件（不应被 session 回放带回）
+            # global event with an empty session (must not come back in a session replay)
             bus.publish("phase:pre_model_request", session_id="", payload={"global": True}),
         ]
         assert all(ev is not None for ev in published)
@@ -135,11 +142,11 @@ class TestReplayRoundTrip:
         expected = [ev for ev in published if ev.session_id == sid]
         assert len(replayed) == len(expected) == 5
         assert [_snapshot(ev) for ev in replayed] == [_snapshot(ev) for ev in expected]
-        # 回放顺序按 seq 升序。
+        # Replay order follows ascending seq.
         assert [ev.seq for ev in replayed] == sorted(ev.seq for ev in replayed)
 
     def test_replay_is_idempotent_and_creates_no_events(self, tmp_path):
-        """连续两次回放结果完全相同；回放不产生新事件、不改动盘上内容。"""
+        """Two consecutive replays return exactly the same result; replay publishes nothing and does not change disk content."""
         path = tmp_path / "events" / "idempotent.jsonl"
         sid = "sess-idem"
         bus = EventSourcedBus("events", ledger_path=path)
@@ -152,23 +159,25 @@ class TestReplayRoundTrip:
         first = fresh.replay(sid)
         second = fresh.replay(sid)
         assert first == second
-        # 回放前后：盘上行数不变、新 bus 内存事件数为 0（未 publish）。
+        # Around replay: the number of lines on disk is unchanged and the fresh bus has 0 in-memory events (nothing published).
         assert len(read_jsonl(path)) == lines_before
         assert fresh.count == 0
 
     def test_replay_does_not_duplicate_real_side_effects(self, tmp_path):
-        """关键：回放事件流不得重新触发真实副作用。
+        """Critical: the replayed event stream must not re-trigger real side effects.
 
-        真实副作用计数点：真实 :class:`MemoryLayerStore` 通过 ``attach(bus)``
-        订阅 ``memory_candidate``，每次订阅回调都会执行真实的 ``intake``
-        （写盘、可能合并/晋升）。若回放错误地 fan-out 观察者，重复 intake 会把
-        已在短时缓冲区的条目合并并晋升为长期记忆——这可在真实 store 状态上观测。
+        Real side-effect counting point: a real :class:`MemoryLayerStore`
+        subscribes to ``memory_candidate`` via ``attach(bus)``, and every
+        subscription callback performs a real ``intake`` (write to disk, possible
+        merge/promotion). If replay wrongly fanned out to observers, the repeated
+        intake would merge buffer-resident entries and promote them to long-term
+        memory -- which is observable on real store state.
         """
         ledger = tmp_path / "events" / "side_effect.jsonl"
         mem_root = tmp_path / "memory"
         sid = "sess-side"
 
-        # 第一段：真实 store 订阅真实 bus，publish 触发真实 intake。
+        # Phase 1: a real store subscribes to a real bus; publish triggers real intake.
         store = MemoryLayerStore(root=mem_root)
         bus = EventSourcedBus("events", ledger_path=ledger)
         store.attach(bus)
@@ -186,28 +195,30 @@ class TestReplayRoundTrip:
         bus.flush()
 
         buffered_ids = {entry.id for entry in store.buffer()}
-        assert len(buffered_ids) == 3          # 真实 intake 发生了 3 次
-        assert store.long_term() == []         # 尚未晋升
+        assert len(buffered_ids) == 3          # 3 real intake events were written
+        assert store.long_term() == []         # nothing promoted to long-term yet
         buffer_records_before = len(read_json(store._buffer_path, default=[]))
 
-        # 第二段：模拟重启——新 bus + 新 store（同 root，从盘 reload），attach 后回放。
+        # Phase 2: simulate a restart -- new bus + new store (same root, reloaded from disk),
+        # then attach and replay.
         fresh_bus = EventSourcedBus("events", ledger_path=ledger)
         fresh_store = MemoryLayerStore(root=mem_root)
         fresh_store.attach(fresh_bus)
-        assert len(fresh_store.buffer()) == 3  # 已从盘恢复短时缓冲区
+        assert len(fresh_store.buffer()) == 3  # short-term buffer restored from disk
 
         replayed = fresh_bus.replay(sid)
         assert len(replayed) == 3
 
-        # 回放若 fan-out，3 条候选会被再次 intake -> 合并 + 晋升；真实状态必须不变。
+        # If replay fanned out, the 3 candidates would be intaken again -> merge + promote;
+        # the real state must stay unchanged.
         assert {entry.id for entry in fresh_store.buffer()} == buffered_ids
         assert fresh_store.long_term() == []
         assert len(read_json(fresh_store._buffer_path, default=[])) == buffer_records_before
-        # 回放本身没有 publish 新事件。
+        # Replay itself did not publish any new event.
         assert fresh_bus.count == 0
 
     def test_project_matches_manual_fold(self, tmp_path):
-        """read-model 投影与按事件流手工推导的结果一致（按其真实语义）。"""
+        """The read-model projection matches the result derived manually from the event stream (per its real semantics)."""
         path = tmp_path / "events" / "project.jsonl"
         sid = "sess-proj"
         bus = EventSourcedBus("events", ledger_path=path)
@@ -219,7 +230,7 @@ class TestReplayRoundTrip:
         bus.publish("tool_call_start", session_id=sid, refs=["c2", ""])
         bus.publish("tool_calls", session_id=sid, refs=["c3"])
         bus.publish("memory_candidate", session_id=sid, payload={"content": "x"})
-        # 另一 session 的事件不得计入。
+        # Events from another session must not be counted.
         bus.publish("turn_started", session_id="other", payload={"turn": 99})
         bus.flush()
 
@@ -227,7 +238,7 @@ class TestReplayRoundTrip:
         project = fresh.project(sid)
         events = fresh.replay(sid)
 
-        # 手工按实现语义折叠，作为独立期望。
+        # Fold manually per the implementation semantics, as an independent expectation.
         turn_kinds = {"turn_started", "turn_start", "phase:turn_start"}
         tool_kinds = {"tool_call", "tool_call_start", "tool_calls"}
         kinds: dict[str, int] = {}
@@ -248,14 +259,14 @@ class TestReplayRoundTrip:
             "tool_calls": tool_calls,
         }
         assert project == expected
-        # 具体数值断言（显式、可读）。
+        # Concrete numeric assertions (explicit and readable).
         assert project["events"] == 8
         assert project["last_seq"] == 8
         assert project["turns"] == 3
         assert project["tool_calls"] == ["c1", "c2", "c3"]
 
     def test_replay_is_session_scoped(self, tmp_path):
-        """同一 ledger 中不同 session_id 的事件互不串味。"""
+        """Events from different session ids in one ledger never bleed into each other."""
         path = tmp_path / "events" / "sessions.jsonl"
         bus = EventSourcedBus("events", ledger_path=path)
         bus.publish("turn_started", session_id="A", payload={"n": 1})
@@ -268,20 +279,20 @@ class TestReplayRoundTrip:
         assert [ev.session_id for ev in fresh.replay("A")] == ["A", "A"]
         assert [ev.payload["n"] for ev in fresh.replay("A")] == [1, 3]
         assert [ev.session_id for ev in fresh.replay("B")] == ["B"]
-        # 空 session_id 只匹配全局事件，不是"全部事件"。
+        # An empty session id matches global events only, not "all events".
         assert [ev.session_id for ev in fresh.replay("")] == [""]
 
 
 class TestCrashRecovery:
-    """模拟进程崩溃（不 close/flush 即丢弃 bus）后的恢复语义。"""
+    """Recovery semantics after a simulated process crash (the bus is dropped without close/flush)."""
 
     def test_write_through_recovers_everything(self, tmp_path):
-        """flush_batch=1（写透）：崩溃后已落盘事件全部可恢复。"""
+        """flush_batch=1 (write-through): every persisted event is recoverable after a crash."""
         path = tmp_path / "events" / "crash_wt.jsonl"
         bus = EventSourcedBus("events", ledger_path=path, flush_batch=1)
         for i in range(5):
             bus.publish("turn_started", session_id="s", payload={"i": i})
-        # 模拟崩溃：不调用 close()/flush()，直接丢弃实例。
+        # Simulate a crash: no close()/flush() call, just drop the instance.
         del bus
 
         fresh = EventSourcedBus("events", ledger_path=path)
@@ -290,23 +301,23 @@ class TestCrashRecovery:
         assert [ev.payload["i"] for ev in replayed] == [0, 1, 2, 3, 4]
 
     def test_batched_unflushed_events_are_lost_on_crash(self, tmp_path):
-        """批量模式：未 flush 的尾部事件在崩溃后丢失（真实语义）。"""
+        """Batched mode: unflushed trailing events are lost after a crash (real semantics)."""
         path = tmp_path / "events" / "crash_batch.jsonl"
         bus = EventSourcedBus("events", ledger_path=path, flush_batch=3)
         for i in range(7):
             bus.publish("turn_started", session_id="s", payload={"i": i})
-        # 批量=3：每累计满 3 条落盘一次 -> 已写 6 条，第 7 条仍在 _pending。
+        # Batch = 3: a flush happens every 3 accumulated events -> 6 written, the 7th still in _pending.
         assert len(read_jsonl(path)) == 6
-        del bus  # 崩溃，未 flush/close
+        del bus  # crash, not flushed/closed
 
         fresh = EventSourcedBus("events", ledger_path=path)
         replayed = fresh.replay("s")
         assert [ev.seq for ev in replayed] == [1, 2, 3, 4, 5, 6]
-        # 结论：批量模式下未 flush 的事件会丢失；显式 flush/close 才保证落盘。
+        # Conclusion: unflushed events are lost in batched mode; only an explicit flush/close guarantees persistence.
         assert all(ev.seq != 7 for ev in replayed)
 
     def test_explicit_flush_recovers_batched_events(self, tmp_path):
-        """对照：批量模式下显式 flush 后，尾部事件同样可恢复。"""
+        """Control case: with an explicit flush in batched mode, trailing events are also recoverable."""
         path = tmp_path / "events" / "crash_flush.jsonl"
         bus = EventSourcedBus("events", ledger_path=path, flush_batch=3)
         for i in range(7):
@@ -318,30 +329,30 @@ class TestCrashRecovery:
 
 
 # ===========================================================================
-# SubTask 10.2 —— 可替换验收
+# SubTask 10.2 -- replaceable acceptance
 # ===========================================================================
 
 
 def _real_model_infos() -> list:
-    """取真实注册表解析出的模型元数据（含不支持工具/图像的本地类模型）。"""
+    """Return real model metadata resolved from the registry (including local models without tool/image support)."""
     return [
-        resolve_model_info("gpt-4.1"),                                  # 全能力
-        resolve_model_info("claude-sonnet-4.6"),                        # 全能力 + thinking
-        resolve_model_info("deepseek-v4-pro"),                          # 不支持图像
-        resolve_model_info("gemini-2.5-pro"),                           # 不支持 prompt caching
-        resolve_model_info("qwen2.5:7b", provider="ollama"),            # 不支持工具/图像
-        resolve_model_info("hf-model", provider="local"),               # 不支持工具/图像
+        resolve_model_info("gpt-4.1"),                                  # full capability
+        resolve_model_info("claude-sonnet-4.6"),                        # full capability + thinking
+        resolve_model_info("deepseek-v4-pro"),                          # no image support
+        resolve_model_info("gemini-2.5-pro"),                           # no prompt caching support
+        resolve_model_info("qwen2.5:7b", provider="ollama"),            # no tool/image support
+        resolve_model_info("hf-model", provider="local"),               # no tool/image support
     ]
 
 
 class TestBackendReplacement:
-    """替换 backend 后能力规划与降级输出仍自洽。"""
+    """After replacing the backend, capability planning and degraded output stay self-consistent."""
 
     def test_compute_plan_matches_real_model_info(self):
-        """四维结果与真实 ModelInfo 的能力位一致，降级原因齐备。"""
+        """The four planning dimensions match the capability bits of the real ModelInfo, with all downgrade reasons present."""
         infos = _real_model_infos()
         assert len(infos) >= 3
-        # 断言覆盖到真实存在的"不支持工具"与"不支持图像"条目。
+        # Assertions must cover the real "no tool support" and "no image support" entries.
         assert any(not info.supports_tools for info in infos)
         assert any(not info.supports_images for info in infos)
 
@@ -363,34 +374,34 @@ class TestBackendReplacement:
                     assert dim in plan.reasons
 
     def test_real_backend_capability_is_stricter_and(self):
-        """真实 backend 的能力方法与 ModelInfo 取"与"（只能更严格）。"""
+        """A real backend's capability methods are ANDed with ModelInfo (only ever stricter)."""
         capable = resolve_model_info("gpt-4.1")
         assert capable.supports_tools and capable.supports_images and capable.supports_prompt_caching
 
-        # 真实 LocalBackend：未加载模型时 supports_tool_calling() 保守返回 False。
+        # Real LocalBackend: with no model loaded, supports_tool_calling() conservatively returns False.
         local = LocalBackend()
         assert local.supports_tool_calling() is False
         plan = compute_plan(capable, backend=local)
         assert plan.use_tools is False
         assert "backend does not support tool calling" in plan.reasons["tools"]
-        # 未受限的维度保持开启（backend 不能放宽，也不误伤）。
+        # Unrestricted dimensions stay enabled (the backend cannot relax, and does not over-restrict).
         assert plan.use_vision is True
         assert plan.use_caching is True
 
-        # 真实 OllamaBackend：OpenAI 协议，supports_tool_calling() 为 True。
+        # Real OllamaBackend: OpenAI protocol, so supports_tool_calling() is True.
         ollama = OllamaBackend(model="llama3.2")
         assert ollama.supports_tool_calling() is True
         plan_ok = compute_plan(capable, backend=ollama)
         assert plan_ok.use_tools is True
 
-        # backend 无法把模型本身缺失的能力"放宽"回来。
+        # A backend cannot "relax" a capability the model itself lacks back on.
         weak = resolve_model_info("qwen2.5:7b", provider="ollama")
         assert weak.supports_tools is False
         plan_weak = compute_plan(weak, backend=ollama)
         assert plan_weak.use_tools is False
 
     def test_degraded_outputs_self_consistent_after_backend_swap(self):
-        """替换 backend 后 apply_to_tools / apply_to_messages / fallback 输出合法。"""
+        """After replacing the backend, apply_to_tools / apply_to_messages / fallback output stays valid."""
         tools_payload = [
             {
                 "type": "function",
@@ -408,7 +419,7 @@ class TestBackendReplacement:
             }
         ]
 
-        # 降级方案（真实 backend 更严格 + 本地模型不支持工具/图像）。
+        # Degraded plan (a stricter real backend + a local model without tool/image support).
         weak = resolve_model_info("hf-model", provider="local")
         degraded = compute_plan(weak, backend=LocalBackend())
         assert apply_to_tools(tools_payload, degraded) is None
@@ -418,7 +429,7 @@ class TestBackendReplacement:
         fallback = tool_intent_fallback(tools_payload)
         assert "file_read" in fallback and "bash" in fallback
 
-        # 全能力方案：tools 原样透传、消息原样透传。
+        # Full-capability plan: tools pass through unchanged, messages pass through unchanged.
         capable = resolve_model_info("gpt-4.1")
         ok = compute_plan(capable, backend=OllamaBackend(model="llama3.2"))
         assert apply_to_tools(tools_payload, ok) is tools_payload
@@ -426,25 +437,26 @@ class TestBackendReplacement:
 
 
 class TestMemoryBackendReplacement:
-    """替换记忆检索后端后，recall 输出结构合法、可追溯，行为一致。"""
+    """After replacing the memory retrieval backend, recall output structure stays valid, traceable, and behaviour-consistent."""
 
     @staticmethod
     def _seed_store(root) -> tuple[MemoryLayerStore, str, str]:
-        """构造带真实关联边的 store：e1 命中查询，e2 只能经扩散激活到达。"""
+        """Build a store with a real association edge: e1 matches the query, e2 is reachable only via spread activation."""
         store = MemoryLayerStore(root=root)
         e1 = MemoryEntry(
-            content="Deploy pipeline uses Docker containers for releases", type="semantic",
+            content="Deploy pipeline uses Docker containers for releases", type="fact",
         )
         e2 = MemoryEntry(
-            content="The release checklist requires a manual approval step", type="semantic",
+            content="The release checklist requires a manual approval step", type="fact",
         )
         store.store(e1)
         store.store(e2)
-        # 真实 link：e1 --causal--> e2，供扩散激活使用。
-        assert store.link(e1.id, e2.id, LinkRelation.CAUSAL.value, weight=1.0) is not None
+        # Real link: e1 --causal--> e2, used by spread activation.
+        assert store.link(e1.id, e2.id, LinkRelation.CAUSES.value, weight=1.0) is not None
         return store, e1.id, e2.id
 
     def test_local_and_native_backends_both_valid(self, tmp_path):
+        """Both backends produce valid, traceable hits; native falls back to local when no index is available."""
         store, e1_id, e2_id = self._seed_store(tmp_path / "memory")
         query = "Deploy pipeline uses Docker containers for releases"
 
@@ -454,7 +466,8 @@ class TestMemoryBackendReplacement:
         assert hits_local, "本地检索必须至少返回一个命中"
 
         engine_native = RecallEngine(store, backend="native", record_access=False)
-        # 未提供 embedding_fn/index 时，native 不可用并静默回退本地（两种环境都能过）。
+        # With no embedding_fn/index supplied, native is unavailable and silently falls back to local
+        # (so both environments pass).
         assert engine_native.backend in ("local", "native")
         hits_native = engine_native.recall(query)
 
@@ -465,31 +478,33 @@ class TestMemoryBackendReplacement:
                 assert isinstance(hit.hops, int) and hit.hops >= 0
                 assert isinstance(hit.via_links, list)
                 assert isinstance(hit.origin_id, str) and hit.origin_id
-                # 可追溯：扩散命中必须带链接路径与来源种子。
+                # Traceable: a spread hit must carry a link path and a source seed.
                 if hit.hops > 0:
                     assert hit.via_links
                     assert hit.origin_id != hit.entry_id
                     assert all("relation" in edge for edge in hit.via_links)
 
-        # 同一 store、同一 query 下，回退本地时结果与显式 local 完全一致。
+        # With the same store and same query, falling back to local yields results identical to an explicit local run.
         assert engine_native.backend == "local"
         assert [h.entry_id for h in hits_native] == [h.entry_id for h in hits_local]
-        # 扩散激活确实把一个非种子记忆带了回来（e2 经 e1 的因果边）。
+        # Spread activation did bring back one non-seed memory (e2 via e1's causal edge).
         spread = [h for h in hits_local if h.hops > 0]
         assert any(h.entry_id == e2_id and h.origin_id == e1_id for h in spread)
 
 
 class TestToolsetReplacement:
-    """替换工具集后，discovery 输出与降级语义随之变化且自洽。"""
+    """After replacing the tool set, the discovery output and degradation semantics change accordingly and stay self-consistent."""
 
     @staticmethod
     def _discovery(*tools) -> ToolDiscovery:
+        """Build a ToolDiscovery over a fresh registry holding exactly the given tools."""
         registry = ToolRegistry()
         for tool in tools:
             registry.register(tool)
         return ToolDiscovery(registry)
 
     def test_active_tools_payload_changes_with_toolset(self):
+        """The active tools payload and the fallback listing track the registered tool set."""
         one = self._discovery(file_read_tool)
         three = self._discovery(file_read_tool, file_write_tool, file_edit_tool)
 
@@ -502,14 +517,14 @@ class TestToolsetReplacement:
         assert names_three == {"file_read", "file_write", "file_edit"}
         assert payload_one != payload_three
 
-        # fallback 渲染的工具清单与 discovery 输出一致。
+        # The tool listing rendered by the fallback matches the discovery output.
         fallback_one = tool_intent_fallback(payload_one)
         fallback_three = tool_intent_fallback(payload_three)
         assert "file_read" in fallback_one and "file_write" not in fallback_one
         assert all(name in fallback_three for name in names_three)
 
     def test_degradation_semantics_unaffected_by_toolset(self):
-        """工具集被替换不影响降级语义：降级时 apply_to_tools 仍返回 None。"""
+        """Replacing the tool set does not affect degradation semantics: when degraded, apply_to_tools still returns None."""
         three = self._discovery(file_read_tool, file_write_tool, file_edit_tool)
         payload = three.get_active_tools_payload("sess")
 
@@ -521,15 +536,16 @@ class TestToolsetReplacement:
 
 
 class TestCombinedReplacement:
-    """三者同时替换后，完整调用链仍无异常、输出结构合法。"""
+    """After all three are replaced at once, the full call chain still runs without error and produces valid output structure."""
 
     def test_combined_swap_is_self_consistent(self, tmp_path):
-        # 1) 替换 backend（真实 LocalBackend）+ 模型元数据（真实本地类模型）。
+        """Swap backend + model metadata + tool set + memory backend together and verify the whole chain."""
+        # 1) Replace the backend (real LocalBackend) + model metadata (real local-class model).
         model_info = resolve_model_info("qwen2.5:7b", provider="ollama")
         backend = LocalBackend()
         plan = compute_plan(model_info, backend=backend)
 
-        # 2) 替换工具集（真实 ToolRegistry + 真实 builtin 工具）。
+        # 2) Replace the tool set (real ToolRegistry + real builtin tools).
         registry = ToolRegistry()
         for tool in (file_read_tool, file_write_tool, file_edit_tool):
             registry.register(tool)
@@ -539,14 +555,14 @@ class TestCombinedReplacement:
             "file_read", "file_write", "file_edit",
         }
 
-        # 3) 替换记忆后端（真实 store + native 请求）。
+        # 3) Replace the memory backend (real store + a native request).
         store = MemoryLayerStore(root=tmp_path / "memory")
-        entry = MemoryEntry(content="Combined replacement smoke entry", type="semantic")
+        entry = MemoryEntry(content="Combined replacement smoke entry", type="fact")
         store.store(entry)
         engine = RecallEngine(store, backend="native", record_access=False)
 
-        # 完整调用链：compute_plan -> apply_to_* -> fallback -> recall。
-        assert apply_to_tools(payload, plan) is None  # 本地模型降级
+        # Full call chain: compute_plan -> apply_to_* -> fallback -> recall.
+        assert apply_to_tools(payload, plan) is None  # local model downgrades
         messages = [
             {
                 "role": "user",

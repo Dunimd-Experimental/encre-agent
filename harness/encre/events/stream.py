@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Typed event stream: a projection over the append-only backbone.
 
@@ -60,6 +62,7 @@ from typing import TYPE_CHECKING, AsyncIterator, Generic, TypeVar
 
 from encre.events.lifecycle import (
     CheckpointCreated,
+    ConfigReloaded,
     SessionEnded,
     SessionStarted,
     TurnEnded,
@@ -83,6 +86,7 @@ _LIFECYCLE_TYPES = (
     TurnEnded,
     CheckpointCreated,
     UserMessagePersisted,
+    ConfigReloaded,
 )
 
 
@@ -129,12 +133,11 @@ class _Subscription(Generic[T]):
             try:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
             try:
                 self._queue.put_nowait(None)
             except asyncio.QueueFull:
-                pass
-
+                logger.debug("exception suppressed", exc_info=True)
     def __aiter__(self) -> "_Subscription[T]":
         return self
 
@@ -259,8 +262,7 @@ class EventStream(Generic[T]):
         try:
             self._subs.remove(sub)
         except ValueError:
-            pass
-
+            logger.debug("exception suppressed", exc_info=True)
     async def close(self) -> None:
         """Close the stream, detach from the backbone and seal subscriptions.
 

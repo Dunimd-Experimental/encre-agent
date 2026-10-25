@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Split, single-source configuration store for Encre.
 
@@ -70,6 +72,12 @@ from typing import Any
 
 from encre.crypto import decrypt, encrypt
 from encre.paths import get_data_dir
+
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
 
 __all__ = [
     "UI_SETTING_KEYS",
@@ -122,6 +130,8 @@ _LEGACY_SETTINGS_NAME = "settings.json"
 # --------------------------------------------------------------------------
 
 _MODEL_FIELDS = frozenset({
+    "providers",
+    # Legacy flat model list -- only read during migration; no longer written.
     "models",
     "active_model_index",
     "model",
@@ -135,6 +145,7 @@ _MODEL_FIELDS = frozenset({
     "fallback_base_url",
     "fallback_api_key",
     "fallback_backend_type",
+    "classifier_model",
     "default_slot_tokens",
     "thinking_config",
     "thinking_prefill_enabled",
@@ -160,6 +171,8 @@ UI_SETTING_KEYS = frozenset({
     "shortcut_send_mode",
     "language",
     "language_preference",
+    "plan_mode_max_turns",
+    "spec_mode_max_turns",
     "default_link_behavior",
     "auto_expand",
     "sub_agent_auto_open_view",
@@ -168,8 +181,77 @@ UI_SETTING_KEYS = frozenset({
     "startup_session_behavior",
     "model_pool_enabled",
     "model_pool_fallback_enabled",
+    "model_pool_cycle_order",
+    "model_pool_cooldown_ms",
+    "model_pool_recycle_wait_ms",
+    "model_pool_max_fallbacks",
     "default_search_engine",
     "default_search_engine_url",
+    "terminal_font_size",
+    "terminal_cursor_blink",
+    "terminal_scrollback",
+    "terminal_font_family",
+    "terminal_line_height",
+    "terminal_cursor_style",
+    "terminal_cursor_inactive",
+    "terminal_bold_bright",
+    "terminal_bell",
+    "terminal_copy_on_select",
+    "terminal_right_click",
+    "terminal_cols_mode",
+    "terminal_shell",
+    "terminal_start_dir",
+    "terminal_cursor_width", "terminal_font_weight", "terminal_letter_spacing",
+    "terminal_min_contrast", "terminal_convert_eol", "terminal_word_separator",
+    "editor_font_size",
+    "editor_word_wrap",
+    "editor_minimap",
+    "editor_line_numbers",
+    "editor_tab_size",
+    "editor_detect_indentation",
+    "editor_render_whitespace",
+    "editor_cursor_blink",
+    "editor_font_ligatures",
+    "editor_sticky_scroll",
+    "editor_auto_save",
+    "editor_tab_indent",
+    "editor_use_spaces",
+    "editor_word_wrap_column",
+    "editor_folding",
+    "editor_glyph_margin",
+    "editor_format_on_paste",
+    "editor_rulers",
+    "editor_cursor_style",
+    "editor_cursor_blinking",
+    "review_split_view",
+    "review_collapse_unified",
+    "review_wrap",
+    "review_word_diff",
+    "review_hide_whitespace",
+    "review_full_file",
+    "review_default_filter",
+    "review_max_lines",
+    "browser_homepage",
+    "browser_record_history",
+    "browser_do_not_track",
+    "browser_deny_site_permissions",
+    "browser_block_popups",
+    "browser_zoom_percent",
+    "browser_ask_before_download",
+    "browser_download_dir",
+    "browser_block_third_party_cookies",
+    "browser_fresh_session",
+    "browser_force_light_page",
+    "browser_identity",
+    "browser_history_limit",
+    "device_context_enabled",
+    "network_proxy_mode",
+    "network_proxy_scheme",
+    "network_proxy_host",
+    "network_proxy_port",
+    "network_proxy_username",
+    "network_proxy_password",
+    "network_proxy_bypass",
 })
 
 #: Adapter fields are stored/transported flattened as ``adapter_<id>_<field>``
@@ -185,10 +267,61 @@ _BORROWED_KEYS = frozenset({"permission_settings"})
 #: read and write.  Keys absent from this map are passed through untouched.
 _UI_KEY_TYPES: dict[str, type] = {
     "auto_expand": bool,
+    "plan_mode_max_turns": int,
+    "spec_mode_max_turns": int,
     "sub_agent_auto_open_view": bool,
     "automation_auto_open_view": bool,
     "model_pool_enabled": bool,
     "model_pool_fallback_enabled": bool,
+    "model_pool_order_sequential": bool,
+    "model_pool_cooldown_ms": int,
+    "model_pool_recycle_wait_ms": int,
+    "model_pool_max_fallbacks": int,
+    "terminal_font_size": int,
+    "terminal_cursor_blink": bool,
+    "terminal_scrollback": int,
+    "terminal_line_height": float,
+    "terminal_cursor_width": int,
+    "terminal_letter_spacing": int,
+    "terminal_min_contrast": float,
+    "terminal_convert_eol": bool,
+    "terminal_bold_bright": bool,
+    "terminal_copy_on_select": bool,
+    "editor_font_size": int,
+    "editor_word_wrap": bool,
+    "editor_minimap": bool,
+    "editor_line_numbers": bool,
+    "editor_tab_size": int,
+    "editor_detect_indentation": bool,
+    "editor_cursor_blink": bool,
+    "editor_font_ligatures": bool,
+    "editor_sticky_scroll": bool,
+    "editor_auto_save": bool,
+    "editor_use_spaces": bool,
+    "editor_folding": bool,
+    "editor_glyph_margin": bool,
+    "editor_format_on_paste": bool,
+    "editor_rulers": bool,
+    "editor_word_wrap_column": int,
+    "review_split_view": bool,
+    "review_collapse_unified": bool,
+    "review_wrap": bool,
+    "review_word_diff": bool,
+    "review_hide_whitespace": bool,
+    "review_full_file": bool,
+    "review_max_lines": int,
+    "browser_record_history": bool,
+    "browser_do_not_track": bool,
+    "browser_deny_site_permissions": bool,
+    "browser_block_popups": bool,
+    "browser_zoom_percent": int,
+    "browser_ask_before_download": bool,
+    "browser_block_third_party_cookies": bool,
+    "browser_fresh_session": bool,
+    "browser_force_light_page": bool,
+    "browser_history_limit": int,
+    "device_context_enabled": bool,
+    "network_proxy_port": int,
 }
 
 _GROUP_FIELDS: dict[str, frozenset[str]] = {
@@ -270,7 +403,7 @@ def _read_encrypted_json(path: Path) -> dict[str, Any] | None:
     try:
         candidates.append(decrypt(text).encode("utf-8"))
     except Exception:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
     candidates.append(raw)  # plaintext fallback
     for blob in candidates:
         try:

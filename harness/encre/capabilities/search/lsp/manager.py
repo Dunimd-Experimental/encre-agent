@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,10 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
+
+from encre.logging_config import get_logger
 
 """Multi-language LSP manager with auto-discovery of installed servers.
 
@@ -46,7 +50,7 @@ from encre.capabilities.search.lsp.protocol import (
 
 logger = logging.getLogger("encre.capabilities.search.lsp.manager")
 
-# 鈹€鈹€ Known LSP servers registry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Known LSP servers registry ───────────────────────────────────────────
 # Each entry: (server_command, [default_args], display_name)
 # Arranged by language for readability -- auto-discovery picks them up
 # by checking if `command` is on PATH.
@@ -234,7 +238,7 @@ class EncreLSPManager:
                     await client.close()
         return None, last_error
 
-    # 鈹€鈹€ LSP query methods 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── LSP query methods ──────────────────────────────────────────────
 
     async def get_diagnostics(self, file_path: str) -> list[Diagnostic]:
         """Return diagnostics for a file from its language's LSP server."""
@@ -297,7 +301,7 @@ class EncreLSPManager:
         self._clients.clear()
         self._status = LSPState(status="not_started")
 
-    # 鈹€鈹€ Helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Helpers ────────────────────────────────────────────────────────
 
     def _get_client(self, file_path: str) -> EncreLSPClient | None:
         """Pick the active LSP client matching *file_path*'s language."""
@@ -378,7 +382,7 @@ class EncreLSPManager:
                     if ext in known_exts:
                         languages.add(EXTENSION_MAP[ext])
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
         return sorted(languages)
 
     @staticmethod

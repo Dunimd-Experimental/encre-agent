@@ -21,11 +21,12 @@
  * Non-compliance may result in service termination or legal liability.
  */
 
-import { getState, setSettings } from "../core/state.js";
+import { getState, setSettings, openRoutedLink } from "../core/state.js";
 import { send } from "../core/ws.js";
+import { renderSlot } from "../core/ui_slots.js";
 import { t } from "../features/i18n.js";
 import { platformIconHtml } from "../ui/icons.js";
-import type { ModelConfigMeta, ProviderEntry } from "../core/types.js";
+import type { ModelConfigMeta, ProviderConfigMeta, ProviderEntry } from "../core/types.js";
 
 interface AdapterFieldDef {
   key: string;
@@ -42,154 +43,65 @@ interface AdapterDef {
   docs?: string;
 }
 
-const ADAPTER_DEFS: AdapterDef[] = [
-  { id: "bluebubbles", name: "BlueBubbles", desc: "Connect to a BlueBubbles server to send and receive iMessage", fields: [
-    { key: "server_url", labelKey: "fieldServerUrl", type: "text", placeholderKey: "placeholderServerUrl" },
-    { key: "api_key", labelKey: "fieldApiKey", type: "password", placeholderKey: "placeholderApiKey" },
-  ], docs: "https://bluebubbles.app/" },
-  { id: "dingtalk", name: "DingTalk", desc: "Connect to a DingTalk custom bot webhook to send work notifications and group messages", fields: [
-    { key: "client_id", labelKey: "fieldDingtalkClientId", type: "text", placeholderKey: "placeholderClientId" },
-    { key: "client_secret", labelKey: "fieldDingtalkClientSecret", type: "password", placeholderKey: "placeholderClientSecret" },
-  ], docs: "https://open.dingtalk.com/document/orgapp/create-and-configure-a-robot" },
-  { id: "discord", name: "Discord", desc: "Integrate Discord bots to manage server channel messages and interactions", fields: [
-    { key: "token", labelKey: "fieldBotToken", type: "password", placeholderKey: "placeholderBotToken" },
-  ], docs: "https://discord.com/developers/applications" },
-  { id: "email", name: "Email", desc: "Send and receive emails via SMTP/IMAP, with auto-reply and processing support", fields: [
-    { key: "smtp_host", labelKey: "fieldSmtpHost", type: "text", placeholderKey: "placeholderSmtpHost" },
-    { key: "smtp_port", labelKey: "fieldSmtpPort", type: "number", placeholderKey: "placeholderSmtpPort" },
-    { key: "smtp_user", labelKey: "fieldSmtpUser", type: "text", placeholderKey: "placeholderSmtpUser" },
-    { key: "smtp_pass", labelKey: "fieldSmtpPass", type: "password", placeholderKey: "placeholderSmtpPass" },
-    { key: "imap_host", labelKey: "fieldImapHost", type: "text", placeholderKey: "placeholderImapHost" },
-    { key: "imap_port", labelKey: "fieldImapPort", type: "number", placeholderKey: "placeholderImapPort" },
-  ]},
-  { id: "feishu", name: "Feishu", desc: "Connect to the Feishu open platform to receive bot events and reply to messages", fields: [
-    { key: "app_id", labelKey: "fieldAppId", type: "text", placeholderKey: "placeholderAppId" },
-    { key: "app_secret", labelKey: "fieldAppSecret", type: "password", placeholderKey: "placeholderAppSecret" },
-  ], docs: "https://open.feishu.cn/document/home/develop-a-bot-in-5-minutes" },
-  { id: "google_chat", name: "Google Chat", desc: "Connect to Google Chat spaces to send and receive messages via Webhook", fields: [
-    { key: "webhook_url", labelKey: "fieldWebhookUrl", type: "text", placeholderKey: "placeholderWebhookUrl" },
-    { key: "service_account", labelKey: "fieldServiceAccount", type: "textarea", placeholderKey: "placeholderServiceAccount" },
-  ], docs: "https://developers.google.com/chat" },
-  { id: "homeassistant", name: "Home Assistant", desc: "Connect to the Home Assistant smart home platform to control devices and query state", fields: [
-    { key: "server_url", labelKey: "fieldServerUrl", type: "text", placeholderKey: "placeholderServerUrl" },
-    { key: "access_token", labelKey: "fieldLongLivedToken", type: "password", placeholderKey: "placeholderAccessToken" },
-  ], docs: "https://www.home-assistant.io/docs/authentication/" },
-  { id: "irc", name: "IRC", desc: "Connect to an IRC server to join channels and auto-respond to messages", fields: [
-    { key: "server", labelKey: "fieldServer", type: "text", placeholderKey: "placeholderServer" },
-    { key: "port", labelKey: "fieldPort", type: "number", placeholderKey: "placeholderPort" },
-    { key: "nickname", labelKey: "fieldNickname", type: "text", placeholderKey: "placeholderNickname" },
-    { key: "password", labelKey: "fieldPassword", type: "password", placeholderKey: "placeholderPassword" },
-  ]},
-  { id: "line", name: "LINE", desc: "Connect to the LINE Messaging API to handle friend and group chat messages", fields: [
-    { key: "channel_access_token", labelKey: "fieldChannelAccessToken", type: "password", placeholderKey: "placeholderChannelAccessToken" },
-    { key: "channel_secret", labelKey: "fieldChannelSecret", type: "password", placeholderKey: "placeholderChannelSecret" },
-  ], docs: "https://developers.line.biz/en/services/messaging-api/" },
-  { id: "matrix", name: "Matrix", desc: "Connect to the Matrix decentralized communication network to join rooms and auto-respond to messages", fields: [
-    { key: "homeserver_url", labelKey: "fieldHomeserverUrl", type: "text", placeholderKey: "placeholderHomeserverUrl" },
-    { key: "access_token", labelKey: "fieldAccessToken", type: "password", placeholderKey: "placeholderAccessToken" },
-  ], docs: "https://matrix.org/docs/guides/" },
-  { id: "mattermost", name: "Mattermost", desc: "Integrate the Mattermost team collaboration platform to listen and send channel messages", fields: [
-    { key: "server_url", labelKey: "fieldServerUrl", type: "text", placeholderKey: "placeholderServerUrl" },
-    { key: "token", labelKey: "fieldBotToken", type: "password", placeholderKey: "placeholderBotToken" },
-  ], docs: "https://developers.mattermost.com/" },
-  { id: "ntfy", name: "ntfy", desc: "Send notification messages via the ntfy push service", fields: [
-    { key: "topic", labelKey: "fieldTopic", type: "text", placeholderKey: "placeholderTopic" },
-    { key: "server_url", labelKey: "fieldServerUrl", type: "text", placeholderKey: "placeholderServerUrl" },
-  ], docs: "https://ntfy.sh/docs/" },
-  { id: "photon", name: "Photon", desc: "Connect to the Photon social platform for messaging and interaction", fields: [
-    { key: "api_url", labelKey: "fieldApiUrl", type: "text", placeholderKey: "placeholderApiUrl" },
-    { key: "api_key", labelKey: "fieldApiKey", type: "password", placeholderKey: "placeholderApiKey" },
-  ]},
-  { id: "qqbot", name: "QQ", desc: "Connect to the QQ platform to receive and reply to group and private chat messages in real time", fields: [
-    { key: "app_id", labelKey: "fieldAppId", type: "text", placeholderKey: "placeholderAppId" },
-    { key: "client_secret", labelKey: "fieldClientSecret", type: "password", placeholderKey: "placeholderClientSecret" },
-  ], docs: "https://bot.q.qq.com/wiki/" },
-  { id: "raft", name: "Raft", desc: "Connect to the Raft distributed communication network to handle inter-node messages", fields: [
-    { key: "node_id", labelKey: "fieldNodeId", type: "text", placeholderKey: "placeholderNodeId" },
-    { key: "peers", labelKey: "fieldPeers", type: "text", placeholderKey: "placeholderPeers" },
-  ]},
-  { id: "signal", name: "Signal", desc: "Connect to the Signal messaging service to send and receive encrypted messages via REST API", fields: [
-    { key: "phone_number", labelKey: "fieldPhoneNumber", type: "text", placeholderKey: "placeholderPhoneNumber" },
-    { key: "api_url", labelKey: "fieldApiUrl", type: "text", placeholderKey: "placeholderApiUrl" },
-  ]},
-  { id: "simplex", name: "SimpleX", desc: "Connect to the SimpleX decentralized messaging platform for private secure communication", fields: [
-    { key: "server_url", labelKey: "fieldServerUrl", type: "text", placeholderKey: "placeholderServerUrl" },
-    { key: "display_name", labelKey: "fieldDisplayName", type: "text", placeholderKey: "placeholderDisplayName" },
-  ], docs: "https://simplex.chat/" },
-  { id: "slack", name: "Slack", desc: "Integrate a Slack workspace to listen on and send channel messages via Bot Token", fields: [
-    { key: "token", labelKey: "fieldBotToken", type: "password", placeholderKey: "placeholderBotToken" },
-    { key: "signing_secret", labelKey: "fieldSigningSecret", type: "password", placeholderKey: "placeholderSigningSecret" },
-  ], docs: "https://api.slack.com/apps" },
-  { id: "sms", name: "SMS", desc: "Connect to an SMS provider API to send and receive SMS notifications", fields: [
-    { key: "provider", labelKey: "fieldProvider", type: "text", placeholderKey: "placeholderProvider" },
-    { key: "account_sid", labelKey: "fieldAccountSid", type: "text", placeholderKey: "placeholderAccountSid" },
-    { key: "auth_token", labelKey: "fieldAuthToken", type: "password", placeholderKey: "placeholderAuthToken" },
-  ]},
-  { id: "teams", name: "Microsoft Teams", desc: "Integrate Microsoft Teams to handle channel and group chat messages via Bot Framework", fields: [
-    { key: "app_id", labelKey: "fieldAppId", type: "text", placeholderKey: "placeholderAppId" },
-    { key: "app_password", labelKey: "fieldAppPassword", type: "password", placeholderKey: "placeholderAppPassword" },
-  ], docs: "https://learn.microsoft.com/en-us/microsoftteams/platform/" },
-  { id: "telegram", name: "Telegram", desc: "Connect to the Telegram Bot API to automatically handle commands and conversations in channels and direct messages", fields: [
-    { key: "token", labelKey: "fieldBotToken", type: "password", placeholderKey: "placeholderBotToken" },
-  ], docs: "https://core.telegram.org/bots#how-do-i-create-a-bot" },
-  { id: "webhook", name: "Webhook", desc: "Start a Webhook listener to receive HTTP callbacks from external systems", fields: [
-    { key: "listen_path", labelKey: "fieldListenPath", type: "text", placeholderKey: "placeholderListenPath" },
-    { key: "secret", labelKey: "fieldSecret", type: "password", placeholderKey: "placeholderSecret" },
-  ]},
-  { id: "weixin", name: "WeChat", desc: "After configuring iLink Bot, connect to WeChat to send and receive messages and auto-reply", fields: [], docs: "https://www.wechatbot.dev/zh/protocol" },
-  { id: "wecom", name: "WeCom", desc: "Connect to a WeCom custom app to enable internal message notifications and collaboration", fields: [
-    { key: "token", labelKey: "fieldWecomToken", type: "text", placeholderKey: "placeholderWecomToken" },
-    { key: "encoding_aes_key", labelKey: "fieldEncodingAesKey", type: "password", placeholderKey: "placeholderEncodingAesKey" },
-    { key: "receive_id", labelKey: "fieldWecomReceiveId", type: "text", placeholderKey: "placeholderWecomReceiveId" },
-  ], docs: "https://developer.work.weixin.qq.com/document/" },
-  { id: "whatsapp", name: "WhatsApp", desc: "Connect to the WhatsApp Business API to handle customer messages and conversations", fields: [
-    { key: "phone_number_id", labelKey: "fieldPhoneNumberId", type: "text", placeholderKey: "placeholderPhoneNumberId" },
-    { key: "access_token", labelKey: "fieldAccessToken", type: "password", placeholderKey: "placeholderAccessToken" },
-  ], docs: "https://developers.facebook.com/docs/whatsapp/" },
-  { id: "yuanbao", name: "Yuanbao", desc: "Connect to the Yuanbao open platform to exchange messages via API", fields: [
-    { key: "app_key", labelKey: "fieldAppKey", type: "text", placeholderKey: "placeholderAppKey" },
-    { key: "app_secret", labelKey: "fieldAppSecret", type: "password", placeholderKey: "placeholderAppSecret" },
-  ]},
-];
+
 
 export function renderModelImpl(this: any): void {
     const st = getState();
-    const models = st.modelConfigs;
-    const activeIdx = st.activeModelIndex;
+    const providers = st.providers || [];
+    const catalog = st.modelCatalog;
+    const providerLabel = (p: ProviderConfigMeta): string =>
+      p.backend_type === "openai_compatible"
+        ? (p.name?.trim() || catalog.providers.find(x => x.id === p.backend_type)?.label || p.backend_type || "?")
+        : catalog.providers.find(x => x.id === p.backend_type)?.label || p.backend_type || "?";
 
     let rowsHtml = "";
-    for (let i = 0; i < models.length; i++) {
-      const m = models[i];
-      const isActive = i === activeIdx && m.enabled !== false;
-      rowsHtml += `
-        <div class="model-table-row" data-model-idx="${i}">
-          <div class="model-table-cell model-cell-name">
-            <span class="model-name-text">${this.esc(m.name || t("common.unnamed"))}</span>
-            ${isActive ? `<span class="model-active-tag">${t("settings.inUse")}</span>` : ''}
+    for (let i = 0; i < providers.length; i++) {
+      const p = providers[i];
+      const modelsAll = p.models || [];
+      const total = modelsAll.length;
+      // Master switch: when the provider is off every model under it counts as
+      // unavailable (mirrors the backend, where the whole provider is skipped).
+      const providerOn = p.enabled !== false;
+      const available = providerOn ? modelsAll.filter((m: any) => m.enabled !== false).length : 0;
+      // Generic plugin override point ("model.provider-row"): a plugin may
+      // replace the row markup declaratively; the default markup below is
+      // the guarded fallback (see core/ui_slots.ts).
+      rowsHtml += renderSlot(
+        "model.provider-row",
+        { idx: i, name: providerLabel(p), total, available, providerOn, backend: p.backend_type || "" },
+        () => `
+        <div class="model-table-row${providerOn ? "" : " model-table-row--off"}" data-provider-idx="${i}">
+          <div class="model-cell-name">
+            <div class="model-name-wrap">
+              <span class="model-name-text">${this.esc(providerLabel(p))}</span>
+            </div>
           </div>
-          <div class="model-table-cell model-cell-provider">${this.esc(m.backend_type)}</div>
+          <div class="model-table-cell model-cell-provider">
+            <span class="model-count${providerOn ? "" : " model-count--off"}"><span class="model-count-avail">${available}</span><span class="model-count-sep">/</span><span class="model-count-total">${total}</span></span>
+          </div>
           <div class="model-table-cell model-cell-actions">
-            <button class="btn-icon" data-action="edit" data-idx="${i}" data-tooltip="${t("settings.edit")}">
-              <i data-lucide="pencil" class="lucide"></i>
-            </button>
-            <button class="btn-icon btn-icon--danger" data-action="delete" data-idx="${i}" data-tooltip="${t("settings.delete")}">
-              <i data-lucide="trash-2" class="lucide"></i>
-            </button>
-            <label class="toggle-switch toggle-sm">
-              <input type="checkbox" class="model-enable-toggle" data-idx="${i}" ${m.enabled !== false ? "checked" : ""} />
+            <label class="toggle-switch toggle-sm provider-master-switch" data-tooltip="${providerOn ? t("settings.enabled") : t("settings.disabled")}">
+              <input type="checkbox" class="provider-enabled-toggle" data-idx="${i}" ${providerOn ? "checked" : ""} />
               <span class="toggle-slider"></span>
             </label>
+            <button class="btn-icon" data-action="edit" data-idx="${i}" data-tooltip="${t("settings.open")}">
+              <i data-lucide="arrow-up-right" class="lucide"></i>
+            </button>
+            <button class="btn-icon btn-icon--danger" data-action="delete" data-idx="${i}" data-tooltip="${t("settings.deleteProvider")}">
+              <i data-lucide="trash-2" class="lucide"></i>
+            </button>
           </div>
-        </div>`;
+        </div>`,
+      );
     }
 
-    const tableHtml = models.length === 0
-      ? `<div class="model-empty"><i data-lucide="cpu" class="lucide"></i><span>${t("settings.noModelsYet")}</span></div>`
+    const tableHtml = providers.length === 0
+      ? `<div class="model-empty"><i data-lucide="cpu" class="lucide"></i><span>${t("settings.noProvidersYet")}</span></div>`
       : `
         <div class="model-table">
           <div class="model-table-header">
-            <div class="model-table-cell model-cell-name">${t("settings.model")}</div>
-            <div class="model-table-cell model-cell-provider">${t("settings.provider")}</div>
+            <div class="model-table-cell model-cell-name">${t("settings.provider")}</div>
+            <div class="model-table-cell model-cell-provider">${t("settings.providerModelsCol")}</div>
             <div class="model-table-cell model-cell-actions">${t("settings.actions")}</div>
           </div>
           ${rowsHtml}
@@ -198,17 +110,17 @@ export function renderModelImpl(this: any): void {
     this.panels.model.innerHTML = `
       <div class="settings-section-title">
         <i data-lucide="cpu" class="lucide section-title-icon"></i>
-        ${t("settings.modelManagement")}
+        ${t("settings.providerManagement")}
         <button class="btn-icon" id="btn-model-pool-settings" data-tooltip="${t("settings.modelPoolSettings")}" style="margin-inline-start:auto">
           <i data-lucide="settings" class="lucide"></i>
         </button>
       </div>
       <div class="settings-card">
         <div class="model-manage-header">
-          <div class="model-manage-desc">${t("settings.modelManagementDesc")}</div>
-          <button class="btn-add-model-top" id="btn-goto-create-model">
+          <div class="model-manage-desc">${t("settings.providerManagementDesc")}</div>
+          <button class="btn-add-model-top" id="btn-goto-create-provider">
             <i data-lucide="plus" class="lucide"></i>
-            <span>${t("settings.addModel")}</span>
+            <span>${t("settings.addProvider")}</span>
           </button>
         </div>
         ${tableHtml}
@@ -226,16 +138,35 @@ export function renderGatewayImpl(this: any): void {
     const adapters = gs?.adapters ?? [];
 
     let cardsHtml = "";
-    for (const def of ADAPTER_DEFS) {
-      const adapterNameKey = `settings.adapterName${def.id.charAt(0).toUpperCase() + def.id.slice(1)}`;
-      const displayName = t(adapterNameKey);
-      const enabled = !!(s[`adapter_${def.id}_enabled` as keyof typeof s]);
-      const statusInfo = adapters.find(a => a.name === def.id);
+    // Connector cards are plugin-provided: each adapter entry in the gateway
+    // status payload carries a declarative ``ui`` spec (fields/docs/qr) from
+    // its ea-connector-* plugin.  Locale keys (adapterName*/adapterDesc*)
+    // still win when present; ui.name/ui.desc are the fallback for
+    // third-party connectors without locale entries.
+    const localeOr = (key: string, fallback: string): string => {
+      const v = t(key);
+      return v && v !== key ? v : fallback;
+    };
+    for (const stInfo of adapters) {
+      const defId = stInfo.name;
+      const ui = ((stInfo as any).ui ?? {}) as {
+        name?: string; desc?: string; docs?: string; qr?: boolean;
+        fields?: AdapterFieldDef[];
+      };
+      // Only plugin connectors carry a declarative card spec.  Built-in
+      // infrastructure adapters (e.g. api_server) are not IM connectors and
+      // stay out of this panel entirely.
+      if (!ui.name && !(ui.fields && ui.fields.length)) continue;
+      const fields = ui.fields ?? [];
+      const adapterNameKey = `settings.adapterName${defId.charAt(0).toUpperCase() + defId.slice(1)}`;
+      const displayName = localeOr(adapterNameKey, ui.name || stInfo.platform || defId);
+      const enabled = !!(s[`adapter_${defId}_enabled` as keyof typeof s]);
+      const statusInfo = stInfo;
       const connected = statusInfo?.connected ?? false;
 
-      const fieldCount = def.fields.length;
-      const allConfigured = def.fields.every(f => {
-        const val = s[`adapter_${def.id}_${f.key}` as keyof typeof s];
+      const fieldCount = fields.length;
+      const allConfigured = fields.every(f => {
+        const val = s[`adapter_${defId}_${f.key}` as keyof typeof s];
         return val && String(val).length > 0;
       });
 
@@ -258,22 +189,23 @@ export function renderGatewayImpl(this: any): void {
 
       // Description shows connection error, adapter description, or config hint
       const connErr = statusInfo?.error || null;
+      const descFallback = ui.desc || "";
       let descHtml: string;
       if (connErr && enabled && allConfigured) {
         descHtml = `<span style="color:var(--text-danger);font-size:11px"><i data-lucide="alert-circle" style="width:11px;height:11px;display:inline-block;vertical-align:middle;margin-right:3px"></i> ${this.esc(connErr)}</span>`;
       } else if (!enabled) {
-        descHtml = `<span style="color:var(--text-muted);font-size:11px">${t("settings.adapterDisabled")} · ${this.esc(t(`settings.adapterDesc${def.id.charAt(0).toUpperCase() + def.id.slice(1)}`))}</span>`;
+        descHtml = `<span style="color:var(--text-muted);font-size:11px">${t("settings.adapterDisabled")} · ${this.esc(localeOr(`settings.adapterDesc${defId.charAt(0).toUpperCase() + defId.slice(1)}`, descFallback))}</span>`;
       } else if (!allConfigured) {
-        descHtml = `<span style="color:var(--text-muted);font-size:11px">${this.esc(t(`settings.adapterDesc${def.id.charAt(0).toUpperCase() + def.id.slice(1)}`))}</span>`;
+        descHtml = `<span style="color:var(--text-muted);font-size:11px">${this.esc(localeOr(`settings.adapterDesc${defId.charAt(0).toUpperCase() + defId.slice(1)}`, descFallback))}</span>`;
       } else {
-        descHtml = `<span style="color:var(--text-muted);font-size:11px">${this.esc(t(`settings.adapterDesc${def.id.charAt(0).toUpperCase() + def.id.slice(1)}`))}</span>`;
+        descHtml = `<span style="color:var(--text-muted);font-size:11px">${this.esc(localeOr(`settings.adapterDesc${defId.charAt(0).toUpperCase() + defId.slice(1)}`, descFallback))}</span>`;
       }
 
-      const iconHtml = platformIconHtml(def.id, 22, "", "margin-right:10px");
+      const iconHtml = platformIconHtml(defId, 22, "", "margin-right:10px");
 
       cardsHtml += `
         <div class="settings-card" style="margin-bottom:12px">
-          <div class="settings-item-row" data-adapter-toggle="${def.id}">
+          <div class="settings-item-row" data-adapter-toggle="${defId}">
             <div class="settings-item-info">
               <div class="settings-item-title" style="display:flex;align-items:center">
                 ${iconHtml}
@@ -284,10 +216,10 @@ export function renderGatewayImpl(this: any): void {
             </div>
             <div class="settings-item-control" style="gap:8px">
               <label class="toggle-switch" onclick="event.stopPropagation()">
-                <input type="checkbox" id="adapter-enable-${def.id}" ${enabled ? "checked" : ""} />
+                <input type="checkbox" id="adapter-enable-${defId}" ${enabled ? "checked" : ""} />
                 <span class="toggle-slider"></span>
               </label>
-              <button class="btn-icon" id="adapter-expand-${def.id}" data-adapter-expand="${def.id}" data-tooltip="${t("settings.adapterConfig")}">
+              <button class="btn-icon" id="adapter-expand-${defId}" data-adapter-expand="${defId}" data-tooltip="${t("settings.adapterConfig")}">
                 <i data-lucide="arrow-up-right" style="width:16px;height:16px"></i>
               </button>
             </div>
@@ -296,11 +228,13 @@ export function renderGatewayImpl(this: any): void {
     }
 
     this.panels.gateway.innerHTML = `
-      <div class="settings-section-title"><i data-lucide="network" class="lucide section-title-icon"></i> ${t("settings.gatewayManagement")}</div>
+      <div class="settings-section-title"><i data-lucide="cable" class="lucide section-title-icon"></i> ${t("settings.gatewayManagement")}</div>
       ${cardsHtml}`;
 
     // Bind event listeners
-    for (const def of ADAPTER_DEFS) {
+    for (const stInfo of adapters) {
+      const defId = stInfo.name;
+      const def = { id: defId, docs: ((stInfo as any).ui ?? {}).docs as string | undefined };
       const enableToggle = document.getElementById(`adapter-enable-${def.id}`) as HTMLInputElement;
       if (enableToggle) {
         enableToggle.addEventListener("change", () => {
@@ -325,20 +259,10 @@ export function renderGatewayImpl(this: any): void {
         docsLink.addEventListener("click", (e) => {
           e.preventDefault();
           e.stopPropagation();
-          const behavior = (getState().settings.default_link_behavior as string) || "system";
-          const url = def.docs || "";
-          if (behavior === "in_app") {
-            const api = (window as any).electronAPI;
-            if (api?.openChildWindow) { api.openChildWindow(url, url); return; }
-          } else {
-            const api = (window as any).electronAPI;
-            if (api?.openExternal) { api.openExternal(url); return; }
-          }
-          window.open(url, "_blank");
-});
-  }
-
-}
+          openRoutedLink(def.docs || "");
+        });
+      }
+    }
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: this.panels.gateway });
     }

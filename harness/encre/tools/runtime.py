@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -30,7 +29,7 @@ cron scheduler, the engine-install requester, the LSP manager).
 
 Historically each module kept its own copy of that state.  Once a tool was
 migrated into a plugin package the copy in the plugin module was never wired
-by the host, so tools such as ``find_tool`` failed with "requires a parent
+by the host, so tools such as ``manage`` failed with "requires a parent
 loop reference".
 
 This module is the single source of truth.  The host wires state here (via the
@@ -40,11 +39,12 @@ new -- reads from here.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Active loop (find_tool, agent, codebase, ...)
+# Active loop (manage, agent, ...)
 # ---------------------------------------------------------------------------
 
 _current_loop: contextvars.ContextVar[Any] = contextvars.ContextVar(
@@ -77,6 +77,54 @@ def _resolve_loop() -> Any:
     return _parent_loop
 
 
+def get_loop_cancel_event() -> Any:
+    """Return the active loop's cancel event, or ``None`` when unset.
+
+    The event is raised by the host when the user hits Stop / pauses the turn.
+    Long-running tools (``bash``) watch it via :func:`_get_loop_cancel_event`
+    so they can abort promptly even when the surrounding task is not itself
+    cancelled (e.g. the whole turn is torn down instead of the per-tool task).
+    """
+    loop = _resolve_loop()
+    if loop is None:
+        return None
+    return getattr(loop, "_cancel_event", None)
+
+
+def _get_loop_cancel_event() -> Any:
+    """Alias kept for symmetry with ``_get_progress_emitter``."""
+    return get_loop_cancel_event()
+
+
+# ---------------------------------------------------------------------------
+# Bash abort event (tool_stop: kill the shell without cancelling the turn).
+# ---------------------------------------------------------------------------
+
+_bash_abort_events: dict[str, asyncio.Event] = {}
+
+
+def get_session_id() -> str:
+    loop = _resolve_loop()
+    if loop is None:
+        return ""
+    session = getattr(loop, "session", None)
+    if session is None:
+        return ""
+    return getattr(session, "id", "") or ""
+
+
+def get_bash_abort_event(session_id: str) -> asyncio.Event | None:
+    return _bash_abort_events.get(session_id)
+
+
+def set_bash_abort_event(session_id: str, event: asyncio.Event) -> None:
+    _bash_abort_events[session_id] = event
+
+
+def clear_bash_abort_event(session_id: str) -> None:
+    _bash_abort_events.pop(session_id, None)
+
+
 # ---------------------------------------------------------------------------
 # Sandbox workspace (bash / terminal)
 # ---------------------------------------------------------------------------
@@ -102,7 +150,37 @@ def _get_workspace() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Cron scheduler (cron_create / cron_delete / cron_list)
+# Tool progress streaming (bash / terminal)
+# ---------------------------------------------------------------------------
+
+_current_progress_emitter: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "encre_current_progress_emitter", default=None,
+)
+
+
+def set_progress_emitter(emitter: Any) -> contextvars.Token:
+    """Bind *emitter* (``str -> None``) as this turn's tool-progress emitter.
+
+    Long-running tools (e.g. ``bash``) read it via :func:`_get_progress_emitter`
+    and push incremental output chunks through it while still executing, so the
+    wire layer can forward real-time progress instead of waiting for completion.
+    Returns a token usable with :func:`reset_progress_emitter`.
+    """
+    return _current_progress_emitter.set(emitter)
+
+
+def reset_progress_emitter(token: contextvars.Token) -> None:
+    """Restore the previous progress emitter using *token*."""
+    _current_progress_emitter.reset(token)
+
+
+def _get_progress_emitter() -> Any:
+    """Return the active tool-progress emitter, or ``None`` when unset."""
+    return _current_progress_emitter.get()
+
+
+# ---------------------------------------------------------------------------
+# Cron scheduler (cron)
 # ---------------------------------------------------------------------------
 
 _scheduler: Any = None
@@ -120,7 +198,7 @@ def get_scheduler() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Engine-install requester (browser / computer_use)
+# Engine-install requester (browser / computer)
 # ---------------------------------------------------------------------------
 
 _engine_requester: Any = None
@@ -135,6 +213,64 @@ def set_engine_requester(requester: Any) -> None:
 def get_engine_requester() -> Any:
     """Return the engine-install requester, or ``None`` when unset."""
     return _engine_requester
+
+
+# ---------------------------------------------------------------------------
+# Pending tool images (screenshot-bearing tools -> tool-result messages)
+# ---------------------------------------------------------------------------
+
+#: Images produced by the most recent tool executions, keyed by
+#: ``"<session_id>\n<tool_call_id>"``.  Tools that capture screenshots write
+#: ``{"media_type": str, "data": str}`` dicts here (base64, no data-URL
+#: prefix); the loop's tool phase pops them right after execution and hands
+#: them to ``Session.add_tool_result`` so the images can be projected into
+#: the model context as image content blocks.  Pop-on-read keeps the slot
+#: self-cleaning; the tool_call_id component prevents parallel tool calls
+#: within one session from cross-contaminating each other's payloads.
+_pending_tool_images: dict[str, list[dict[str, str]]] = {}
+
+
+def _tool_images_key(session_id: str, tool_call_id: str) -> str:
+    return f"{session_id or ''}\n{tool_call_id or ''}"
+
+
+#: tool_call_id of the tool currently being executed.  Set by the loop's tool
+#: phase before dispatch so screenshot-producing tools can address the
+#: pending-images slot without the id being part of their schema.
+_current_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "encre_current_tool_call_id", default=""
+)
+
+
+def set_current_tool_call_id(tool_call_id: str) -> contextvars.Token:
+    """Set the tool_call_id for the in-flight tool execution."""
+    return _current_tool_call_id.set(tool_call_id or "")
+
+
+def reset_current_tool_call_id(token: contextvars.Token) -> None:
+    """Restore the previous tool_call_id contextvar value."""
+    _current_tool_call_id.reset(token)
+
+
+def get_current_tool_call_id() -> str:
+    """Return the tool_call_id of the currently executing tool (may be '')."""
+    return _current_tool_call_id.get()
+
+
+def set_pending_tool_images(
+    session_id: str, tool_call_id: str, images: list[dict[str, str]]
+) -> None:
+    """Store screenshot payloads produced by one tool execution."""
+    if not images:
+        return
+    _pending_tool_images[_tool_images_key(session_id, tool_call_id)] = list(images)
+
+
+def pop_pending_tool_images(
+    session_id: str, tool_call_id: str
+) -> list[dict[str, str]]:
+    """Take (and clear) the pending images for one tool execution."""
+    return _pending_tool_images.pop(_tool_images_key(session_id, tool_call_id), None) or []
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +297,7 @@ def set_lsp_manager(manager: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Browser session state (browser / computer_use)
+# Browser session state (browser / computer)
 # ---------------------------------------------------------------------------
 
 #: Per-chat-session browser sessions, keyed by session id.
@@ -188,6 +324,17 @@ def set_cdp_url(url: str) -> None:
         browser_cdp_ws_urls[browser_session_id] = url
     else:
         browser_cdp_ws_urls[BROWSER_DEFAULT_KEY] = url
+
+
+def clear_cdp_url() -> None:
+    """Drop the stored CDP websocket URL for the current (or default) session.
+
+    Called when the frontend webview is closed or destroyed: the relay behind
+    the old URL is gone, so keeping the entry would only make the browser tool
+    retry a dead port instead of waiting for the fresh endpoint.
+    """
+    browser_cdp_ws_urls.pop(browser_session_id, None)
+    browser_cdp_ws_urls.pop(BROWSER_DEFAULT_KEY, None)
 
 
 def set_search_engine_url(url: str) -> None:
@@ -248,12 +395,13 @@ def _enforce_tool_policy(tool_name: str, tool_input: dict[str, Any] | None = Non
         return None
     policy = getattr(loop.config, "current_tool_policy", "all")
     # Hard-fence first: a sub-agent (depth > 0) must not spawn more sub-agents
-    # or swarms, regardless of policy.
-    if tool_name in ("agent", "swarm") and getattr(loop, "sub_agent_depth", 0) > 0:
+    # or workflows, regardless of policy.
+    if tool_name in ("agent", "workflow") and getattr(loop, "sub_agent_depth", 0) > 0:
         return (
-            "Sub-agents are forbidden from spawning further sub-agents or swarms. "
-            "The runtime only allows one level of delegation. Complete the "
-            "assigned task with your own tools and return the result."
+            "Sub-agents are forbidden from spawning further sub-agents or "
+            "workflows. The runtime only allows one level of delegation. "
+            "Complete the assigned task with your own tools and return the "
+            "result."
         )
     if not isinstance(policy, str) or policy == "all":
         return None
@@ -266,13 +414,12 @@ def _enforce_tool_policy(tool_name: str, tool_input: dict[str, Any] | None = Non
     if policy == "readonly" and tool_name in write_tools:
         return f"Tool {tool_name} is forbidden in readonly sub-agent policy."
     if policy == "readonly" and tool_name in (
-        "docker", "deploy", "workflow", "cron_create", "cron_delete",
-        "cron_list", "task_create", "task_update", "agent", "swarm",
+        "docker", "deploy", "workflow", "cron", "task", "agent",
     ):
         return f"Tool {tool_name} is forbidden in readonly sub-agent policy."
     if policy == "no_writes" and tool_name in write_tools:
         return f"Tool {tool_name} is forbidden in no_writes sub-agent policy."
-    if policy == "no_writes" and tool_name in ("docker", "deploy", "workflow", "agent", "swarm"):
+    if policy == "no_writes" and tool_name in ("docker", "deploy", "workflow", "agent"):
         return f"Tool {tool_name} is forbidden in no_writes sub-agent policy."
     return None
 

@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -22,6 +22,17 @@
 # Non-compliance may result in service termination or legal liability.
 
 from __future__ import annotations
+
+"""Backend subsystem tests covering model metadata, registry lookup, backend
+creation, retry policy, capability predicates, and config wiring.
+
+These tests exercise the ModelInfo dataclass, the BackendRegistry and
+resolve_model_info fallback table, the BaseBackend ABC contract, the
+create_backend factory for every registered provider, RetryConfig defaults,
+and the interaction between EncreConfig and the backend factory. No live
+provider API key is required: every backend is constructed with dummy
+credentials and only its interface and metadata are asserted.
+"""
 
 import asyncio
 
@@ -619,7 +630,7 @@ class TestBackendCapabilities:
         """Validate Anthropic backend reports all extended capabilities.
 
         The test asserts tool calling, a positive context window, extended thinking enabled,
-        and prompt caching enabled — the four capabilities that distinguish Anthropic from
+        and prompt caching enabled -- the four capabilities that distinguish Anthropic from
         generic OpenAI-compatible backends.
         """
         be = create_backend("anthropic", api_key="sk-ant-fake")

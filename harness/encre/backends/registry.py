@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 Model metadata registry -- centralised model info for all supported providers.
@@ -59,6 +61,8 @@ As of mid-2026, the LLM market has undergone significant changes:
 import threading
 from dataclasses import dataclass
 from typing import Any
+
+from encre.backends.catalog import get_context_window
 
 
 @dataclass
@@ -723,10 +727,15 @@ def resolve_model_info(model_name: str, provider: str | None = None) -> ModelInf
 
     # Fall back to provider defaults.
     defaults = _PROVIDER_DEFAULTS.get(provider, {})
+    # Context window: the model catalog is the single source of truth for
+    # known model families; the provider default only covers unknown names.
+    context_window = get_context_window(model_name)
+    if context_window is None:
+        context_window = defaults.get("context_window", 128000)
     return ModelInfo(
         name=model_name,
         provider=provider,
-        context_window=defaults.get("context_window", 128000),
+        context_window=context_window,
         max_output_tokens=defaults.get("max_output_tokens", 8192),
         supports_tools=defaults.get("supports_tools", True),
         supports_thinking=defaults.get("supports_thinking", False),

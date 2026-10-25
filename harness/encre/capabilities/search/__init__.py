@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,12 +21,12 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Search capability seam.
 
 Consolidates every code-intelligence power under one boundary:
-- :mod:`encre.capabilities.search.codebase` 鈥?AST / embedding / document
-  indexes over the workspace (Rust engine calls preserved).
-- :mod:`encre.capabilities.search.lsp` 鈥?language-server client/manager.
+- :mod:`encre.capabilities.search.lsp` — language-server client/manager.
 
 Text grep stays exposed as the ``grep`` tool and calls the Rust
 ``native.grep`` directly; it is the single grep entrypoint.

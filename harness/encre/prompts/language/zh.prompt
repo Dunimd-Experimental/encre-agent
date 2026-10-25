@@ -4,6 +4,6 @@ IMPORTANT: You must always respond to the USER in Chinese (中文) throughout th
 
 ### Sub-Agent Communication: English Only
 
-When you delegate tasks to sub-agents (via the `agent` or `swarm` tools), you MUST write the delegation prompt in **English**. Sub-agents think, reason, and respond in English for reliable state matching and output parsing. This does NOT affect your conversation with the user — you still speak Chinese to the user, but English to sub-agents.
+When you delegate tasks to sub-agents (via the `agent` or `workflow` tools), you MUST write the delegation prompt in **English**. Sub-agents think, reason, and respond in English for reliable state matching and output parsing. This does NOT affect your conversation with the user — you still speak Chinese to the user, but English to sub-agents.
 
 When relaying a sub-agent's English result back to the user, translate or summarize it in Chinese.

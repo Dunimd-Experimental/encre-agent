@@ -24,9 +24,10 @@
 import { getState, setSettings, setCustomCommands, setTheme, setThemePreference, setPermissionPolicies, subscribe, showToast, isEnabled } from "../core/state.js";
 import { send } from "../core/ws.js";
 import { waitForModelValidation, onWechatScanResult, refreshAllData } from "../core/stream.js";
-import { setModelConfigs, setMcpServers, setSkillsList, setSubAgents } from "../core/state.js";
+import { setModelConfigs, setMcpServers, setProviders, setSkillsList, setSubAgents } from "../core/state.js";
 import type { ModelConfigMeta, MCPServerConfig, SkillInfo, ModelCatalog, McpCatalog, McpProviderEntry, ProviderEntry, ProfileData, CustomCommand, UsageStatsSessionEntry } from "../core/types.js";
 import { defaultSearchFilter } from "../core/types.js";
+import { scheduleRender } from "../core/render_scheduler.js";
 import { Dialog } from "../ui/dialog.js";
 import {
   bindTargetModelSelection,
@@ -36,10 +37,10 @@ import {
   serializeTargetModelSelection,
 } from "./model-selection.js";
 import { t, initLocale, setLocale, getLocale, getIntlLocale, clearLocaleCache, onLocaleChange, LOCALES, type Locale } from "../features/i18n.js";
-import { applyServerCommands } from "../features/slash_commands.js";
+import { applyServerCommands } from "../ui/slash-commands.js";
 import { renderMarkdown } from "../chat/chat.js";
 import { platformIconHtml, searchEngineIconSrc } from "../ui/icons.js";
-import { formatShortcut } from "../features/shortcutDisplay.js";
+import { formatShortcut } from "../ui/shortcut-display.js";
 // Chart.js is lazy-loaded on first render of the usage panel (see
 // _renderUsageSection) so it no longer blocks startup parsing.
 import { showTooltipAt, hideTooltip } from "../ui/tooltip.js";
@@ -74,73 +75,34 @@ export function initSettingsDomEvents(this: any): void {
     // ── Event delegation on panel containers ─────────────────────────
     // These survive innerHTML replacement — no need to re-bind after render.
 
-    // Index panel: document add/remove
-    this.panels.index.addEventListener("click", (e) => {
-      console.log("[DEBUG index] click fired, target:", (e.target as HTMLElement).className, "tag:", (e.target as HTMLElement).tagName);
-      const target = e.target as HTMLElement;
-
-      // Add document dropdown trigger
-      const trigger = target.closest("#doc-add-trigger");
-      if (trigger) {
-        e.stopPropagation();
-        const dd = document.getElementById("doc-add-dropdown");
-        if (dd) {
-          const isOpen = dd.classList.contains("open");
-          document.querySelectorAll(".settings-dropdown.open").forEach((d) => d.classList.remove("open"));
-          if (!isOpen) dd.classList.add("open");
-        }
-        return;
+    // Library panel: auto-refresh on backend tree/content pushes. All click
+    // logic is bound inside the panel itself (delegated on the library
+    // containers in _bindLibraryInteractions), so nothing to route here.
+    let lastLibTreeRef = getState().libraryTree;
+    let lastLibContentRef = getState().libraryContent;
+    subscribe(() => {
+      const app = document.getElementById("app");
+      if (!app?.classList.contains("settings-mode")) return;
+      const st = getState();
+      if (st.libraryTree !== lastLibTreeRef) {
+        lastLibTreeRef = st.libraryTree;
+        if (this.panels.library) this.refreshLibraryTree();
       }
-
-      // Dropdown items (local file / URL)
-      const item = target.closest(".settings-dropdown-item");
-      if (item && document.getElementById("doc-add-dropdown")?.contains(item)) {
-        document.getElementById("doc-add-dropdown")?.classList.remove("open");
-        const action = item.getAttribute("data-action");
-        if (action === "local") {
-          (async () => {
-            const api = (window as any).electronAPI;
-            if (api?.pickFiles) {
-              const paths = await api.pickFiles();
-              if (!paths?.length) return;
-              const filePath = paths[0];
-              const fileName = filePath.split(/[/\\]/).pop() || filePath;
-              this._showDocNameDialog(fileName, (name) => {
-                send({ type: "add_document", name: name || fileName, file_path: filePath } as any);
-              }, t);
-            }
-          })();
-        } else if (action === "url") {
-          this._showDocUrlDialog(t);
-        }
-        return;
+      if (st.libraryContent !== lastLibContentRef) {
+        lastLibContentRef = st.libraryContent;
+        if (this.panels.library) this.refreshLibraryContent();
       }
+    }, ["libraryTree", "libraryContent"]);
 
-      // Remove document button
-      const removeBtn = target.closest("[data-action='delete-doc']");
-      if (removeBtn) {
-        const id = removeBtn.getAttribute("data-doc-id");
-        const name = removeBtn.getAttribute("data-doc-name");
-        if (id && name) {
-          Dialog.confirm(t("settings.deleteDoc"), t("settings.confirmDeleteDoc", { name }), { container: document.getElementById("settings-view") ?? undefined }).then((ok) => {
-            if (ok) {
-              send({ type: "remove_document", id } as any);
-            }
-          });
-        }
-        return;
-      }
-    });
-
-    // Skills panel: skill view/edit/delete, command add/edit/delete
+    // Skills panel: skill view/edit/delete, command add/edit/delete, rules
+    // (the rules table now renders inline in this panel, so its own bindings
+    //  live in renderRules() — nothing to route here).
     this.panels.skills.addEventListener("click", (e) => {
-      console.log("[DEBUG skills] click fired, target:", (e.target as HTMLElement).className, "tag:", (e.target as HTMLElement).tagName);
       const target = e.target as HTMLElement;
 
       // View skill
       const viewBtn = target.closest("[data-action='view-skill']");
       if (viewBtn) {
-        console.log("[DEBUG skills] view-slick matched, name:", viewBtn.getAttribute("data-name"));
         const name = viewBtn.getAttribute("data-name") || "";
         if (name) this.showSkillDetail(name);
         return;
@@ -149,7 +111,6 @@ export function initSettingsDomEvents(this: any): void {
       // Edit skill
       const editBtn = target.closest("[data-action='edit-skill']");
       if (editBtn) {
-        console.log("[DEBUG skills] edit-skill matched, name:", editBtn.getAttribute("data-name"));
         const name = editBtn.getAttribute("data-name") || "";
         if (name) this.showSkillDetail(name, true);
         return;
@@ -160,7 +121,7 @@ export function initSettingsDomEvents(this: any): void {
       if (deleteBtn) {
         const name = deleteBtn.getAttribute("data-name") || "";
         if (name) {
-          Dialog.confirm(t("settings.delete"), t("settings.skillDeleteConfirm", { name }), { container: document.getElementById("settings-view") ?? undefined }).then(async (ok) => {
+          Dialog.confirm(t("settings.delete"), t("settings.skillDeleteConfirm", { name }), { scope: "panel" }).then(async (ok) => {
             if (ok) {
               const filtered = getState().skillsList.filter(s => s.name !== name);
               setSkillsList(filtered);
@@ -185,7 +146,7 @@ export function initSettingsDomEvents(this: any): void {
       if (deleteCmd) {
         const name = deleteCmd.getAttribute("data-name") || "";
         if (name) {
-          Dialog.confirm(t("settings.delete"), t("settings.commandRemoveConfirm", { name }), { container: document.getElementById("settings-view") ?? undefined }).then(async (ok) => {
+          Dialog.confirm(t("settings.delete"), t("settings.commandRemoveConfirm", { name }), { scope: "panel" }).then(async (ok) => {
             if (ok) {
               this.removeCustomCommand(name);
             }
@@ -224,30 +185,9 @@ export function initSettingsDomEvents(this: any): void {
 
     });
 
-    // ── Model panel: edit, delete, enable/disable ───────────────────
-    this.panels.model.addEventListener("change", (e) => {
-      const cb = (e.target as HTMLInputElement).closest(".model-enable-toggle") as HTMLInputElement | null;
-      if (!cb) return;
-      const idx = parseInt(cb.getAttribute("data-idx") || "0");
-      const currentModels = [...getState().modelConfigs];
-      if (idx < 0 || idx >= currentModels.length) return;
-
-      const isMultimodal = cb.classList.contains("model-multimodal-toggle");
-      if (isMultimodal) {
-        currentModels[idx] = { ...currentModels[idx], multimodal: cb.checked };
-      } else {
-const newEnabled = cb.checked;
-        currentModels[idx] = { ...currentModels[idx], enabled: newEnabled };
-        let activeIdx = getState().activeModelIndex;
-        if (!newEnabled && idx === activeIdx) {
-          const nextIdx = currentModels.findIndex((m, i) => i !== idx && m.enabled !== false);
-          if (nextIdx >= 0) activeIdx = nextIdx;
-        }
-setModelConfigs(currentModels, activeIdx);
-        send({ type: "update_models", models: currentModels, active_model_index: activeIdx });
-      }
-    });
-
+    // ── Provider panel: edit, delete ────────────────────────────────
+    // Models are enabled/disabled and edited inside the provider dialog;
+    // the list itself only needs edit / delete / add entry points.
     this.panels.model.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
 
@@ -260,17 +200,23 @@ setModelConfigs(currentModels, activeIdx);
       const deleteBtn = target.closest("[data-action='delete']");
       if (deleteBtn) {
         const idx = parseInt(deleteBtn.getAttribute("data-idx") || "0");
-        const m = getState().modelConfigs[idx];
-        Dialog.confirm(t("common.confirmDeleteTitle"), t("common.confirmDelete", { name: m?.name || t("common.unnamed") }), { container: document.getElementById("settings-view") ?? undefined }).then((ok) => {
-          if (ok) {
-            const currentModels = [...getState().modelConfigs];
-            currentModels.splice(idx, 1);
-            let activeIdx = getState().activeModelIndex;
-            if (idx < activeIdx) activeIdx--;
-            if (activeIdx >= currentModels.length) activeIdx = Math.max(0, currentModels.length - 1);
-            setModelConfigs(currentModels, activeIdx);
-            send({ type: "delete_model", model_index: idx });
-          }
+        const prov = (getState().providers || [])[idx];
+        const name = (prov ? this._providerDisplayName?.(prov) : "") || prov?.backend_type || t("common.unnamed");
+        Dialog.confirm(t("settings.confirmRemoveProviderTitle"), t("settings.confirmRemoveProvider", { name }), { scope: "panel" }).then((ok) => {
+          if (!ok) return;
+          const current = [...(getState().providers || [])];
+          if (idx < 0 || idx >= current.length) return;
+          // Shift the flat active-model index past the removed models.
+          let offset = 0;
+          for (let i = 0; i < idx; i++) offset += current[i]?.models?.length || 0;
+          const removedCount = current[idx]?.models?.length || 0;
+          let activeIdx = getState().activeModelIndex;
+          if (activeIdx >= offset + removedCount) activeIdx -= removedCount;
+          else if (activeIdx >= offset) activeIdx = Math.max(0, offset - 1);
+          current.splice(idx, 1);
+          setProviders(current);
+          setModelConfigs(getState().modelConfigs.filter((_, i) => i < offset || i >= offset + removedCount), activeIdx);
+          send({ type: "update_providers", providers: current, active_model_index: activeIdx });
         });
         return;
       }
@@ -278,15 +224,51 @@ setModelConfigs(currentModels, activeIdx);
       const editBtn = target.closest("[data-action='edit']");
       if (editBtn) {
         const idx = parseInt(editBtn.getAttribute("data-idx") || "0");
-        this.showModelEdit(idx);
+        this.showProviderEdit(idx);
         return;
       }
 
-      const createBtn = target.closest("#btn-goto-create-model");
+      const createBtn = target.closest("#btn-goto-create-provider");
       if (createBtn) {
-        this.showModelCreate();
+        this.showProviderCreate();
         return;
       }
+    });
+
+    // ── Provider master switch (model table 操作 column) ──────────────
+    // Turning a provider off makes every one of its models unavailable
+    // WITHOUT touching the individual per-model switches, so switching it
+    // back on restores exactly the previous selection.  Saves immediately.
+    this.panels.model.addEventListener("change", (e) => {
+      const input = (e.target as HTMLElement).closest(".provider-enabled-toggle") as HTMLInputElement | null;
+      if (!input) return;
+      const idx = parseInt(input.getAttribute("data-idx") || "-1");
+      const current = [...(getState().providers || [])];
+      if (idx < 0 || idx >= current.length) return;
+      const next = current.map((p, i) => (i === idx ? { ...p, enabled: input.checked } : p));
+      setProviders(next);
+
+      // If the active model lived under the provider we just switched off,
+      // move it to the first enabled model of the first provider still on.
+      let activeIdx = getState().activeModelIndex;
+      let offset = 0;
+      for (let i = 0; i < idx; i++) offset += current[i]?.models?.length || 0;
+      const count = current[idx]?.models?.length || 0;
+      if (!input.checked && activeIdx >= offset && activeIdx < offset + count) {
+        activeIdx = -1;
+        let n = 0;
+        for (let i = 0; i < next.length; i++) {
+          const prov = next[i];
+          if (prov.enabled === false) continue;
+          const j = (prov.models || []).findIndex((m: any) => m.enabled !== false);
+          if (j >= 0) { activeIdx = n + j; break; }
+          n += prov.models?.length || 0;
+        }
+        if (activeIdx < 0) activeIdx = 0;
+      }
+
+      send({ type: "update_providers", providers: next, active_model_index: activeIdx });
+      this.renderModel();
     });
 
     // ── MCP panel: create, edit, delete, toggle ─────────────────────
@@ -299,7 +281,7 @@ setModelConfigs(currentModels, activeIdx);
         const current = [...(getState().mcpServers || [])];
         const srv = current[idx];
         const name = srv?.name || t("settings.mcpServer");
-        Dialog.confirm(t("settings.confirmDeleteMcpTitle"), t("settings.confirmDeleteMcp", { name }), { container: document.getElementById("settings-view") ?? undefined }).then((ok) => {
+        Dialog.confirm(t("settings.confirmDeleteMcpTitle"), t("settings.confirmDeleteMcp", { name }), { scope: "panel" }).then((ok) => {
           if (ok) {
             current.splice(idx, 1);
             setMcpServers(current);
@@ -361,7 +343,7 @@ setModelConfigs(currentModels, activeIdx);
         const agents = getState().subAgents || [];
         if (idx < 0 || idx >= agents.length) return;
         const name = agents[idx].name;
-        Dialog.confirm(t("settings.confirmDeleteSubAgent", { name }), t("settings.confirmDeleteSubAgentTitle"), { container: document.getElementById("settings-view") ?? undefined }).then((confirmed) => {
+        Dialog.confirm(t("settings.confirmDeleteSubAgent", { name }), t("settings.confirmDeleteSubAgentTitle"), { scope: "panel" }).then((confirmed) => {
           if (!confirmed) return;
           const updated = agents.filter((_, i) => i !== idx);
           setSubAgents(updated);
@@ -371,20 +353,16 @@ setModelConfigs(currentModels, activeIdx);
       }
     });
 
-    // ── Memory panel: refresh, view ──────────────────────────────────
+    // ── Memory panel: the graph owns the panel and wires its own node clicks
+    //    (renderMemory → createMemoryGraph.onSelect → sub-page reader).  A
+    //    `view-memory` row can still jump straight to one node's reader. ───
     this.panels.memory.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
-
-      const refreshBtn = target.closest("#btn-refresh-memory");
-      if (refreshBtn) {
-        refreshAllData();
-        return;
-      }
 
       const viewBtn = target.closest("[data-action='view-memory']");
       if (viewBtn) {
         const path = viewBtn.getAttribute("data-path") || "";
-        if (path) this._showMemoryDetailDialog(path);
+        if (path) this._openMemoryEditor(path);
         return;
       }
     });
@@ -395,18 +373,23 @@ setModelConfigs(currentModels, activeIdx);
       this.refreshCurrentPanel();
     });
 
-    // Auto-refresh skills panel when skillsList changes (install/uninstall)
-    let lastSkillsLen = getState().skillsList.length;
+    // Auto-refresh the skills + commands panel when either list is replaced
+    // (skill install/uninstall/edit, or command add/edit/delete).  The backend
+    // swaps each slice for a fresh array, so a reference check catches adds,
+    // removes and in-place edits alike — a length check would miss the latter.
+    let lastSkillsRef = getState().skillsList;
+    let lastCommandsRef = getState().customCommands;
     subscribe(() => {
       const app = document.getElementById("app");
       if (!app?.classList.contains("settings-mode")) return;
-      const currentLen = getState().skillsList.length;
-      if (currentLen !== lastSkillsLen) {
-        lastSkillsLen = currentLen;
-        // Always re-render skills list in case user navigates there
+      const st = getState();
+      if (st.skillsList !== lastSkillsRef || st.customCommands !== lastCommandsRef) {
+        lastSkillsRef = st.skillsList;
+        lastCommandsRef = st.customCommands;
+        // Always re-render in case the user navigates there next.
         if (this.panels.skills) this.renderSkills();
       }
-    });
+    }, ["skillsList", "customCommands"]);
 
     // Auto-refresh model panel when modelConfigs or activeModelIndex change
     let lastModelIdx = getState().activeModelIndex;
@@ -426,7 +409,7 @@ setModelConfigs(currentModels, activeIdx);
         lastModelsRef = st.modelConfigs;
         if (this.currentPanel === "model" && this.panels.model) this.renderModel();
       }
-    });
+    }, ["activeModelIndex", "modelConfigs"]);
 
     // Auto-refresh MCP panel when mcpServers change
     let lastMcpLen = getState().mcpServers.length;
@@ -438,7 +421,7 @@ setModelConfigs(currentModels, activeIdx);
         lastMcpLen = cur;
         if (this.currentPanel === "mcp" && this.panels.mcp) this.renderMcpList();
       }
-    });
+    }, ["mcpServers"]);
 
     // Auto-refresh agent panel when subAgents change
     let lastAgentLen = getState().subAgents.length;
@@ -450,64 +433,53 @@ setModelConfigs(currentModels, activeIdx);
         lastAgentLen = cur;
         if (this.currentPanel === "agent" && this.panels.agent) this.renderAgent();
       }
-    });
+    }, ["subAgents"]);
 
-    // Auto-refresh memory panel when memoryList or profile changes
-    let lastMemoryLen = getState().memoryList.length;
+    // Auto-refresh the memory graph only when the payload itself is replaced
+    // (reference check).  profile_updated / memory_list churn must NOT
+    // rebuild the view: a rebuild resets pan/zoom and used to wipe in-flight
+    // node drags -- the "page refreshed itself" complaint.  The graph now
+    // lives inside the memory editor card, so updates only flow while the
+    // card is open; the panel itself no longer paints a graph.
+    let lastMemoryGraphRef = getState().memoryGraph;
     subscribe(() => {
       const app = document.getElementById("app");
       if (!app?.classList.contains("settings-mode")) return;
-      if (getState().memoryList.length !== lastMemoryLen) {
-        lastMemoryLen = getState().memoryList.length;
-        if (this.currentPanel === "memory" && this.panels.memory) this.renderMemory();
+      if (getState().memoryGraph !== lastMemoryGraphRef) {
+        lastMemoryGraphRef = getState().memoryGraph;
+        if (this.currentPanel !== "memory" || !this._memoryGraphCtl || this._memoryGraphCtl.isInteracting()) return;
+        // Reader sub-page open (graph view is display:none): applying the
+        // push now would rebuild the canvas right before the user returns
+        // ("refreshed itself").  The next push after the way back repaints.
+        const graphView = document.getElementById("mem-graph-view");
+        if (graphView && !graphView.offsetParent) return;
+        // Graph data changed (e.g. a node's use count ticked after the
+        // user opened a detail view).  update() keeps pan/zoom and dragged
+        // positions, so returning from the markdown reader no longer looks
+        // like the page refreshed itself.
+        this._memoryGraphCtl.update(getState().memoryGraph || { nodes: [], edges: [] });
       }
-    });
-    let lastProfileUpd = getState().profile?.update_count ?? -1;
-    subscribe(() => {
-      const app = document.getElementById("app");
-      if (!app?.classList.contains("settings-mode")) return;
-      const currUpd = getState().profile?.update_count ?? -1;
-      if (currUpd !== lastProfileUpd) {
-        lastProfileUpd = currUpd;
-        if (this.currentPanel === "memory" && this.panels.memory) this.renderMemory();
-      }
-    });
+    }, ["memoryGraph"]);
 
-    // Auto-refresh index panel when docsList changes
-    let lastDocsLen = getState().docsList.length;
-    subscribe(() => {
-      const app = document.getElementById("app");
-      if (!app?.classList.contains("settings-mode")) return;
-      if (getState().docsList.length !== lastDocsLen) {
-        lastDocsLen = getState().docsList.length;
-        if (this.panels.index) this.renderIndex();
-      }
-    });
-
-    // Auto-refresh rules panel when globalRules / projectRules changes
-    let lastRulesLen = getState().globalRules.length;
-    let lastProjectRulesLen = getState().projectRules.length;
+    // Auto-refresh the rules panel when global/project rules are replaced
+    // (reference check catches edits, not just count changes).
+    let lastGlobalRulesRef = getState().globalRules;
+    let lastProjectRulesRef = getState().projectRules;
     let lastViewingRule = getState().viewingGlobalRule;
     subscribe(() => {
       const app = document.getElementById("app");
       if (!app?.classList.contains("settings-mode")) return;
       const st = getState();
-      if (st.globalRules.length !== lastRulesLen) {
-        lastRulesLen = st.globalRules.length;
-        if (this.currentPanel === "rules" && this.panels.rules) {
-          this.renderRules();
-        }
-      }
-      if (st.projectRules.length !== lastProjectRulesLen) {
-        lastProjectRulesLen = st.projectRules.length;
-        if (this.currentPanel === "rules" && this.panels.rules) {
+      if (st.globalRules !== lastGlobalRulesRef || st.projectRules !== lastProjectRulesRef) {
+        lastGlobalRulesRef = st.globalRules;
+        lastProjectRulesRef = st.projectRules;
+        if (this.currentPanel === "skills" && this.panels.skills) {
           this.renderRules();
         }
       }
       if (st.viewingGlobalRule !== lastViewingRule && st.viewingGlobalRule) {
-        const prev = lastViewingRule;
         lastViewingRule = st.viewingGlobalRule;
-        if (this.currentPanel === "rules" && !st.viewingGlobalRule.error) {
+        if (this.currentPanel === "skills" && !st.viewingGlobalRule.error) {
           this._showRuleFormDialog(
             st.viewingGlobalRule.name,
             st.viewingGlobalRule.content,
@@ -515,21 +487,7 @@ setModelConfigs(currentModels, activeIdx);
           );
         }
       }
-    });
-
-    // Auto-refresh permissions panel when policies change
-    let lastPermissionPolicies = JSON.stringify(getState().permissionPolicies);
-    subscribe(() => {
-      const app = document.getElementById("app");
-      if (!app?.classList.contains("settings-mode")) return;
-      const current = JSON.stringify(getState().permissionPolicies);
-      if (current !== lastPermissionPolicies) {
-        lastPermissionPolicies = current;
-        if (this.currentPanel === "permissions" && this.panels.permissions) {
-          this.renderPermissions();
-        }
-      }
-    });
+    }, ["globalRules", "projectRules", "viewingGlobalRule"]);
 
     // Auto-refresh usage panel when usageStats changes
     let lastUsageStats = getState().usageStats;
@@ -541,7 +499,7 @@ setModelConfigs(currentModels, activeIdx);
         lastUsageStats = cur;
         if (this.currentPanel === "usage") void this._renderUsageSection();
       }
-    });
+    }, ["usageStats"]);
 
     // Auto-refresh gateway panel when gatewayStatus changes
     let lastGatewayStatus = getState().gatewayStatus;
@@ -551,9 +509,11 @@ setModelConfigs(currentModels, activeIdx);
       const cur = getState().gatewayStatus;
       if (cur !== lastGatewayStatus) {
         lastGatewayStatus = cur;
-        if (this.currentPanel === "gateway" && this.panels.gateway) requestAnimationFrame(() => this.renderGateway());
+        if (this.currentPanel === "gateway" && this.panels.gateway) {
+          scheduleRender("settings:gateway", () => this.renderGateway(), 60);
+        }
       }
-    });
+    }, ["gatewayStatus"]);
 
     // Fill memory detail dialog when content arrives
     let lastMemoryDetail = getState().memoryDetail;
@@ -563,68 +523,116 @@ setModelConfigs(currentModels, activeIdx);
         lastMemoryDetail = curr;
         const contentEl = document.getElementById("memory-detail-content");
         if (contentEl) {
+          // The branded loader belongs to the dialog lifetime: drop it as
+          // soon as real content (or an error) takes over the body.
+          this._destroyMemoryDetailLoader();
           if (curr?.error) {
             contentEl.innerHTML = `<span class="error-text">Error: ${this.esc(curr.error)}</span>`;
           } else if (curr?.content) {
-            contentEl.innerHTML = renderMarkdown(curr.content);
+            // Detail layers start with a YAML frontmatter block (machine
+            // metadata: name/type/tags/description).  Rendering it produces
+            // a stray <hr> (the opening --- delimiter) followed by raw
+            // key-value text before the real body -- strip the whole block
+            // so only the authored markdown shows.
+            const frontmatter = /^---\r?\n[\s\S]*?\r?\n---\s*(?:\r?\n|$)/;
+            contentEl.innerHTML = renderMarkdown(curr.content.replace(frontmatter, ""));
+            // Code-block copy buttons are lucide placeholders until rasterised.
+            if (typeof (window as any).lucide !== "undefined") {
+              (window as any).lucide.createIcons({ root: contentEl });
+            }
           } else {
-            contentEl.textContent = t("settings.loading");
+            this._showMemoryDetailLoading(contentEl);
           }
         }
       }
-    });
+    }, ["memoryDetail"]);
 
-    // Handle WeChat QR code scan results
+    // Handle WeChat QR code scan results (adapter-config dialog elements)
     onWechatScanResult((event) => {
       if (!(this as any)._wechatDialogOpen) return;
-      const img = document.getElementById("wechat-qr-img") as HTMLImageElement | null;
-      const statusEl = document.getElementById("wechat-qr-status");
-      const countdownEl = document.getElementById("wechat-qr-countdown");
-      const scanBtn = document.getElementById("wechat-scan-btn");
-      if (scanBtn) scanBtn.removeAttribute("disabled");
+      const img = document.getElementById("dlg-weixin-qr-img") as HTMLImageElement | null;
+      const statusEl = document.getElementById("dlg-weixin-qr-status");
+      const countdownEl = document.getElementById("dlg-weixin-qr-countdown");
+      const successOverlay = document.getElementById("dlg-weixin-qr-success");
+      const refreshOverlay = document.getElementById("dlg-weixin-qr-refresh");
       if (event.scan_confirmed) {
         if ((this as any)._qrCountdown) clearInterval((this as any)._qrCountdown);
         if (countdownEl) { countdownEl.style.display = "none"; countdownEl.textContent = ""; }
         if (statusEl) {
-          statusEl.textContent = t("settings.wechatScanSuccess");
-          statusEl.style.padding = "12px 0 0";
+          // The success message names the bound platform ("{name}"), which
+          // comes from the adapter id captured when the dialog opened.
+          const qrAdapterId = ((this as any)._qrAdapterId as string) || "weixin";
+          const platformName = t(`settings.adapterName${qrAdapterId.charAt(0).toUpperCase() + qrAdapterId.slice(1)}`);
+          statusEl.textContent = t("settings.wechatScanSuccess").replace("{name}", platformName);
           statusEl.style.display = "block";
         }
-        const successOverlay = document.getElementById("wechat-qr-success-overlay");
-        if (successOverlay) {
-          successOverlay.style.display = "flex";
-          // Shared one-shot entrance (see `.fade-in-once` in styles.css) —
-          // the class comes back off on animationend so a later reveal can
-          // replay it.
-          successOverlay.classList.add("fade-in-once");
-          successOverlay.addEventListener(
-            "animationend",
-            () => successOverlay.classList.remove("fade-in-once"),
-            { once: true },
-          );
-        }
-        // Save credentials to local state so the card shows correct status
+        if (successOverlay) successOverlay.style.display = "flex";
+        // Save credentials to local state so the card shows correct status.
+        // Credential keys are platform-specific: QQ Bot carries app_id /
+        // app_secret from the bind task, WeCom carries bot_id / secret,
+        // WeChat carries iLink credentials.
         if (event.credentials) {
-          const current = { ...getState().settings,
-            adapter_weixin_enabled: true,
-            adapter_weixin_app_id: event.credentials.ilink_bot_id || "",
-            adapter_weixin_token: event.credentials.bot_token || "",
-            adapter_weixin_api_url: event.credentials.baseurl || "",
-          };
+          const creds = event.credentials;
+          const wecomBind = creds.bot_id !== undefined;
+          const qqBind = creds.app_id !== undefined;
+          const current = wecomBind
+            ? { ...getState().settings,
+                adapter_wecom_enabled: true,
+                adapter_wecom_bot_id: creds.bot_id || "",
+                adapter_wecom_secret: creds.secret || "",
+              }
+            : qqBind
+            ? { ...getState().settings,
+                adapter_qqbot_enabled: true,
+                adapter_qqbot_app_id: creds.app_id || "",
+                adapter_qqbot_client_secret: creds.app_secret || "",
+              }
+            : { ...getState().settings,
+                adapter_weixin_enabled: true,
+                adapter_weixin_app_id: creds.ilink_bot_id || "",
+                adapter_weixin_account_id: creds.ilink_bot_id || "",
+                adapter_weixin_token: creds.bot_token || "",
+                adapter_weixin_api_url: creds.baseurl || "",
+                adapter_weixin_base_url: creds.baseurl || "",
+              };
           setSettings(current as any);
         }
         // Auto-close dialog after 1.5s and refresh the card
         setTimeout(() => {
           (this as any)._wechatDialogOpen = false;
-          document.getElementById("wechat-qr-overlay")?.remove();
+          const closeFn = (this as any)._closeWeixinDialog;
+          if (typeof closeFn === "function") closeFn();
           if (this.currentPanel === "gateway") this.renderGateway();
         }, 1500);
+        return;
+      }
+      // Scanned, confirmation pending on the phone: stop the countdown and
+      // keep waiting — the QR itself stays valid until confirmed.
+      if (event.scan_detected) {
+        if ((this as any)._qrCountdown) clearInterval((this as any)._qrCountdown);
+        if (countdownEl) { countdownEl.style.display = "none"; countdownEl.textContent = ""; }
+        if (statusEl) {
+          statusEl.textContent = t("settings.wechatScanDetected");
+          statusEl.style.display = "block";
+        }
+        return;
+      }
+      // Server-side expiry (QQ bind task): same UI as the countdown reaching
+      // zero — show the expired status and the refresh overlay.
+      if (event.qr_expired) {
+        if ((this as any)._qrCountdown) clearInterval((this as any)._qrCountdown);
+        if (countdownEl) { countdownEl.style.display = "none"; countdownEl.textContent = ""; }
+        if (statusEl) {
+          statusEl.textContent = t("settings.wechatQrExpired");
+          statusEl.style.display = "block";
+        }
+        if (refreshOverlay) refreshOverlay.style.display = "flex";
         return;
       }
       if (event.success && event.qrcode_url) {
         if ((this as any)._qrResultReceived) return;
         (this as any)._qrResultReceived = true;
-        if (statusEl) { statusEl.style.display = "none"; statusEl.style.padding = "60px 0 0"; }
+        if (statusEl) { statusEl.style.display = "none"; statusEl.textContent = ""; }
         if (img) {
           img.src = event.qrcode_url;
           img.style.display = "block";
@@ -636,7 +644,7 @@ setModelConfigs(currentModels, activeIdx);
           if ((this as any)._qrCountdown) clearInterval((this as any)._qrCountdown);
           (this as any)._qrCountdown = setInterval(() => {
             remain -= 1;
-            const el = document.getElementById("wechat-qr-countdown");
+            const el = document.getElementById("dlg-weixin-qr-countdown");
             if (!el) {
               clearInterval((this as any)._qrCountdown);
               return;
@@ -644,13 +652,12 @@ setModelConfigs(currentModels, activeIdx);
             if (remain <= 0) {
               el.textContent = "";
               el.style.display = "none";
-              const statusEl = document.getElementById("wechat-qr-status");
+              const statusEl = document.getElementById("dlg-weixin-qr-status");
               if (statusEl) {
                 statusEl.textContent = t("settings.wechatQrExpired");
-                statusEl.style.padding = "12px 0 0";
                 statusEl.style.display = "block";
               }
-              const refreshOverlay = document.getElementById("wechat-qr-refresh-overlay");
+              const refreshOverlay = document.getElementById("dlg-weixin-qr-refresh");
               if (refreshOverlay) refreshOverlay.style.display = "flex";
               clearInterval((this as any)._qrCountdown);
               return;
@@ -661,20 +668,10 @@ setModelConfigs(currentModels, activeIdx);
       } else {
         if (img) img.style.display = "none";
         if (countdownEl) { countdownEl.style.display = "none"; countdownEl.textContent = ""; }
+        if (refreshOverlay) refreshOverlay.style.display = "none";
         if (statusEl) {
-          statusEl.style.display = "flex";
-          statusEl.style.flexDirection = "column";
-          statusEl.style.alignItems = "center";
-          statusEl.style.justifyContent = "center";
-          statusEl.style.gap = "8px";
-          statusEl.style.padding = "40px 0";
-          statusEl.style.color = "var(--text-muted)";
-          statusEl.innerHTML = `
-            <i data-lucide="scan-line" style="width:32px;height:32px;opacity:0.3"></i>
-            <span style="font-size:13px;opacity:0.7">${event.message || t("settings.wechatScanning")}</span>`;
-          if (typeof (window as any).lucide !== "undefined") {
-            (window as any).lucide.createIcons({ root: statusEl });
-          }
+          statusEl.style.display = "block";
+          statusEl.textContent = event.message || t("settings.wechatScanning");
         }
       }
     });

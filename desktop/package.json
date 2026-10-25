@@ -1,14 +1,19 @@
 {
   "name": "encre",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Encre Agent Desktop",
-  "author": "Dunimd Team",
+  "author": {
+    "name": "Dunimd Team",
+    "email": "dunimd@outlook.com"
+  },
+  "homepage": "https://github.com/mf2023/Encre",
   "main": "dist/main.js",
   "scripts": {
     "build": "node build.js",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder",
-    "typecheck": "tsc -p tsconfig.json && tsc -p renderer/tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p renderer/tsconfig.json",
+    "i18n-audit": "node scripts/i18n-audit.mjs"
   },
   "devDependencies": {
     "@types/ws": "^8.18.1",

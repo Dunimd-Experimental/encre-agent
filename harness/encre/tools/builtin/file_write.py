@@ -1,5 +1,27 @@
-﻿"""EA File Write Tool 鈥?mandatory builtin package."""
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+#
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# DISCLAIMER: Users must comply with applicable AI regulations.
+# Non-compliance may result in service termination or legal liability.
+
+"""EA File Write Tool - mandatory builtin package."""
 
 import re
 from typing import Any
@@ -8,7 +30,8 @@ from encre.native import compute_diff as _native_diff
 from encre.native import read_file as _native_read
 from encre.native import write_file as _native_write
 from encre.tools.base import build_tool
-from encre.capabilities.process import remap_tool_path
+from encre.tools.path_guard import guard_tool_path
+from encre.tools.tool_ui import ui_dict
 
 _DIFF_ADD_RE = re.compile(r"^\+(?!\+\+)", re.MULTILINE)
 _DIFF_DEL_RE = re.compile(r"^-(?!--)", re.MULTILINE)
@@ -18,9 +41,10 @@ async def _file_write_execute(**kwargs: Any) -> str:
     """Write content to a file, overwriting if it exists. Returns a diff summary."""
     file_path = kwargs.get("file_path", "")
     content = kwargs.get("content", "")
-    file_path = remap_tool_path(file_path)
-    if not file_path:
-        return "Error: Path rejected by sandbox"
+    guard = guard_tool_path(file_path, tool="file_write", for_write=True)
+    if not guard.allowed:
+        return f"Error: {guard.reason}"
+    file_path = guard.resolved
 
     try:
         try:
@@ -39,7 +63,7 @@ async def _file_write_execute(**kwargs: Any) -> str:
             add_count = max(line_delta, 0)
             del_count = max(-line_delta, 0)
             if line_delta == 0 and before != content:
-                changed = sum(1 for o, c in zip(before_lines, content_lines) if o != c)
+                changed = sum(1 for o, c in zip(before_lines, content_lines, strict=False) if o != c)
                 add_count = del_count = changed
             return (
                 f"Successfully wrote {len(content)} characters to {file_path}\n"
@@ -90,6 +114,7 @@ file_write_tool = build_tool(
         "required": ["file_path", "content"],
     },
     execute=_file_write_execute,
+    ui=ui_dict(icon="pencil-line", label="Write File", body="diff", result="file").as_dict(),
     intents=["general", "coding", "data"],
     category="filesystem",
     triggers=["write file", "create file", "save file", "overwrite", "put"],
@@ -98,5 +123,5 @@ file_write_tool = build_tool(
     retryability="guarded",
     safe_fallback="Check the file path and content before retrying. For small changes, prefer file_edit instead.",
     is_destructive=True,
-    get_effective_path=lambda self, args: args.get("file_path") or None,
+    get_effective_path=lambda self, args: args.get("file_path") or None,  # noqa: ARG005
 )

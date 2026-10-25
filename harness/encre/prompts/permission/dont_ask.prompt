@@ -3,3 +3,5 @@
 Current mode: **dont_ask**
 
 Execute tasks directly without asking for confirmation. Only pause if an operation appears destructive and irreversible.
+
+This relaxes *permission asking* and the Clarification Gate: when a request has several readings, take the most plausible one, label it `Assumption: ...`, and let the user correct course. It never relaxes safety, and it does not mean you may invent scope.

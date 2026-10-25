@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -42,11 +41,10 @@ Usage::
 """
 
 from abc import ABC, abstractmethod
-
 from collections.abc import Callable
 from typing import Any, ClassVar
 
-# 鈹€鈹€ Defaults for optional fields 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- Defaults for optional fields --------------------------------------------
 
 _TOOL_DEFAULTS = {
     "intents": ["general"],
@@ -62,7 +60,7 @@ _TOOL_DEFAULTS = {
 }
 
 
-# 鈹€鈹€ EncreTool (legacy base -- NOT abstract) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- EncreTool (legacy base -- NOT abstract) ----------------------------------
 
 class EncreTool(ABC):
     """Base class for tool definitions.
@@ -87,8 +85,9 @@ class EncreTool(ABC):
     retryability: str = "auto"
     safe_fallback: str = ""
     source: str = "user"
+    ui: dict[str, Any] | None = None
 
-    _minified_schema: dict[str, Any] = {}
+    _minified_schema: ClassVar[dict[str, Any]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -99,11 +98,11 @@ class EncreTool(ABC):
     async def execute(self, **kwargs: Any) -> str:
         ...
 
-    def is_concurrency_safe(self, input_data: dict[str, Any]) -> bool:
+    def is_concurrency_safe(self, _input_data: dict[str, Any]) -> bool:
         """Whether this tool may run in parallel with other concurrency-safe tools.
 
         Args:
-            input_data: The tool call arguments dict.
+            _input_data: The tool call arguments dict.
 
         Returns:
             True if the tool can execute concurrently, False if it requires
@@ -111,34 +110,34 @@ class EncreTool(ABC):
         """
         return False
 
-    def is_readonly(self, input_data: dict[str, Any]) -> bool:
+    def is_readonly(self, _input_data: dict[str, Any]) -> bool:
         """Whether this tool performs only read operations.
 
         Args:
-            input_data: The tool call arguments dict.
+            _input_data: The tool call arguments dict.
 
         Returns:
             True if the tool is read-only, False if it may write.
         """
         return False
 
-    def is_destructive(self, input_data: dict[str, Any]) -> bool:
+    def is_destructive(self, _input_data: dict[str, Any]) -> bool:
         """Whether this tool performs destructive operations.
 
         Args:
-            input_data: The tool call arguments dict.
+            _input_data: The tool call arguments dict.
 
         Returns:
             True if the tool may destroy data, False otherwise.
         """
         return False
 
-    # 鈹€鈹€ Optional hooks (Tool Protocol) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # --- Optional hooks (Tool Protocol) -----------------------------------------
     # These are optional lifecycle hooks that tools may override to
     # participate in the richer permission / scheduling / validation
     # pipeline.  Default no-ops maintain backward compatibility.
 
-    def validate_input(self, args: dict[str, Any]) -> str | None:
+    def validate_input(self, _args: dict[str, Any]) -> str | None:
         """Validate tool arguments before execution.
         Returns None if valid, or an error message string if invalid."""
         return None
@@ -148,7 +147,7 @@ class EncreTool(ABC):
         the model sees the tool result.  Default no-op."""
         return args
 
-    def should_defer(self, context: dict[str, Any]) -> bool:
+    def should_defer(self, _context: dict[str, Any]) -> bool:
         """Return True if the tool should be deferred (e.g. high resource
         cost, requires user confirmation outside permission check)."""
         return False
@@ -179,7 +178,7 @@ class EncreTool(ABC):
         }
 
     def discovery_card(self) -> dict[str, Any]:
-        """Return a discovery card for this tool, used by the find_tool system."""
+        """Return a discovery card for this tool, used by the discovery system."""
         return {
             "name": self.name,
             "category": self.category,
@@ -192,7 +191,7 @@ class EncreTool(ABC):
         }
 
 
-# 鈹€鈹€ build_tool -- the recommended way 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- build_tool -- the recommended way ----------------------------------------
 
 def build_tool(
     *,
@@ -210,6 +209,7 @@ def build_tool(
     retryability: str | None = None,
     safe_fallback: str | None = None,
     source: str | None = None,
+    ui: dict[str, Any] | None = None,
     is_concurrency_safe: Callable[[dict[str, Any]], bool] | None = None,
     is_readonly: bool | Callable[[dict[str, Any]], bool] | None = None,
     is_destructive: bool | Callable[[dict[str, Any]], bool] | None = None,
@@ -260,29 +260,29 @@ def build_tool(
     minified = _minify_schema(input_schema)
 
     # Build a tool instance from attributes, mimicking a EncreTool subclass.
-    async def _execute(self, **kwargs: Any) -> str:
+    async def _execute(_self, **kwargs: Any) -> str:
         return await execute(**kwargs)
 
-    def _concurrency_check(self, input_data: dict[str, Any]) -> bool:
+    def _concurrency_check(_self, input_data: dict[str, Any]) -> bool:
         if is_concurrency_safe is None:
             return False
         return is_concurrency_safe(input_data)
 
-    def _readonly_check(self, input_data: dict[str, Any]) -> bool:
+    def _readonly_check(_self, input_data: dict[str, Any]) -> bool:
         if is_readonly is None:
             return False
         if isinstance(is_readonly, bool):
             return is_readonly
         return is_readonly(input_data)
 
-    def _destructive_check(self, input_data: dict[str, Any]) -> bool:
+    def _destructive_check(_self, input_data: dict[str, Any]) -> bool:
         if is_destructive is None:
             return False
         if isinstance(is_destructive, bool):
             return is_destructive
         return is_destructive(input_data)
 
-    def _openai_format(self) -> dict[str, Any]:
+    def _openai_format(_self) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
@@ -292,14 +292,14 @@ def build_tool(
             },
         }
 
-    def _anthropic_format(self) -> dict[str, Any]:
+    def _anthropic_format(_self) -> dict[str, Any]:
         return {
             "name": name,
             "description": description,
             "input_schema": minified,
         }
 
-    def _discovery(self) -> dict[str, Any]:
+    def _discovery(_self) -> dict[str, Any]:
         return {
             "name": name,
             "category": category or "general",
@@ -322,14 +322,15 @@ def build_tool(
         "retryability": retryability if retryability is not None else _TOOL_DEFAULTS["retryability"],
         "safe_fallback": safe_fallback if safe_fallback is not None else _TOOL_DEFAULTS["safe_fallback"],
         "source": source if source is not None else _TOOL_DEFAULTS["source"],
+        "ui": ui,
         "execute": _execute,
         "is_concurrency_safe": _concurrency_check,
         "is_readonly": _readonly_check,
         "is_destructive": _destructive_check,
-        "validate_input": validate_input or (lambda self, args: None),
-        "backfill_observable_input": backfill_observable_input or (lambda self, args: args),
-        "should_defer": should_defer or (lambda self, context: False),
-        "get_effective_path": get_effective_path or (lambda self, args: None),
+        "validate_input": validate_input or (lambda _self, _args: None),
+        "backfill_observable_input": backfill_observable_input or (lambda _self, args: args),
+        "should_defer": should_defer or (lambda _self, _context: False),
+        "get_effective_path": get_effective_path or (lambda _self, _args: None),
         "to_openai_format": to_openai_format if to_openai_format is not None else _openai_format,
         "to_anthropic_format": to_anthropic_format if to_anthropic_format is not None else _anthropic_format,
         "discovery_card": _discovery,
@@ -339,7 +340,7 @@ def build_tool(
     return tool_cls()
 
 
-# 鈹€鈹€ Schema compression helper 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- Schema compression helper --------------------------------------------------
 # Parameter names that are self-explanatory -- their descriptions can be
 # omitted from API tool schemas to reduce prompt token usage.
 _SELF_EXPLANATORY_PARAMS: frozenset[str] = frozenset({

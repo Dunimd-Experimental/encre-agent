@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -174,24 +172,60 @@ class BedrockBackend(BaseBackend):
             messages: OpenAI-format message list.
 
         Returns:
-            A tuple of (converted_messages, system_message) where
-            ``system_message`` is the extracted system prompt (or None).
+            A tuple of (converted_messages, system_prompt) where
+            ``system_prompt`` is the merged system prompt (or None).
         """
         converted: list[dict[str, Any]] = []
-        system_message: dict[str, Any] | None = None
+        system_texts: list[str] = []
 
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
             if role == "system":
-                system_message = {"content": content}
+                # Collect every system message; multiple system messages are
+                # merged so none is silently dropped.
+                if isinstance(content, str):
+                    if content:
+                        system_texts.append(content)
+                elif isinstance(content, list):
+                    text = "\n".join(
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                    if text:
+                        system_texts.append(text)
+                elif content:
+                    system_texts.append(json.dumps(content))
                 continue
 
             if role == "assistant":
                 tool_calls = msg.get("tool_calls")
                 if tool_calls:
                     content_blocks: list[dict[str, Any]] = []
+                    # Bedrock extended-thinking models require the
+                    # assistant's ``reasoningContent`` (with its signature)
+                    # to be replayed on tool-call turns; text alone is
+                    # rejected, so a signature-less block is omitted.
+                    reasoning_blocks = msg.get("reasoning_blocks")
+                    if not reasoning_blocks:
+                        reasoning_text = msg.get("reasoning_content", "")
+                        reasoning_blocks = (
+                            [{"text": reasoning_text, "signature": ""}] if reasoning_text else []
+                        )
+                    for rb in reasoning_blocks:
+                        if not isinstance(rb, dict):
+                            continue
+                        if rb.get("signature"):
+                            content_blocks.append(
+                                {
+                                    "reasoningContent": {
+                                        "text": rb.get("text") or "",
+                                        "signature": rb["signature"],
+                                    }
+                                }
+                            )
                     for tc in tool_calls:
                         func = tc.get("function", {})
                         func_args = func.get("arguments", "{}")
@@ -241,6 +275,7 @@ class BedrockBackend(BaseBackend):
                         blocks.append(self._convert_image_block(item))
                 converted.append({"role": "user", "content": blocks})
 
+        system_message: str | None = "\n\n".join(system_texts) if system_texts else None
         return converted, system_message
 
     @staticmethod
@@ -265,7 +300,7 @@ class BedrockBackend(BaseBackend):
         url = image_url.get("url", "")
         mime_type = "image/jpeg"
 
-        if url.startswith("data: "):
+        if url.startswith("data:"):
             header, b64_data = url.split(",", 1)
             mime_type = header.split(";")[0].replace("data:", "")
             image_bytes = base64.b64decode(b64_data)
@@ -350,6 +385,14 @@ class BedrockBackend(BaseBackend):
             "maxTokens": max_tokens,
             "temperature": temperature,
         }
+        # Provider "advanced config" sampling overrides -- the Converse API
+        # inferenceConfig supports temperature/topP only (topK would be
+        # rejected as an unknown field).
+        self._merge_sampling_overrides(
+            inference_config,
+            mapping={"top_p": "topP", "top_k": "_unsupported_top_k"},
+        )
+        inference_config.pop("_unsupported_top_k", None)
 
         params: dict[str, Any] = {
             "modelId": self.model,
@@ -358,7 +401,7 @@ class BedrockBackend(BaseBackend):
         }
 
         if system_message:
-            params["system"] = [{"text": system_message["content"]}]
+            params["system"] = [{"text": system_message}]
 
         if tools:
             params["toolConfig"] = {
@@ -416,87 +459,120 @@ class BedrockBackend(BaseBackend):
                 # is a reasoning block so that deltas are routed to
                 # create_backend_thinking vs create_backend_text.
 
-                for event in stream:
-                    if "contentBlockStart" in event:
-                        # A new content block begins; detect tool vs thinking.
-                        start = event["contentBlockStart"]
-                        tool_use = start.get("toolUse", {})
-                        thinking_data = start.get("thinking", {})
-                        if tool_use:
-                            thinking_block = False
-                            tool_use_buffer = {
-                                "toolUseId": tool_use.get("toolUseId", ""),
-                                "name": tool_use.get("name", ""),
-                                "input": "",
-                            }
-                            yield create_backend_tool_call_delta(tool_index, "name", tool_use.get("name", ""))
-                        elif thinking_data:
-                            thinking_block = True
-                            # Initial thinking text from contentBlockStart
-                            text = thinking_data.get("text", "")
-                            if text:
-                                yield create_backend_thinking(text)
-                        else:
-                            thinking_block = False
+                # boto3's EventStream is synchronous: iterating it inline would
+                # block the event loop for the whole response.  Pump events
+                # from a worker thread into an asyncio.Queue and consume them
+                # asynchronously here.
+                queue: asyncio.Queue[Any] = asyncio.Queue()
+                _stream_end: object = object()
 
-                    elif "contentBlockDelta" in event:
-                        delta = event["contentBlockDelta"]
-                        if thinking_block:
-                            th_text = delta.get("delta", {}).get("text", "")
-                            if th_text:
-                                yield create_backend_thinking(th_text)
-                        else:
-                            text_delta = delta.get("delta", {}).get("text", "")
-                            if text_delta:
-                                yield create_backend_text(text_delta)
-                        tool_input_delta = delta.get("delta", {}).get("toolInput", {}).get("input", "")
-                        if tool_input_delta and tool_use_buffer is not None:
-                            if isinstance(tool_input_delta, str):
-                                tool_use_buffer["input"] += tool_input_delta
-                            td = tool_input_delta
-                            arg_val = td if isinstance(td, str) else json.dumps(td)
-                            yield create_backend_tool_call_delta(
-                                tool_index,
-                                "arguments",
-                                arg_val,
-                            )
+                def _pump_stream() -> None:
+                    try:
+                        for event in stream:
+                            loop.call_soon_threadsafe(queue.put_nowait, event)
+                    except BaseException as exc:  # surfaced to the consumer
+                        loop.call_soon_threadsafe(queue.put_nowait, exc)
+                    finally:
+                        loop.call_soon_threadsafe(queue.put_nowait, _stream_end)
 
-                    elif "contentBlockStop" in event:
-                        if tool_use_buffer is not None:
-                            buf_input = tool_use_buffer["input"]
-                            arg_str = buf_input if isinstance(buf_input, str) else json.dumps(buf_input)
-                            yield create_backend_tool_call(
-                                id=tool_use_buffer["toolUseId"],
-                                name=tool_use_buffer["name"],
-                                arguments=arg_str,
-                            )
-                            tool_use_buffer = None
-                            tool_index += 1
+                loop.run_in_executor(None, _pump_stream)
 
-                    elif "messageStop" in event:
-                        # End of the message; normalize the stop reason.
-                        stop_reason = event["messageStop"].get("stopReason", "")
-                        if stop_reason == "end_turn":
-                            finish_reason = "stop"
-                        elif stop_reason == "tool_use":
-                            finish_reason = "tool_calls"
-                        elif stop_reason == "max_tokens":
-                            finish_reason = "max_tokens"
-                        else:
-                            finish_reason = stop_reason or "stop"
+                try:
+                    while True:
+                        item = await queue.get()
+                        if item is _stream_end:
+                            break
+                        if isinstance(item, BaseException):
+                            raise item
+                        event = item
 
-                    elif "internalServerException" in event:
-                        yield create_backend_error("Bedrock internal server error")
-                        return
+                        if "contentBlockStart" in event:
+                            # A new content block begins; detect tool vs thinking.
+                            start = event["contentBlockStart"]
+                            tool_use = start.get("toolUse", {})
+                            thinking_data = start.get("thinking", {})
+                            if tool_use:
+                                thinking_block = False
+                                tool_use_buffer = {
+                                    "toolUseId": tool_use.get("toolUseId", ""),
+                                    "name": tool_use.get("name", ""),
+                                    "input": "",
+                                }
+                                yield create_backend_tool_call_delta(tool_index, "name", tool_use.get("name", ""))
+                            elif thinking_data:
+                                thinking_block = True
+                                # Initial thinking text from contentBlockStart
+                                text = thinking_data.get("text", "")
+                                if text:
+                                    yield create_backend_thinking(text)
+                            else:
+                                thinking_block = False
 
-                    elif "metadata" in event:
-                        meta_usage = event["metadata"].get("usage", {})
-                        if meta_usage:
-                            _usage = {
-                                "input_tokens": meta_usage.get("inputTokens", 0),
-                                "output_tokens": meta_usage.get("outputTokens", 0),
-                            }
+                        elif "contentBlockDelta" in event:
+                            delta = event["contentBlockDelta"]
+                            if thinking_block:
+                                th_text = delta.get("delta", {}).get("text", "")
+                                if th_text:
+                                    yield create_backend_thinking(th_text)
+                            else:
+                                text_delta = delta.get("delta", {}).get("text", "")
+                                if text_delta:
+                                    yield create_backend_text(text_delta)
+                            tool_input_delta = delta.get("delta", {}).get("toolInput", {}).get("input", "")
+                            if tool_input_delta and tool_use_buffer is not None:
+                                if isinstance(tool_input_delta, str):
+                                    tool_use_buffer["input"] += tool_input_delta
+                                td = tool_input_delta
+                                arg_val = td if isinstance(td, str) else json.dumps(td)
+                                yield create_backend_tool_call_delta(
+                                    tool_index,
+                                    "arguments",
+                                    arg_val,
+                                )
 
+                        elif "contentBlockStop" in event:
+                            if tool_use_buffer is not None:
+                                buf_input = tool_use_buffer["input"]
+                                arg_str = buf_input if isinstance(buf_input, str) else json.dumps(buf_input)
+                                yield create_backend_tool_call(
+                                    id=tool_use_buffer["toolUseId"],
+                                    name=tool_use_buffer["name"],
+                                    arguments=arg_str,
+                                )
+                                tool_use_buffer = None
+                                tool_index += 1
+
+                        elif "messageStop" in event:
+                            # End of the message; normalize the stop reason.
+                            stop_reason = event["messageStop"].get("stopReason", "")
+                            if stop_reason == "end_turn":
+                                finish_reason = "stop"
+                            elif stop_reason == "tool_use":
+                                finish_reason = "tool_calls"
+                            elif stop_reason == "max_tokens":
+                                finish_reason = "max_tokens"
+                            else:
+                                finish_reason = stop_reason or "stop"
+
+                        elif "internalServerException" in event:
+                            yield create_backend_error("Bedrock internal server error")
+                            return
+
+                        elif "metadata" in event:
+                            meta_usage = event["metadata"].get("usage", {})
+                            if meta_usage:
+                                _usage = {
+                                    "input_tokens": meta_usage.get("inputTokens", 0),
+                                    "output_tokens": meta_usage.get("outputTokens", 0),
+                                }
+                finally:
+                    # Unblock the pump thread if the consumer stops early.
+                    stream_close = getattr(stream, "close", None)
+                    if stream_close is not None:
+                        try:
+                            stream_close()
+                        except Exception:
+                            logger.debug("exception suppressed", exc_info=True)
                 yield create_backend_finish(finish_reason, usage=_usage)
 
             else:
@@ -576,14 +652,14 @@ class BedrockBackend(BaseBackend):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, self._client.close)
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
         self._client = None
 
     def supports_thinking(self) -> bool:
         """Bedrock supports thinking for Claude Opus and Sonnet models."""
         return True
 
-    # 鈹€鈹€ Multimodal capability declarations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Multimodal capability declarations ───────────────────────────────
     # Bedrock exposes image generation (Stability / Titan Image Generator)
     # and text embeddings (Titan Embeddings, Cohere Embed) via the
     # ``InvokeModel`` API.  Vision input is supported through the Converse
@@ -622,7 +698,7 @@ class BedrockBackend(BaseBackend):
         body_bytes = response.get("body").read()
         return json.loads(body_bytes)
 
-    # 鈹€鈹€ Image generation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Image generation ────────────────────────────────────────────────
 
     async def generate_image(
         self,
@@ -734,7 +810,7 @@ class BedrockBackend(BaseBackend):
         }
         return ratios.get((width, height), "1:1")
 
-    # 鈹€鈹€ Embeddings 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Embeddings ───────────────────────────────────────────────────────
 
     async def create_embeddings(
         self,
@@ -745,7 +821,13 @@ class BedrockBackend(BaseBackend):
         _user: str | None = None,
         extra_params: dict[str, Any] | None = None,
     ):
-        """Generate embeddings via Amazon Titan Embeddings or Cohere Embed."""
+        """Generate embeddings via Amazon Titan Embeddings 
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
+or Cohere Embed."""
         from encre.utils.types import EmbeddingResponse, EmbeddingResult
 
         texts = [input] if isinstance(input, str) else list(input)

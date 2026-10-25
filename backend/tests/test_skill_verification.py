@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,12 +23,12 @@
 
 from __future__ import annotations
 
-"""Tests for encre.improve.verification -- the skill verification gate.
+"""Tests for :mod:`encre.improve.verification`, the skill verification gate.
 
-These tests lock in the core guarantee of the verification gate: a generated
-skill is *proposed* first and is never injected into the main prompt until it
-passes verification.  A failing artifact is rejected (or stays proposed) with
-recorded reasons and does not change regular behaviour.
+These tests lock in the core guarantee of the gate: a generated skill is
+proposed first and is never injected into the main prompt until it passes
+verification. Failing artifacts are rejected with recorded reasons, remain
+auditable, and never change regular agent behaviour.
 """
 
 import time
@@ -69,6 +69,7 @@ class FakeAgent:
     """Minimal agent exposing the two registries the verifier consults."""
 
     def __init__(self, tool_names: tuple[str, ...] = ()) -> None:
+        """Register the given tool names and expose an empty skill registry."""
         self.tool_registry = ToolRegistry()
         for name in tool_names:
             self.tool_registry.register(_make_tool(name))
@@ -111,6 +112,12 @@ class TestProposalGate:
     """A proposed artifact must never be injected into the main prompt."""
 
     def test_verify_proposed_artifact_is_not_registered(self, tmp_path):
+        """Validate that proposing an artifact keeps it out of the registry and the catalogue.
+
+        The artifact must land in the PROPOSED state, stay absent from both the
+        registry lookup and the rendered catalogue, and appear in pending() so a
+        later verify() call can promote or reject it.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
 
@@ -123,6 +130,11 @@ class TestProposalGate:
         assert verifier.pending() == [artifact]
 
     async def test_generator_register_writes_to_proposed_not_registry(self, tmp_path):
+        """Validate that SkillGenerator.register() proposes a skill instead of activating it.
+
+        Confirms the generator's register() call returns a PROPOSED artifact that
+        is neither registered nor present in the rendered catalogue.
+        """
         agent = FakeAgent(("file_read", "glob"))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         generator = SkillGenerator(agent, verifier=verifier)
@@ -140,6 +152,12 @@ class TestVerification:
     """Verification decides promotion vs rejection using quantifiable evidence."""
 
     def test_verify_good_skill_promotes_and_is_injected(self, tmp_path):
+        """Validate that a skill whose tools all exist is promoted to ACTIVE and injected.
+
+        Checks the passed flag, the ACTIVE status, registry presence, catalogue
+        injection, an empty pending queue, the active list, and that the on-disk
+        markdown is written with an active status line so it survives a restart.
+        """
         agent = FakeAgent(("file_read", "glob"))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         artifact = verifier.propose(_skill_def(tools=("file_read", "glob")))
@@ -152,11 +170,17 @@ class TestVerification:
         assert artifact.name in _catalogue(agent)
         assert verifier.pending() == []
         assert verifier.active() == [artifact]
-        # The active markdown is written with status: active so it survives a restart.
+        # The active markdown carries a status line so it reloads as active.
         md = (tmp_path / f"{artifact.name}.md").read_text(encoding="utf-8")
         assert "status: active" in md
 
     def test_verify_skill_referencing_unknown_tool_is_rejected(self, tmp_path):
+        """Validate that a skill referencing a tool absent from the registry is rejected.
+
+        Confirms the rejection is recorded with a reason naming the missing tool,
+        and that the artifact is neither registered nor injected but remains
+        auditable in the artifact store.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         artifact = verifier.propose(_skill_def(tools=("file_read", "ghost_tool")))
@@ -166,12 +190,18 @@ class TestVerification:
         assert result.passed is False
         assert artifact.status == SkillStatus.REJECTED
         assert any("ghost_tool" in reason for reason in result.record.reasons)
-        # Bad skill is neither registered nor injected, and remains auditable.
+        # A rejected skill is never registered or injected, but stays auditable.
         assert agent.skill_registry.lookup(artifact.name) is None
         assert artifact.name not in _catalogue(agent)
         assert artifact in verifier.all_artifacts()
 
     def test_verify_duplicate_of_active_tool_signature_is_rejected(self, tmp_path):
+        """Validate that a second skill with the same tool signature is rejected as a duplicate.
+
+        Promotes a first skill to ACTIVE, then proposes a second skill over the
+        same tools and asserts it is rejected with a "duplicates active skill"
+        reason while staying out of the registry.
+        """
         agent = FakeAgent(("file_read", "glob"))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         first = verifier.propose(_skill_def(name="auto-a-11111111", tools=("file_read", "glob")))
@@ -187,9 +217,16 @@ class TestVerification:
         assert agent.skill_registry.lookup(second.name) is None
 
     def test_verify_name_colliding_with_non_auto_skill_is_rejected(self, tmp_path):
+        """Validate that a proposal colliding with an existing non-auto skill name is rejected.
+
+        Registers a project-owned bundled skill under the same name the generator
+        would choose, then asserts the proposal is rejected with a "collides"
+        reason so auto-generated skills can never shadow project skills.
+        """
         agent = FakeAgent(("file_read",))
 
         async def _prompt(args=None, ctx=None):
+            """Return a fixed prompt body for the bundled skill double."""
             return "body"
 
         agent.skill_registry.register(
@@ -210,6 +247,12 @@ class TestVerification:
         assert any("collides" in r for r in result.record.reasons)
 
     def test_verify_history_check_rejects_high_failure_tool(self, tmp_path):
+        """Validate that a tool with a high historical failure rate blocks promotion.
+
+        Wires a failure_stats provider reporting a 0.9 failure rate for the only
+        tool in the skill, and asserts the verification fails with a reason
+        mentioning the failure rate.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(
             agent,
@@ -224,6 +267,12 @@ class TestVerification:
         assert any("failure rate" in r for r in result.record.reasons)
 
     def test_artifact_carries_version_source_and_rollback_id(self, tmp_path):
+        """Validate that artifacts carry versioning, provenance, run and rollback identifiers.
+
+        Proposes a first artifact and checks version 1, the auto_generated source,
+        the run id, the trigger and a non-empty rollback id; a second proposal with
+        a different body advances the version and yields a distinct rollback id.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
 
@@ -243,6 +292,11 @@ class TestVerification:
         assert v2.rollback_id != v1.rollback_id
 
     def test_identical_proposal_is_deduplicated(self, tmp_path):
+        """Validate that two byte-identical proposals collapse into a single artifact.
+
+        Proposing the same skill definition twice must return the same object and
+        leave exactly one artifact in the store.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
 
@@ -253,6 +307,12 @@ class TestVerification:
         assert len(verifier.all_artifacts()) == 1
 
     def test_verification_record_is_persisted_with_reasons(self, tmp_path):
+        """Validate that the verification record survives a verifier reload with its reasons.
+
+        Rejects an artifact referencing a missing tool, then reloads the verifier
+        from the same skills directory and asserts the rejected status and the
+        failing verification record with its reasons are persisted.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         artifact = verifier.propose(_skill_def(tools=("ghost_tool",)))
@@ -270,6 +330,12 @@ class TestRollback:
     """One-click disable/rollback must take an active skill out of service."""
 
     def test_disable_by_rollback_id_removes_from_prompt(self, tmp_path):
+        """Validate that disabling by rollback id removes the skill from registry, prompt and disk.
+
+        Confirms the artifact becomes DISABLED, disappears from the registry and
+        catalogue, and that the markdown file is renamed to a .disabled sibling
+        rather than deleted.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         artifact = verifier.propose(_skill_def())
@@ -285,6 +351,11 @@ class TestRollback:
         assert (tmp_path / f"{artifact.name}.md.disabled").exists() is True
 
     def test_disable_by_name_and_unknown_key(self, tmp_path):
+        """Validate that disabling accepts a skill name, rejects unknown keys, and is idempotent.
+
+        Disabling by name succeeds once, an unknown key returns False, and a
+        second disable of the same skill returns False because it is already gone.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         artifact = verifier.propose(_skill_def())
@@ -295,6 +366,11 @@ class TestRollback:
         assert verifier.disable(artifact.name) is False  # already disabled
 
     def test_rollback_alias_disables(self, tmp_path):
+        """Validate that rollback() acts as an alias for disable() by skill name.
+
+        Confirms the rollback call returns True and moves the artifact to the
+        DISABLED state.
+        """
         agent = FakeAgent(("file_read",))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
         artifact = verifier.propose(_skill_def())
@@ -308,6 +384,12 @@ class TestEvents:
     """State changes are published on the event backbone."""
 
     def test_promotion_publishes_proposed_verified_promoted(self, tmp_path):
+        """Validate that promotion emits skill_proposed, skill_verified and skill_promoted events.
+
+        Subscribes to the bus and asserts all three kinds are observed in order,
+        and that the promotion payload carries the artifact name, rollback id,
+        version and active status.
+        """
         agent = FakeAgent(("file_read",))
         bus = EventSourcedBus(name="test-skills")
         seen: list[tuple[str, dict]] = []
@@ -328,6 +410,12 @@ class TestEvents:
         assert promoted["status"] == "active"
 
     def test_rejection_publishes_verified_and_rejected(self, tmp_path):
+        """Validate that rejection emits a failing skill_verified event and a skill_rejected event.
+
+        Uses a skill referencing a missing tool and asserts the verified event
+        reports passed False while the rejected event carries the rejected status
+        and a non-empty reason list.
+        """
         agent = FakeAgent(("file_read",))
         bus = EventSourcedBus(name="test-skills")
         seen: list[tuple[str, dict]] = []
@@ -346,6 +434,11 @@ class TestEvents:
         assert rejected["reasons"]
 
     def test_disable_publishes_disabled_event(self, tmp_path):
+        """Validate that disabling an active skill publishes a skill_disabled event with its name.
+
+        Subscribes to the skill_disabled kind and asserts exactly one event fires
+        carrying the disabled artifact name.
+        """
         agent = FakeAgent(("file_read",))
         bus = EventSourcedBus(name="test-skills")
         seen: list[str] = []
@@ -386,6 +479,13 @@ class TestLegacyMigration:
     """Pre-verification auto_generated skills are marked proposed."""
 
     def test_migrate_legacy_marks_file_proposed_and_unregisters(self, tmp_path):
+        """Validate that migrate_legacy() demotes an active legacy skill to proposed and unregisters it.
+
+        Loads a legacy auto_generated markdown file as an active skill, runs the
+        migration and asserts the file gains a proposed status, the skill is
+        unregistered and absent from the catalogue, and the recovered tool names
+        land in a pending artifact. A fresh registry must skip the proposed file.
+        """
         agent = FakeAgent(("bash", "file_read"))
         legacy = tmp_path / "auto-bash-deadbeef.md"
         legacy.write_text(LEGACY_MD, encoding="utf-8")
@@ -400,10 +500,10 @@ class TestLegacyMigration:
         assert migrated == 1
         content = legacy.read_text(encoding="utf-8")
         assert "status: proposed" in content
-        # No longer active and no longer injected.
+        # The migrated skill is no longer active and no longer injected.
         assert agent.skill_registry.lookup("auto-bash-deadbeef") is None
         assert "auto-bash-deadbeef" not in _catalogue(agent)
-        # Recorded as a pending artifact with tools recovered from the body.
+        # The migration records a pending artifact with tools recovered from the body.
         pending = verifier.pending()
         assert len(pending) == 1
         assert set(pending[0].tool_names) == {"bash", "file_read"}
@@ -415,6 +515,11 @@ class TestLegacyMigration:
         assert "auto-bash-deadbeef" not in {s.name for s in fresh.list_all()}
 
     def test_migrate_legacy_is_idempotent(self, tmp_path):
+        """Validate that migrate_legacy() migrates once and reports zero on a second call.
+
+        Confirms the first run migrates one legacy file while a repeat run finds
+        nothing left to migrate.
+        """
         agent = FakeAgent(("bash", "file_read"))
         (tmp_path / "auto-bash-deadbeef.md").write_text(LEGACY_MD, encoding="utf-8")
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
@@ -423,6 +528,11 @@ class TestLegacyMigration:
         assert verifier.migrate_legacy() == 0
 
     def test_migrate_absent_directory_returns_zero(self, tmp_path):
+        """Validate that migrate_legacy() returns zero when the skills directory does not exist.
+
+        Confirms a missing directory is treated as "nothing to migrate" rather
+        than an error condition.
+        """
         agent = FakeAgent()
         verifier = SkillVerifier(agent, skills_dir=tmp_path / "does-not-exist")
 
@@ -433,6 +543,11 @@ class TestEngineIntegration:
     """The learning engine proposes then verifies a crystallised skill."""
 
     async def test_engine_promotes_verified_skill(self, tmp_path):
+        """Validate that the learning engine promotes a crystallised skill whose tools all exist.
+
+        Crystallises a skill over five registered tools and asserts exactly one
+        active artifact exists, is registered, and carries the run id.
+        """
         tools = ("file_read", "glob", "grep", "bash", "file_write")
         agent = FakeAgent(tools)
         verifier = SkillVerifier(agent, skills_dir=tmp_path)
@@ -447,6 +562,13 @@ class TestEngineIntegration:
         assert active[0].run_id == "run-1"
 
     async def test_engine_rejects_skill_with_unknown_tool(self, tmp_path):
+        """Validate that the learning engine rejects a crystallised skill referencing a missing tool.
+
+        Crystallises over a tool list containing ghost_tool, which is not
+        registered, and asserts nothing is active while one rejected artifact
+        carries a verification record with reasons and stays out of the registry
+        and catalogue.
+        """
         tools = ("file_read", "glob", "grep", "bash", "ghost_tool")
         agent = FakeAgent(("file_read", "glob", "grep", "bash"))
         verifier = SkillVerifier(agent, skills_dir=tmp_path)

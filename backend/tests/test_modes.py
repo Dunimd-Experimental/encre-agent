@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -25,18 +25,13 @@ from __future__ import annotations
 
 """Tests for plan / spec mode switching -- the single-source-of-truth model.
 
-These tests lock down the invariants that previously broke mode switching:
-
-* ``loop.plan_mode_active`` is *derived* from ``config.slash_command_mode``
-  so the boolean flag and the mode string can never disagree.
-* :meth:`EncreLoop.set_mode` is the only transition entry point and keeps
-  ``config``, the ``session.metadata`` mirror, and the derived flag
-  consistent.
-* Exiting a mode clears the persisted metadata slot -- the old "sticky
-  restore" bug where a one-off ``/plan`` kept replaying across every
-  later normal message must not recur.
-* ``spec`` mode does NOT activate write-tool interception (only ``plan``
-  does); switching plan <-> spec flips the flag correctly.
+``loop.plan_mode_active`` is derived from ``config.slash_command_mode``, so
+the boolean flag and the mode string cannot disagree. :meth:`EncreLoop.set_mode`
+is the only transition entry point and keeps config, the session.metadata
+mirror, and the derived flag consistent.
+These tests also guard two regressions: exiting a mode clears the persisted
+metadata slot so a one-off ``/plan`` cannot replay on later normal messages,
+and ``spec`` mode never activates write-tool interception (only ``plan`` does).
 """
 
 from unittest.mock import MagicMock, patch
@@ -48,7 +43,11 @@ from encre.session import EncreSession
 
 
 def _make_loop() -> EncreLoop:
-    """Build an EncreLoop with a mocked backend (no real API calls)."""
+    """Build an EncreLoop with a mocked backend (no real API calls).
+
+    Patches encre.loop.create_backend so the loop constructor receives a
+    MagicMock instead of opening a network connection to any model provider.
+    """
     config = EncreConfig(
         model="gpt-5.6",
         backend_type="openai",
@@ -69,20 +68,24 @@ def _make_loop() -> EncreLoop:
 
 
 def _invariant(loop: EncreLoop) -> None:
-    """Assert the flag and the mode string never disagree."""
+    """Assert the flag and the mode string never disagree.
+
+    The derived property must be True exactly when the canonical mode
+    string is "plan"; any drift indicates a broken transition.
+    """
     assert loop.plan_mode_active == (loop.config.slash_command_mode == "plan")
 
 
 class TestModeSwitchingInvariants:
-    """Engineered to validate that the plan-mode boolean flag and the
-    slash-command-mode string stay in sync across every transition.
+    """Verify that the plan-mode boolean flag and the slash-command-mode
+    string stay in sync across every single transition.
 
-    This test class exercises 6 scenarios 鈥?default state, enter plan, enter
-    spec, exit to normal, normalize invalid value, and enter/exit plan via
-    the dedicated wrappers 鈥?to confirm the invariant holds. The design
-    follows the single-source-of-truth model where config.slash_command_mode
-    is the canonical value and plan_mode_active is a derived property, so
-    any drift between them indicates a bug in the transition logic.
+    This test class exercises 6 scenarios: default state, enter plan,
+    enter spec, exit to normal, normalize an invalid value, and
+    enter/exit plan via the dedicated wrappers. The design follows the
+    single-source-of-truth model where ``config.slash_command_mode`` is
+    the canonical value and ``plan_mode_active`` is a derived property,
+    so any drift between them indicates a bug in the transition logic.
     """
 
     def test_verify_default_state_is_normal_with_no_mode(self):
@@ -125,8 +128,8 @@ class TestModeSwitchingInvariants:
         loop = _make_loop()
         loop.set_mode("spec")
         assert loop.config.slash_command_mode == "spec"
-        # spec is a strict mode but does NOT intercept write tools --
-        # only plan does.
+        # spec is a strict-output mode but does NOT gate write tools --
+        # only plan mode does.
         assert loop.plan_mode_active is False
         assert loop.session.metadata.get("slash_command_mode") == "spec"
         assert loop.session.metadata.get("plan_mode_active") is False
@@ -145,8 +148,8 @@ class TestModeSwitchingInvariants:
         loop.set_mode("plan")
         assert "slash_command_mode" in loop.session.metadata
         loop.set_mode("")
-        # The persistent slot must be cleared so nothing can sticky-restore
-        # the old mode on a later normal message.
+        # Clearing the slot is what prevents a stale "plan" value from
+        # being read back on the next normal turn.
         assert loop.session.metadata.get("slash_command_mode", "") == ""
         assert loop.config.slash_command_mode == ""
         assert loop.plan_mode_active is False
@@ -190,11 +193,11 @@ class TestModeSwitchingInvariants:
 
 
 class TestModeSwitchScenarios:
-    """Engineered to validate the user-reported flow: enter plan, exit,
-    then enter another mode 鈥?ensuring the session never gets stuck.
+    """Validate the user-reported flow: enter plan, exit, then enter another
+    mode, ensuring the session never gets stuck.
 
     This test class exercises 5 scenarios covering the full exit-re-enter
-    cycle, direct plan<->spec switching, sticky-restore regression guard,
+    cycle, direct plan <-> spec switching, sticky-restore regression guard,
     idempotent re-entry, and safe exit-from-normal. The design follows the
     invariant that every mode transition must be stateless at the metadata
     level so that the session can recover to normal from any state.
@@ -237,8 +240,8 @@ class TestModeSwitchScenarios:
 
         The test exercises three transitions and asserts the flag and mode
         string are consistent after each because direct mode switches must
-        not depend on an explicit exit step 鈥?the target mode fully replaces
-        the source mode.
+        not depend on an explicit exit step -- the target mode fully
+        replaces the source mode.
         """
         loop = _make_loop()
         loop.set_mode("plan")
@@ -307,12 +310,12 @@ class TestModeSwitchScenarios:
 
 
 class TestPlanModeWaiterWake:
-    """Engineered to validate that leaving plan mode wakes any coroutine
-    parked on the pending PlanProposal event, and that entering plan does
-    not spuriously wake unrelated waiters.
+    """Validate that leaving plan mode wakes any coroutine parked on the
+    pending PlanProposal event, and that entering plan does not spuriously
+    wake unrelated waiters.
 
-    This test class exercises 2 scenarios 鈥?wake on exit and no-wake on
-    enter 鈥?to confirm the event signaling is correctly scoped. The design
+    This test class exercises 2 scenarios: wake on exit and no-wake on
+    enter, to confirm the event signaling is correctly scoped. The design
     follows the invariant that the plan event is only set when transitioning
     out of plan so that a pending proposal resolver unblocks exactly when
     the mode that created it is terminated.
@@ -352,11 +355,11 @@ class TestPlanModeWaiterWake:
 
 
 class TestStagePromptNotAMode:
-    """Engineered to validate that the internal work-phase prompt uses
-    wording that cannot be confused with a user-facing mode declaration.
+    """Validate that the internal work-phase prompt uses wording that cannot
+    be confused with a user-facing mode declaration.
 
-    This test class exercises 1 scenario 鈥?building the stage prompt when
-    task_stage is 'discover' 鈥?to confirm the wording uses 'Work Phase' and
+    This test class exercises 1 scenario: building the stage prompt when
+    task_stage is 'discover', to confirm the wording uses 'Work Phase' and
     explicitly disclaims being a mode. The design follows the regression
     guard that the model previously answered 'discover mode' instead of
     the real slash-command mode, so the prompt wording was changed to
@@ -387,24 +390,33 @@ class TestStagePromptNotAMode:
 
 
 class TestSpecDataRouting:
-    """Engineered to validate that ``__spec_data__:`` SystemMessages are
-    intercepted and re-routed as spec_update events instead of leaking as
-    visible bubble messages in the conversation.
+    """Validate that ``__spec_data__:`` SystemMessages are intercepted and
+    re-routed as spec_update events instead of leaking as visible bubble
+    messages in the conversation.
 
-    This test class exercises 2 scenarios 鈥?spec-data reroute and plain
-    system message passthrough 鈥?to confirm the WebSocket handler's
-    prefix detection works correctly. The design follows the invariant
-    that spec JSON must never render as raw text in the chat because it
-    is consumed by the frontend spec-card renderer, not the message stream.
+    This test class exercises 2 scenarios: spec-data reroute and plain
+    system message passthrough, to confirm the WebSocket handler's prefix
+    detection works correctly. The design follows the invariant that spec
+    JSON must never render as raw text in the chat because it is consumed
+    by the frontend spec-card renderer, not the message stream.
     """
 
     def _make_handler(self):
-        """Build a bare EncreWSHandler with a capturing _send."""
+        """Build a bare EncreWSHandler with a capturing _send.
+
+        Skips __init__ and replaces _send with a recorder so the test can
+        inspect exactly which WebSocket event types the dispatcher emitted.
+        """
         from encre.transport.ws import EncreWSHandler
         handler = EncreWSHandler.__new__(EncreWSHandler)
         sent: list[tuple[str, dict]] = []
 
         async def _send(ws, msg_type, **kwargs):
+            """Record every dispatched event instead of touching a real socket.
+
+            Stores the event type and keyword payload in order so the test
+            can assert which WebSocket messages the dispatcher produced.
+            """
             sent.append((msg_type, kwargs))
         handler._send = _send  # type: ignore[assignment]
         return handler, sent
@@ -417,7 +429,7 @@ class TestSpecDataRouting:
         The test exercises the handler with a spec payload and asserts the
         first sent event is spec_update with the parsed payload and that no
         system_message event was emitted because the prefix interception
-        must be exclusive 鈥?the same data must not appear in both channels.
+        must be exclusive -- the same data must not appear in both channels.
         """
         import asyncio
         import json

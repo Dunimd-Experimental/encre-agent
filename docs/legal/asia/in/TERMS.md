@@ -10,7 +10,7 @@ Download, installation, registration or use constitutes acceptance. Nothing in t
 
 ## 2. Services
 
-**Encre Agent** (local-first AI Agent platform; desktop app, Python framework, Rust core, 18 chat-platform integrations) · **PiscesLx** (LLM foundation models, fine-tuning, hosted inference API) · **Dunimd Enterprise** · **StadionOS** · **Dunimd Cloud** · **Dunimd Studio** · **Dunimd Support**. New services are covered automatically.
+**Encre Agent** (local-first AI Agent platform; Encre Agent Desktop, Python gateway, Encre Agent Core, 18 chat-platform integrations) · **PiscesLx** (LLM foundation models, fine-tuning, hosted inference API) · **Dunimd Enterprise** · **StadionOS** · **Dunimd Cloud** · **Dunimd Studio** · **Dunimd Support**. New services are covered automatically.
 
 ## 3. Accounts
 

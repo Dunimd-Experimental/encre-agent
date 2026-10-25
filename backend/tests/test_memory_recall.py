@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,27 +23,21 @@
 
 from __future__ import annotations
 
-"""Tests for associative recall and forgetting (Task 5).
+"""Tests for associative recall and the forgetting pipeline.
 
-The engine under test is the real :class:`RecallEngine` on the real
-:class:`MemoryLayerStore`: the real local :class:`SemanticMemorySearch`, the
-real encrypted :mod:`encre.secure_io` persistence, and -- when the compiled
-extension is present -- the real native embedding backend.  No mock store,
-searcher or embedder is used.
+The engine under test is the real :class:`RecallEngine` running on the real
+:class:`MemoryLayerStore`, with the real local :class:`SemanticMemorySearch`,
+the real encrypted :mod:`encre.secure_io` persistence, and -- when the compiled
+extension is available -- the real native embedding backend.  No mock store,
+searcher or embedder is substituted.
 
-Covered invariants:
-
-1. spreading activation recalls linked memories (causal / dependency /
-   same_goal / reference) and the result is traceable back to its seed;
-2. hop and activation boundaries hold, and a linkless store degrades to pure
-   similarity search;
-3. freshness + importance decay drives ``decay_score`` down and archives a
-   stale, low-importance memory;
-4. archived memories are invisible to default recall but readable through the
-   audit surface, and their records are **never physically deleted**;
-5. local retrieval is the default and remains available when native is
-   missing or unconfigured (offline usable);
-6. a recall hit records an access, which promotes a buffered candidate.
+The suite locks down spreading activation over the four link relations with
+traceable provenance, the hop and activation boundaries and graceful
+degradation to pure similarity when no links exist, decay and archival of stale
+low-importance memories, the guarantee that archival never physically deletes
+a record, the local-by-default embedding fallback that keeps recall usable
+offline, and the feedback loop in which a recall hit records an access and
+promotes a buffered candidate.
 """
 
 import time
@@ -67,7 +61,7 @@ _LONG_AGO = time.time() - 400 * 24 * 3600.0
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
-    """A layer store rooted in a temp tree, with the data dir isolated."""
+    """Layer store rooted in a temp tree, with the data directory isolated."""
     monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "data"))
     return MemoryLayerStore(root=tmp_path / "memory")
 
@@ -76,11 +70,11 @@ def _entry(
     store: MemoryLayerStore,
     content: str,
     *,
-    memory_type: str = MemoryType.SEMANTIC.value,
+    memory_type: str = MemoryType.FACT.value,
     importance: float = 0.7,
     created_at: float | None = None,
 ) -> MemoryEntry:
-    """Persist a fully-formed long-term memory and return it."""
+    """Persist a fully-formed long-term memory and return the stored entry."""
     entry = MemoryEntry(
         content=content,
         type=memory_type,
@@ -102,14 +96,17 @@ def _entry(
 @pytest.mark.parametrize(
     "relation",
     [
-        LinkRelation.CAUSAL,
-        LinkRelation.DEPENDENCY,
-        LinkRelation.SAME_GOAL,
-        LinkRelation.REFERENCE,
+        LinkRelation.CAUSES,
+        LinkRelation.CONTRADICTS,
+        LinkRelation.REFINES,
+        LinkRelation.SUPERSEDES,
+        LinkRelation.SUPPORTS,
+        LinkRelation.MENTIONS,
+        LinkRelation.CO_OCCURS,
     ],
 )
 def test_spreading_activation_recalls_linked_memories(store, relation):
-    """A seed pulls in the memory it is linked to, with provenance."""
+    """A seed pulls in the memory it is linked to, with full provenance."""
     seed = _entry(store, "alpha deploy pipeline orchestrator", importance=0.9)
     linked = _entry(store, "zeta unrelated maintenance mechanism", importance=0.8)
     store.link(seed.id, linked.id, relation)
@@ -118,13 +115,13 @@ def test_spreading_activation_recalls_linked_memories(store, relation):
     hits = engine.recall("alpha deploy pipeline orchestrator")
     by_id = {hit.entry_id: hit for hit in hits}
 
-    # The seed is a pure similarity hit.
+    # The seed itself is a pure similarity hit.
     assert seed.id in by_id
     assert by_id[seed.id].is_seed
     assert by_id[seed.id].hops == 0
     assert by_id[seed.id].via_links == []
 
-    # The linked memory is recalled through the link, not by similarity.
+    # The linked memory arrives through the link, not through similarity.
     assert linked.id in by_id
     spread = by_id[linked.id]
     assert not spread.is_seed
@@ -137,12 +134,12 @@ def test_spreading_activation_recalls_linked_memories(store, relation):
 
 
 def test_spread_hit_is_traceable_through_multiple_hops(store):
-    """A two-hop hit carries the full link path back to its seed."""
+    """A two-hop hit carries the complete link path back to its seed."""
     seed = _entry(store, "alpha deploy pipeline orchestrator", importance=0.9)
     middle = _entry(store, "beta caching subsystem internal", importance=0.8)
     far = _entry(store, "gamma telemetry collector endpoint", importance=0.8)
-    store.link(seed.id, middle.id, LinkRelation.CAUSAL)
-    store.link(middle.id, far.id, LinkRelation.DEPENDENCY)
+    store.link(seed.id, middle.id, LinkRelation.CAUSES)
+    store.link(middle.id, far.id, LinkRelation.SUPPORTS)
 
     engine = RecallEngine(store, record_access=False, max_hops=3)
     hits = engine.recall("alpha deploy pipeline orchestrator")
@@ -150,8 +147,8 @@ def test_spread_hit_is_traceable_through_multiple_hops(store):
 
     assert far_hit.hops == 2
     assert far_hit.origin_id == seed.id
-    assert [edge["relation"] for edge in far_hit.via_links] == ["causal", "dependency"]
-    assert far_hit.score < 0.45  # decayed below the one-hop activation
+    assert [edge["relation"] for edge in far_hit.via_links] == ["causes", "supports"]
+    assert far_hit.score < 0.45  # decayed below the one-hop activation level
 
 
 # ----------------------------------------------------------------------
@@ -165,9 +162,9 @@ def test_max_hops_boundary_stops_spreading(store):
     b = _entry(store, "beta caching subsystem internal", importance=0.8)
     c = _entry(store, "gamma telemetry collector endpoint", importance=0.8)
     d = _entry(store, "delta retention compaction schedule", importance=0.8)
-    store.link(a.id, b.id, LinkRelation.CAUSAL)
-    store.link(b.id, c.id, LinkRelation.CAUSAL)
-    store.link(c.id, d.id, LinkRelation.CAUSAL)
+    store.link(a.id, b.id, LinkRelation.CAUSES)
+    store.link(b.id, c.id, LinkRelation.CAUSES)
+    store.link(c.id, d.id, LinkRelation.CAUSES)
 
     engine = RecallEngine(store, record_access=False, max_hops=2)
     hops = {hit.entry_id: hit.hops for hit in engine.recall("alpha deploy pipeline orchestrator")}
@@ -178,10 +175,10 @@ def test_max_hops_boundary_stops_spreading(store):
 
 
 def test_min_activation_boundary_blocks_weak_links(store):
-    """A link too weak to clear the activation floor is not traversed."""
+    """A link too weak to clear the activation floor is never traversed."""
     seed = _entry(store, "alpha deploy pipeline orchestrator", importance=0.9)
     weak = _entry(store, "zeta unrelated maintenance mechanism", importance=0.8)
-    store.link(seed.id, weak.id, LinkRelation.REFERENCE, weight=0.05)
+    store.link(seed.id, weak.id, LinkRelation.MENTIONS, weight=0.05)
 
     engine = RecallEngine(store, record_access=False, min_activation=0.05)
     hits = engine.recall("alpha deploy pipeline orchestrator")
@@ -190,7 +187,7 @@ def test_min_activation_boundary_blocks_weak_links(store):
 
 
 def test_no_links_degrades_to_pure_similarity(store):
-    """Without links recall returns only similarity seeds, at hop 0."""
+    """Without links, recall returns only similarity seeds at hop zero."""
     match = _entry(store, "the deploy pipeline uses blue environment", importance=0.9)
     _entry(store, "an entirely different observation about tea", importance=0.5)
 
@@ -214,7 +211,7 @@ def test_blank_query_returns_nothing(store):
 
 
 def test_decay_archives_stale_low_importance_memory(store):
-    """A long-unreferenced, low-importance memory decays and is archived."""
+    """A long-unreferenced, low-importance memory decays and gets archived."""
     fresh = _entry(store, "fresh important memory", importance=0.9)
     stale = _entry(
         store, "stale low value memory", importance=0.2, created_at=_LONG_AGO,
@@ -232,7 +229,7 @@ def test_decay_archives_stale_low_importance_memory(store):
 
 
 def test_recently_accessed_memory_survives_decay(store):
-    """Recording an access refreshes freshness so the memory is not archived."""
+    """Recording an access refreshes freshness so the memory stays active."""
     stale = _entry(
         store, "stale but recently used memory", importance=0.2, created_at=_LONG_AGO,
     )
@@ -266,7 +263,7 @@ def test_archived_memory_invisible_but_auditable_and_persisted(store):
 
     engine = RecallEngine(store, record_access=False)
 
-    # Default recall: archived memory is invisible.
+    # Default recall: an archived memory is invisible.
     assert engine.recall("obsolete deployment convention") == []
 
     # Audit surface: the memory is still readable, and include_archived
@@ -277,12 +274,12 @@ def test_archived_memory_invisible_but_auditable_and_persisted(store):
     )
     assert stale.id in {hit.entry_id for hit in revived}
 
-    # No physical deletion: the JSONL only ever grew, and the record remains.
+    # No physical deletion: the JSONL only ever grows and the record stays.
     records_after = read_jsonl(layer_file)
     assert len(records_after) >= records_before
     assert any(record.get("id") == stale.id for record in records_after)
 
-    # Archival survives a reload (it is persisted, not in-memory only).
+    # Archival also survives a reload, so it is persisted and not in-memory only.
     store.reload()
     assert [entry.id for entry in store.archived()] == [stale.id]
 
@@ -293,7 +290,7 @@ def test_archived_memory_invisible_but_auditable_and_persisted(store):
 
 
 def test_local_is_default_and_offline_usable(store):
-    """Without any embedding configuration recall runs on the local backend."""
+    """With no embedding configuration at all, recall runs on the local backend."""
     _entry(store, "the deploy pipeline uses blue environment", importance=0.9)
 
     engine = RecallEngine(store, record_access=False)
@@ -305,7 +302,7 @@ def test_local_is_default_and_offline_usable(store):
 
 
 def test_native_unavailable_falls_back_to_local(store, monkeypatch):
-    """When native is missing, an explicitly native request degrades silently."""
+    """When native is missing, an explicit native request degrades silently."""
     _entry(store, "the deploy pipeline uses blue environment", importance=0.9)
     monkeypatch.setattr(native_backend, "_HAS_NATIVE", False)
 
@@ -340,6 +337,7 @@ def test_explicit_native_backend_scores_with_native(store):
     other = _entry(store, "unrelated memory about tea", importance=0.9)
 
     def embed(text: str) -> list[float]:
+        """Deterministic embedder: caching text maps to the x axis, else y."""
         return [1.0, 0.0] if "cach" in text else [0.0, 1.0]
 
     engine = RecallEngine(
@@ -365,7 +363,7 @@ def test_invalid_backend_is_rejected(store):
 
 
 # ----------------------------------------------------------------------
-# 6. Recall feeds the Task 4 promotion trigger
+# 6. Recall feeds the promotion trigger
 # ----------------------------------------------------------------------
 
 
@@ -375,7 +373,7 @@ def test_recall_hit_records_access_and_promotes_buffered(store):
         content="the cache layer uses redis",
         significance=0.7,
         reasons=["repeated_pattern"],
-        suggested_type=MemoryType.SEMANTIC.value,
+        suggested_type=MemoryType.FACT.value,
         session_id="sess-1",
     )
     buffered = store.intake(candidate)
@@ -393,7 +391,7 @@ def test_recall_hit_records_access_and_promotes_buffered(store):
 
 
 def test_recall_records_access_on_long_term_memory(store):
-    """A long-term hit bumps its access bookkeeping."""
+    """A long-term hit bumps that entry's access bookkeeping."""
     entry = _entry(store, "the deploy pipeline uses blue environment", importance=0.9)
     assert entry.decay.access_count == 0
 
@@ -403,10 +401,10 @@ def test_recall_records_access_on_long_term_memory(store):
 
 
 def test_recall_hit_serialises_for_auditing(store):
-    """RecallHit exposes a JSON-friendly view for Task 10 validation."""
+    """RecallHit exposes a JSON-friendly view for the audit path."""
     seed = _entry(store, "alpha deploy pipeline orchestrator", importance=0.9)
     linked = _entry(store, "zeta unrelated maintenance mechanism", importance=0.8)
-    store.link(seed.id, linked.id, LinkRelation.CAUSAL)
+    store.link(seed.id, linked.id, LinkRelation.CAUSES)
 
     hit = next(
         h for h in RecallEngine(store, record_access=False).recall(
@@ -421,4 +419,4 @@ def test_recall_hit_serialises_for_auditing(store):
     assert payload["hops"] == 1
     assert payload["is_seed"] is False
     assert payload["origin_id"] == seed.id
-    assert payload["via_links"][0]["relation"] == "causal"
+    assert payload["via_links"][0]["relation"] == "causes"

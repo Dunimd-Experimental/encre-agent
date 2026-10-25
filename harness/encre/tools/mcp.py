@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """MCP (Model Context Protocol) client implementation.
 
 Implements the standard JSON-RPC 2.0 based MCP protocol with support for:
@@ -32,7 +34,6 @@ Implements the standard JSON-RPC 2.0 based MCP protocol with support for:
 - Proper JSON-RPC 2.0 error codes
 """
 
-from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -52,9 +53,9 @@ from encre.tools._encoding import decode_bytes
 
 logger = logging.getLogger("encre.tools.mcp")
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # JSON-RPC 2.0 constants
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 JSONRPC_VERSION = "2.0"
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -81,9 +82,9 @@ JSONRPC_ERROR_MESSAGES: dict[int, str] = {
 }
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # JSON-RPC 2.0 message helpers
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 def _make_request(method: str, params: dict[str, Any] | None = None,
                   request_id: int | str = 0) -> dict[str, Any]:
@@ -136,9 +137,9 @@ def _extract_error(msg: dict[str, Any]) -> tuple[int, str]:
     return code, message
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # Transport layer
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 
 class MCPTransport(ABC):
@@ -205,9 +206,9 @@ class MCPProtocolError(MCPError):
         self.data = data
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # Stdio transport (subprocess with Content-Length framing)
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 
 def _strip_surrounding_quotes(token: str) -> str:
@@ -229,6 +230,10 @@ class StdioTransport(MCPTransport):
         Content-Length: 42\r\n\r\n{"jsonrpc":"2.0","id":1,"result":{}}
     """
 
+    # Cap for the pending read buffer: a server that never emits a complete
+    # frame would otherwise grow it without bound (OOM risk).
+    _MAX_READ_BUFFER = 8 * 1024 * 1024
+
     def __init__(self, command: str | list[str], env: dict[str, str] | None = None,
                  cwd: str | None = None) -> None:
         """Initialize stdio transport.
@@ -245,6 +250,10 @@ class StdioTransport(MCPTransport):
         self._request_id = 0
         self._lock = asyncio.Lock()
         self._connected = False
+        # Bytes read from stdout but not yet consumed as a complete message.
+        # Persists across reads so leftover bytes in a chunk that contained
+        # multiple messages are not dropped.
+        self._read_buffer = b""
 
     # ------------------------------------------------------------------
     # Properties
@@ -308,6 +317,7 @@ class StdioTransport(MCPTransport):
 
         self._connected = True
         self._request_id = 0
+        self._read_buffer = b""
         logger.info("MCP stdio transport connected (pid=%s)", self._process.pid)
 
     async def disconnect(self) -> None:
@@ -407,24 +417,70 @@ class StdioTransport(MCPTransport):
             if msg_id == expected_id:
                 return msg
 
-            # Mismatched id -- should not happen in sequential usage
+            # Mismatched id -- a late response for an earlier request.  Do
+            # not surface it as this request's result (cross-talk); keep
+            # reading until the matching response arrives.
             logger.warning(
                 "Received response with unexpected id=%s (expected %s)", msg_id, expected_id
             )
-            # Return it anyway to avoid deadlocks
-            return msg
+            continue
+
+    def _extract_message(self, data: bytes) -> tuple[dict[str, Any] | None, bytes]:
+        """Extract the first complete message from *data*.
+
+        Returns ``(message, remaining_bytes)``, or ``(None, data)`` when no
+        complete message is available yet.  Supports newline-delimited JSON
+        (rmcp-native) and legacy Content-Length framing; bytes after a
+        consumed message are preserved so a chunk holding several messages
+        is not truncated.
+        """
+        # Newline-delimited JSON first: try the first complete line.
+        newline = data.find(b"\n")
+        if newline != -1:
+            line = data[:newline].strip()
+            if line:
+                try:
+                    return json.loads(line), data[newline + 1:]
+                except json.JSONDecodeError:
+                    pass  # Not JSON -- might be Content-Length framing
+
+        # Fallback: Content-Length framing
+        header_end = data.find(b"\r\n\r\n")
+        if header_end != -1:
+            header = data[:header_end].decode("utf-8", errors="replace")
+            body_start = header_end + 4
+            cl = self._parse_content_length(header)
+            if cl is not None:
+                if len(data) >= body_start + cl:
+                    body = data[body_start:body_start + cl]
+                    try:
+                        return json.loads(body), data[body_start + cl:]
+                    except json.JSONDecodeError as exc:
+                        raise MCPTransportError(
+                            f"Failed to parse MCP response body: {body[:200]!r}"
+                        ) from exc
+                # Incomplete body -- wait for more data
+                return None, data
+        return None, data
 
     async def _read_one_message(self) -> dict[str, Any]:
-        """Read a single JSON-line message from stdout.
+        """Read a single JSON message from stdout.
 
-        Supports both newline-delimited JSON (rmcp-native) and legacy
-        Content-Length framing for backward compatibility.
+        Bytes left over after a complete message (e.g. a chunk that carried
+        several messages) persist in ``self._read_buffer`` and are consumed
+        by the next read.  The buffer is capped at ``_MAX_READ_BUFFER`` so
+        a server that never emits a complete frame raises instead of
+        exhausting memory.
         """
         assert self._process is not None
         assert self._process.stdout is not None
 
-        data = b""
         while True:
+            # Consume any complete message already sitting in the buffer.
+            msg, self._read_buffer = self._extract_message(self._read_buffer)
+            if msg is not None:
+                return msg
+
             # Check if the server process has died
             if self._process.returncode is not None:
                 stderr_data = b""
@@ -442,33 +498,12 @@ class StdioTransport(MCPTransport):
             if not chunk:
                 await asyncio.sleep(0.01)
                 continue
-            data += chunk
-
-            # Try newline-delimited JSON first
-            lines = data.split(b"\n")
-            if len(lines) > 1:
-                line = lines[0].strip()
-                if line:
-                    try:
-                        return json.loads(line)
-                    except json.JSONDecodeError:
-                        # Not JSON -- might be Content-Length header; fall through
-                        pass
-
-            # Fallback: Content-Length framing
-            header_end = data.find(b"\r\n\r\n")
-            if header_end != -1:
-                header = data[:header_end].decode("utf-8", errors="replace")
-                body_start = header_end + 4
-                cl = self._parse_content_length(header)
-                if cl is not None and len(data) >= body_start + cl:
-                    body = data[body_start:body_start + cl]
-                    try:
-                        return json.loads(body)
-                    except json.JSONDecodeError:
-                        raise MCPTransportError(
-                            f"Failed to parse MCP response body: {body[:200]!r}"
-                        )
+            self._read_buffer += chunk
+            if len(self._read_buffer) > self._MAX_READ_BUFFER:
+                raise MCPTransportError(
+                    f"MCP read buffer exceeded {self._MAX_READ_BUFFER} bytes "
+                    "without a complete message"
+                )
 
     @staticmethod
     def _parse_content_length(header: str) -> int | None:
@@ -492,9 +527,9 @@ class StdioTransport(MCPTransport):
         logger.debug("MCP server notification: %s params=%s", method, msg.get("params"))
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # HTTP transport (Streamable HTTP with SSE)
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 
 class HttpTransport(MCPTransport):
@@ -725,9 +760,9 @@ class HttpTransport(MCPTransport):
         return last_response
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # MCP Client -- protocol-level logic
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 
 class MCPClient:
@@ -1024,9 +1059,9 @@ class MCPClient:
         return self._initialized
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # EncreTool adapter -- bridge between MCP and encre tool registry
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 
 class EncreMCPTool(EncreTool):
@@ -1084,6 +1119,7 @@ class EncreMCPTool(EncreTool):
                  cwd: str | None = None,
                  http_timeout: float = 60.0,
                  auto_connect: bool = True,
+                 allowed_server_urls: list[str] | tuple[str, ...] | set[str] | None = None,
                  **_kwargs: Any) -> None:
         """Initialize the MCP tool.
 
@@ -1096,6 +1132,11 @@ class EncreMCPTool(EncreTool):
             http_timeout: HTTP request timeout in seconds (HTTP mode only).
             auto_connect: If True (default), lazily connect on first use.
                           If False, the caller must call ``_connect()`` explicitly.
+            allowed_server_urls: Explicit allowlist of MCP HTTP server URLs a
+                          model may pass via ``execute(server_url=...)``.  When
+                          ``None`` (default), model-provided server URLs are
+                          rejected outright (fail closed against SSRF /
+                          exfiltration to arbitrary hosts).
         """
         super().__init__()
         self._command = command
@@ -1104,6 +1145,11 @@ class EncreMCPTool(EncreTool):
         self._cwd = cwd
         self._http_timeout = http_timeout
         self._auto_connect = auto_connect
+        # Normalized allowlist (trailing slashes stripped); None = no allowlist.
+        self._allowed_server_urls: set[str] | None = (
+            {str(u).rstrip("/") for u in allowed_server_urls if u}
+            if allowed_server_urls is not None else None
+        )
         self._client: MCPClient | None = None
         self._connection_lock = asyncio.Lock()
 
@@ -1152,6 +1198,21 @@ class EncreMCPTool(EncreTool):
             await self._client.close()
             self._client = None
             logger.info("EncreMCPTool disconnected")
+
+    def _server_url_allowed(self, server_url: str) -> bool:
+        """Whether a model-provided ``server_url`` may be connected to.
+
+        Fail closed: only ``http(s)`` URLs explicitly listed in the
+        configured allowlist are accepted; with no allowlist configured the
+        one-off HTTP connection path is disabled entirely.
+        """
+        if not isinstance(server_url, str) or not server_url:
+            return False
+        if not (server_url.startswith("http://") or server_url.startswith("https://")):
+            return False
+        if self._allowed_server_urls is None:
+            return False
+        return server_url.rstrip("/") in self._allowed_server_urls
 
     # ------------------------------------------------------------------
     # Tool discovery
@@ -1234,8 +1295,19 @@ class EncreMCPTool(EncreTool):
             return "Error: No MCP tool_name provided"
 
         # If a server_url is passed and the tool has no pre-configured
-        # transport, create a temporary HTTP transport (backward compat).
+        # transport, create a temporary HTTP transport -- but only if the URL
+        # is explicitly allowlisted.  A model-provided URL pointing anywhere
+        # else is an SSRF / exfiltration vector and must be refused.
         if self._transport is None and server_url:
+            if not self._server_url_allowed(server_url):
+                logger.warning(
+                    "Refusing MCP connection to non-allowlisted server_url: %s",
+                    server_url,
+                )
+                return (
+                    "Error: MCP server_url is not in the configured MCP server "
+                    f"allowlist; refusing to connect to {server_url}"
+                )
             temp_transport = HttpTransport(server_url, timeout=self._http_timeout)
             temp_client = MCPClient(temp_transport)
             try:
@@ -1368,9 +1440,9 @@ class EncreMCPTool(EncreTool):
         return registered
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 # Internal: individual discovered tool wrapper
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────────────────────────────────────────────────────────
 
 
 class _MCPDiscoveredTool(EncreTool):

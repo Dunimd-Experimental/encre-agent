@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright (c) 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -35,9 +34,11 @@ prefetch) still produce a linear timeline.
 """
 
 
+import argparse
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from encre.crypto import decrypt
@@ -213,3 +214,266 @@ class ReplayPlayer:
             "first_timestamp": self.events[0].timestamp if self.events else None,
             "last_timestamp": self.events[-1].timestamp if self.events else None,
         }
+
+
+# ---------------------------------------------------------------------------
+# Loop events.jsonl replay (StateEventLog stream, distinct from the encrypted
+# telemetry log played back by ``ReplayPlayer`` above)
+# ---------------------------------------------------------------------------
+
+#: Event types that carry a runtime state transition (mirrors
+#: ``encre.loop.state._STATE_EVENT_TYPES``).
+_STATE_EVENT_TYPES = frozenset({"state", "state_recovered"})
+
+
+@dataclass
+class ReplayResult:
+    """Reconstructed session view over one ``events.jsonl`` stream."""
+
+    session_id: str
+    final_state: str = "idle"
+    state_timeline: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_results_index: dict[str, Any] = field(default_factory=dict)
+    messages_summary: list[dict[str, Any]] = field(default_factory=list)
+    permission_decisions: list[dict[str, Any]] = field(default_factory=list)
+    undo_events: list[dict[str, Any]] = field(default_factory=list)
+    ended: dict[str, Any] | None = None
+    integrity: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "final_state": self.final_state,
+            "state_timeline": self.state_timeline,
+            "tool_calls": self.tool_calls,
+            "tool_results_index": self.tool_results_index,
+            "messages_summary": self.messages_summary,
+            "permission_decisions": self.permission_decisions,
+            "undo_events": self.undo_events,
+            "ended": self.ended,
+            "integrity": self.integrity,
+        }
+
+
+def _events_path(session_id: str, data_root: str | Path | None) -> Path:
+    """Resolve ``<data_root>/sessions/<session_id>/events.jsonl``.
+
+    Mirrors the ``LoopStateMachine`` wiring convention
+    (``Path("data", "sessions", session_id)``): the default data root is the
+    ``data/`` tree relative to the working directory.
+    """
+    root = Path(data_root) if data_root else Path("data")
+    return root / "sessions" / session_id / "events.jsonl"
+
+
+def _read_events(path: Path, target_seq: int | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Parse the JSONL event stream, tolerating a damaged crash tail.
+
+    Returns ``(events, integrity)`` where *events* are the parsed dicts in
+    file order truncated to ``seq <= target_seq`` (``None`` = no truncation)
+    and *integrity* carries line/parse statistics.
+    """
+    events: list[dict[str, Any]] = []
+    total_lines = 0
+    corrupted_lines = 0
+    last_seq = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                total_lines += 1
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    corrupted_lines += 1
+                    continue
+                if not isinstance(event, dict):
+                    corrupted_lines += 1
+                    continue
+                seq = event.get("seq")
+                if isinstance(seq, int) and seq > last_seq:
+                    last_seq = seq
+                if target_seq is not None and (
+                    not isinstance(seq, int) or seq > target_seq
+                ):
+                    continue
+                events.append(event)
+    except FileNotFoundError:
+        logger.debug("exception suppressed", exc_info=True)
+    integrity = {
+        "total_lines": total_lines,
+        "corrupted_lines": corrupted_lines,
+        "last_seq": last_seq,
+    }
+    return events, integrity
+
+
+def replay_session(
+    session_id: str,
+    *,
+    data_root: str | Path | None = None,
+    target_seq: int | None = None,
+) -> ReplayResult:
+    """Rebuild a session summary from its ``events.jsonl`` event stream.
+
+    Reads the append-only loop event log written by
+    :class:`encre.loop.state.StateEventLog` (state transitions, tool/undo/
+    permission/inbox events, ``session_ended`` attribution) and derives a
+    structured replay view.
+
+    Args:
+        session_id: The session directory name under ``<data_root>/sessions``.
+        data_root: Data root holding ``sessions/``; defaults to ``data/``
+            (same relative resolution the loop's ``StateEventLog`` uses).
+        target_seq: When given, only events with ``seq <= target_seq`` are
+            replayed (inclusive truncation); ``None`` replays everything.
+
+    Returns:
+        A :class:`ReplayResult` with the final state, state timeline,
+        tool-call index, message (steering inbox) summary, permission
+        decisions, undo events, terminal attribution and integrity stats.
+    """
+    path = _events_path(session_id, data_root)
+    events, integrity = _read_events(path, target_seq)
+    result = ReplayResult(session_id=session_id)
+    result.integrity = integrity
+    by_tool_seqs: dict[str, list[int]] = {}
+    for event in events:
+        etype = str(event.get("type", ""))
+        seq = event.get("seq")
+        ts = event.get("ts", "")
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        if etype in _STATE_EVENT_TYPES:
+            result.state_timeline.append({
+                "seq": seq,
+                "ts": ts,
+                "from": str(event.get("from", "")),
+                "to": str(event.get("to", "")),
+            })
+            result.final_state = str(event.get("to") or event.get("from") or "") \
+                or result.final_state
+        elif etype == "tool_executed":
+            entry = {
+                "seq": seq,
+                "ts": ts,
+                "tool": str(payload.get("tool", "")),
+                "path": str(payload.get("path", "")),
+                "action": str(payload.get("action", "")),
+                "undo_seq": payload.get("undo_seq"),
+                "success": bool(payload.get("success", True)),
+            }
+            result.tool_calls.append(entry)
+            # Result-reference index: prefer an explicit call id when the
+            # payload carries one, otherwise list tool_executed sequences
+            # grouped by tool name.
+            call_id = payload.get("tool_call_id") or payload.get("id")
+            if call_id:
+                result.tool_results_index[str(call_id)] = {
+                    "seq": seq,
+                    "ts": ts,
+                    "tool": entry["tool"],
+                }
+            elif entry["tool"]:
+                by_tool_seqs.setdefault(entry["tool"], []).append(seq)
+        elif etype in ("inbox_enqueue", "inbox_drain"):
+            result.messages_summary.append({
+                "seq": seq,
+                "ts": ts,
+                "event": etype,
+                "count": payload.get("count", 1),
+                "source": str(payload.get("source", "")),
+            })
+        elif etype == "permission_decision":
+            result.permission_decisions.append({
+                "seq": seq,
+                "ts": ts,
+                "tool": str(payload.get("tool", "")),
+                "effect": str(payload.get("effect", "")),
+                "source": str(payload.get("source", "")),
+            })
+        elif etype in ("undo_executed", "undo_empty"):
+            entry = {"seq": seq, "ts": ts, "event": etype}
+            if etype == "undo_executed":
+                entry.update({
+                    "tool": str(payload.get("tool", "")),
+                    "path": str(payload.get("path", "")),
+                    "action": str(payload.get("action", "")),
+                    "undone": bool(payload.get("undone", False)),
+                })
+            result.undo_events.append(entry)
+        elif etype == "session_ended":
+            result.ended = {"seq": seq, "ts": ts, **payload}
+    if by_tool_seqs:
+        result.tool_results_index["by_tool"] = by_tool_seqs
+    if not result.final_state:
+        result.final_state = "idle"
+    return result
+
+
+def _print_human(result: ReplayResult) -> None:
+    """Print a human-readable replay summary."""
+    integrity = result.integrity
+    print(f"Session   : {result.session_id}")
+    print(f"Events    : integrity={integrity}")
+    print(f"Final state: {result.final_state}")
+    if result.ended:
+        print(f"Ended     : {result.ended.get('reason', '')} -- "
+              f"{result.ended.get('detail', '')}")
+    print(f"State transitions ({len(result.state_timeline)}):")
+    for entry in result.state_timeline:
+        print(f"  #{entry['seq']} {entry['ts']} {entry['from']} -> {entry['to']}")
+    print(f"Tool executions ({len(result.tool_calls)}):")
+    for entry in result.tool_calls:
+        print(f"  #{entry['seq']} {entry['ts']} {entry['tool']} "
+              f"undo_seq={entry['undo_seq']} success={entry['success']}")
+    if result.tool_results_index:
+        print(f"Tool results index: {result.tool_results_index}")
+    print(f"Messages (steering inbox) ({len(result.messages_summary)}):")
+    for entry in result.messages_summary:
+        print(f"  #{entry['seq']} {entry['ts']} {entry['event']} "
+              f"count={entry['count']} source={entry['source']}")
+    print(f"Permission decisions ({len(result.permission_decisions)}):")
+    for entry in result.permission_decisions:
+        print(f"  #{entry['seq']} {entry['ts']} {entry['tool']} "
+              f"effect={entry['effect']} source={entry['source']}")
+    print(f"Undo events ({len(result.undo_events)}):")
+    for entry in result.undo_events:
+        print(f"  #{entry['seq']} {entry['ts']} {entry['event']} "
+              f"{entry.get('tool', '')} {entry.get('path', '')}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: ``python -m encre.replay <session_id> [--seq N]``."""
+    parser = argparse.ArgumentParser(
+        prog="python -m encre.replay",
+        description="Replay a session's loop event stream (events.jsonl).",
+    )
+    parser.add_argument("session_id", help="Session id under <data-root>/sessions/")
+    parser.add_argument(
+        "--seq", type=int, default=None,
+        help="Truncate replay to events with seq <= N (default: all)",
+    )
+    parser.add_argument(
+        "--data-root", default=None,
+        help="Data root holding sessions/ (default: ./data)",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    args = parser.parse_args(argv)
+    result = replay_session(
+        args.session_id,
+        data_root=args.data_root,
+        target_seq=args.seq,
+    )
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        _print_human(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

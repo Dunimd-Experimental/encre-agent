@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,16 +21,18 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-"""DeviceContextManager 鈥?orchestrates provider collection, caching, and
+from __future__ import annotations
+
+"""DeviceContextManager — orchestrates provider collection, caching, and
 catalog building for the L1 device context block.
 
 Usage::
 
     mgr = DeviceContextManager(config)
     catalog = await mgr.build_catalog()
-    # 鈫?inject catalog into system prompt
+    # → inject catalog into system prompt
     detail = await mgr.get_detail("hardware_info")
-    # 鈫?return full data for a device_* tool
+    # → return full data for a device_* tool
 """
 
 from typing import Any
@@ -65,13 +67,12 @@ _DEFAULT_PROVIDERS = [
 class DeviceContextManager:
     def __init__(self, config: EncreConfig) -> None:
         self._config = config
-        self._enabled = getattr(config, "device_context_enabled", True)
         ttl = getattr(config, "device_context_cache_ttl", 86400)
-        whitelist: list[str] = getattr(config, "device_context_providers", []) or []
-
-        self._providers = _DEFAULT_PROVIDERS
-        if whitelist:
-            self._providers = [p for p in self._providers if p.name in whitelist]
+        # Initial provider set from the construction-time config.  Kept only
+        # as a starting value: ``build_catalog`` re-reads the LIVE config on
+        # every call, so toggling the master switch or the provider whitelist
+        # in settings applies to the running loop without rebuilding it.
+        self._providers = self._resolve_providers()
 
         from encre.config import get_data_dir
         cache_dir = get_data_dir() / "device_context"
@@ -80,13 +81,45 @@ class DeviceContextManager:
         self._cached_data: dict[str, dict[str, Any] | None] | None = None
         self._catalog: str = ""
 
+    def _resolve_providers(self) -> list[Any]:
+        """Providers active under the LIVE config (empty whitelist = all on)."""
+        whitelist: list[str] = getattr(self._config, "device_context_providers", []) or []
+        if not whitelist:
+            return list(_DEFAULT_PROVIDERS)
+        return [p for p in _DEFAULT_PROVIDERS if p.name in whitelist]
+
     async def build_catalog(self) -> str:
-        if not self._enabled:
+        # Live-read the config so a settings toggle takes effect on the next
+        # run: ``self._config`` is the same object the configure handler
+        # mutates, so no loop reconstruction is needed.
+        if not getattr(self._config, "device_context_enabled", True):
+            # Drop the in-memory catalog so get_catalog() (and the prompt
+            # block built from it) goes empty immediately.
+            self._catalog = ""
+            self._cached_data = None
             return ""
+        providers = self._resolve_providers()
+        if providers != self._providers:
+            # Whitelist changed since the catalog was built: rebuild from a
+            # fresh collection instead of reusing the stale shape.
+            self._providers = providers
+            self._catalog = ""
+            self._cached_data = None
         if self._catalog:
             return self._catalog
 
         data = self._cache.load()
+        if data is not None:
+            if any(p.name not in data for p in self._providers):
+                # The disk cache was written under a WIDER provider set than
+                # the current whitelist allows -- re-collect rather than show
+                # a partial catalog.
+                data = None
+            else:
+                # A cache written under a different whitelist must never leak
+                # out-of-whitelist providers into the catalog: keep only the
+                # currently active providers' entries.
+                data = {p.name: data.get(p.name) for p in self._providers}
         if data is None:
             data = await self._collect_all()
             self._cache.save(data)

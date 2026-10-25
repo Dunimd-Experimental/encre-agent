@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 # ---------------------------------------------------------------------------
 # Module summary
 # ---------------------------------------------------------------------------
@@ -29,19 +31,27 @@
 # This script builds the native Rust extension, compiles the desktop TypeScript
 # front-end, marks the prebuilt ``node-pty`` binary so Electron's rebuild is
 # skipped, packages the desktop installer, and finally copies the produced
-# installer artifacts to the repository root.
+# installer artifacts to the repository root.  It also deploys the bundled EA
+# plugin packages into the unique plugin install directory
+# (``~/.dunimd/encre/plugins``) so both the dev run (``npm start``) and the
+# packaged app see the same plugin set — the runtime scanner looks ONLY there.
 #
 # Usage (run from the repository root):
-#     python build.py          # full build (deps + rust + wheels + server + desktop)
+#     python build.py          # full build (deps + rust + wheels + server + cli + desktop)
+#     python build.py plugins  # deploy bundled plugin packages to the install dir
+#     python build.py cli      # build only the standalone encre-plugin executable
+#     python build.py vendor   # batch-build official packages -> dist/vendor/ for the registry
 #     python build.py clean    # remove build artifacts
 # ---------------------------------------------------------------------------
 
 import argparse
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -53,10 +63,19 @@ DESKTOP = ROOT / "desktop"
 HARNESS_PKG = ROOT / "harness" / "encre"
 CORE_PKG = ROOT / "core" / "encre"
 SERVER_DIST = ROOT / "build" / "server"  # PyInstaller output directory
+CLI_SRC = ROOT / "cli"  # encre-plugin source package
+CLI_DIST = ROOT / "build" / "cli"  # PyInstaller output directory
 
 IS_WIN = platform.system() == "Windows"
-EXT = ".pyd" if IS_WIN else ".dylib" if platform.system() == "Darwin" else ".so"
+EXT = ".pyd" if IS_WIN else ".so"
 SERVER_EXE = "encre-server.exe" if IS_WIN else "encre-server"
+CLI_EXE = "encre-plugin.exe" if IS_WIN else "encre-plugin"
+
+# Bundled EA plugin packages live at <repo>/core/ea_tools; the runtime plugin
+# scanner looks exclusively at ~/.dunimd/encre/plugins, so both the dev run
+# and the packaged app need them materialized there.
+PLUGINS_SRC = ROOT / "core" / "ea_tools"
+PLUGIN_INSTALL_DIR = Path.home() / ".dunimd" / "encre" / "plugins"
 
 # Locale alias map: user-friendly short names →canonical registry keys.
 # "en" is always injected as a mandatory fallback regardless of input.
@@ -79,6 +98,13 @@ LOCALE_ALIASES: dict[str, str] = {
 
 ALL_REGISTRY_LOCALES = ["zh", "en", "zh-Hant", "ja", "ko", "de", "es", "pt", "tr", "ar", "he"]
 
+# harness/ and core/ declare requires-python = ">=3.14"; ea-cwh/cli need >=3.11.
+MIN_PYTHON = (3, 14)
+
+# Last-resort package index, used when the user's configured mirror is blocked.
+DEFAULT_INDEX = "https://pypi.org/simple/"
+
+
 def run(cmd, **kw):
     """Run a shell command, echoing it first.
 
@@ -93,6 +119,63 @@ def run(cmd, **kw):
     cwd = kw.pop("cwd", ROOT)
     subprocess.run(cmd, shell=True, check=True, cwd=cwd, **kw)
 
+
+def _probe_index(index_url: str, timeout: int = 10) -> bool:
+    """True when ``index_url`` answers a real simple-index request."""
+    req = urllib.request.Request(
+        index_url.rstrip("/") + "/setuptools/",
+        headers={"User-Agent": "pip/22.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _ambient_index() -> str | None:
+    """The index URL pip would use here (PIP_INDEX_URL, else pip.conf)."""
+    url = os.environ.get("PIP_INDEX_URL")
+    if url:
+        return url
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "config", "get", "global.index-url"],
+            capture_output=True, text=True, cwd=str(ROOT), timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    val = r.stdout.strip()
+    # pip prints placeholders like <merged>/<env> when nothing is configured.
+    return val if val and not val.startswith("<") else None
+
+
+def reachable_index() -> str:
+    """Return a package index that actually answers HTTP requests.
+
+    Linux/WSL developer boxes routinely point pip at a university mirror that
+    has since been blocked, retired or rate-limited.  When that happens pip
+    reports "Could not find a version that satisfies the requirement
+    setuptools>=68 (from versions: none)" -- an empty version list with no
+    hint that the index itself refused the request.  Probe the configured
+    index and fall back to the public PyPI index instead of that dead end.
+
+    ``ENCRE_PIP_INDEX_URL`` forces a specific index (and skips the probe).
+    """
+    override = os.environ.get("ENCRE_PIP_INDEX_URL")
+    if override:
+        return override.rstrip("/") + "/"
+    ambient = _ambient_index()
+    candidates = [c.rstrip("/") + "/"
+                  for c in dict.fromkeys([x for x in (ambient, DEFAULT_INDEX) if x])]
+    for idx in candidates:
+        if _probe_index(idx):
+            if ambient and idx.rstrip("/") != ambient.rstrip("/"):
+                print(f"  [pip] configured index is unreachable: {ambient}")
+                print(f"  [pip] falling back to {idx}")
+            return idx
+    print(f"  [pip] no reachable index; using {DEFAULT_INDEX}")
+    return DEFAULT_INDEX
+
+
 def install_deps():
     """Install build-time dependencies for Python and Node.js.
 
@@ -100,9 +183,148 @@ def install_deps():
     their declared dependencies land in the active interpreter (the same one
     PyInstaller later uses), plus the ``build``/``pyinstaller`` tooling.  The
     desktop Node dependencies are installed by ``npm ci`` further down.
+
+    Three layers of hardening, all needed on Linux/WSL developer boxes:
+
+      1. Resolve a reachable package index (see :func:`reachable_index`).
+      2. Upgrade ``pip``, ``setuptools`` and ``wheel`` in the active
+         interpreter first -- the Ubuntu distro ships setuptools 59, which
+         cannot honour the ``setuptools>=68`` the pyproject build-system
+         tables declare.
+      3. Install the source trees with ``--no-build-isolation``.  All three
+         use the plain ``setuptools.build_meta`` backend, so pip reuses the
+         ambient setuptools/wheel from step 2 instead of spawning an isolated
+         build-dependency subprocess that would have to re-download
+         setuptools from the (possibly blocked) index -- the exact subprocess
+         that dies with "No matching distribution found for setuptools>=68".
     """
     print("\n=== Installing Python build dependencies ===")
-    run(f'"{sys.executable}" -m pip install -e ./harness -e ./core pyinstaller build')
+    index = reachable_index()
+    idx = f'--index-url "{index}"'
+    base = f'"{sys.executable}" -m pip install --disable-pip-version-check --no-input'
+    print(f"  [pip] using index: {index}")
+
+    run(f'{base} {idx} -U pip "setuptools>=68" wheel')
+    # Editable installs of the three source trees (pure setuptools backend).
+    run(f'{base} {idx} --no-build-isolation -e ./harness -e ./core -e ./ea-cwh')
+    # Build tooling ships binary wheels; keep the isolated build env for them.
+    run(f'{base} {idx} build pyinstaller')
+
+
+def _python_version(exe: str) -> tuple[int, int] | None:
+    """(major, minor) of an interpreter, or None when it cannot be probed."""
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True,
+                           text=True, timeout=20)
+        out = (r.stdout or "") + (r.stderr or "")
+        m = re.search(r"(\d+)\.(\d+)", out)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _candidate_pythons() -> list[str]:
+    """Interpreter candidates worth trying, best-first (current one excluded)."""
+    out: list[str] = []
+    override = os.environ.get("ENCRE_PYTHON")
+    if override:
+        out.append(override)
+    for name in ("python3.14", "python", "python3"):
+        found = shutil.which(name)
+        if found:
+            out.append(found)
+    # Common locations that are not on PATH.
+    out += [str(p) for p in sorted(Path("/usr/local/bin").glob("python3.1*"))]
+    out += [str(p) for p in sorted(
+        Path(os.path.expanduser("~/.pyenv/versions")).glob("3.1*/bin/python3"))]
+    # uv-managed interpreters (the documented way to get 3.14): they are never
+    # put on PATH, so probe the uv data dir directly.
+    out += [str(p) for p in sorted(
+        Path(os.path.expanduser("~/.local/share/uv/python")).glob(
+            "cpython-3.1*/bin/python3"))]
+    current = str(Path(sys.executable).resolve())
+    return [p for p in dict.fromkeys(out)
+            if str(Path(p).resolve()) != current]
+
+
+def ensure_build_python() -> None:
+    """Re-exec the build with a Python interpreter new enough for this repo.
+
+    ``harness``/``core`` declare ``requires-python = ">=3.14"``.  On a Linux
+    box whose only interpreter is the distribution Python (3.10/3.11/3.12) the
+    editable installs fail inside the resolver, with no mention of the version
+    floor -- and nothing later in the pipeline would work either, since the
+    same interpreter is handed to PyInstaller.
+
+    Preference order: ``ENCRE_PYTHON``, then any newer interpreter already on
+    the box (PATH, /usr/local/bin, pyenv).  If none exists, print how to get
+    one instead of letting pip fail cryptically.
+    """
+    cur = _python_version(sys.executable) or (0, 0)
+    if cur >= MIN_PYTHON:
+        return
+    for cand in _candidate_pythons():
+        ver = _python_version(cand)
+        if ver and ver >= MIN_PYTHON:
+            print(f"  [python] {sys.executable} is {cur[0]}.{cur[1]}, too old for "
+                  f"this repo -- switching to {cand} ({ver[0]}.{ver[1]})")
+            os.execv(cand, [cand, str(Path(__file__).resolve()), *sys.argv[1:]])
+            return
+    needed = ".".join(map(str, MIN_PYTHON))
+    print(f"\n  [!!] build aborted: {sys.executable} is Python {cur[0]}.{cur[1]}, "
+          f"but Encre Agent requires Python {needed}+")
+    print("      harness/core declare requires-python >= 3.14, so pip cannot "
+          "install them,")
+    print("      and the same interpreter would later be bundled by PyInstaller.")
+    print("      Install Python 3.14+ and point build.py at it:")
+    print(f"          ENCRE_PYTHON=/path/to/python3.14 python3 build.py")
+    print("      (or just run it directly, e.g. `python3.14 build.py`)")
+    print("      To obtain one: `uv python install 3.14` (see `uv python find 3.14`)")
+    print("      or `pyenv install 3.14`.  build.py also probes uv/pyenv/")
+    print("      /usr/local/bin for a suitable interpreter on its own.")
+    sys.exit(1)
+
+
+def check_prerequisites(command: str) -> None:
+    """Fail fast when a required toolchain binary is missing.
+
+    The Rust, wheel and desktop steps each take minutes, so a missing binary
+    should surface as one clear line up front rather than a mid-build failure
+    of whichever step needs it.  Only the commands that actually need the tool
+    are gated -- ``plugins``/``clean`` need nothing but Python.
+    """
+    print("\n=== Checking build prerequisites ===")
+    names = ("python3", "cargo", "node", "npm", "make", "g++")
+    found = {name: shutil.which(name) for name in names}
+    for name in names:
+        print(f"  [{found[name] or 'missing':<44}] {name}")
+
+    required = set()
+    if command in ("build", "cli", "vendor"):
+        required.add("cargo")
+    if command == "build":
+        required |= {"node", "npm"}
+        if not IS_WIN:
+            # npm ci compiles node-pty from source via node-gyp.
+            required |= {"make", "g++"}
+    missing = [n for n in names if n in required and not found[n]]
+    if missing:
+        print(f"  [!!] missing required tool(s): {', '.join(missing)} -- aborting.")
+        if not found["cargo"]:
+            print("      Rust: https://rustup.rs")
+        if not found["node"] or not found["npm"]:
+            print("      Node: install a NATIVE build for this OS "
+                  "(>= 20, npm 10+) from https://nodejs.org")
+            if not IS_WIN and (shutil.which("npm") or shutil.which("npx")):
+                print("      Note: an npm/npx shim from a Windows install is not "
+                      "usable inside Linux/WSL.")
+        if not IS_WIN:
+            print("      Linux deps: build-essential plus the Electron runtime "
+                  "libraries")
+            print("      (libwebkit2gtk-4.0-37 libnss3 libatk1.0-0 "
+                  "libatk-bridge2.0-0 libcups2 libdrm2 libgtk-3-0 libxss1 "
+                  "libasound2).")
+        sys.exit(1)
 
 
 def build_wheels():
@@ -167,19 +389,52 @@ def build_frontend(locale_list: list[str]) -> None:
     run("cd desktop && node build.js", env=env)
 
 
-def build(locale_list: list[str] | None = None) -> None:
+def deploy_plugins():
+    """Deploy bundled EA plugin packages to the unique install directory.
+
+    Copies every package from ``<repo>/core/ea_tools`` into
+    ``~/.dunimd/encre/plugins`` (overwrite per package).  The runtime plugin
+    scanner looks exclusively there, so this makes the dev run (``npm start``
+    spawning the source backend) see the same plugin set as a packaged app.
+    Third-party packages already present in the install dir are untouched;
+    only names that exist in the bundled tree are managed here.
+    """
+    print("\n=== Deploying plugin packages to ~/.dunimd/encre/plugins ===")
+    if not PLUGINS_SRC.is_dir():
+        print(f"  [!!] No bundled plugin packages at {PLUGINS_SRC} -- skipped.")
+        return
+    PLUGIN_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for pkg in sorted(PLUGINS_SRC.iterdir()):
+        if pkg.is_dir():
+            shutil.copytree(
+                pkg, PLUGIN_INSTALL_DIR / pkg.name, dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"),
+            )
+            count += 1
+    print(f"  [OK] {count} plugin package(s) available at {PLUGIN_INSTALL_DIR}")
+
+
+def build(locale_list: list[str] | None = None, publish_vendor: bool = False) -> None:
     """Run the full Encre build pipeline.
 
     Steps performed (in order):
       1. Install Python/Node build dependencies.
-      2. Compile the Rust native extension and copy it into the Python package.
-      3. Build importable wheels for the harness and core libraries.
-      4. Bundle the Python backend into a standalone executable via PyInstaller.
-      5. Install desktop Node dependencies and build the TypeScript front-end
+      2. Deploy bundled EA plugin packages to the unique install directory.
+      3. Compile the Rust native extension and copy it into the Python package.
+      4. Build importable wheels for the harness and core libraries.
+      5. Bundle the Python backend into a standalone executable via PyInstaller.
+      6. Compile the standalone encre-plugin CLI executable via PyInstaller.
+      7. Compile the official tools/skills into wheels + catalog.d entries
+         (dist/vendor/) — the same packages already bundled into the installer,
+         re-built so they can be published to the central repository.
+      8. Install desktop Node dependencies and build the TypeScript front-end
          (with the requested locale subset; default: all).
-      6. Stamp a prebuilt ``node-pty`` marker so Electron source rebuild is skipped.
-      7. Package the desktop installer via ``electron-builder``.
-      8. Copy the resulting installer(s) to the repository root.
+      9. Stamp a prebuilt ``node-pty`` marker so Electron source rebuild is skipped.
+      10. Package the desktop installer via ``electron-builder``.
+      11. Copy the resulting installer(s) to the repository root.
+      12. If ``publish_vendor`` (``--publish-vendor``): upload the official wheels
+         to PyPI and open the registry PR (the ONLY step that touches the network).
     """
     env = os.environ.copy()
     if sys.version_info >= (3, 14):
@@ -190,13 +445,39 @@ def build(locale_list: list[str] | None = None) -> None:
     # 1. Install Python build dependencies (harness/core deps + pyinstaller/build).
     install_deps()
 
-    # 2. Compile the Rust native extension in release mode for the encre-py crate.
+    # 2. Deploy bundled plugin packages (dev + packaged apps share one dir).
+    deploy_plugins()
+
+    # 3. Compile the Rust native extension in release mode for the encre-py crate.
     run(f"cd native && cargo build --release -p encre-py", env=env)
     # Pick the real compiled binary: skip .d/.exp/.lib/.pdb auxiliary files.
+    # Cargo prefixes Unix cdylib output with "lib" (lib_native.so/
+    # lib_native.dylib) but leaves Windows bare (_native.dll), so accept both.
     exts = (".dll", ".pyd", ".so", ".dylib")
-    src = next((f for f in sorted((NATIVE/"target"/"release").glob("_native*"))
-                if f.suffix in exts), None)
-    if src: shutil.copy2(src, HARNESS_PKG / f"_native{EXT}")
+    src = next((f for f in sorted((NATIVE/"target"/"release").glob("*native*"))
+                if f.suffix in exts and f.stem in ("_native", "lib_native")), None)
+    if not src:
+        # Hard failure: the Rust extension is a mandatory runtime component
+        # (the permission engine and all native accel live in it), so the
+        # build must never silently continue without it.
+        print("  !!! native extension not found in native/target/release -- "
+              "aborting: the package must never ship without the Encre Agent Core.")
+        sys.exit(1)
+    shutil.copy2(src, HARNESS_PKG / f"_native{EXT}")
+    print(f"  [OK] native extension deployed: {src.name} -> harness/encre/_native{EXT}")
+
+    # The `encre` package is a namespace split across harness/encre and
+    # core/encre, and `_native` is the one module name both trees can carry.
+    # Which copy wins depends on ordering: at runtime core/encre sorts first in
+    # ``encre.__path__``, while the staged bundle copies harness first and core
+    # second -- so a leftover binary in core/encre silently replaces the freshly
+    # built one in production too. It belongs to the harness distribution
+    # (only ``encre.native``, which lives in harness, imports it), so strip any
+    # copy from the core tree rather than let a stale artifact shadow the build.
+    for stale in CORE_PKG.glob("_native*"):
+        if stale.suffix in exts:
+            stale.unlink()
+            print(f"  [OK] removed stale native copy from core tree: {stale}")
 
     # 3. Build importable wheels for the harness and core Python libraries.
     build_wheels()
@@ -204,27 +485,86 @@ def build(locale_list: list[str] | None = None) -> None:
     # 4. Bundle encre.server.app into a standalone executable with all dependencies.
     build_server()
 
-    # 5. Install desktop Node dependencies (locked) and build the TS front-end.
+    # 4b. Compile the standalone encre-plugin CLI executable for this OS.
+    build_cli()
+
+    # 4c. Compile the official tools/skills into wheels + catalog.d entries.
+    # These are the SAME packages step 2/4 already bundled into the installer;
+    # compiling them here produces the registry-ready artifacts so a build can
+    # also (re-)publish them to the central repository as official plugins.
+    build_vendor()
+
+    # 8. Install desktop Node dependencies (locked) and build the TS front-end.
     locales = locale_list if locale_list is not None else list(ALL_REGISTRY_LOCALES)
     build_frontend(locales)
 
-    # 6. Stamp the prebuilt node-pty binary so Electron source rebuild is skipped.
+    # 9. Stamp the prebuilt node-pty binary so Electron source rebuild is skipped.
     meta = DESKTOP / "node_modules" / "node-pty" / "build" / "Release" / ".forge-meta"
     meta.parent.mkdir(parents=True, exist_ok=True)
     meta.write_text(f"{target_arch}--146")
 
-    # 7. Package the desktop app into an installer (no publishing).
+    # 10. Package the Encre Agent Desktop into an installer (no publishing).
     # Pass target arch so only the runner's native arch is built.
     cmd = "cd desktop && npx electron-builder --publish never"
     if target_arch in ("arm64", "x64"):
         cmd += f" --{target_arch}"
     run(cmd)
 
-    # 8. Copy the produced installer(s) up to the repository root for easy access.
+    # 11. Copy the produced installer(s) up to the repository root for easy access.
     for pattern in ("EA Setup*", "Encre*Setup*"):
         for f in (DESKTOP/"release").glob(pattern):
             shutil.copy2(f, ROOT / f.name)
             print(f"  >>> {f.name}")
+
+    # 12. Optional: publish the compiled official plugins to the central repo.
+    # The one network-touching step, and only when explicitly asked for.
+    if publish_vendor:
+        publish_vendor_registry()
+
+
+def publish_vendor_registry() -> None:
+    """Publish ``dist/vendor/`` (official wheels + catalog.d) to the registry.
+
+    Uploads every compiled wheel to PyPI, then copies the generated
+    ``catalog.d`` entries into the local registry checkout and lets the
+    registry's own publish-index workflow regenerate + release ``ea-cwh``.
+    This is deliberately the only step that reaches the network, gated behind
+    ``--publish-vendor`` because a PyPI upload is irreversible.
+
+    Requires ``TWINE_USERNAME``/``TWINE_PASSWORD`` and a ``gh``-authenticated
+    registry checkout (``ENCRE_REGISTRY_DIR``, default ``../ea-cwh``).
+    """
+    print("\n=== Publishing official plugins to the central repository ===")
+    staging = ROOT / "dist" / "vendor"
+    wheels = sorted((staging / "wheels").glob("*"))
+    entries = sorted((staging / "catalog.d").glob("*.json"))
+    if not wheels or not entries:
+        print("  [!!] nothing staged under dist/vendor -- run the build first")
+        sys.exit(1)
+
+    host = sys.executable
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(CLI_SRC), env.get("PYTHONPATH")]))
+
+    print(f"  uploading {len(wheels)} artifact(s) to PyPI ...")
+    r = subprocess.run([host, "-m", "twine", "upload", *[str(w) for w in wheels]],
+                       cwd=str(ROOT), env=env)
+    if r.returncode != 0:
+        print("  [!!] twine upload failed")
+        sys.exit(1)
+
+    registry = Path(os.environ.get("ENCRE_REGISTRY_DIR", str(ROOT.parent / "ea-cwh")))
+    if not (registry / ".git").is_dir():
+        print(f"  [!!] no registry checkout at {registry} "
+              "(set ENCRE_REGISTRY_DIR); wheels uploaded, PR not opened")
+        sys.exit(1)
+    (registry / "catalog.d").mkdir(exist_ok=True)
+    for e in entries:
+        shutil.copy2(e, registry / "catalog.d" / e.name)
+    print(f"  staged {len(entries)} catalog.d entries into {registry}")
+    print("  commit + push the registry to open the PR; publish-index.yml then "
+          "regenerates ea-cwh and releases it to PyPI.")
+
 
 def build_server():
     """Bundle the Python backend into a standalone executable via PyInstaller.
@@ -232,7 +572,7 @@ def build_server():
     Produces ``build/server/encre-server[.exe]`` containing the full Python
     runtime, all encre modules, prompt templates, skill definitions, and the
     Rust native extension.  The resulting binary can be spawned by the
-    Electron desktop app without requiring a system Python installation.
+    Electron Encre Agent Desktop without requiring a system Python installation.
     """
     print("\n=== Building Python backend (PyInstaller) ===")
 
@@ -267,14 +607,16 @@ def build_server():
                             ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"))
     datas = [(str(encre_stage), "encre")]
 
-    # Ship the entire EA packages tree.  At runtime the plugin registry
-    # auto-scans <bundle>/ea_tools/ (encre.plugins.ea_scan): reads each
-    # ea-tool-* package's pyproject.toml, imports its plugin module from
-    # the shipped source, and loads its bundled skills/.  No package is
-    # hardcoded here — dropping a new package into core/ea_tools/ ships it
-    # automatically.  __pycache__ / egg-info are stripped from the copy.
-    # (EA extension packages belong to the encre-core distribution; the six
-    # mandatory primitives live in harness as encre.tools.builtin.)
+    # Ship the entire EA packages tree as raw data.  At runtime (frozen) the
+    # plugin scanner first DEPLOYS these packages from <bundle>/ea_tools into
+    # the unique install dir (~/.dunimd/encre/plugins) and then scans only
+    # that directory (encre.plugins.ea_scan): reads each package's
+    # pyproject.toml, imports its plugin module from the deployed source, and
+    # loads its bundled skills/.  No package is hardcoded here — dropping a
+    # new package into core/ea_tools/ ships it automatically.
+    # __pycache__ / egg-info are stripped from the copy.
+    # (EA extension packages belong to the encre-core distribution; the seven
+    # mandatory system tools live in harness as encre.tools.builtin.)
     ea_src = ROOT / "core" / "ea_tools"
     if ea_src.is_dir():
         ea_stage = ROOT / "build" / "ea_tools_stage"
@@ -306,6 +648,10 @@ def build_server():
     hidden_args = []
     for mod in hidden_imports:
         hidden_args.extend(["--hidden-import", mod])
+    # Ship the CURRENT central index snapshot inside the server bundle: the
+    # market renders it offline from first launch (frozen builds refresh it
+    # via HTTPS into the data-dir cache afterwards — encre.market_catalog).
+    hidden_args.extend(["--hidden-import", "ea_cwh", "--collect-data", "ea_cwh"])
 
     # Exclude heavy optional dependencies to keep bundle smaller
     excludes = [
@@ -323,7 +669,7 @@ def build_server():
     # EA packages need no --paths/--hidden-import: they ship as raw source
     # data and the runtime scanner inserts their dirs into sys.path itself.
     path_args = []
-    for p in [ROOT / "harness", ROOT / "core"]:
+    for p in [ROOT / "harness", ROOT / "core", ROOT / "ea-cwh"]:
         path_args.extend(["--paths", str(p)])
 
     # Run PyInstaller
@@ -353,6 +699,132 @@ def build_server():
         print(f"  [!!] ERROR: Expected output not found at {output_exe}")
         sys.exit(1)
 
+    # Hard-verify the Rust extension made it into the bundle: the staged
+    # encre/ tree ships as raw data, so a missing file here would only
+    # surface at runtime as an ImportError.  Fail the build instead.
+    bundled_native = SERVER_DIST / "encre-server" / "_internal" / "encre" / f"_native{EXT}"
+    if not bundled_native.exists():
+        print(f"  [!!] ERROR: native extension missing from the server bundle: "
+              f"{bundled_native} -- aborting so the app can never ship native-less.")
+        sys.exit(1)
+    print(f"  [OK] native extension present in server bundle: {bundled_native}")
+
+
+def build_plugin_sdk():
+    """Rebuild the distributable plugin UI SDK and embed it in the CLI."""
+    print("\n=== Building plugin UI SDK ===")
+    node = shutil.which("node")
+    if not node:
+        print("  [!!] ERROR: node is required to build the plugin UI SDK")
+        sys.exit(1)
+    run(f'"{node}" "{ROOT / "sdk" / "build.mjs"}"')
+    src = ROOT / "sdk" / "dist"
+    dst = CLI_SRC / "ea_plugin_cli" / "sdk_dist"
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.is_file():
+            shutil.copy2(item, dst / item.name)
+    print(f"  [OK] SDK embedded in {dst}")
+
+
+def build_cli():
+    """Compile the encre-plugin CLI into a standalone executable for THIS OS.
+
+    ``--onefile`` packs the interpreter plus the (stdlib-only) ea_plugin_cli
+    package into a single download-and-run binary: ``encre-plugin.exe`` on
+    Windows, extension-free on macOS/Linux — platform and architecture come
+    from whatever machine runs the build (PyInstaller does not cross-compile).
+    The exe still shells out to a host Python for build/verify/twine work, so
+    nothing has to be pip-installed for the CLI itself.
+
+    Output: ``build/cli/encre-plugin[.exe]``.
+    """
+    print("\n=== Building encre-plugin CLI (PyInstaller) ===")
+
+    build_plugin_sdk()
+
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        print("Installing PyInstaller...")
+        run(f'"{sys.executable}" -m pip install pyinstaller')
+
+    if CLI_DIST.exists():
+        shutil.rmtree(CLI_DIST)
+    CLI_DIST.mkdir(parents=True, exist_ok=True)
+
+    cmd_parts = [
+        f'"{sys.executable}"', "-m", "PyInstaller",
+        "--noconfirm",
+        "--clean",
+        "--onefile",
+        "--name", "encre-plugin",
+        "--distpath", str(CLI_DIST),
+        "--workpath", str(ROOT / "build" / "pyinstaller-work-cli"),
+        "--specpath", str(ROOT / "build"),
+        "--paths", str(CLI_SRC),
+        # ea_cwh rides along so `encre-plugin catalog regen|check` works in
+        # the downloaded exe too (registry-side index validation).
+        "--paths", str(ROOT / "ea-cwh"),
+        "--hidden-import", "ea_cwh",
+        # Plugin UI SDK ships as data so `encre-plugin init/sdk` works in the
+        # downloaded onefile executable without a network fetch.
+        "--add-data", f"{CLI_SRC / 'ea_plugin_cli' / 'sdk_dist'}{os.pathsep}ea_plugin_cli/sdk_dist",
+        str(CLI_SRC / "pyi_entry.py"),
+    ]
+    run(" ".join(cmd_parts))
+
+    output_exe = CLI_DIST / CLI_EXE
+    if not output_exe.exists():
+        print(f"  [!!] ERROR: Expected output not found at {output_exe}")
+        sys.exit(1)
+    size_mb = output_exe.stat().st_size / (1024 * 1024)
+    print(f"  [OK] CLI bundled: {output_exe} ({size_mb:.1f} MB, "
+          f"{platform.system()}/{platform.machine()})")
+
+
+def build_vendor() -> None:
+    """Batch-build the official EA packages into a registry-ready staging dir.
+
+    Delegates entirely to ``encre-plugin vendor`` (the CLI owns the publish
+    policy, tier gate, wheel build and sha256 digests — no duplication here).
+    Produces ``dist/vendor/catalog.d/<name>.json`` + ``dist/vendor/wheels/``
+    ready to publish to PyPI and PR into the ea-cwh registry.  This is a
+    GENERATOR: it uploads nothing and opens no PR — reviewing/publishing is a
+    separate, deliberate ``encre-plugin publish`` step.
+
+    Optional flags pass through: ``--filter <substr>`` (repeatable) to build a
+    subset, and ``--keep-going`` to continue past per-package failures.
+    """
+    print("\n=== Building official plugin catalogue (encre-plugin vendor) ===")
+    cmd = [sys.executable, "-m", "ea_plugin_cli", "vendor",
+           "--src", str(PLUGINS_SRC), "--out", str(ROOT / "dist" / "vendor")]
+    for extra in _pass_through("filter"):
+        cmd.append(extra)
+    env = os.environ.copy()
+    # The CLI lives in ./cli and is not necessarily pip-installed; put it on
+    # the subprocess path so `-m ea_plugin_cli` resolves.
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(CLI_SRC), env.get("PYTHONPATH")]))
+    r = subprocess.run(cmd, cwd=str(ROOT), env=env)
+    if r.returncode != 0:
+        print("  [!!] vendor build failed")
+        sys.exit(1)
+
+
+def _pass_through(name: str) -> list[str]:
+    """Re-surface ``--name`` occurrences from the build.py argv to the CLI."""
+    out, argv, take = [], sys.argv[1:], False
+    for tok in argv:
+        if take and not tok.startswith("-"):
+            out += [f"--{name}", tok]
+            take = False
+        elif tok == f"--{name}":
+            take = True
+        elif tok.startswith(f"--{name}="):
+            out += [f"--{name}", tok.split("=", 1)[1]]
+    return out
+
 
 def clean():
     """Remove all build artifacts produced by :func:`build`.
@@ -375,16 +847,38 @@ def clean():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Encre build orchestrator")
     parser.add_argument("command", nargs="?", default="build",
-                        choices=["build", "clean"],
-                        help="Command to run (default: build)")
+                        choices=["build", "plugins", "cli", "vendor", "clean"],
+                        help="Command to run (default: build). 'plugins' only deploys "
+                             "bundled plugin packages to ~/.dunimd/encre/plugins; "
+                             "'cli' only builds the standalone encre-plugin executable; "
+                             "'vendor' only batch-builds the official packages into "
+                             "dist/vendor/ for registry publishing.")
     parser.add_argument("--locales", "-L",
                         default="all",
                         help='Locale filter for frontend build. Comma-separated alias list (e.g. "cn", "cn,ja", "all"). "en" is always included. Default: all.')
+    parser.add_argument("--filter", action="append", default=[],
+                        help="vendor only: package-name substring (repeatable)")
+    parser.add_argument("--publish-vendor", action="store_true",
+                        help="with the full build: after compiling, upload the official "
+                             "wheels to PyPI and stage catalog.d into the registry checkout "
+                             "(network + irreversible; off by default)")
     args = parser.parse_args()
+
+    # Fail fast (or switch interpreter) before any step spends minutes on
+    # dependencies: an interpreter below the repo's requires-python floor breaks
+    # pip's resolver and would later be the very runtime PyInstaller bundles.
+    ensure_build_python()
+    check_prerequisites(args.command)
 
     if args.command == "clean":
         clean()
+    elif args.command == "plugins":
+        deploy_plugins()
+    elif args.command == "cli":
+        build_cli()
+    elif args.command == "vendor":
+        build_vendor()
     else:
         locale_list = _resolve_locales(args.locales)
         print(f"Locale build target: {locale_list}")
-        build(locale_list)
+        build(locale_list, publish_vendor=args.publish_vendor)

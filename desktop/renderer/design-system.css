@@ -46,6 +46,23 @@
   --transition-slow: var(--duration-slow) var(--easing-standard);
   --transition-emphasized: var(--duration-slow) var(--easing-emphasized);
 
+  /* Control transitions enumerate exactly the properties a control animates
+     (colour / shadow / opacity / press scale), so a hover or press can never
+     accidentally animate a layout property. Use these instead of
+     `transition: all` anywhere a control changes state. */
+  --transition-control: background-color var(--transition-fast),
+                        border-color var(--transition-fast),
+                        color var(--transition-fast),
+                        box-shadow var(--transition-fast),
+                        opacity var(--transition-fast),
+                        transform var(--transition-fast);
+  --transition-control-base: background-color var(--transition-base),
+                             border-color var(--transition-base),
+                             color var(--transition-base),
+                             box-shadow var(--transition-base),
+                             opacity var(--transition-base),
+                             transform var(--transition-base);
+
   /* ══ Scene → step aliases ══════════════════════════════════════
      Pick by *what is happening*, not by how long you feel like.
 
@@ -62,11 +79,6 @@
   /* Travel distance for entering content. Small on purpose: enough to
      read as motion, not enough to feel like a layout shift. */
   --motion-travel: 8px;
-
-  /* Travel distance for horizontal slide entrances (mode switches, sub-view
-     swaps). Larger than --motion-travel so the move reads as a real slide
-     rather than a fade with a nudge. */
-  --motion-slide-travel: 40px;
 
   /* Application-wide layout tokens. Components that need these dimensions
      must read them here rather than hard-coding px values. */
@@ -93,7 +105,6 @@
     --motion-exit: 0.01ms linear;
     --motion-slide: 0.01ms linear;
     --motion-travel: 0px;
-    --motion-slide-travel: 0px;
   }
 
   /* Keyframe animations carry their duration inline (`animation: spin 1s
@@ -174,6 +185,10 @@
   color: var(--text-primary);
 }
 
+.btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
 .btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
@@ -181,15 +196,17 @@
 }
 
 .btn--primary {
-  background: var(--text-primary);
-  color: var(--bg-primary);
-  border-color: var(--text-primary);
+  /* Primary CTA takes the skin accent (step9), not the inverted text
+     colour — this is what makes dialogs/buttons follow the theme skin. */
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-color: var(--accent);
   font-weight: 600;
 }
 .btn--primary:hover {
-  opacity: 0.85;
-  background: var(--text-primary);
-  color: var(--bg-primary);
+  background: var(--accent-hover);
+  color: var(--accent-contrast);
+  border-color: var(--accent-hover);
 }
 
 .btn-sm {
@@ -204,18 +221,18 @@
 
 .btn-primary {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-contrast);
   border: 1px solid var(--accent);
 }
 
 .btn-primary:hover {
-  filter: brightness(1.12);
-  background: var(--accent);
-  color: #fff;
+  background: var(--accent-hover);
+  color: var(--accent-contrast);
+  border-color: var(--accent-hover);
 }
 
 .btn-primary:active {
-  filter: brightness(0.92);
+  transform: scale(0.98);
 }
 
 .btn-secondary {
@@ -244,7 +261,7 @@
 }
 
 .btn-danger:hover {
-  background: rgba(239, 68, 68, 0.1);
+  background: color-mix(in srgb, var(--error) 10%, transparent);
   color: var(--error);
 }
 
@@ -262,12 +279,12 @@
 .btn-accent {
   background: var(--accent-light);
   border: 1px solid var(--accent);
-  color: var(--accent);
+  color: var(--text-primary);
 }
 
 .btn-accent:hover {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-contrast);
 }
 
 .card {
@@ -352,23 +369,23 @@
 }
 
 .badge-success {
-  background: rgba(34, 197, 94, 0.12);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
   color: var(--success);
 }
 
 .badge-error {
-  background: rgba(239, 68, 68, 0.1);
+  background: color-mix(in srgb, var(--error) 10%, transparent);
   color: var(--error);
 }
 
 .badge-warning {
-  background: rgba(245, 158, 11, 0.12);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
   color: var(--warning);
 }
 
 .badge-accent {
   background: var(--accent-light);
-  color: var(--accent);
+  color: var(--text-primary);
 }
 
 .badge-outline {
@@ -441,8 +458,14 @@
 .tab-bar {
   display: flex;
   align-items: stretch;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-secondary);
+  /* No bottom rule: the strip's base edge is intentionally colorless.  This
+     container must NOT borrow the tabs' `--border-control` (owned by
+     `.header-tabs .tab.active` in styles.css) — the two borders are separate
+     UI definitions on purpose. */
+  border-bottom: none;
+  /* Fully transparent strip: the panel paper runs through it (the base
+     --bg-secondary fill was removed on user request). */
+  background: transparent;
   min-height: 36px;
 }
 
@@ -474,7 +497,10 @@
 
 .tab.active {
   color: var(--text-primary);
-  border-bottom-color: var(--accent);
+  /* `border-bottom-color: var(--accent)` (the legacy underline) removed: it
+     painted a #666 line under the active tab's bottom edge only, so that edge
+     never matched the other three. Tab borders are owned by
+     `.header-tabs .tab` in styles.css now. */
 }
 
 .tab-close {
@@ -515,7 +541,7 @@
   font-family: inherit;
   color: var(--text-primary);
   background: var(--bg-input);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   border-radius: var(--radius-sm);
   outline: none;
   transition: border-color var(--transition-base), box-shadow var(--transition-base);
@@ -524,6 +550,9 @@
 
 .input:focus {
   border-color: var(--accent);
+}
+
+.input:focus-visible {
   box-shadow: 0 0 0 3px var(--accent-light);
 }
 
@@ -555,10 +584,54 @@
   cursor: pointer;
 }
 
-.scrollbar-thin {
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
+/* ── Keyboard focus ring ───────────────────────────────────────────
+   One ring for every interactive control. The skin accent passes 4.5:1
+   against the mode paper by contract (see themes/*.css), so the ring is
+   visible in every skin/mode without per-control overrides. Elements
+   whose own `outline: none` would win on specificity rely on this rule
+   appearing later in the cascade (design-system.css loads after
+   styles.css). */
+.btn:focus-visible,
+.btn--primary:focus-visible,
+.btn-primary:focus-visible,
+.btn-secondary:focus-visible,
+.btn-ghost:focus-visible,
+.btn-danger:focus-visible,
+.btn-accent:focus-visible,
+.btn-text:focus-visible,
+.btn-icon:focus-visible,
+.nav-item:focus-visible,
+.settings-nav-item:focus-visible,
+.sidebar-settings-back-btn:focus-visible,
+.settings-dropdown-trigger:focus-visible,
+.input-selector:focus-visible,
+.context-menu-item:focus-visible,
+.tab-add-item:focus-visible,
+.mention-dropdown-item:focus-visible,
+.settings-dropdown-item:focus-visible,
+.tab-close:focus-visible,
+.msg-action:focus-visible,
+.window-btn:focus-visible,
+.code-copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
+
+/* Menu rows sit inside an overflow-clipped container: pull the ring
+   inside the row so it is never cut off by the menu's edge. */
+.context-menu-item:focus-visible,
+.tab-add-item:focus-visible,
+.mention-dropdown-item:focus-visible,
+.settings-dropdown-item:focus-visible {
+  outline-offset: -2px;
+}
+
+/* ── Theme / skin switch ───────────────────────────────────────────
+   Theme and skin changes are applied synchronously (core/state.ts) so the
+   control that triggered them and the palette can never disagree. A
+   View-Transition cross-fade would defer the attribute swap to the next
+   frame, which is exactly how the settings row ended up re-rendering the
+   old skin; do not reintroduce that here. */
 
 /* ── Shared keyframes ─────────────────────────────────────────────
    Generic, reusable animations. Anything that needs to fade in, fade
@@ -576,18 +649,42 @@
   to { opacity: 0; }
 }
 
+/* ── Unified enter/exit motion for all floating surfaces ─────
+   One motion language for every floating panel, menu, and dialog:
+   fade in + a small upward drop + subtle scale. Matches the
+   summary panel's expand so the whole app reads as one surface.
+   Entrance: --motion-enter (0.18s easing-emphasized).
+   Exit:    --motion-exit  (0.12s easing-exit). */
+@keyframes encre-enter {
+  from { opacity: 0; transform: translateY(-6px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0)   scale(1);    }
+}
+@keyframes encre-exit {
+  from { opacity: 1; transform: translateY(0)   scale(1);    }
+  to   { opacity: 0; transform: translateY(-6px) scale(0.97); }
+}
+
+/* Content-area variant of the same language: session open / session switch
+   swaps a whole transcript in place, so it keeps the fade + the small settle
+   but drops the scale — a full-height tape must not visibly shrink — and
+   resolves to `transform: none` so the finished state creates no containing
+   block for sticky/fixed descendants. */
+@keyframes encre-content-enter {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Exact reverse of the above: a full-height surface leaves by
+   fading out — no scale, no translate, so it never dips or sinks
+   into its new position. */
+@keyframes encre-content-exit {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
 @keyframes slide-up {
   from { opacity: 0; transform: translateY(12px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-/* Content arriving into a slot: a short fade with a horizontal travel from
-   the inline-end edge, matching the app-wide "slide in" mode-switch motion.
-   Deliberately no scale — these are full-width surfaces (a chat area, a
-   sidebar section), not floating cards. The travel distance is the shared
-   --motion-slide-travel step, so every "content enters" move matches. */
-@keyframes rise-in {
-  from { opacity: 0; transform: translateX(var(--motion-slide-travel)); }
 }
 
 @keyframes spin {

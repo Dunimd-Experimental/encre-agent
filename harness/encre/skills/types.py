@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,11 +21,26 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Skill type definitions.
 
 Defines the enums (:class:`SkillContext`, :class:`SkillSource`), the source
 priority ordering, and the :class:`BundledSkillDefinition` dataclass that
 describes a single registered skill.
+
+Skill provenance is modelled by :class:`SkillSource`, which drives the
+priority hierarchy used during registration conflicts.  Lower numeric values
+represent higher precedence, so a ``MANAGED`` skill (priority 0) always
+overrides a ``USER`` skill (priority 1), which in turn overrides ``PROJECT``
+and ``BUNDLED``.  The :data:`_PRIORITY_ORDER` dict is the single source of
+truth for this mapping and is consulted by :class:`EncreSkillRegistry`.
+
+The :class:`BundledSkillDefinition` dataclass is the canonical representation
+of a skill throughout the system.  It bundles together the skill's metadata
+(name, description, aliases, etc.) with a coroutine that renders the prompt
+body, allowing skills to be either static markdown files or dynamic Python
+functions.
 """
 
 from collections.abc import Awaitable, Callable
@@ -35,14 +50,27 @@ from typing import Any
 
 
 class SkillContext(str, Enum):
-    """Where a skill's prompt is injected when activated."""
+    """Where a skill's prompt is injected when activated.
+
+    ``INLINE`` injects the prompt directly into the current conversation
+    context, while ``FORK`` spawns a new sub-agent with the prompt as its
+    initial system message.  The forked context is useful for skills that
+    need isolated execution (e.g. long-running tasks) so the main agent's
+    conversation is not polluted with intermediate output.
+    """
 
     INLINE = "inline"
     FORK = "fork"
 
 
 class SkillSource(str, Enum):
-    """Origin of a skill definition (lower number = higher precedence)."""
+    """Origin of a skill definition (lower number = higher precedence).
+
+    The numeric ordering is determined by :data:`_PRIORITY_ORDER` below and
+    governs conflict resolution during registration.  A skill loaded from
+    a higher-precedence source (e.g. ``MANAGED``) silently replaces a
+    same-named skill from a lower-precedence source (e.g. ``BUNDLED``).
+    """
 
     MANAGED = "managed"
     USER = "user"
@@ -52,6 +80,8 @@ class SkillSource(str, Enum):
 
 # Priority ordering for skill sources: managed overrides user, user overrides
 # project, project overrides bundled.  Used during registration conflict resolution.
+# The dict is consulted by EncreSkillRegistry.register(); the default value
+# of 3 (bundled) is used when an unknown source is encountered.
 _PRIORITY_ORDER: dict[SkillSource, int] = {
     SkillSource.MANAGED: 0,
     SkillSource.USER: 1,
@@ -63,6 +93,19 @@ _PRIORITY_ORDER: dict[SkillSource, int] = {
 @dataclass
 class BundledSkillDefinition:
     """A registered skill: its metadata plus a callable that renders its prompt.
+
+    This is the canonical representation of a skill throughout the system.
+    All fields have sensible defaults so that skill definitions can be
+    constructed minimally (name + description + get_prompt_for_command) and
+    enriched later.  The ``get_prompt_for_command`` coroutine is the only
+    required callable; it is invoked when the skill is activated and receives
+    the raw user arguments and an optional context dict.
+
+    The ``source`` field determines conflict resolution priority: when two
+    skills share the same name, the one with the higher-precedence source
+    wins.  The ``hidden`` flag removes the skill from user-facing listings
+    while still allowing the agent to invoke it.  The ``auto_activate`` flag
+    enables file-extension-based triggering via :meth:`activate_for_paths`.
 
     Attributes:
         name: Unique skill identifier (lowercase, hyphen-separated).

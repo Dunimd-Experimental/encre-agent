@@ -18,42 +18,27 @@
 //! DISCLAIMER: Users must comply with applicable AI regulations.
 //! Non-compliance may result in service termination or legal liability.
 
-//! Core crate for Encre: AST/code indexing, search, sandboxing,
-//! permissions, LSP, embeddings, and SIMD text search, exposed to Python.
-pub mod ast;
-pub mod codebase;
+//! Core crate for Encre: text search, similarity scoring, sandboxing,
+//! permissions, LSP, and SIMD text search, exposed to Python.
 pub mod diff;
 pub mod embedding;
 pub mod fs;
-pub mod indexer;
 pub mod landlock;
 pub mod lsp_proto;
 pub mod permission;
+pub mod plugin_sandbox;
 pub mod sandbox;
 pub mod search;
 pub mod shell;
 pub mod simd_search;
 pub mod tokenizer;
 
-pub use ast::{
-    ast_available, ast_backend_name, ast_find_references, ast_find_relevant, ast_get_outline,
-    ast_get_symbol, ast_goto_definition, ast_list_files, build_ast_index, load_ast_index,
-    update_ast_index, AstIndexData, Reference, Symbol,
-};
-pub use codebase::{
-    build_code_context, build_code_index, count_code_index_candidates, load_code_index,
-    save_code_index, search_code_index, update_code_index, CodeIndexData, ModuleInfo,
-};
 pub use diff::{apply_diff, compute_diff};
-pub use embedding::{
-    build_embedding_slices, cosine_similarity, load_embedding_index, save_embedding_index,
-    search_embedding_index, text_similarity, EmbeddingHit, EmbeddingIndexData, EmbeddingSlice,
-};
+pub use embedding::{cosine_similarity, text_similarity};
 pub use fs::{read_file, write_file};
-pub use indexer::Bm25Index;
 pub use landlock::{
     landlock_abi_version, landlock_available, landlock_full_sandbox,
-    landlock_restrict_network, landlock_restrict_read_only,
+    landlock_plugin_sandbox, landlock_restrict_network, landlock_restrict_read_only,
     landlock_workspace_sandbox,
 };
 pub use lsp_proto::{
@@ -70,6 +55,3 @@ pub use search::{glob, grep, search_codebase, SearchResult};
 pub use shell::execute_shell;
 pub use simd_search::{simd_contains, simd_find_all, simd_memmem};
 pub use tokenizer::count_tokens;
-
-#[cfg(feature = "embedding")]
-pub use embedding::TextEmbedder;

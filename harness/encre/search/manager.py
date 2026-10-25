@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,10 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
+
+from encre.logging_config import get_logger
 
 """Hidden MCP-powered search engine.
 
@@ -48,7 +52,7 @@ from encre.tools.mcp import HttpTransport, MCPClient
 
 logger = logging.getLogger("encre.search")
 
-# 鈹€鈹€ MCP search server identity 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── MCP search server identity ─────────────────────────────────────────
 # Hardcoded here; auto-encrypted to a machine-bound file on first use so
 # the endpoint never appears on disk in plaintext.
 
@@ -365,7 +369,7 @@ def _map_search_args(
         if ("category" in low or "source" in low or "engine" in low) and categories != "general":
             args[pname] = categories
 
-    # 鈹€鈹€ Content / full-text switches 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Content / full-text switches ────────────────────────────────────
     # Without these the server returns title+URL only; the model then has to
     # web_fetch each URL, which anti-crawling sites (ctrip, fliggy, ...) block.
     if content:
@@ -435,7 +439,7 @@ def _normalize_mcp_response(content: list[dict[str, Any]]) -> dict[str, Any]:
                         results.append(_normalize_result_entry(entry))
                 return {"results": results, "suggestions": []}
         except json.JSONDecodeError:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
     # Try JSON object with "results" key
     if stripped.startswith("{"):
@@ -450,7 +454,7 @@ def _normalize_mcp_response(content: list[dict[str, Any]]) -> dict[str, Any]:
                             results.append(_normalize_result_entry(entry))
                     return {"results": results, "suggestions": list(suggestions)}
         except json.JSONDecodeError:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
     # Try structured plaintext: blocks separated by "---" with "Title:" / "URL:" lines
     blocks = re.split(r"\n---+\n", stripped)
@@ -555,7 +559,7 @@ def _truncate_content(text: str, limit: int) -> str:
     """Truncate to ``limit`` chars with a visible marker when cut."""
     if len(text) <= limit:
         return text
-    return text[:limit].rstrip() + "\n鈥content truncated]"
+    return text[:limit].rstrip() + "\n…[content truncated]"
 
 
 # Matches a "URL: <url>" line as emitted by web_fetch_exa.

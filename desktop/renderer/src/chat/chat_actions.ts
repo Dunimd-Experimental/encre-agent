@@ -31,18 +31,84 @@
 // @ts-nocheck -- helpers relocated from the Chat class; called via
 // `XImpl.call(this, ...)` so the instance context is preserved.
 
-import type { Chat } from "./chat.js";
-import type { AttachmentMeta } from "../core/types.js";
-import { getState, showToast, addAttachments, removeBranchMessages, startAssistantMessage, setSessionState, truncateToUserMessage, rememberRollbackEditTarget, restoreInputModeChip, restoreInputCommandChip } from "../core/state.js";
-import { send } from "../core/ws.js";
+import type { Message, ToolCallState, BranchMeta } from "../core/types.js";
+import { getState, showToast, removeBranchMessages, startAssistantMessage, setSessionState, truncateToUserMessage, rememberRollbackEditTarget, restoreInputModeChip, restoreInputCommandChip, openRoutedLink, isNoticeMode, realUserMessages } from "../core/state.js";
+import { restoreComposerWithChips } from "../features/files.js";
+import { send, sendRollback } from "../core/ws.js";
 import { t } from "../features/i18n.js";
 import { Dialog } from "../ui/dialog.js";
-import { clampElLeft } from "../ui/context-menu.js";
-import { createLucideIcons, flashCopyButton } from "./chat_tool_display.js";
+import { flashCopyButton } from "./chat_tool_display.js";
 import { pickRandomQuote } from "./timeline.js";
+import { pinBodyTails } from "./chat_render_engine.js";
+
+/**
+ * Resolves a chat link target to a local filesystem path, or returns null
+ * when the target is not a file (web URL, anchor, data URI, ...).
+ *
+ * Order matters: explicit absolute paths win, then workspace-relative paths,
+ * then file:// URLs (written explicitly or produced by the browser resolving
+ * a relative anchor against the app's file:// base).
+ */
+function resolveLocalFileTarget(rawHref: string, resolvedHref: string): string | null {
+  const raw = (rawHref || "").trim();
+  if (!raw || raw.startsWith("#")) return null;
+
+  // Explicit scheme handling: file:// is local, everything else (http,
+  // mailto, data, ...) is not a filesystem target. A single-letter "scheme"
+  // like "D:" is a Windows drive, not a scheme.
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(raw)?.[1]?.toLowerCase();
+  if (scheme && scheme !== "file" && scheme.length > 1) return null;
+  if (/^www\./i.test(raw)) return null; // bare "www." link, not a file
+
+  // 1. Absolute local path (Windows drive, UNC share, POSIX absolute).
+  if (/^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\") || /^\/(?!\/)/.test(raw)) {
+    return raw;
+  }
+
+  // 2. Workspace-relative path — resolve against the active workspace root
+  //    so a model-mentioned "src/foo.ts" lands on the actual file.
+  if (!scheme) {
+    const ws = (getState().activeWorkspace || "").replace(/[\\/]+$/, "");
+    if (ws) {
+      let rel = raw.replace(/\\/g, "/");
+      try { rel = decodeURIComponent(rel); } catch { /* keep encoded */ }
+      rel = rel.replace(/^\.\//, "").replace(/^\/+/, "");
+      if (rel) return ws + "/" + rel;
+    }
+  }
+
+  // 3. Explicit file:// URL (raw or browser-resolved).
+  const src = /^file:\/\//i.test(raw) ? raw : (/^file:\/\//i.test(resolvedHref || "") ? resolvedHref : "");
+  if (src) {
+    let p = src.replace(/^file:\/\/\/?/i, "");
+    try { p = decodeURIComponent(p); } catch { /* keep encoded */ }
+    p = p.replace(/^\/([A-Za-z]:)/, "$1"); // /D:/... -> D:/...
+    if (p.startsWith("//")) p = p.slice(1); // UNC share
+    return p || null;
+  }
+  return null;
+}
 
   export function handleDelegateClickImpl(this: Chat, e: MouseEvent): void {
     const target = e.target as HTMLElement;
+
+    // Stop tool (terminal) — kill the shell only, turn continues.
+    const stopBtn = target.closest("[data-tool-stop]") as HTMLElement | null;
+    if (stopBtn) {
+      e.stopPropagation();
+      send({ type: "tool_stop", session_id: getState().sessionId });
+      return;
+    }
+
+    // 「继续」 on an interrupted turn — identical to the user typing the
+    // resume prompt and pressing send. The timeline only renders the button
+    // while the card is the tail of the transcript.
+    const continueBtn = target.closest("[data-turn-continue]") as HTMLElement | null;
+    if (continueBtn) {
+      e.stopPropagation();
+      if (this.onResume) this.onResume();
+      return;
+    }
 
     // Expandable strip / terminal card toggle (delegated).
     const strip = target.closest(".strip, .terminal-card-header") as HTMLElement | null;
@@ -71,42 +137,52 @@ import { pickRandomQuote } from "./timeline.js";
           this.expandedItems.add(tid);
           reviewToggle.classList.add("expanded");
         }
+        // Scoped to the row that just toggled. A document-wide pass here would
+        // replace every icon in the app inside the very click that expanded
+        // this section — wiping the section's own state and stealing clicks
+        // landing anywhere else on screen.
         if (typeof (window as any).lucide !== "undefined") {
-          (window as any).lucide.createIcons();
+          (window as any).lucide.createIcons({ root: reviewToggle });
         }
         e.stopPropagation();
         return;
       }
     }
 
-    // Link click handling — route based on default_link_behavior setting
+    // Link click handling
     const link = target.closest("a");
-    if (link && link.href) {
-      const behavior = (getState().settings.default_link_behavior as string) || "system";
-      let url = link.href;
-      // Only intercept http/https/www links
-      if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("www.")) {
+    if (link) {
+      const rawHref = link.getAttribute("href") || "";
+      const href = link.href || "";
+      // Files the model mentioned (absolute / workspace-relative / file://
+      // targets) always open in the in-app file viewer — never the Encre Agent Desktop Subwindow (ESD)
+      // sub-app or the system browser.
+      const localPath = resolveLocalFileTarget(rawHref, href);
+      if (localPath) {
         e.preventDefault();
         e.stopPropagation();
-        if (url.startsWith("www.")) url = "https://" + url;
-        if (behavior === "in_app") {
-          const api = (window as any).electronAPI;
-          if (api?.openChildWindow) {
-            api.openChildWindow(url, url);
-          } else {
-            window.open(url, "_blank");
-          }
-        } else {
-          // Default: open in system browser
-          const api = (window as any).electronAPI;
-          if (api?.openExternal) {
-            api.openExternal(url);
-          } else {
-            window.open(url, "_blank");
-          }
-        }
+        if (this.onOpenFile) this.onOpenFile(localPath);
         return;
       }
+      // Web/mailto URLs go through the shared router
+      if (href && /^(https?:\/\/|www\.|mailto:)/i.test(href)) {
+        e.preventDefault();
+        e.stopPropagation();
+        openRoutedLink(href);
+        return;
+      }
+    }
+
+    // Local images inside rendered markdown open in the file viewer too
+    const msgImg = target.closest(".msg-text img") as HTMLImageElement | null;
+    if (msgImg && msgImg.src && /^file:/i.test(msgImg.src)) {
+      e.preventDefault();
+      e.stopPropagation();
+      let p = msgImg.src.replace(/^file:\/\/\/?/i, "");
+      try { p = decodeURIComponent(p); } catch { /* keep encoded */ }
+      p = p.replace(/^\/([A-Za-z]:)/, "$1");
+      if (p && this.onOpenFile) this.onOpenFile(p);
+      return;
     }
 
     const codeCopyBtn = target.closest(".code-copy");
@@ -114,7 +190,7 @@ import { pickRandomQuote } from "./timeline.js";
       e.stopPropagation();
       const code = codeCopyBtn.getAttribute("data-code") || "";
       navigator.clipboard.writeText(code)
-        .then(() => { codeCopyBtn.textContent = t("chat.copied"); setTimeout(() => { codeCopyBtn.textContent = t("chat.copy"); }, 2000); })
+        .then(() => flashCopyButton(codeCopyBtn as HTMLElement))
         .catch(() => showToast(t("chat.copyFailed"), "", "error", "Chat"));
       return;
     }
@@ -125,7 +201,7 @@ import { pickRandomQuote } from "./timeline.js";
       const userItem = copyBtn.closest(".user-item") as HTMLElement | null;
       const idx = userItem ? parseInt(userItem.getAttribute("data-user-idx") ?? "") : NaN;
       const st = getState();
-      const userMsgs = st.messages.filter(m => m.role === "user");
+      const userMsgs = realUserMessages(st.messages);
       if (!isNaN(idx) && userMsgs[idx]) {
         navigator.clipboard.writeText(userMsgs[idx].content)
           .then(() => flashCopyButton(copyBtn as HTMLElement))
@@ -140,7 +216,13 @@ import { pickRandomQuote } from "./timeline.js";
       const userItem = editBtn.closest(".user-item") as HTMLElement | null;
       const idx = userItem ? parseInt(userItem.getAttribute("data-user-idx") ?? "") : NaN;
       const st = getState();
-      const userMsgs = st.messages.filter(m => m.role === "user");
+      // data-user-idx is assigned by buildTimeline AFTER skipping the notice
+      // modes (compact_marker / compact_notice / model_switch), so the lookup
+      // must skip them too. A bare role === "user" filter counted the notices
+      // and resolved one turn EARLIER than the one clicked -- which rolled
+      // back the second-to-last turn and pre-filled the composer with the
+      // wrong text.
+      const userMsgs = realUserMessages(st.messages);
       if (isNaN(idx) || !userMsgs[idx]) return;
       const targetMsg = userMsgs[idx];
       let origContent = targetMsg.content;
@@ -149,20 +231,46 @@ import { pickRandomQuote } from "./timeline.js";
       // re-render it as a chip instead of raw markup.
       const cmdTagMatch = origContent.match(/^<command>(\w[\w-]*)<\/command>$/s);
       if (origContent.includes("<terminal>") || origContent.includes("<attach ") || origContent.includes("<mode>") || cmdTagMatch) origContent = "";
-      Dialog.confirm(t("chat.rollbackEdit"), t("chat.rollbackEditDesc"), { container: document.getElementById("main-content") ?? undefined }).then((confirmed) => {
+      Dialog.confirm(t("chat.rollbackEdit"), t("chat.rollbackEditDesc"), { scope: "session" }).then((confirmed) => {
         if (confirmed) {
+          // The dialog was open, so the user may have switched sessions in the
+          // meantime. Re-read state and abort unless this is still the session
+          // the click happened in -- otherwise the rollback lands in a
+          // different conversation.
+          const cur = getState();
+          if (cur.sessionId !== st.sessionId) return;
           const sid = targetMsg.serverId;
           rememberRollbackEditTarget(targetMsg, idx);
-          if (sid && st.activeBranchId) {
-            send({ type: "rollback", branch_id: st.activeBranchId, message_id: sid });
+          if (sid && cur.activeBranchId) {
+            // session_id is mandatory: the backend binds an omitted one to the
+            // connection's LAST session, not to this conversation.
+            sendRollback(cur.activeBranchId, sid, cur.sessionId);
           } else {
-            send({ type: "delete_message", message_index: idx, session_id: st.sessionId });
+            // No branch exists yet, so a branch rollback has nothing to roll
+            // back against: delete the message outright instead. message_id is
+            // the reliable locator -- a frontend-computed index can misalign
+            // with the backend's raw list (synthetic loop plumbing, compact
+            // markers) and delete the wrong turn.
+            send({ type: "delete_message", message_index: idx, message_id: targetMsg.serverId || "", session_id: cur.sessionId });
           }
-          // Immediately remove this message and all after from local state
+          // Immediately remove this message and all after from local state.
+          // This is optimistic: if the server refuses the request, the error
+          // handler in stream.ts re-syncs (resume) and clears the pending-edit
+          // marker, so the UI returns to the real backend conversation instead
+          // of staying truncated.
           truncateToUserMessage(idx);
+          // The conversation just got truncated: pin the re-render to the
+          // bottom instead of preserving the pre-rollback scroll offset.
+          this.requestPinToBottom();
           this.renderForce();
+          // Restore the composer with attachment chips rebuilt at their
+          // inline positions (the content carries `<attach n="..." />`
+          // placeholders where the chips originally sat).
           const input = document.getElementById("prompt-input") as HTMLElement | null;
-          if (input) { input.textContent = origContent; input.focus(); }
+          if (input) {
+            restoreComposerWithChips(input, origContent, targetMsg.fileRefs);
+            input.focus();
+          }
           const msgMode = (targetMsg as any).mode;
           if (msgMode) {
             restoreInputModeChip(msgMode);
@@ -172,19 +280,14 @@ import { pickRandomQuote } from "./timeline.js";
           if (cmdTagMatch) {
             restoreInputCommandChip(cmdTagMatch[1]);
           }
-          // Restore attachment chips from fileRefs
-          const refs = targetMsg.fileRefs;
-          if (refs && refs.length > 0) {
-            const atts: AttachmentMeta[] = [];
-            for (const r of refs) {
-              if (r.mime_type === "text/x-terminal") continue;
-              if (r.path) {
-                atts.push({ name: r.name, path: r.path, content: "", mime_type: r.mime_type || "", size: r.size, is_binary: false });
-              }
-            }
-            if (atts.length > 0) addAttachments(atts);
-          }
+          // (Attachment chips are restored by restoreComposerWithChips above.)
         }
+      }).catch((err) => {
+        // The confirmation rejected instead of resolving: nothing was sent
+        // and nothing was truncated, so the only duty is to keep the
+        // rejection from going unhandled. A legitimate rollback in flight
+        // keeps its own pending-edit marker.
+        console.warn("[chat] rollback confirmation failed", err);
       });
       return;
     }
@@ -195,10 +298,18 @@ import { pickRandomQuote } from "./timeline.js";
       const userItem = deleteBtn.closest(".user-item") as HTMLElement | null;
       const idx = userItem ? parseInt(userItem.getAttribute("data-user-idx") ?? "") : NaN;
       const st = getState();
-      const userMsgs = st.messages.filter(m => m.role === "user");
+      const userMsgs = realUserMessages(st.messages);
       if (isNaN(idx) || !userMsgs[idx]) return;
-      Dialog.confirm(t("chat.deleteMessage"), t("chat.deleteMessageDesc"), { container: document.getElementById("main-content") ?? undefined }).then((confirmed) => {
-        if (confirmed) send({ type: "delete_message", message_index: idx });
+      const targetMsg = userMsgs[idx];
+      Dialog.confirm(t("chat.deleteMessage"), t("chat.deleteMessageDesc"), { scope: "session" }).then((confirmed) => {
+        if (!confirmed) return;
+        // Re-read after the await: the session may have changed while the
+        // dialog was open, and the delete must reach the session that owns
+        // the message (an omitted session_id binds to the connection's last
+        // session, i.e. a different conversation).
+        const cur = getState();
+        if (cur.sessionId !== st.sessionId) return;
+        send({ type: "delete_message", message_index: idx, message_id: targetMsg.serverId || "", session_id: cur.sessionId });
       });
       return;
     }
@@ -213,28 +324,12 @@ import { pickRandomQuote } from "./timeline.js";
       const st = getState();
       const msg = st.messages.find(m => m.id === msgId);
       const btn = assistantCopyBtn as HTMLElement;
-      this.openActionMenu(btn, [
-        {
-          icon: "copy",
-          label: t("chat.copy"),
-          onClick: () => {
-            const text = assistantItem?.innerText ?? msg?.content ?? "";
-            navigator.clipboard.writeText(text)
-              .then(() => flashCopyButton(btn))
-              .catch(() => showToast(t("chat.copyFailed"), "", "error", "Chat"));
-          },
-        },
-        {
-          icon: "code",
-          label: t("chat.copyMarkdown"),
-          onClick: () => {
-            if (!msg) return;
-            navigator.clipboard.writeText(msg.content)
-              .then(() => flashCopyButton(btn))
-              .catch(() => showToast(t("chat.copyFailed"), "", "error", "Chat"));
-          },
-        },
-      ]);
+      // Markdown is the only copy format — the previous dropdown
+      // (plain text vs markdown) was removed by design.
+      const text = msg ? msg.content : (assistantItem?.innerText ?? "");
+      navigator.clipboard.writeText(text)
+        .then(() => flashCopyButton(btn))
+        .catch(() => showToast(t("chat.copyFailed"), "", "error", "Chat"));
       return;
     }
 
@@ -245,12 +340,9 @@ import { pickRandomQuote } from "./timeline.js";
       const assistantItem = turn?.querySelector(".assistant-text") as HTMLElement | null;
       const msgId = assistantItem?.dataset.messageId;
       if (!msgId) return;
-      const btn = assistantRetryBtn as HTMLElement;
-      this.openActionMenu(btn, [
-        { icon: "refresh-cw", label: t("chat.retryNormal"), onClick: () => this.performRetry(msgId, "normal") },
-        { icon: "stretch-horizontal", label: t("chat.retryDetailed"), onClick: () => this.performRetry(msgId, "detailed") },
-        { icon: "minimize-2", label: t("chat.retryConcise"), onClick: () => this.performRetry(msgId, "concise") },
-      ]);
+      // Regenerate runs immediately with the default mode — the detailed /
+      // concise dropdown was removed by design.
+      this.performRetry(msgId, "normal");
       return;
     }
 
@@ -305,32 +397,18 @@ import { pickRandomQuote } from "./timeline.js";
       return;
     }
 
-    // Plan file rows: open in sidebar markdown tab
-    const openMdBtn = target.closest("[data-open-md]") as HTMLElement | null;
+    // Plan file rows: open the artifact in the sidebar markdown tab
+    const openMdBtn = target.closest("[data-md-path]") as HTMLElement | null;
     if (openMdBtn) {
       e.stopPropagation();
-      const fileKey = openMdBtn.getAttribute("data-open-md") || "";
-      const title = openMdBtn.getAttribute("data-md-title") || "";
-      const content = this._planFileLookup.get(fileKey) || "";
-      (window as any).__sessionInner?.openMarkdownPreview(content, title);
+      const path = openMdBtn.getAttribute("data-md-path") || "";
+      if (path) void (window as any).__sessionInner?.openMarkdownPreviewFile?.(path);
       return;
     }
 
-    // Plan approve/reject buttons
-    const planApproveBtn = target.closest("[data-plan-approve]") as HTMLElement | null;
-    if (planApproveBtn) {
-      e.stopPropagation();
-      const sessionId = planApproveBtn.getAttribute("data-plan-approve") || "";
-      send({ type: "plan_approve", session_id: sessionId } as any);
-      return;
-    }
-    const planRejectBtn = target.closest("[data-plan-reject]") as HTMLElement | null;
-    if (planRejectBtn) {
-      e.stopPropagation();
-      const sessionId = planRejectBtn.getAttribute("data-plan-reject") || "";
-      send({ type: "plan_reject", session_id: sessionId } as any);
-      return;
-    }
+    // Plan approve/reject are NOT handled here: the review card binds them
+    // inline through `window.__reviewDecision` (see chat.ts), so there is one
+    // path instead of a delegate plus an inline handler.
   }
 
   export function toggleItemImpl(this: Chat, id: string, el: HTMLElement): void {
@@ -344,138 +422,10 @@ import { pickRandomQuote } from "./timeline.js";
       el.classList.add("expanded");
       this.userCollapsedItems.delete(id);
       this.userExpandedItems.add(id);
-    }
-  }
-
-  /** Opens a unified dropdown menu anchored to the given action button.
-   *  Reuses the same visual language as the model selector / @-command
-   *  menus (`.mention-dropdown` / `.mention-dropdown-item`). */
-  export function openActionMenuImpl(
-    this: Chat,
-    btn: HTMLElement,
-    items: Array<{ icon: string; label: string; onClick: () => void }>,
-  ): void {
-    // If the same menu is already open on this button, just close it.
-    if (btn.classList.contains("action-menu-open")) {
-      this.closeActionMenu();
-      return;
-    }
-    // Close any other action menu first.
-    this.closeActionMenu();
-
-    const rect = btn.getBoundingClientRect();
-    const menu = document.createElement("div");
-    menu.className = "mention-dropdown action-menu";
-    menu.style.position = "fixed";
-    menu.style.top = `${rect.bottom + 4}px`;
-    menu.style.left = `${rect.left}px`;
-    menu.style.marginBottom = "0";
-    menu.style.bottom = "auto";
-    menu.style.minWidth = "160px";
-
-    for (const item of items) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "mention-dropdown-item";
-      row.innerHTML = `<i data-lucide="${item.icon}" class="lucide"></i><span>${item.label}</span>`;
-      row.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        this.closeActionMenu();
-        item.onClick();
-      });
-      menu.appendChild(row);
-    }
-
-    document.body.appendChild(menu);
-    // Position uses a physical `left`, which never mirrors. Clamp it now
-    // that the menu is in the DOM and its width is measurable, otherwise
-    // an action button near the inline-end edge opens it off-window (rtl).
-    menu.style.left = `${clampElLeft(menu, rect.left)}px`;
-    createLucideIcons(menu);
-    btn.classList.add("action-menu-open");
-    this._actionMenu = menu;
-    this._actionMenuBtn = btn;
-
-    const closeOnOutside = (ev: MouseEvent) => {
-      if (this._actionMenu && !this._actionMenu.contains(ev.target as Node)) {
-        this.closeActionMenu();
-      }
-    };
-    this._actionMenuClose = closeOnOutside;
-    setTimeout(() => document.addEventListener("click", closeOnOutside), 0);
-
-    // The action buttons are only visible while the turn is hovered. When
-    // the mouse leaves the turn the buttons disappear, so the menu must
-    // follow suit — but with a short grace period so the pointer has time
-    // to travel from the button to the menu (which lives in document.body,
-    // outside the turn). Entering the menu cancels the pending close.
-    const turn = btn.closest(".turn") as HTMLElement | null;
-    const scheduleClose = () => {
-      if (this._actionMenuCloseTimer !== null) return;
-      this._actionMenuCloseTimer = window.setTimeout(() => {
-        this._actionMenuCloseTimer = null;
-        this.closeActionMenu();
-      }, 180);
-    };
-    const cancelClose = () => {
-      if (this._actionMenuCloseTimer !== null) {
-        window.clearTimeout(this._actionMenuCloseTimer);
-        this._actionMenuCloseTimer = null;
-      }
-    };
-    if (turn) {
-      const onTurnLeave = (ev: MouseEvent) => {
-        if (!this._actionMenu) return;
-        const rel = ev.relatedTarget as Node | null;
-        if (rel && this._actionMenu.contains(rel)) return;
-        scheduleClose();
-      };
-      turn.addEventListener("mouseleave", onTurnLeave);
-      this._actionMenuTurnLeave = { el: turn, fn: onTurnLeave };
-    }
-    menu.addEventListener("mouseenter", cancelClose);
-    menu.addEventListener("mouseleave", scheduleClose);
-    this._actionMenuEnter = { el: menu, fn: cancelClose };
-    this._actionMenuLeave = { el: menu, fn: scheduleClose };
-  }
-
-  export function closeActionMenuImpl(this: Chat): void {
-    if (this._actionMenu) {
-      this._actionMenu.remove();
-      this._actionMenu = null;
-    }
-    if (this._actionMenuBtn) {
-      this._actionMenuBtn.classList.remove("action-menu-open");
-      this._actionMenuBtn = null;
-    }
-    if (this._actionMenuClose) {
-      document.removeEventListener("click", this._actionMenuClose);
-      this._actionMenuClose = null;
-    }
-    if (this._actionMenuTurnLeave) {
-      this._actionMenuTurnLeave.el.removeEventListener(
-        "mouseleave",
-        this._actionMenuTurnLeave.fn,
-      );
-      this._actionMenuTurnLeave = null;
-    }
-    if (this._actionMenuEnter) {
-      this._actionMenuEnter.el.removeEventListener(
-        "mouseenter",
-        this._actionMenuEnter.fn,
-      );
-      this._actionMenuEnter = null;
-    }
-    if (this._actionMenuLeave) {
-      this._actionMenuLeave.el.removeEventListener(
-        "mouseleave",
-        this._actionMenuLeave.fn,
-      );
-      this._actionMenuLeave = null;
-    }
-    if (this._actionMenuCloseTimer !== null) {
-      window.clearTimeout(this._actionMenuCloseTimer);
-      this._actionMenuCloseTimer = null;
+      // The class flip reveals a body that was laid out while collapsed, so
+      // its scroll window has to be moved to the tail now — nothing else
+      // re-renders this card on a manual expand.
+      pinBodyTails(el);
     }
   }
 
@@ -485,20 +435,24 @@ import { pickRandomQuote } from "./timeline.js";
     const st = getState();
     const assistantIdx = st.messages.findIndex(m => m.id === msgId);
     if (assistantIdx < 0) return;
+    // Re-generate from the last REAL user turn before this card: the notice
+    // modes (compact_marker / compact_notice / model_switch) ride along as
+    // user-role messages but consume no data-user-idx, so they must not be
+    // counted here either.
     let userContent = "";
     for (let i = assistantIdx - 1; i >= 0; i--) {
-      if (st.messages[i].role === "user" && st.messages[i].mode !== "compact_marker") {
-        userContent = st.messages[i].content;
+      const m = st.messages[i];
+      if (m.role === "user" && !isNoticeMode(m.mode)) {
+        userContent = m.content;
         break;
       }
     }
     if (!userContent) return;
 
-    // Compute user message index (0-based among all user messages in the session)
-    let userMsgIdx = -1;
-    for (let i = 0; i < assistantIdx; i++) {
-      if (st.messages[i].role === "user" && st.messages[i].mode !== "compact_marker") userMsgIdx++;
-    }
+    // 0-based among the real user turns, i.e. the same base buildTimeline
+    // uses for data-user-idx. The turn found above is the last real one
+    // before assistantIdx, so it is index (count - 1) of that prefix.
+    const userMsgIdx = realUserMessages(st.messages.slice(0, assistantIdx)).length - 1;
 
     // Remove old assistant messages after the fork point; the preceding
     // user message stays in place (no duplicate needed).
@@ -522,7 +476,15 @@ import { pickRandomQuote } from "./timeline.js";
     if (st.messages.length === 0) return;
     if (st.messages[st.messages.length - 1].role === "user") { this.scrollToBottom(); return; }
     if (!st.running) return;
-    if (!this.userScrolledUp) this.scrollToBottom();
+    if (this.userScrolledUp) {
+      const c = document.getElementById("chat-container");
+      // Self-heal a flag poisoned by clamp scroll events during DOM swaps
+      // (media collapse makes the old scrollTop clamp and fire a bogus
+      // "scrolled up" event): only a real upward scroll -- well away from
+      // the bottom -- stops the follow.
+      if (!c || c.scrollHeight - c.scrollTop - c.clientHeight > 120) return;
+    }
+    this.scrollToBottom();
   }
 
   export function toggleWelcomeImpl(this: Chat, show: boolean): void {
@@ -540,22 +502,37 @@ import { pickRandomQuote } from "./timeline.js";
    *  (images / videos inside the message list) has finished loading.
    *  A plain scrollToBottom() on session entry runs before images resolve,
    *  so the container grows afterwards and leaves unread content below the
-   *  fold.  This variant waits for those elements to settle. */
-  export function scrollToBottomAfterMediaImpl(this: Chat): void {
+   *  fold.  This variant waits for those elements to settle.
+   *  Force mode bypasses the userScrolledUp guard: session entry is a fresh
+   *  navigation, so a stale "scrolled up" flag from the previous session
+   *  (or from scroll events fired mid DOM-swap) must not keep the view
+   *  anchored in the middle of the new history. */
+  export function scrollToBottomAfterMediaImpl(this: Chat, force = false): void {
     const c = document.getElementById("chat-container");
     if (!c) return;
+    // The userScrolledUp flag alone is not trustworthy: the innerHTML swap
+    // collapses media heights, the browser clamps the old scrollTop and the
+    // resulting scroll event marks the user as "scrolled up" even though
+    // they never touched the wheel.  "Near the bottom" therefore counts as
+    // pinned; only a real upward scroll keeps the view anchored.
+    const atBottom = () => c.scrollHeight - c.scrollTop - c.clientHeight < 120;
     const pin = () => {
-      if (this.userScrolledUp) return;
+      if (!force && this.userScrolledUp && !atBottom()) return;
       c.scrollTop = c.scrollHeight;
     };
     pin();
     // Re-pin on the next frame so layout shifts from the same tick apply.
     requestAnimationFrame(pin);
+    // Late layout growth (webfonts, KaTeX, code highlighting, lazy media
+    // resolving after the settle window) can land after every media event
+    // has fired.  Watch the message-list size for a grace period and
+    // re-assert the bottom while the user has not scrolled away.
+    const ro = new ResizeObserver(() => pin());
+    ro.observe(this.ml);
     const media = Array.from(this.ml.querySelectorAll("img, video")).filter(
       (el) => el instanceof HTMLImageElement && !el.complete
         || el instanceof HTMLVideoElement && el.readyState < 2,
     );
-    if (media.length === 0) return;
     const done = () => {
       pin();
       media.forEach((el) => {
@@ -564,20 +541,24 @@ import { pickRandomQuote } from "./timeline.js";
         el.removeEventListener("error", done);
       });
     };
-    media.forEach((el) => {
-      el.addEventListener("load", done, { once: true });
-      el.addEventListener("loadeddata", done, { once: true });
-      el.addEventListener("error", done, { once: true });
-    });
-    // Safety net: never wait longer than this for slow media.
+    if (media.length > 0) {
+      media.forEach((el) => {
+        el.addEventListener("load", done, { once: true });
+        el.addEventListener("loadeddata", done, { once: true });
+        el.addEventListener("error", done, { once: true });
+      });
+    }
+    // Safety net: never wait longer than this for slow media, then stop
+    // watching for layout shifts.
     window.setTimeout(() => {
       media.forEach((el) => {
         el.removeEventListener("load", done);
         el.removeEventListener("loadeddata", done);
         el.removeEventListener("error", done);
       });
+      ro.disconnect();
       pin();
-    }, 800);
+    }, 1500);
   }
 
   /** Keeps the floating scroll-to-bottom button in sync with the real state
@@ -601,15 +582,158 @@ import { pickRandomQuote } from "./timeline.js";
     if (btn) btn.classList.add("hidden");
   }
 
+  /**
+   * Keeps the status bar OUT of #message-list on purpose: fullRender rebuilds
+   * that list via innerHTML on every structural streaming change, and moving
+   * the bar back in after each rebuild restarted its CSS animation (the
+   * shimmer froze at its first frame).  The bar stays an absolute child of
+   * the scroll container and is translated under the latest output by
+   * syncStatusBarPosition — same visual spot, but the node (and its running
+   * animation) is never touched by list rebuilds.
+   */
+  export function mountStatusBarImpl(this: Chat): void {
+    const bar = this.statusBar;
+    if (!bar) return;
+    if (bar.parentElement !== this.container) this.container.appendChild(bar);
+    if (!this.statusBarRO) {
+      this.statusBarRO = new ResizeObserver(() => this.syncStatusBarPosition());
+      this.statusBarRO.observe(this.ml);
+    }
+    this.syncStatusBarPosition();
+    this.startStatusBarFollow();
+  }
+
+  /** Viewport-relative bottom of the last non-empty text line inside `root`,
+   *  or null when the block paints no text at all (images, cards, a turn that
+   *  only holds tool strips). */
+  function lastTextLineBottom(root: HTMLElement): number | null {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let node: Node | null = null;
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) node = n;
+    // Step back over text nodes that paint nothing (they live in a
+    // display:none subtree) until one reports a real line box. Bounded so a
+    // pathological tail cannot turn a per-frame measure into a tree walk.
+    for (let steps = 0; node && steps < 64; steps++) {
+      if (node.nodeValue && node.nodeValue.trim()) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const rect = range.getBoundingClientRect();
+        if (rect.height || rect.width) return rect.bottom;
+      }
+      node = walker.previousNode();
+    }
+    return null;
+  }
+
+  /** Y, in the scroll container's CONTENT coordinates, of the transcript's
+   *  last painted line.
+   *
+   *  Deliberately not `#message-list.scrollHeight`: the list is `flex: 1`
+   *  inside the scroll container, so while a transcript is shorter than the
+   *  pane the list is stretched to the full pane height and its scrollHeight
+   *  marks the empty tail below the content.  The bar then floated a fixed
+   *  distance above the input instead of sitting under the model's last line,
+   *  and only snapped into place once the transcript outgrew the pane.
+   *
+   *  Nor the last block's BOX bottom: `.assistant-text` carries 12px of bottom
+   *  padding plus the trailing paragraph's 6px margin, which pushed the line a
+   *  plainly visible ~20px below the model's final sentence.  A range over the
+   *  last text node measures the LINE, so the status reads as the next line of
+   *  the reply.  Falls back to the block box, then to the list content bottom,
+   *  for tails that paint no text. */
+  function transcriptBottom(ml: HTMLElement, container: HTMLElement): number {
+    let last = ml.lastElementChild as HTMLElement | null;
+    // Trailing zero-height nodes (hidden action rows) never mark the bottom.
+    while (last && last.offsetHeight === 0) {
+      last = last.previousElementSibling as HTMLElement | null;
+    }
+    if (!last) {
+      const padBottom = parseFloat(getComputedStyle(ml).paddingBottom) || 0;
+      return Math.max(0, ml.scrollHeight - padBottom);
+    }
+    const lineBottom = lastTextLineBottom(last);
+    if (lineBottom !== null) {
+      return Math.max(0, lineBottom - container.getBoundingClientRect().top + container.scrollTop);
+    }
+    return Math.max(0, last.offsetTop + last.offsetHeight);
+  }
+
+  /** Pins the bar right below the transcript's last rendered line. The
+   *  position rides on `transform`, which never restarts CSS animations and
+   *  scrolls naturally with the container's content. Styles are only written
+   *  when the value actually changed, so the per-frame caller stays cheap. */
+  export function syncStatusBarPositionImpl(this: Chat): void {
+    const bar = this.statusBar;
+    if (!bar || bar.classList.contains("hidden")) return;
+    const ml = this.ml;
+    const cs = getComputedStyle(ml);
+    // One list-gap keeps the bar's rhythm identical to the transcript's own
+    // spacing (falls back to 10px if the gap is ever 0 or unparsable).
+    const gap = parseFloat(cs.rowGap) || 10;
+    const top = transcriptBottom(ml, this.container) + gap;
+    const ty = `translateY(${top}px)`;
+    if (bar.style.transform !== ty) bar.style.transform = ty;
+    // The transcript's text column is the list's CONTENT box (the list carries
+    // `padding: 28px 24px 42px`). Spanning the list's BORDER box instead put
+    // the shimmer a full padding-left — 24px — to the left of the assistant
+    // name and of every message, so the status line never read as the reply's
+    // next line no matter how well its vertical offset was measured.
+    const padLeft = parseFloat(cs.paddingLeft) || 0;
+    const padRight = parseFloat(cs.paddingRight) || 0;
+    const left = `${ml.offsetLeft + padLeft}px`;
+    if (bar.style.left !== left) bar.style.left = left;
+    const width = `${ml.clientWidth - padLeft - padRight}px`;
+    if (bar.style.width !== width) bar.style.width = width;
+  }
+
+  /** Re-pins the bar on every frame for as long as it is visible.
+   *
+   *  The ResizeObserver alone is not enough: it fires when the LIST's box
+   *  changes, and with a short transcript the stretched list keeps its height
+   *  while the model streams text into the last block — no resize, no
+   *  reposition, so the bar lagged behind the incoming text.  A per-frame
+   *  measure costs one layout read (no writes unless the value changed) and
+   *  makes the bar correct regardless of what moved it: streaming text,
+   *  webfonts, KaTeX, lazy media, a resize, a transcript rebuild. */
+  export function startStatusBarFollowImpl(this: Chat): void {
+    if (this.statusBarRaf) return;
+    const step = () => {
+      this.statusBarRaf = 0;
+      const bar = this.statusBar;
+      // Hidden bar (turn finished, session switched) ends the loop.
+      if (!bar || bar.classList.contains("hidden")) return;
+      this.syncStatusBarPosition();
+      this.statusBarRaf = requestAnimationFrame(step);
+    };
+    this.statusBarRaf = requestAnimationFrame(step);
+  }
+
   export function _updateStatusBarImpl(this: Chat, running: boolean): void {
     if (running) {
+      this.mountStatusBar();
       if (!this._currentQuote) {
         this._currentQuote = pickRandomQuote();
       }
       const q = this._currentQuote;
-      this.statusBar.innerHTML = `<span class="status-shimmer">${t(`chat.${q.textKey}`)}</span>`;
-      this.statusBar.classList.remove("hidden");
+      // Rewrite the span only when the quote actually changes: rebuilding it
+      // on every render frame restarted the shimmer animation over and over,
+      // which read as the shimmer being stuck in place during streaming.
+      const want = t(`chat.${q.textKey}`);
+      const span = this.statusBar.querySelector(".status-shimmer");
+      if (!span || span.textContent !== want) {
+        this.statusBar.innerHTML = `<span class="status-shimmer"></span>`;
+        this.statusBar.querySelector(".status-shimmer")!.textContent = want;
+      }
+      if (this.statusBar.classList.contains("hidden")) {
+        this.statusBar.classList.remove("hidden");
+        this.syncStatusBarPosition();
+      }
+      this.startStatusBarFollow();
     } else {
+      if (this.statusBarRaf) {
+        cancelAnimationFrame(this.statusBarRaf);
+        this.statusBarRaf = 0;
+      }
       this.statusBar.classList.add("hidden");
       this._currentQuote = null;
     }

@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Turn transition types and history tracking for the agent loop.
 
@@ -41,12 +43,17 @@ Usage::
         ...
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
 
 class TurnTransition(Enum):
     """Every way a turn of the agent loop can end or continue.
@@ -56,7 +63,7 @@ class TurnTransition(Enum):
     ``BUDGET_GRACE``, ``SPEC_PARSE``).
     """
 
-    # 鈹€鈹€ Normal continuations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Normal continuations ────────────────────────────────────────
     NEXT_TURN = "next_turn"
     """Normal tool_use continuation: the model issued tool calls,
     we executed them, and the next turn begins with the results."""
@@ -65,7 +72,7 @@ class TurnTransition(Enum):
     """Model produced a text-only response with no tool calls.  The
     turn ends normally; the outer loop receives it as a final answer."""
 
-    # 鈹€鈹€ Output budget transitions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Output budget transitions ───────────────────────────────────
     MAX_OUTPUT_TOKENS = "max_output_tokens"
     """Model hit the output-token limit (``max_tokens``/``length`` finish
     reason).  The slot budget is escalated or a continuation is injected."""
@@ -84,12 +91,16 @@ class TurnTransition(Enum):
     """Token budget exhausted: the model gets one final "wrap up" call
     (grace call) before termination."""
 
-    # 鈹€鈹€ Error recovery transitions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Error recovery transitions ──────────────────────────────────
     REACTIVE_COMPACT = "reactive_compact"
     """API 413 / context overflow: compact the session and retry the turn."""
 
     MODEL_FALLBACK = "model_fallback"
     """Rate-limit or overload: switch to the fallback model and retry."""
+
+    TIER_ESCALATION = "tier_escalation"
+    """Light-tier model stuck in a loop: escalate the rest of the session to
+    a stronger-tier model from the user's own configured pool."""
 
     NETWORK_RETRY = "network_retry"
     """Transient network error: retry after a short delay."""
@@ -112,15 +123,17 @@ class TurnTransition(Enum):
     """Unknown/uncategorised error: one retry then surface to user."""
 
     ERROR_CONSUMED = "error_consumed"
-    """Error was silently consumed after recovery (auth, exhausted-unknown, etc.).
-    The loop continues without surfacing the error to the user."""
+    """The error was withheld from the user because the per-turn recovery
+    budget was exhausted.  The loop flags the turn so it finishes quietly
+    rather than reporting a failure, and so the resulting empty output is
+    not mistaken for an empty response."""
 
-    # 鈹€鈹€ Hook-driven transitions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Hook-driven transitions ─────────────────────────────────────
     STOP_HOOK_BLOCK = "stop_hook_block"
     """A stop hook returned a blocking result.  The hook output is
     injected as a user message and the loop continues."""
 
-    # 鈹€鈹€ Terminal transitions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Terminal transitions ────────────────────────────────────────
     CANCELLED = "cancelled"
     """User cancelled the run (Stop button / keyboard interrupt)."""
 
@@ -189,7 +202,7 @@ class TransitionHistory:
     session_id: str = ""
     """Session id stamped on published transition events."""
 
-    # 鈹€鈹€ properties 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── properties ──────────────────────────────────────────────────
 
     @property
     def last(self) -> TurnTransition | None:
@@ -218,7 +231,7 @@ class TransitionHistory:
                 return r
         return None
 
-    # 鈹€鈹€ recording 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── recording ───────────────────────────────────────────────────
 
     def record(
         self,
@@ -258,13 +271,12 @@ class TransitionHistory:
                 },
             )
         except Exception:
-            pass
-
+            logger.debug("exception suppressed", exc_info=True)
     def clear(self) -> None:
         """Clear the history (called at start of a new ``_run_impl``)."""
         self.records.clear()
 
-    # 鈹€鈹€ iteration (newest first) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── iteration (newest first) ────────────────────────────────────
 
     def __iter__(self):
         return iter(reversed(self.records))
@@ -275,7 +287,7 @@ class TransitionHistory:
     def __bool__(self) -> bool:
         return bool(self.records)
 
-    # 鈹€鈹€ serialization 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── serialization ───────────────────────────────────────────────
 
     def to_dict(self) -> list[dict[str, Any]]:
         return [

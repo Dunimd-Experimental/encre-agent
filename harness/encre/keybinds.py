@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Keyboard shortcut configuration.
 
@@ -52,7 +54,7 @@ def default_keybinds() -> dict[str, Any]:
     return {
         "version": 1,
         "keybinds": [
-            # 鈹€鈹€ Application 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Application ──────────────────────────────────────────
             {
                 "id": "quit",
                 "keys": ["ctrlcmd+q"],
@@ -78,7 +80,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Toggle fullscreen",
             },
 
-            # 鈹€鈹€ Session Management 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Session Management ───────────────────────────────────
             {
                 "id": "new_session",
                 "keys": ["ctrlcmd+l"],
@@ -122,7 +124,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Export session as Markdown",
             },
 
-            # 鈹€鈹€ Message Operations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Message Operations ───────────────────────────────────
             {
                 "id": "edit_last_message",
                 "keys": ["ctrlcmd+up"],
@@ -166,7 +168,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Retry (concise)",
             },
 
-            # 鈹€鈹€ Input Area 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Input Area ───────────────────────────────────────────
             {
                 "id": "attach_file",
                 "keys": ["ctrlcmd+shift+g"],
@@ -192,7 +194,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Next input history",
             },
 
-            # 鈹€鈹€ Mode Switching 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Mode Switching ───────────────────────────────────────
             {
                 "id": "toggle_plan_mode",
                 "keys": ["ctrlcmd+shift+p"],
@@ -212,7 +214,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Cancel / stop generation",
             },
 
-            # 鈹€鈹€ Sidebar / Navigation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Sidebar / Navigation ─────────────────────────────────
             {
                 "id": "toggle_sidebar",
                 "keys": ["ctrlcmd+b"],
@@ -232,7 +234,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Automation view",
             },
 
-            # 鈹€鈹€ Search 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Search ───────────────────────────────────────────────
             {
                 "id": "search_global",
                 "keys": ["ctrlcmd+k"],
@@ -246,7 +248,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Search in settings",
             },
 
-            # 鈹€鈹€ Settings 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Settings ─────────────────────────────────────────────
             {
                 "id": "open_settings",
                 "keys": ["ctrlcmd+,"],
@@ -284,22 +286,22 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Settings - Agent config",
             },
             {
-                "id": "settings_index",
+                "id": "settings_library",
                 "keys": ["ctrlcmd+alt+i"],
                 "category": "settings",
-                "description": "Settings - Index & documents",
+                "description": "Settings - Library",
             },
             {
-                "id": "settings_rules",
+                "id": "settings_assist",
                 "keys": ["ctrlcmd+shift+r"],
                 "category": "settings",
-                "description": "Settings - Rules",
+                "description": "Settings - Assist panels",
             },
             {
                 "id": "settings_memory",
                 "keys": ["ctrlcmd+shift+y"],
                 "category": "settings",
-                "description": "Settings - Memory",
+                "description": "Settings - Memory & rules",
             },
             {
                 "id": "settings_usage",
@@ -313,8 +315,38 @@ def default_keybinds() -> dict[str, Any]:
                 "category": "settings",
                 "description": "Settings - About",
             },
+            {
+                "id": "settings_gateway",
+                "keys": ["ctrlcmd+alt+g"],
+                "category": "settings",
+                "description": "Settings - Gateway",
+            },
+            {
+                "id": "settings_plugins",
+                "keys": ["ctrlcmd+alt+p"],
+                "category": "settings",
+                "description": "Settings - Plugins",
+            },
+            {
+                "id": "settings_shortcuts",
+                "keys": ["ctrlcmd+alt+k"],
+                "category": "settings",
+                "description": "Settings - Keyboard shortcuts",
+            },
+            {
+                "id": "settings_storage",
+                "keys": ["ctrlcmd+alt+u"],
+                "category": "settings",
+                "description": "Settings - Storage",
+            },
+            {
+                "id": "settings_developer",
+                "keys": ["ctrlcmd+alt+d"],
+                "category": "settings",
+                "description": "Settings - Developer",
+            },
 
-            # 鈹€鈹€ Session Inner Panels 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Session Inner Panels ─────────────────────────────────
             {
                 "id": "toggle_terminal",
                 "keys": ["ctrlcmd+`"],
@@ -364,7 +396,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Next panel tab",
             },
 
-            # 鈹€鈹€ Automation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Automation ───────────────────────────────────────────
             {
                 "id": "automation_open",
                 "keys": ["ctrlcmd+alt+a"],
@@ -396,7 +428,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "View automation history",
             },
 
-            # 鈹€鈹€ Workspace 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Workspace ────────────────────────────────────────────
             {
                 "id": "workspace_open",
                 "keys": ["ctrlcmd+alt+o"],
@@ -409,14 +441,8 @@ def default_keybinds() -> dict[str, Any]:
                 "category": "workspace",
                 "description": "Close workspace",
             },
-            {
-                "id": "workspace_reindex",
-                "keys": ["ctrlcmd+alt+r"],
-                "category": "workspace",
-                "description": "Re-index workspace",
-            },
 
-            # 鈹€鈹€ Notifications 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Notifications ────────────────────────────────────────
             {
                 "id": "notifications_open",
                 "keys": ["ctrlcmd+alt+m"],
@@ -430,7 +456,7 @@ def default_keybinds() -> dict[str, Any]:
                 "description": "Clear all notifications",
             },
 
-            # 鈹€鈹€ Theme & Language 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+            # ── Theme & Language ─────────────────────────────────────
             {
                 "id": "toggle_theme",
                 "keys": ["ctrlcmd+alt+t"],
@@ -465,10 +491,26 @@ def load_keybinds() -> dict[str, Any]:
         try:
             raw = path.read_text(encoding="utf-8")
             binds = json.loads(decrypt(raw))
+            # Migration: drop entries whose id is no longer in the default
+            # set.  The persisted file outlives removed features — e.g. an
+            # old default set carried workspace_reindex / settings_index /
+            # settings_rules after their underlying features were deleted.
+            # Pruning by id keeps every user's rebinding of live ids intact.
+            entries = binds.get("keybinds", [])
+            default_ids = {b["id"] for b in default_keybinds()["keybinds"]}
+            kept = [e for e in entries if isinstance(e, dict) and e.get("id") in default_ids]
+            if len(kept) != len(entries):
+                logger.info(
+                    "[keybinds] pruning %d stale entries (feature removed): %s",
+                    len(entries) - len(kept),
+                    sorted({e.get("id") for e in entries if e not in kept}),
+                )
+                binds["keybinds"] = kept
+                save_keybinds(binds)
             logger.info("[keybinds] loaded %d entries from %s", len(binds.get("keybinds", [])), path)
             return binds
         except Exception as exc:
-            logger.warning("[keybinds] failed to load from %s: %s 鈥?falling back to defaults", path, exc)
+            logger.warning("[keybinds] failed to load from %s: %s — falling back to defaults", path, exc)
 
     binds = default_keybinds()
     save_keybinds(binds)
@@ -487,7 +529,7 @@ def save_keybinds(binds: dict[str, Any]) -> None:
     encrypted = encrypt(raw)
     path.write_text(encrypted, encoding="utf-8")
 
-    # Readback verification 鈥?detect corruption early
+    # Readback verification — detect corruption early
     try:
         stored = path.read_text(encoding="utf-8")
         decrypted = decrypt(stored)
@@ -495,7 +537,7 @@ def save_keybinds(binds: dict[str, Any]) -> None:
         if verified.get("version") != binds.get("version"):
             logger.warning("[keybinds] save verification: version mismatch")
     except Exception as exc:
-        logger.error("[keybinds] save verification FAILED: %s 鈥?re-saving", exc)
+        logger.error("[keybinds] save verification FAILED: %s — re-saving", exc)
         # Retry once
         path.write_text(encrypted, encoding="utf-8")
         try:

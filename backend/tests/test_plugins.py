@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,32 +23,39 @@
 
 from __future__ import annotations
 
-"""Tests for plugin system: manifest, plugin protocol, and registry."""
+"""Tests for the plugin system: manifest, plugin protocol, and registry.
 
+The plugin stack is exercised layer by layer.  First the ``PluginManifest``
+data model: its defaults, its optional fields and its ``to_dict``
+serialisation.  Second the ``EncrePlugin`` base class contract for
+declaring tools, skills, hooks and backends.  Third the ``PluginRegistry``
+lifecycle: registration, activation, lookup, aggregation and reset.
+Fourth the market-facing truth in :meth:`PluginRegistry.snapshot_states` —
+what counts as installed on this machine, and the enable/disable ledger
+adoption that decision implies.
+"""
 
 from encre.plugins.registry import PluginRegistry
-from encre.plugins.types import EncrePlugin, PluginManifest, PluginSource
+from encre.plugins.types import EncrePlugin, PluginManifest, PluginSource, PluginState
 
 
 class TestPluginManifest:
-    """Engineered to validate PluginManifest construction and serialization.
+    """Tests for ``PluginManifest`` construction and serialisation.
 
-Tests confirm that minimal manifests default source to
-PluginSource.INSTALLED, that full manifests preserve all optional
-fields (description, author, license, homepage, dependencies, tags,
-tool/skill/hook/backend provisions), that the PluginSource enum maps
-to the correct string values, and that to_dict serialises the
-manifest faithfully.
-"""
+    Covers the defaults applied to a minimal manifest, the preservation of
+    every optional field on a fully specified one, the string value of each
+    ``PluginSource`` member, and the faithfulness of ``to_dict``.
+    """
+
     def test_verify_manifest_create_minimal(self):
-        """Validate that minimal PluginManifest defaults source to INSTALLED."""
+        """A minimal manifest applies the INSTALLED default source."""
         m = PluginManifest(name="test-plugin", version="0.1.0")
         assert m.name == "test-plugin"
         assert m.version == "0.1.0"
         assert m.source == PluginSource.INSTALLED
 
     def test_verify_manifest_create_full(self):
-        """Validate that full PluginManifest preserves all optional fields."""
+        """A fully specified manifest preserves every optional field."""
         m = PluginManifest(
             name="full-plugin",
             version="1.0.0",
@@ -74,14 +81,14 @@ manifest faithfully.
         assert "db_query" in m.provides_tools
 
     def test_verify_manifest_plugin_source_enum(self):
-        """Validate that PluginSource enum values map to correct strings."""
+        """Each ``PluginSource`` member maps to its documented string value."""
         assert PluginSource.BUNDLED.value == "bundled"
         assert PluginSource.INSTALLED.value == "installed"
         assert PluginSource.PROJECT.value == "project"
         assert PluginSource.USER.value == "user"
 
     def test_verify_manifest_to_dict(self):
-        """Validate that to_dict serialises the manifest faithfully."""
+        """``to_dict`` serialises the manifest faithfully."""
         m = PluginManifest(name="dict-test", version="0.1.0")
         d = m.to_dict()
         assert d["name"] == "dict-test"
@@ -90,16 +97,19 @@ manifest faithfully.
 
 
 class TestEncrePlugin:
-    """Engineered to validate the EncrePlugin base class contract.
+    """Tests for the ``EncrePlugin`` base class contract.
 
-Tests confirm that plugin subclasses can declare tools, hooks, and
-empty defaults for unimplemented interfaces (skills, backends), and
-that the base class provides sensible empty return values when a
-subclass overrides nothing.
-"""
+    Confirms that a subclass can declare tools and hooks, that the base
+    class supplies empty defaults for interfaces a subclass does not
+    override, and that the manifest attribute is carried through to the
+    instance.
+    """
+
     def test_verify_plugin_with_tools(self):
-        """Validate that a plugin subclass can declare and return tools."""
+        """A plugin subclass can declare and return tools."""
         class MyPlugin(EncrePlugin):
+            """Plugin that advertises a single fake tool."""
+
             manifest = PluginManifest(name="my-plugin", version="1.0.0")
 
             def get_tools(self):
@@ -111,8 +121,10 @@ subclass overrides nothing.
         assert plugin.get_tools() == ["fake_tool"]
 
     def test_verify_plugin_with_hooks(self):
-        """Validate that a plugin subclass can declare and return hooks."""
+        """A plugin subclass can declare and return hooks."""
         class HookPlugin(EncrePlugin):
+            """Plugin that advertises a single session-start hook."""
+
             manifest = PluginManifest(name="hook-plugin", version="1.0.0")
 
             def get_hooks(self):
@@ -125,8 +137,10 @@ subclass overrides nothing.
         assert hooks[0][0] == "on_session_start"
 
     def test_verify_plugin_default_returns_empty(self):
-        """Validate that unimplemented interface methods return sensible empty defaults."""
+        """Unimplemented interface methods return sensible empty defaults."""
         class EmptyPlugin(EncrePlugin):
+            """Plugin that overrides nothing and relies on every base default."""
+
             manifest = PluginManifest(name="empty", version="0.1.0")
 
         plugin = EmptyPlugin()
@@ -137,22 +151,26 @@ subclass overrides nothing.
 
 
 class TestPluginRegistry:
-    """Engineered to validate the PluginRegistry lifecycle operations.
+    """Tests for the ``PluginRegistry`` lifecycle operations.
 
-Tests cover empty registry invariants, registration, duplicate-name
-suppression, activate/deactivate toggling, unregistration, lookup by
-name, full manifest listing, and aggregate tool/skill/hook/backend
-collection from active plugins.  Reset must clear all state.
-"""
+    Covers the empty-registry invariants, registration and duplicate-name
+    suppression, activation and deactivation, unregistration, lookup by
+    name, full manifest listing, aggregate tool/skill/hook/backend
+    collection from active plugins, and the full clear performed by
+    reset.
+    """
+
     def test_verify_registry_empty(self):
-        """Validate that a new registry has zero count and zero active count."""
+        """A new registry has zero count and zero active count."""
         registry = PluginRegistry()
         assert registry.count == 0
         assert registry.active_count == 0
 
     def test_verify_registry_register_plugin(self):
-        """Validate that register increments the count."""
+        """Registering a plugin increments the count."""
         class TestPlugin(EncrePlugin):
+            """Plain plugin used to check that registration is counted."""
+
             manifest = PluginManifest(name="reg-test", version="1.0.0")
 
         registry = PluginRegistry()
@@ -160,8 +178,10 @@ collection from active plugins.  Reset must clear all state.
         assert registry.count == 1
 
     def test_verify_registry_register_duplicate_name(self):
-        """Validate that duplicate registration is suppressed."""
+        """Duplicate registration under the same name is suppressed."""
         class DupPlugin(EncrePlugin):
+            """Plugin name reused on purpose to trigger duplicate suppression."""
+
             manifest = PluginManifest(name="dup", version="1.0.0")
 
         registry = PluginRegistry()
@@ -170,8 +190,10 @@ collection from active plugins.  Reset must clear all state.
         assert registry.count == 1
 
     def test_verify_registry_activate_deactivate(self):
-        """Validate that activate/deactivate toggle active_count correctly."""
+        """Activate and deactivate toggle the active count correctly."""
         class ActPlugin(EncrePlugin):
+            """Plugin used to exercise the activation toggle."""
+
             manifest = PluginManifest(name="act-test", version="1.0.0")
 
         registry = PluginRegistry()
@@ -183,8 +205,10 @@ collection from active plugins.  Reset must clear all state.
         assert registry.active_count == 0
 
     def test_verify_registry_unregister(self):
-        """Validate that unregister removes the plugin and decrements count."""
+        """Unregister removes the plugin and decrements the count."""
         class UnregPlugin(EncrePlugin):
+            """Plugin used to check that unregistration decrements the count."""
+
             manifest = PluginManifest(name="unreg-test", version="1.0.0")
 
         registry = PluginRegistry()
@@ -193,8 +217,10 @@ collection from active plugins.  Reset must clear all state.
         assert registry.count == 0
 
     def test_verify_registry_get(self):
-        """Validate that get and get_manifest return the registered plugin."""
+        """``get`` and ``get_manifest`` return the registered plugin."""
         class GetPlugin(EncrePlugin):
+            """Plugin used to check the name-based lookup helpers."""
+
             manifest = PluginManifest(name="get-test", version="1.0.0")
 
         registry = PluginRegistry()
@@ -204,8 +230,10 @@ collection from active plugins.  Reset must clear all state.
         assert registry.get_manifest("get-test") is not None
 
     def test_verify_registry_list_all(self):
-        """Validate that list_all returns all registered manifests."""
+        """``list_all`` returns every registered manifest."""
         class ListPlugin(EncrePlugin):
+            """Plugin used to check the manifest listing helper."""
+
             manifest = PluginManifest(name="list-test", version="1.0.0")
 
         registry = PluginRegistry()
@@ -215,8 +243,10 @@ collection from active plugins.  Reset must clear all state.
         assert manifests[0].name == "list-test"
 
     def test_verify_registry_get_all_tools(self):
-        """Validate that get_all_tools collects tools from active plugins."""
+        """``get_all_tools`` collects tools from active plugins."""
         class ToolPlugin(EncrePlugin):
+            """Plugin advertising two tools for the aggregation test."""
+
             manifest = PluginManifest(name="tool-plugin", version="1.0.0")
 
             def get_tools(self):
@@ -231,8 +261,10 @@ collection from active plugins.  Reset must clear all state.
         assert isinstance(tools, list)
 
     def test_verify_registry_get_all_skills(self):
-        """Validate that get_all_skills collects skills from active plugins."""
+        """``get_all_skills`` collects skills from active plugins."""
         class SkillPlugin(EncrePlugin):
+            """Plugin advertising one skill for the aggregation test."""
+
             manifest = PluginManifest(name="skill-plugin", version="1.0.0")
 
             def get_skills(self):
@@ -247,8 +279,10 @@ collection from active plugins.  Reset must clear all state.
         assert isinstance(skills, list)
 
     def test_verify_registry_get_all_hooks(self):
-        """Validate that get_all_hooks collects hooks from active plugins."""
+        """``get_all_hooks`` collects hooks from active plugins."""
         class HookPlugin(EncrePlugin):
+            """Plugin advertising one pre-tool hook for the aggregation test."""
+
             manifest = PluginManifest(name="hook-plugin2", version="1.0.0")
 
             def get_hooks(self):
@@ -263,8 +297,10 @@ collection from active plugins.  Reset must clear all state.
         assert isinstance(hooks, dict)
 
     def test_verify_registry_get_all_backends(self):
-        """Validate that get_all_backends collects backends from active plugins."""
+        """``get_all_backends`` collects backends from active plugins."""
         class BackendPlugin(EncrePlugin):
+            """Plugin advertising one custom backend for the aggregation test."""
+
             manifest = PluginManifest(name="be-plugin", version="1.0.0")
 
             def get_backends(self):
@@ -280,8 +316,10 @@ collection from active plugins.  Reset must clear all state.
         assert "custom" in backends
 
     def test_verify_registry_reset(self):
-        """Validate that reset clears all state including active count."""
+        """Reset clears all state, including the active count."""
         class ResetPlugin(EncrePlugin):
+            """Plugin registered and activated before the reset under test."""
+
             manifest = PluginManifest(name="reset-test", version="1.0.0")
 
         registry = PluginRegistry()
@@ -290,3 +328,115 @@ collection from active plugins.  Reset must clear all state.
         registry.reset()
         assert registry.count == 0
         assert registry.active_count == 0
+
+
+class TestPluginInstalledTruth:
+    """``snapshot_states`` presence and the enable/disable ledger adoption.
+
+    The market's 已安装 tab reads ``installed`` straight off this snapshot, so
+    these two fields decide what a user sees when they open it: presence on
+    this machine (not ``installed.json`` membership, which only market/zip
+    installs ever wrote), and a switch that persists for anything present.
+    """
+
+    @staticmethod
+    def _registry(tmp_path, monkeypatch):
+        """A registry whose installed ledger lives under ``tmp_path``."""
+        ledger = tmp_path / "installed.json"
+        monkeypatch.setattr(
+            PluginRegistry, "_installed_ledger_path",
+            staticmethod(lambda: ledger),
+        )
+        return PluginRegistry()
+
+    @staticmethod
+    def _register(registry, name, **fields):
+        """Register one plain plugin whose manifest carries ``fields``."""
+        manifest = PluginManifest(name=name, version="1.0.0", **fields)
+
+        class _Plugin(EncrePlugin):
+            """No-op plugin used to exercise the installed/enabled fields."""
+
+        _Plugin.manifest = manifest
+        registry.register(_Plugin())
+
+    def _entry(self, registry: PluginRegistry, name: str) -> dict:
+        """The one snapshot entry named ``name``."""
+        return next(e for e in registry.snapshot_states() if e["name"] == name)
+
+    def test_verify_on_disk_plugin_without_ledger_is_installed(self, tmp_path, monkeypatch):
+        """A package present on disk is installed even with no ledger record."""
+        registry = self._registry(tmp_path, monkeypatch)
+        pkg = tmp_path / "plugins" / "ea-skill-demo"
+        pkg.mkdir(parents=True)
+        self._register(
+            registry, "ea-skill-demo",
+            source=PluginSource.BUNDLED, tier="system-default", pkg_dir=str(pkg),
+        )
+        entry = self._entry(registry, "ea-skill-demo")
+        assert entry["installed"] is True
+        # Nobody ever disabled it, so the absent record means enabled.
+        assert entry["enabled"] is True
+
+    def test_verify_entry_point_install_without_pkg_dir_is_installed(self, tmp_path, monkeypatch):
+        """A pip/entry-point install has no scanned dir but is installed."""
+        registry = self._registry(tmp_path, monkeypatch)
+        self._register(registry, "pip-plugin", source=PluginSource.INSTALLED)
+        assert self._entry(registry, "pip-plugin")["installed"] is True
+
+    def test_verify_pending_shell_is_not_installed(self, tmp_path, monkeypatch):
+        """A third-party shell awaiting authorisation is not installed yet."""
+        registry = self._registry(tmp_path, monkeypatch)
+        pkg = tmp_path / "plugins" / "guest"
+        pkg.mkdir(parents=True)
+        self._register(registry, "guest", pkg_dir=str(pkg))
+        registry._states["guest"] = PluginState.PENDING
+        assert self._entry(registry, "guest")["installed"] is False
+
+    def test_verify_mandatory_core_is_not_installed(self, tmp_path, monkeypatch):
+        """Hardcoded core has no package of its own, so it is not installed."""
+        registry = self._registry(tmp_path, monkeypatch)
+        self._register(
+            registry, "core-tool",
+            source=PluginSource.MANDATORY, tier="mandatory",
+        )
+        assert self._entry(registry, "core-tool")["installed"] is False
+
+    def test_verify_disable_adopts_plugin_without_record(self, tmp_path, monkeypatch):
+        """Disabling a present-but-unrecorded plugin persists, not errors."""
+        registry = self._registry(tmp_path, monkeypatch)
+        pkg = tmp_path / "plugins" / "vendor"
+        pkg.mkdir(parents=True)
+        self._register(
+            registry, "vendor",
+            source=PluginSource.BUNDLED, tier="system-default", pkg_dir=str(pkg),
+        )
+        assert registry.set_plugin_enabled("vendor", False) is True
+        assert registry.is_plugin_disabled("vendor") is True
+        # The adoption really went to disk: a fresh registry reads it back.
+        reopened = PluginRegistry()
+        assert reopened.installed_records()["vendor"]["enabled"] is False
+
+    def test_verify_enable_adopts_plugin_without_record(self, tmp_path, monkeypatch):
+        """Enabling the same kind of plugin is the mirror image of disabling."""
+        registry = self._registry(tmp_path, monkeypatch)
+        pkg = tmp_path / "plugins" / "vendor2"
+        pkg.mkdir(parents=True)
+        self._register(registry, "vendor2", pkg_dir=str(pkg), factory="demo:create_plugin", allow_local=True)
+        assert registry.set_plugin_enabled("vendor2", True) is True
+        assert registry.is_plugin_disabled("vendor2") is False
+
+    def test_verify_switch_rejects_unknown_plugin(self, tmp_path, monkeypatch):
+        """A name with no manifest has nothing to switch."""
+        registry = self._registry(tmp_path, monkeypatch)
+        assert registry.set_plugin_enabled("ghost", False) is False
+        assert not (tmp_path / "installed.json").exists()
+
+    def test_verify_switch_rejects_missing_package(self, tmp_path, monkeypatch):
+        """A manifest pointing at a directory that is gone cannot be switched."""
+        registry = self._registry(tmp_path, monkeypatch)
+        self._register(
+            registry, "gone",
+            source=PluginSource.USER, pkg_dir=str(tmp_path / "no-such-dir"),
+        )
+        assert registry.set_plugin_enabled("gone", False) is False

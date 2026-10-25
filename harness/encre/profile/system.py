@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Durable, privacy-aware user profile storage and inference merge.
 
@@ -145,7 +147,7 @@ class UserProfile:
             if len(w) > 2:
                 words.add(w)
         # CJK characters as individual features
-        for m in re.finditer("[涓€-榭裤悁-涠匡-铽縘", text):
+        for m in re.finditer("[一-鿿㐀-䶿豈-﫿]", text):
             words.add(m.group())
         return words
 
@@ -362,13 +364,10 @@ class EncreProfileSystem:
         body = self._profile.to_prompt_text()
         content = f"---\n{fm_str}\n---\n\n{body}\n"
         from encre.crypto import encrypt
-        try:
-            encrypted = encrypt(content)
-            with open(self._profile_path, "w", encoding="utf-8") as f:
-                f.write(encrypted)
-        except Exception:
-            with open(self._profile_path, "w", encoding="utf-8") as f:
-                f.write(content)
+        # Fail-closed: encryption failure must never fall back to plaintext.
+        encrypted = encrypt(content)
+        with open(self._profile_path, "w", encoding="utf-8") as f:
+            f.write(encrypted)
 
     def build_profile_prompt(self) -> str:
         """Return the full-profile prompt text."""

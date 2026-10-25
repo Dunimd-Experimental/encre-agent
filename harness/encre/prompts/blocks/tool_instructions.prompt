@@ -1,6 +1,10 @@
 ## Available Tools
 
-You have access to the following tools:
+Every tool below is **active and callable right now** — the list is rendered from the exact tool payload sent with each request, so it can never drift from what you can actually invoke:
+
 {{tools_list}}
 
-Use them as needed to accomplish the task.
+This is the complete surface for this session. Registration IS activation: there is no deferred zone, no hidden tools waiting to be unlocked.
+
+- A tool **not** in this list is **not available**. If a task seems to need one (or another prompt section references a tool you don't see), call `manage(action="discover", query="...")` to search the tool index — it reports whether a matching tool exists (discover is informational; it activates nothing). If no match exists, achieve the goal with the closest listed tool or plain text instead. Never invent arguments or assume a schema you have not seen.
+- `manage(action="plugin_...")` can change this list mid-session (install/enable/activate a plugin): after such a call, the new tools join your payload on the **next** turn.

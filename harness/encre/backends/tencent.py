@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -69,22 +67,28 @@ class TencentBackend(OpenAISSEBackend):
         super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
 
     def _thinking_request_param(self) -> dict[str, Any] | None:
-        """Hunyuan thinking models use ``enable_thinking`` (boolean).
+        """Return the provider-specific thinking toggle for Tencent Hunyuan.
 
-        Hunyuan-T1 / hunyuan-a13b thinking variants require
-        ``enable_thinking: true`` to emit ``reasoning_content``.  Regular
-        Hunyuan-Pro / Standard models do not accept this parameter, so
-        we only send it for thinking-capable model IDs.
+        The legacy Hunyuan platform (``enable_thinking`` boolean, only for
+        ``-think``/``-t1``/``-a13b`` SKUs) is scheduled for shutdown
+        (2026-12-21); its capability moved to TokenHub
+        (``tokenhub.tencentmaas.com``).  TokenHub's current models
+        (``hy4-*``/``hy3``) use the GLM-style ``{"thinking": {"type": ...}}``
+        envelope, which is on by default and can be switched off.
         """
-        if not self.thinking_enabled or not self.model:
+        if not self.model:
             return None
         m = self.model.lower()
-        # Heuristic: send the thinking toggle for Hunyuan reasoning
-        # variants (``-think``/``-t1``/``-a13b``).  Other SKUs reject the
-        # parameter, so we omit it for them.
+        # Legacy reasoning SKUs keep the old boolean toggle.
         if "think" in m or "t1" in m or "a13b" in m:
-            # Only Hunyuan reasoning-capable SKUs accept this parameter.
-            return {"enable_thinking": True}
+            return {"enable_thinking": True} if self.thinking_enabled else None
+        # TokenHub current-generation models accept the thinking envelope.
+        if "hy4" in m or "hy3" in m:
+            return {
+                "thinking": {
+                    "type": "enabled" if self.thinking_enabled else "disabled",
+                }
+            }
         return None
 
     def context_window_size(self) -> int:

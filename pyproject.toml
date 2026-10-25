@@ -29,19 +29,33 @@ testpaths = ["backend/tests"]
 markers = ["asyncio: mark a test as an async test"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py314"
 line-length = 140
 exclude = ["crates", "_native.pyi"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "RUF"]
+# Project-wide protected-header style: every source file opens with the
+# copyright/encoding banner (UP009), which pushes some imports below the
+# docstring in a few modules.  Docstrings and comments are bilingual
+# (Chinese + English) by convention, so full-width CJK punctuation in
+# strings/docstrings/comments is intentional, not an ambiguity (RUF001-003).
+ignore = ["UP009", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "E402"]
 "tests/*" = ["SIM", "ARG", "RUF"]
+# Win32 ctypes mirrors keep the exact API struct names (N801) and
+# un-annotated _fields_ tuples (RUF012); the dispatch helper predates SIM108.
+"harness/encre/plugins/transport.py" = ["N801", "RUF012", "SIM108"]
+# ws.py keeps its legacy mid-file lazy imports (E402/I001), the encoding
+# declaration pinned inside its protected header (UP009), blanket
+# noqa directives (RUF100), broad try/except-pass blocks (SIM105) and
+# mutable default tables (RUF012) — all pre-existing structure.
+"core/encre/transport/ws.py" = ["UP009", "E402", "I001", "RUF100", "SIM105", "RUF012"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 strict = true
 ignore_missing_imports = true
 exclude = ["crates/", "build/", "dist/"]

@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -21,9 +20,49 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-from typing import Any, Callable
+import contextlib
+from collections.abc import Callable
+from typing import Any
 
 from encre.tools.base import EncreTool
+
+
+def _tool_schema(tool: Any) -> dict[str, Any]:
+    """Best-effort input schema extraction for third-party tool objects."""
+    schema = getattr(tool, "input_schema", None) or getattr(tool, "parameters", None)
+    return schema if isinstance(schema, dict) else {"type": "object", "properties": {}}
+
+
+def tool_to_openai_format(tool: Any) -> dict[str, Any]:
+    """OpenAI function format; duck-typed fallback for third-party tools.
+
+    Plugin tools that predate the ``to_openai_format`` protocol (or simply
+    declare ``name``/``description``/``input_schema``) must not crash the
+    whole payload build -- fall back to a structural conversion instead.
+    """
+    fmt = getattr(tool, "to_openai_format", None)
+    if callable(fmt):
+        return fmt()
+    return {
+        "type": "function",
+        "function": {
+            "name": getattr(tool, "name", ""),
+            "description": getattr(tool, "description", ""),
+            "parameters": _tool_schema(tool),
+        },
+    }
+
+
+def tool_to_anthropic_format(tool: Any) -> dict[str, Any]:
+    """Anthropic tool format; duck-typed fallback for third-party tools."""
+    fmt = getattr(tool, "to_anthropic_format", None)
+    if callable(fmt):
+        return fmt()
+    return {
+        "name": getattr(tool, "name", ""),
+        "description": getattr(tool, "description", ""),
+        "input_schema": _tool_schema(tool),
+    }
 
 
 class ToolRegistry:
@@ -32,6 +71,11 @@ class ToolRegistry:
     Manages tool lifecycle: registration, validation, lookup, and format
     conversion (OpenAI / Anthropic).  Supports listeners for dynamic
     tool-set changes and caches converted formats for performance.
+
+    Registration IS activation: every registered tool is executable AND
+    visible in the prompt-facing views.  There is no deferred zone --
+    plugins activate at startup and their tools join the active set
+    immediately.
     """
 
     def __init__(self) -> None:
@@ -53,10 +97,8 @@ class ToolRegistry:
     def _notify_listeners(self, event: str, tool: EncreTool) -> None:
         """Notify all registered listeners of a tool registration event."""
         for cb in self._listeners:
-            try:
+            with contextlib.suppress(Exception):
                 cb(event, tool)
-            except Exception:
-                pass
 
     def _invalidate_cache(self) -> None:
         """Clear all cached format conversions so they are regenerated."""
@@ -83,7 +125,12 @@ class ToolRegistry:
         return tool
 
     def get(self, name: str) -> EncreTool | None:
-        """Look up a tool by name."""
+        """Look up a tool by name in the execution layer.
+
+        Registration makes a tool callable, period.  Visibility and
+        executability are the same thing: the prompt-facing views
+        (``get_openai_tools`` etc.) expose exactly the registered set.
+        """
         return self._tools.get(name)
 
     def list_tools(self) -> dict[str, EncreTool]:
@@ -105,10 +152,7 @@ class ToolRegistry:
 
     def get_by_intents(self, intents: list[str]) -> list[EncreTool]:
         """Filter tools that match at least one of the given intents."""
-        return [
-            t for t in self._tools.values()
-            if any(i in getattr(t, "intents", ["general"]) for i in intents)
-        ]
+        return [t for t in self._tools.values() if any(i in getattr(t, "intents", ["general"]) for i in intents)]
 
     def register_listener(self, callback: Callable[[str, EncreTool], None]) -> None:
         """Register a callback invoked on tool register/unregister events."""
@@ -118,16 +162,16 @@ class ToolRegistry:
         """Return all tools in OpenAI function-calling format (cached)."""
         key = "openai"
         if key not in self._format_cache:
-            self._format_cache[key] = [t.to_openai_format() for t in self._tools.values()]
+            self._format_cache[key] = [tool_to_openai_format(t) for t in self._tools.values()]
         return self._format_cache[key]
 
     def get_openai_tools_for_intents(self, intents: list[str]) -> list[dict[str, Any]]:
         """Return tools matching given intents in OpenAI format."""
-        return [t.to_openai_format() for t in self.get_by_intents(intents)]
+        return [tool_to_openai_format(t) for t in self.get_by_intents(intents)]
 
     def get_anthropic_tools(self) -> list[dict[str, Any]]:
         """Return all tools in Anthropic tool format (cached)."""
         key = "anthropic"
         if key not in self._format_cache:
-            self._format_cache[key] = [t.to_anthropic_format() for t in self._tools.values()]
+            self._format_cache[key] = [tool_to_anthropic_format(t) for t in self._tools.values()]
         return self._format_cache[key]

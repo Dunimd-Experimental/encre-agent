@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -51,9 +50,9 @@ import logging
 import sys
 from typing import Any
 
-_LOGURU_AVAILABLE: bool = False
 from loguru import logger as _loguru_logger  # type: ignore[import-untyped]
-_LOGURU_AVAILABLE = True
+
+_LOGURU_AVAILABLE: bool = True
 
 
 class _StdlibLogger:
@@ -400,11 +399,97 @@ def setup_logging(
             yim_logger.addHandler(file_handler)
 
 
+class _LoguruCompat:
+    """Wrap a bound loguru logger with stdlib-logging call semantics.
+
+    The harness logs with ``logger.warning("tpl %s", arg, exc_info=True)``
+    — stdlib style.  Raw loguru neither interpolates ``%s`` args nor
+    accepts ``exc_info``: every message ships as a literal template and
+    ``exc_info`` calls raise.  The shim renders the message eagerly, maps
+    ``exc_info`` onto ``.opt(exception=...)``, keeps ``extra=`` and fixes
+    the caller frame via ``depth`` so file/function/line stay accurate.
+    """
+
+    __slots__ = ("_lg",)
+
+    def __init__(self, lg: Any) -> None:
+        self._lg = lg
+
+    @staticmethod
+    def _render(message: Any, args: tuple[Any, ...]) -> str:
+        if not args:
+            return message if isinstance(message, str) else str(message)
+        try:
+            return str(message) % args
+        except Exception:
+            # Malformed template/args mismatch: keep the payload visible
+            # instead of raising out of a log call.
+            return f"{message} | args={args!r}"
+
+    def _dispatch(self, method: str, message: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        exc_info = kwargs.pop("exc_info", None)
+        if method == "exception" and exc_info is None:
+            exc_info = True
+        kwargs.pop("stack_info", None)
+        kwargs.pop("stacklevel", None)
+        extra = kwargs.pop("extra", None)
+        lg = self._lg.opt(depth=1, exception=exc_info if exc_info is not None else False)
+        if extra:
+            lg = lg.bind(**extra)
+        target = "error" if method == "exception" else method
+        getattr(lg, target)(self._render(message, args))
+
+    def trace(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("trace", message, args, kwargs)
+
+    def debug(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("debug", message, args, kwargs)
+
+    def info(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("info", message, args, kwargs)
+
+    def success(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("success", message, args, kwargs)
+
+    def warning(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("warning", message, args, kwargs)
+
+    def error(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("error", message, args, kwargs)
+
+    def critical(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("critical", message, args, kwargs)
+
+    def exception(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        self._dispatch("exception", message, args, kwargs)
+
+    def log(self, level: Any, message: Any, *args: Any, **kwargs: Any) -> None:
+        exc_info = kwargs.pop("exc_info", None)
+        kwargs.pop("stack_info", None)
+        kwargs.pop("stacklevel", None)
+        extra = kwargs.pop("extra", None)
+        lg = self._lg.opt(depth=1, exception=exc_info if exc_info is not None else False)
+        if extra:
+            lg = lg.bind(**extra)
+        lg.log(level, self._render(message, args))
+
+    def bind(self, **kw: Any) -> "_LoguruCompat":
+        return _LoguruCompat(self._lg.bind(**kw))
+
+    def opt(self, **kw: Any) -> "_LoguruCompat":
+        return _LoguruCompat(self._lg.opt(**kw))
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._lg, item)
+
+
 def get_logger(name: str = "encre") -> Any:
     """Return a logger for *name*.
 
-    Returns a **loguru** logger when loguru is installed, otherwise a
-    :class:`_StdlibLogger` wrapper that presents a compatible API.
+    Returns a **loguru** logger (wrapped with stdlib-style call semantics —
+    ``%s`` interpolation and ``exc_info``) when loguru is installed,
+    otherwise a :class:`_StdlibLogger` wrapper that presents a compatible
+    API.
 
     Args:
         name: Logger name, bound onto the loguru logger or used as the stdlib
@@ -416,7 +501,7 @@ def get_logger(name: str = "encre") -> Any:
     """
     if _LOGURU_AVAILABLE:
         assert _loguru_logger is not None
-        return _loguru_logger.bind(name=name)
+        return _LoguruCompat(_loguru_logger.bind(name=name))
     return _StdlibLogger(name)
 
 

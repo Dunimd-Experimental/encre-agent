@@ -2,7 +2,7 @@
 
 **Last updated: August 22, 2026**
 
-**Scope:** This notice applies to individuals in the United States who use Dunimd services (Encre Agent desktop application, Encre Agent Python framework and Rust native core, chat-platform integrations, PiscesLx LLM hosting, StadionOS, and Dunimd Enterprise/Cloud/Studio/Support). This is the sole applicable version for U.S. users; no other version binds you.
+**Scope:** This notice applies to individuals in the United States who use Dunimd services (Encre Agent Desktop, Encre Agent Python gateway and Rust native core, chat-platform integrations, PiscesLx LLM hosting, StadionOS, and Dunimd Enterprise/Cloud/Studio/Support). This is the sole applicable version for U.S. users; no other version binds you.
 
 > Related documents: [Terms of Service](TERMS.md) · [User Agreement](USER_AGREEMENT.md) · [Minors' Privacy](MINORS_PRIVACY.md) · [Content Guidelines](CONTENT_GUIDELINES.md) · [Data Processing Overview](DATA_PROCESSING.md)
 

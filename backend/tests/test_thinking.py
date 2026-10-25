@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,14 @@
 
 from __future__ import annotations
 
-"""Tests for resolve_thinking_config and get_thinking_budget_tokens from encre.thinking."""
+"""Tests for the extended-thinking helpers in encre.thinking.config.
+
+resolve_thinking_config maps a caller-supplied config plus a model name onto
+one of the three ThinkingConfig subtypes, and get_thinking_budget_tokens
+collapses any of those subtypes to the single token budget the LLM provider
+receives. The suite also inspects the resolver's signature to pin the public
+parameter contract.
+"""
 
 import inspect
 
@@ -36,23 +43,23 @@ from encre.utils.types import (
 
 
 class TestResolveThinkingConfig:
-    """Engineered to validate the thinking-config resolution logic based on model family and explicit config.
+    """Validate the thinking-config resolution logic for model family and explicit config.
 
-    This test class exercises the resolver across 9 scenarios 鈥?explicit config
-    passthrough for EnabledThinking and DisabledThinking, adaptive selection for
-    Claude-family models (including 'sonnet' and 'opus' substrings), disabled
-    fallback for non-supporting models (GPT-4.1), and adaptive fallback for
-    models that declare thinking support (DeepSeek, Gemini) 鈥?to ensure the
-    resolver maps model names to the correct ThinkingConfig subtype so that
-    downstream code can rely on the enabled flag and budget fields being
-    semantically consistent with the model's actual capabilities.
+    This class exercises the resolver across 9 scenarios: explicit config
+    passthrough for EnabledThinking, DisabledThinking, and AdaptiveThinking;
+    adaptive selection for Claude-family models (including the 'claude' and
+    'sonnet' substrings); a disabled fallback for a non-supporting model
+    (GPT-4.1); and adaptive fallback for DeepSeek and Gemini, which declare
+    thinking support. The goal is to ensure the resolver maps model names to
+    the correct ThinkingConfig subtype so downstream code can rely on the
+    enabled flag and budget fields matching the model's real capabilities.
     """
-    """Verify resolve_thinking_config returns correct ThinkingConfig based on inputs."""
+    """Map a model name and optional override to a concrete ThinkingConfig."""
 
     def test_verify_explicit_config_is_returned_unmodified(self):
         """Validate that an explicitly provided EnabledThinking config is returned unchanged.
 
-        The test passes an Explicit config with enabled=True and budget_tokens=5000
+        The test passes an explicit config with enabled=True and budget_tokens=5000
         and asserts result is the same object and its fields are preserved because
         an explicit config represents a caller override that must not be second-guessed
         by the resolver, regardless of the model name supplied.
@@ -161,15 +168,15 @@ class TestResolveThinkingConfig:
 
 
 class TestGetThinkingBudget:
-    """Engineered to validate the thinking-budget token calculation for each ThinkingConfig subtype.
+    """Validate the thinking-budget token calculation for each ThinkingConfig subtype.
 
-    This test class exercises AdaptiveThinking, EnabledThinking, and DisabledThinking
-    across 5 scenarios to ensure get_thinking_budget_tokens returns max_tokens for
-    adaptive configs, budget_tokens for enabled configs, and 0 for disabled configs,
-    because the budget value is the scalar that the token allocator passes to the
-    LLM provider to cap the extended-thinking output length.
+    This class exercises AdaptiveThinking, EnabledThinking, and DisabledThinking
+    across 5 scenarios to ensure get_thinking_budget_tokens returns max_tokens
+    for adaptive configs, budget_tokens for enabled configs, and 0 for disabled
+    configs, because the budget value is the scalar that the token allocator
+    passes to the LLM provider to cap the extended-thinking output length.
     """
-    """Verify get_thinking_budget_tokens returns correct token budgets."""
+    """Reduce any ThinkingConfig subtype to its effective token budget."""
 
     def test_verify_adaptive_returns_max_tokens(self):
         """Validate that AdaptiveThinking budget equals its max_tokens field.
@@ -225,14 +232,14 @@ class TestGetThinkingBudget:
 
 
 class TestResolveThinkingConfigSignature:
-    """Engineered to validate the resolve_thinking_config function signature matches expectations.
+    """Validate that the resolve_thinking_config signature matches its public contract.
 
-    This test class exercises signature introspection across 2 scenarios to ensure
-    the function accepts at least two parameters named 'config' and 'model', because
-    external callers and framework integrations depend on these parameter names
-    for keyword-based invocation and for IDE autocompletion.
+    This class exercises signature introspection across 2 scenarios to ensure
+    the function accepts at least two parameters named 'config' and 'model',
+    because external callers and framework integrations depend on these
+    parameter names for keyword-based invocation and for IDE autocompletion.
     """
-    """Verify the function signature matches expectations."""
+    """Guard against accidental renames of the resolver's public parameters."""
 
     def test_verify_signature_contains_config_and_model_parameters(self):
         """Validate that resolve_thinking_config accepts 'config' and 'model' parameters.

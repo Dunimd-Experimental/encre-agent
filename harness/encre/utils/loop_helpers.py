@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -28,6 +28,8 @@ They operate solely on their parameters.  Extracted to reduce the ~5600-line
 loop.py and enable independent testing.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -35,9 +37,19 @@ import pathlib
 import re
 from typing import Any
 
-# 鈹€鈹€ Constants 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-_WRITE_TOOL_NAMES = {"file_write", "file_edit", "write_file", "writeFile", "apply_patch"}
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
+
+# ── Constants ───────────────────────────────────────────────────────
+
+_WRITE_TOOL_NAMES = {"file_write", "file_edit", "write_file", "writeFile", "apply_patch", "bash", "terminal"}
+#: Argument keys that carry a filesystem target on write tools.  Builtin and
+#: plugin tools alike; keys are matched in this order.
+_WRITE_PATH_ARG_KEYS = (
+    "file_path", "path", "file", "target_path", "destination", "output_path",
+)
 _PROMPT_CACHE_TTL_SECONDS = 30.0
 _TASK_STAGES = ("discover", "plan", "execute", "verify", "report")
 _STUCK_LOOP_THRESHOLD = 6
@@ -57,10 +69,17 @@ _GUARDRAIL_HALT_AFTER = 8
 # IDEMPOTENT_TOOL_NAMES.
 _IDEMPOTENT_TOOL_NAMES = frozenset({
     "file_read", "glob", "grep", "web_search", "web_fetch",
-    "lsp", "codebase_search", "codebase_context", "browser",
+    "lsp", "browser",
 })
 # How many consecutive identical results on an idempotent tool count as no-progress.
 _NO_PROGRESS_AFTER = 3
+# Tools whose errors cancel the remaining sequential tools in the same batch:
+# a failed shell command often invalidates the context the following calls
+# were prepared against, so running them wastes resources on doomed work.
+_ERROR_CASCADE_TOOLS = frozenset({"bash", "bash_io", "powershell"})
+# Poll interval (seconds) used while a tool is executing to drain incremental
+# progress chunks pushed through the runtime progress emitter.
+_PROGRESS_POLL_INTERVAL = 0.1
 
 
 def _canonical_tool_signature(name: str, args_raw: str) -> str:
@@ -84,7 +103,7 @@ def _canonical_tool_signature(name: str, args_raw: str) -> str:
             compact = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
     except Exception:
         pass  # keep the whitespace-normalized raw string as the canonical form
-    return hashlib.sha256(f"{name}|{compact}".encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(f"{name}|{compact}".encode()).hexdigest()[:16]
 
 
 def _result_digest(result: str) -> str:
@@ -174,14 +193,12 @@ _PLAN_STATUS_MAP = {
     "completed": "done",
 }
 
-# 鈹€鈹€ Helper functions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Helper functions ────────────────────────────────────────────────
 
 
 def _spillover_dir(session_id: str) -> str | None:
     try:
         from encre.config import get_data_dir
-
-        import pathlib
 
         d = get_data_dir() / "spillover" / (session_id or "default")
         d.mkdir(parents=True, exist_ok=True)
@@ -249,7 +266,7 @@ def _extract_file_path(tool_name: str, result: str) -> str | None:
                 if fp and os.path.isabs(fp) and os.path.exists(fp):
                     return fp
         except (_json.JSONDecodeError, IndexError, KeyError):
-            pass
+            logger.debug("exception suppressed", exc_info=True)
         return None
 
     for pattern in [
@@ -265,7 +282,7 @@ def _extract_file_path(tool_name: str, result: str) -> str | None:
     return None
 
 
-# Language 鈫?best-fit verification tool mapping.  Used to turn the passive
+# Language → best-fit verification tool mapping.  Used to turn the passive
 # "[VERIFY] read the file" reminder into an actionable quality gate that tells
 # the model *which* existing tool to run on the changed file.
 _VERIFY_TOOL_BY_EXT = {
@@ -356,28 +373,107 @@ def _extract_apply_patch_paths(result: str) -> list[str]:
         return []
 
 
-def _extract_write_target_paths(tool_name: str, args: dict[str, Any]) -> set[str]:
-    if tool_name not in _WRITE_TOOL_NAMES:
-        return set()
+def _is_write_tool_name(tool_name: str) -> bool:
+    """Single verdict for "this tool writes files", shared by every layer.
+
+    Snapshot capture, path-conflict splitting and rollback extraction must
+    agree on which tool calls touched the filesystem -- if one of them grew
+    its own name list the two sides silently diverged and a rolled-back turn
+    restored nothing.  Plugin tools participate through their declared
+    write/edit/patch/delete name.
+    """
+    lowered = (tool_name or "").lower()
+    return lowered in _WRITE_TOOL_NAMES or _name_says_write(lowered)
+
+
+def _name_says_write(lowered_name: str) -> bool:
+    """Name heuristic for write semantics (``lowered_name`` already lowered).
+
+    Covers the plugin tool names outside the builtin set (``*_save``,
+    ``*_append``) so their files are rollback targets too; read tools
+    (``file_read``, ``*_view``) match none of these tokens.
+    """
+    return any(
+        tok in lowered_name for tok in ("write", "edit", "patch", "delete", "save", "append")
+    )
+
+
+def _extract_bash_write_paths(command: str) -> list[str]:
+    """Extract file paths that a shell command might write to.
+
+    Heuristic: catches redirections (>, >>), file operations (cp, mv, rm,
+    touch, sed -i, tee). False positives filtered downstream by path_guard.
+    """
+    paths: list[str] = []
+
+    def _add(p: str) -> None:
+        p = p.strip().strip('"\'')
+        if p and p not in paths and not p.startswith("-") and p not in ("/dev/null", "/dev/stdout", "/dev/stderr", "NUL"):
+            paths.append(p)
+
+    for m in re.finditer(r"\d*>\s*([^;\s|&<>]+)", command):
+        _add(m.group(1))
+
+    for part in re.split(r"[;|&]+", command):
+        part = part.strip()
+        if not part:
+            continue
+        for verb, groups in (
+            (r"\bcp\s+(.+?)\s+([^;\s|&]+)", (1, 2)),
+            (r"\bmv\s+(.+?)\s+([^;\s|&]+)", (1, 2)),
+            (r"\brm\s+(.+)", (1,)),
+            (r"\btouch\s+(.+)", (1,)),
+            (r"\btee\s+(.+)", (1,)),
+            (r"\bsed\s+(?:-\w*i)+\s+(.+)", (1,)),
+        ):
+            m = re.match(verb, part)
+            if m:
+                for g in groups:
+                    if g <= len(m.groups()):
+                        for p in m.group(g).split():
+                            _add(p)
+
+    return paths
+
+
+def extract_write_paths(tool_name: str, args: dict[str, Any]) -> list[str]:
+    """Raw file paths a write tool call operates on, in argument order.
+
+    Deliberately un-resolved: callers resolve through
+    :func:`encre.tools.path_guard.resolve_write_target` so the on-disk
+    resolution rule lives in exactly one place.
+    """
+    if not isinstance(args, dict) or not _is_write_tool_name(tool_name):
+        return []
+    if tool_name in ("bash", "terminal"):
+        command = args.get("command", "")
+        if isinstance(command, str) and command:
+            return _extract_bash_write_paths(command)
+    paths: list[str] = []
     if tool_name == "apply_patch":
-        paths: set[str] = set()
         for fd in (args.get("files") or []):
-            if isinstance(fd, dict):
-                for key in ("old_path", "new_path"):
-                    p = fd.get(key) or ""
-                    if p:
-                        try:
-                            paths.add(os.path.abspath(p))
-                        except Exception:
-                            paths.add(p)
+            if not isinstance(fd, dict):
+                continue
+            for key in ("old_path", "new_path"):
+                p = fd.get(key)
+                if isinstance(p, str) and p and p not in paths:
+                    paths.append(p)
         return paths
-    fp = args.get("file_path") or args.get("path") or ""
-    if not fp:
-        return set()
-    try:
-        return {os.path.abspath(fp)}
-    except Exception:
-        return {fp}
+    for key in _WRITE_PATH_ARG_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value and value not in paths:
+            paths.append(value)
+    return paths
+
+
+def _extract_write_target_paths(tool_name: str, args: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for p in extract_write_paths(tool_name, args):
+        try:
+            paths.add(os.path.abspath(p))
+        except Exception:
+            paths.add(p)
+    return paths
 
 
 def _split_writes_by_path_conflict(
@@ -424,7 +520,7 @@ async def _try_lsp_diagnostics(file_path: str) -> str:
                 if d.range and d.range.start is not None:
                     loc = f" line {d.range.start.line}:{d.range.start.character}"
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
             src = f" ({d.source})" if d.source else ""
             lines.append(f"  [{sev}]{loc}{src} {msg}")
         return "\n".join(lines)
@@ -434,9 +530,9 @@ async def _try_lsp_diagnostics(file_path: str) -> str:
 
 def _is_reference_tool(tool_name: str) -> bool:
     name = tool_name.lower()
-    if tool_name.startswith("mcp__") or name.startswith("memory_") or name.startswith("web_"):
-        return True
-    return False
+    return (
+        tool_name.startswith("mcp__") or name.startswith("memory_") or name.startswith("web_")
+    )
 
 
 def _memory_file_exists_on_disk(fn: str) -> bool:
@@ -456,7 +552,9 @@ def _memory_file_exists_on_disk(fn: str) -> bool:
     return os.path.isfile(str(get_data_dir() / "memory" / fn))
 
 
-def _extract_ref_summary(tool_name: str, args: dict[str, Any], result: str) -> str | None:
+def _extract_ref_summary(
+    tool_name: str, args: dict[str, Any], result: str,  # noqa: ARG001
+) -> str | None:
     """Build the display summary for a reference entry.
 
     Returns ``None`` when the reference should be omitted entirely: memory
@@ -525,11 +623,16 @@ def _ensure_plan_items(tool_name: str, args: dict[str, Any]) -> list[dict[str, A
         if not content:
             continue
         status = _PLAN_STATUS_MAP.get(todo.get("status", "pending"), "pending")
-        items.append({
-            "id": f"plan-{i}",
+        # Prefer the stable id the todo tool assigns (survives reordering);
+        # fall back to positional ids for raw/legacy calls.
+        item: dict[str, Any] = {
+            "id": str(todo.get("id", "")).strip() or f"plan-{i}",
             "text": content,
             "status": status,
-        })
+        }
+        if todo.get("priority"):
+            item["priority"] = todo.get("priority")
+        items.append(item)
     return items if items else None
 
 
@@ -543,7 +646,7 @@ def _infer_tool_semantics(tool_name: str, tool: Any) -> dict[str, str]:
     declared_type = bool(semantic_type) and semantic_type != "general"
 
     if not semantic_type or semantic_type == "general":
-        if lowered in _WRITE_TOOL_NAMES or "write" in lowered or "edit" in lowered or "patch" in lowered or "delete" in lowered:
+        if _is_write_tool_name(lowered):
             semantic_type = "write"
         elif "read" in lowered or "cat" in lowered or "view" in lowered:
             semantic_type = "read"
@@ -612,15 +715,11 @@ def _tool_retry_allowed(p: dict[str, Any], repeated_signatures: list[tuple[str, 
     if retryability == "manual":
         # Manual retry is permitted unless the exact call already happened in
         # the very recent past, where re-invoking is almost always a stall.
-        if any(sig == item for turn in recent for item in turn):
-            return False
-        return True
+        return not any(sig == item for turn in recent for item in turn)
     if retryability == "guarded":
         # Guarded (write/exec/orchestrate): block once the identical call has
         # been made recently, even if other tools ran in between.
-        if any(sig == item for turn in recent for item in turn):
-            return False
-        return True
+        return not any(sig == item for turn in recent for item in turn)
     return True
 
 

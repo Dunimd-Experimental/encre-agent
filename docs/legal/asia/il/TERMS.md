@@ -21,14 +21,14 @@
 
 ## 1. Formation and acceptance
 
-Registering an account, downloading the desktop app, or using a service constitutes acceptance of these terms and forms a binding agreement.
+Registering an account, downloading the Encre Agent Desktop, or using a service constitutes acceptance of these terms and forms a binding agreement.
 
 ## 2. Our services
 
 | Service | Description | Availability |
 |---|---|---|
-| **Encre Agent Desktop** | Local-first AI Agent desktop app | Windows, macOS, Linux |
-| **Encre Agent Framework** | Python framework + Rust native core | Open source, github.com/mf2023/Encre |
+| **Encre Agent Desktop** | Local-first AI Agent Encre Agent Desktop | Windows, macOS, Linux |
+| **Encre Agent** | Python gateway + Rust native core | Open source, github.com/mf2023/Encre |
 | **Chat integrations** | 18 chat-platform connectors | Per platform availability |
 | **PiscesLx** | Hosted LLM inference (optional) | Subscription |
 | **StadionOS** | OS project | Separate licence |

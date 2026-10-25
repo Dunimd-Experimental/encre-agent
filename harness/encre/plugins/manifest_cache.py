@@ -43,6 +43,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,11 @@ logger = get_logger("encre.plugins.cache")
 
 _CACHE_DIR = Path.home() / ".dunimd" / "encre"
 _CACHE_FILE = _CACHE_DIR / "ea_manifest_cache.json"
+
+#: Compact the on-disk mirror once it exceeds this many entries, and keep
+#: at most ``_MAX_ENTRIES`` of the freshest surviving entries.
+_COMPACT_THRESHOLD = 2000
+_MAX_ENTRIES = 4000
 
 #: In-memory cache loaded once per process (lazy init).
 _mem_cache: dict[str, Any] | None = None
@@ -65,8 +71,13 @@ def _ensure_cache_dir() -> None:
 
 
 def _load_cache_once() -> dict[str, Any]:
-    """Load the on-disk cache into memory once per process."""
-    global _mem_cache
+    """Load the on-disk cache into memory once per process.
+
+    A bloated mirror (test runs leave thousands of dead temp paths behind)
+    is compacted right away so the write-back shrinks the file for every
+    later startup instead of only at this process's exit.
+    """
+    global _mem_cache, _dirty
     if _mem_cache is not None:
         return _mem_cache
     try:
@@ -75,6 +86,15 @@ def _load_cache_once() -> dict[str, Any]:
                 data = json.load(f)
             if isinstance(data, dict) and "entries" in data:
                 _mem_cache = data
+                entries = data.get("entries", {})
+                if len(entries) > _COMPACT_THRESHOLD:
+                    data["entries"] = {
+                        path: value
+                        for path, value in entries.items()
+                        if os.path.isdir(os.path.dirname(path))
+                    }
+                    _dirty = True
+                    _flush_cache()
                 return _mem_cache
     except Exception:
         pass
@@ -83,12 +103,36 @@ def _load_cache_once() -> dict[str, Any]:
 
 
 def _flush_cache() -> None:
-    """Write the in-memory cache to disk if dirty."""
+    """Write the in-memory cache to disk if dirty.
+
+    The cache is shared by every path that parses a pyproject (tests point
+    it at throwaway temp trees), and it used to grow forever: a 16 MB file
+    of long-deleted test paths cost ~160 ms of JSON parsing on every real
+    startup.  Large caches are compacted on flush -- entries whose package
+    directory no longer exists are dropped, and a hard cap keeps a
+    pathological tree from growing without bound.
+    """
     global _dirty
     if not _dirty or _mem_cache is None:
         return
     try:
         _ensure_cache_dir()
+        entries = _mem_cache.get("entries", {})
+        if len(entries) > _COMPACT_THRESHOLD:
+            entries = {
+                path: value
+                for path, value in entries.items()
+                if os.path.isdir(os.path.dirname(path))
+            }
+            if len(entries) > _MAX_ENTRIES:
+                entries = dict(
+                    sorted(
+                        entries.items(),
+                        key=lambda item: float((item[1] or {}).get("mtime") or 0.0),
+                        reverse=True,
+                    )[:_MAX_ENTRIES]
+                )
+            _mem_cache["entries"] = entries
         _mem_cache["_built_at"] = time.time()
         with open(_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(_mem_cache, f, ensure_ascii=False)
@@ -100,17 +144,22 @@ def _flush_cache() -> None:
 def get_cached_pyproject(path: Path) -> dict[str, Any] | None:
     """Return cached pyproject.toml data if fresh, else None.
 
-    Uses mtime to detect staleness.  O(1) in-memory lookup after the
-    initial load.
+    Uses mtime + size to detect staleness (size catches a same-tick
+    overwrite that mtime alone would miss).  O(1) in-memory lookup after
+    the initial load.
     """
     try:
-        mtime = path.stat().st_mtime
+        st = path.stat()
     except OSError:
         return None
     cache = _load_cache_once()
     entries = cache.get("entries", {})
     entry = entries.get(str(path))
-    if isinstance(entry, dict) and entry.get("mtime") == mtime:
+    if (
+        isinstance(entry, dict)
+        and entry.get("mtime") == st.st_mtime
+        and entry.get("size") == st.st_size
+    ):
         data = entry.get("data")
         if isinstance(data, dict):
             return data
@@ -125,12 +174,12 @@ def put_cached_pyproject(path: Path, data: dict[str, Any]) -> None:
     """
     global _dirty
     try:
-        mtime = path.stat().st_mtime
+        st = path.stat()
     except OSError:
         return
     cache = _load_cache_once()
     entries = cache.setdefault("entries", {})
-    entries[str(path)] = {"mtime": mtime, "data": data}
+    entries[str(path)] = {"mtime": st.st_mtime, "size": st.st_size, "data": data}
     _dirty = True
 
 
@@ -181,6 +230,23 @@ def prune_cache(valid_paths: set[Path]) -> int:
         _dirty = True
         _flush_cache()
     return pruned
+
+
+def invalidate_cached_pyproject(path: Path) -> None:
+    """Drop the cache entry for *path* so the next parse re-reads the file.
+
+    The correct way to invalidate: storing an empty dict instead would
+    poison the cache (the entry stays mtime-valid and parses as ``{}``,
+    silently losing tier/factory metadata on subsequent startups).
+    """
+    global _dirty
+    cache = _load_cache_once()
+    entries = cache.get("entries", {})
+    key = str(path)
+    if key in entries:
+        entries.pop(key)
+        _dirty = True
+        _flush_cache()
 
 
 def clear_cache() -> None:

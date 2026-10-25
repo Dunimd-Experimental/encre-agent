@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -38,13 +37,13 @@ Priority order (first-match wins):
 """
 
 import random
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from encre.recovery import RetryBudget
 
-# 鈹€鈹€ Recovery limits 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- Recovery limits ---
 
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 EMPTY_RESPONSE_RETRY_LIMIT = 2
@@ -57,18 +56,20 @@ ESCALATED_MAX_TOKENS = 64_000
 
 
 class RecoveryAction(str, Enum):
-    """What the caller (``_run_impl``) should do next."""
-    CONTINUE = "continue"                 # retry the turn
+    """What the caller (the model phase) should do next."""
+
+    CONTINUE = "continue"  # re-issue the backend call (one attempt reserved)
     FALLBACK_CONTINUE = "fallback_continue"  # switch model and retry
-    COMPACT_CONTINUE = "compact_continue"    # compact and retry
-    CONSUMED = "consumed"                 # error withheld, continue silently
-    RELEASE = "release"                   # surface error to user (terminal)
-    RETRY = "retry"                       # retry after delay
+    COMPACT_CONTINUE = "compact_continue"  # compact and retry
+    CONSUMED = "consumed"  # withhold the error, finish the turn quietly
+    RELEASE = "release"  # surface error to user (terminal)
+    RETRY = "retry"  # retry after delay
 
 
 @dataclass
 class RecoveryDecision:
     """Result of an error classification and recovery attempt."""
+
     action: RecoveryAction
     delay: float = 0.0
     message: str = ""
@@ -77,25 +78,27 @@ class RecoveryDecision:
     detail: str = ""
 
 
-# 鈹€鈹€ Post-stream recovery decisions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- Post-stream recovery decisions ---
 
 
 class PostStreamAction(str, Enum):
     """What to do after the model finishes streaming."""
-    CONTINUE = "continue"           # retry the model call
-    FALL_THROUGH = "fall_through"   # proceed with normal turn processing
-    STOP = "stop"                   # end the session gracefully
+
+    CONTINUE = "continue"  # retry the model call
+    FALL_THROUGH = "fall_through"  # proceed with normal turn processing
+    STOP = "stop"  # end the session gracefully
 
 
 @dataclass
 class PostStreamDecision:
     """Result of post-stream recovery classification."""
+
     action: PostStreamAction
     message: str = ""
     detail: str = ""
 
 
-# 鈹€鈹€ The orchestrator 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --- The orchestrator ---
 
 
 class ErrorOrchestrator:
@@ -123,8 +126,12 @@ class ErrorOrchestrator:
             return
     """
 
-    def __init__(self, loop: Any = None) -> None:
+    def __init__(self, loop: Any = None, budget: Any = None) -> None:
         self.loop = loop
+        # Shared numeric retry budget (see encre.recovery.RetryBudget).  Each
+        # granted model-round recovery spends one "model" unit; when the
+        # budget is gone the orchestrator releases instead of looping.
+        self.budget = budget if budget is not None else RetryBudget()
 
         # Reactive compact guard (once per turn)
         self._reactive_compacted = False
@@ -154,7 +161,11 @@ class ErrorOrchestrator:
         # Fallback tracking
         self._attempt_fallback = False
 
-    # 鈹€鈹€ Turn lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # Fallback switches granted this turn (bounded by
+        # ``model_pool_max_fallbacks`` when the user configured a cap).
+        self._pool_fallbacks_this_turn = 0
+
+    # --- Turn lifecycle ---
 
     def reset_for_new_turn(self) -> None:
         """Reset per-turn recovery counters."""
@@ -166,15 +177,26 @@ class ErrorOrchestrator:
         self._server_retry_count = 0
         self._recoveries_this_turn = 0
         self._attempt_fallback = False
+        self._pool_fallbacks_this_turn = 0
+        self.budget.reset_turn()
+
+    def _grant_model_retry(self) -> bool:
+        """Spend one "model" budget unit for a retry-family decision.
+
+        Returns:
+            ``True`` when the retry may proceed; ``False`` when the numeric
+            budget is exhausted and the caller must release instead.
+        """
+        return self.budget.try_spend("model")
 
     def can_attempt_recovery(self) -> bool:
         return self._recoveries_this_turn < MAX_TOTAL_RECOVERIES_PER_TURN
 
-    # 鈹€鈹€ Backend exception handling 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # --- Backend exception handling ---
 
     def handle_backend_exception(
         self,
-        exc: BaseException,
+        exc: BaseException,  # noqa: ARG002 -- classification uses error_code/category
         *,
         error_code: str = "unknown",
         error_category: str = "unknown",
@@ -182,31 +204,44 @@ class ErrorOrchestrator:
         is_rate_limit: bool = False,
         config: Any = None,
         compact_engine: Any = None,
-        session: Any = None,
+        session: Any = None,  # noqa: ARG002 -- reserved for session-scoped recovery
         backend: Any = None,
-        system_prompt: str = "",
-        tool_call_buffers: dict | None = None,
-        turn_count: int = 0,
+        system_prompt: str = "",  # noqa: ARG002 -- reserved for recovery messages
+        tool_call_buffers: dict | None = None,  # noqa: ARG002 -- reserved
+        turn_count: int = 0,  # noqa: ARG002 -- reserved for audit
     ) -> RecoveryDecision:
         """Classify *exc* and decide what action the loop should take.
 
         Priority order:
-          1. Context overflow   鈫?compact and retry
-          2. Rate limit         鈫?fallback model if available
-          3. Network error      鈫?retry with backoff
-          4. Auth error         鈫?surface immediately
-          5. Unknown error      鈫?one silent retry
-          6. Otherwise          鈫?release to user
+          1. Context overflow   → compact and retry
+          2. Rate limit         → fallback model if available
+          3. Network error      → retry with backoff
+          4. Auth error         → surface immediately
+          5. Unknown error      → one silent retry
+          6. Otherwise          → release to user
         """
         if not self.can_attempt_recovery():
+            # The per-turn recovery budget is spent: withhold the error
+            # (priority 6) instead of surfacing it, so the tail of a turn
+            # that already burned every recovery does not end in an error
+            # banner.  ``RecoveryAction.CONSUMED`` is the only action that
+            # means "withhold": the loop flags the turn and finishes quietly.
             return RecoveryDecision(
-                RecoveryAction.RELEASE,
+                RecoveryAction.CONSUMED,
                 error_code=error_code,
                 error_category=error_category,
+                detail="recovery budget exhausted",
             )
 
         # 1. Reactive compact
         if is_context_overflow and compact_engine is not None and backend is not None:
+            if not self._grant_model_retry():
+                return RecoveryDecision(
+                    RecoveryAction.RELEASE,
+                    error_code=error_code,
+                    error_category=error_category,
+                    detail="model retry budget exhausted",
+                )
             self._recoveries_this_turn += 1
             return RecoveryDecision(
                 RecoveryAction.COMPACT_CONTINUE,
@@ -218,10 +253,27 @@ class ErrorOrchestrator:
         # 2. Model fallback
         if (is_rate_limit or error_category == "model") and config is not None:
             from encre.recovery_loop import can_fallback
+
             _pool_on = getattr(config, "model_pool_enabled", True)
             _fallback_on = getattr(config, "model_pool_fallback_enabled", False)
             if _pool_on and _fallback_on and can_fallback(config):
+                _max_fb = int(getattr(config, "model_pool_max_fallbacks", 0) or 0)
+                if _max_fb > 0 and self._pool_fallbacks_this_turn >= _max_fb:
+                    return RecoveryDecision(
+                        RecoveryAction.RELEASE,
+                        error_code=error_code,
+                        error_category=error_category,
+                        detail="pool fallback limit reached",
+                    )
+                if not self._grant_model_retry():
+                    return RecoveryDecision(
+                        RecoveryAction.RELEASE,
+                        error_code=error_code,
+                        error_category=error_category,
+                        detail="model retry budget exhausted",
+                    )
                 self._recoveries_this_turn += 1
+                self._pool_fallbacks_this_turn += 1
                 self._attempt_fallback = True
                 return RecoveryDecision(
                     RecoveryAction.FALLBACK_CONTINUE,
@@ -259,10 +311,27 @@ class ErrorOrchestrator:
         # 3.6. Server error fallback (retries exhausted — switch to next model in pool)
         if error_category == "server" and config is not None:
             from encre.recovery_loop import can_fallback
+
             _pool_on = getattr(config, "model_pool_enabled", True)
             _fallback_on = getattr(config, "model_pool_fallback_enabled", False)
             if _pool_on and _fallback_on and can_fallback(config):
+                _max_fb = int(getattr(config, "model_pool_max_fallbacks", 0) or 0)
+                if _max_fb > 0 and self._pool_fallbacks_this_turn >= _max_fb:
+                    return RecoveryDecision(
+                        RecoveryAction.RELEASE,
+                        error_code=error_code,
+                        error_category=error_category,
+                        detail="pool fallback limit reached",
+                    )
+                if not self._grant_model_retry():
+                    return RecoveryDecision(
+                        RecoveryAction.RELEASE,
+                        error_code=error_code,
+                        error_category=error_category,
+                        detail="model retry budget exhausted",
+                    )
                 self._recoveries_this_turn += 1
+                self._pool_fallbacks_this_turn += 1
                 self._attempt_fallback = True
                 return RecoveryDecision(
                     RecoveryAction.FALLBACK_CONTINUE,
@@ -271,7 +340,7 @@ class ErrorOrchestrator:
                     detail="server fallback",
                 )
 
-        # 4. Auth 鈫?surface
+        # 4. Auth → surface
         if error_category == "auth":
             return RecoveryDecision(
                 RecoveryAction.RELEASE,
@@ -280,8 +349,15 @@ class ErrorOrchestrator:
                 detail="auth error",
             )
 
-        # 5. Unknown 鈫?one silent retry
+        # 5. Unknown → one silent retry
         if error_code == "unknown" and self._unknown_error_retry_count < UNKNOWN_ERROR_RETRY_LIMIT:
+            if not self._grant_model_retry():
+                return RecoveryDecision(
+                    RecoveryAction.RELEASE,
+                    error_code=error_code,
+                    error_category=error_category,
+                    detail="model retry budget exhausted",
+                )
             self._unknown_error_retry_count += 1
             self._recoveries_this_turn += 1
             return RecoveryDecision(
@@ -298,7 +374,7 @@ class ErrorOrchestrator:
             error_category=error_category,
         )
 
-    # 鈹€鈹€ Post-stream recovery 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # --- Post-stream recovery ---
 
     def handle_post_stream(
         self,
@@ -306,20 +382,20 @@ class ErrorOrchestrator:
         finish_reason: str | None = None,
         is_empty: bool = False,
         is_truncated: bool = False,
-        tool_call_buffers: dict | None = None,
-        text_parts: list[str] | None = None,
-        thinking_parts: list[str] | None = None,
-        config: Any = None,
-        session: Any = None,
-        turn_count: int = 0,
+        tool_call_buffers: dict | None = None,  # noqa: ARG002 -- reserved
+        text_parts: list[str] | None = None,  # noqa: ARG002 -- reserved
+        thinking_parts: list[str] | None = None,  # noqa: ARG002 -- reserved
+        config: Any = None,  # noqa: ARG002 -- reserved for slot escalation
+        session: Any = None,  # noqa: ARG002 -- reserved
+        turn_count: int = 0,  # noqa: ARG002 -- reserved for audit
     ) -> PostStreamDecision:
         """Classify post-stream conditions and decide next action.
 
         Priority order:
-          1. Max output tokens 鈫?slot escalation or recovery message
-          2. Empty response    鈫?retry prompt
-          3. Truncated tool    鈫?re-issue prompt
-          4. Fall through      鈫?normal turn processing
+          1. Max output tokens → slot escalation or recovery message
+          2. Empty response    → retry prompt
+          3. Truncated tool    → re-issue prompt
+          4. Fall through      → normal turn processing
         """
         # 1. Max output tokens
         if finish_reason in ("max_tokens", "length"):
@@ -359,7 +435,7 @@ class ErrorOrchestrator:
         # 4. Fall through (normal processing or exhausted retries)
         return PostStreamDecision(PostStreamAction.FALL_THROUGH)
 
-    # 鈹€鈹€ Diagnostic 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # --- Diagnostic ---
 
     def snapshot(self) -> dict[str, Any]:
         return {

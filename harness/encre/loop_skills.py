@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,7 +21,10 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import re
+from collections.abc import Iterable
 from typing import Any
 
 
@@ -35,6 +38,17 @@ class SkillManager:
     """
 
     _SKILL_PATTERN = re.compile(r"^/(\S+)(?:\s+(.*))?", re.DOTALL)
+
+    #: Tool guides are indexed rather than inlined: one exists per tool and the
+    #: bodies are long, so a compact index keeps the prompt cheap while still
+    #: telling the model the guide exists *before* the first call.
+    _TOOL_INDEX_CAP = 40
+    _TOOL_INDEX_DESC_CHARS = 160
+    #: Per-skill body cap for injected playbooks.  A few shipped guides run to
+    #: 70k+ characters; injected whole they would consume the entire
+    #: background budget and evict the catalogue (and the guidance itself
+    #: would be head/tail-truncated anyway).
+    _ACTIVE_SKILL_MAX_CHARS = 16_000
 
     def __init__(self, skill_registry: Any | None) -> None:
         self._skill_registry = skill_registry
@@ -72,12 +86,17 @@ class SkillManager:
             return "\n\n".join(parts) + "\n\n---\n\n", remaining
         return "", prompt
 
+    @staticmethod
+    def tool_skill_name(tool_name: str) -> str:
+        """Map a tool name to its guide name (``read_file`` -> ``tool-read-file``)."""
+        return f"tool-{tool_name.replace('_', '-')}"
+
     async def collect_tool_skill(self, tool_name: str) -> None:
         if not self._skill_registry or not tool_name:
             return
         if tool_name in self._active_tool_skills:
             return
-        skill_name = f"tool-{tool_name.replace('_', '-')}"
+        skill_name = self.tool_skill_name(tool_name)
         skill = self._skill_registry.lookup(skill_name)
         if skill is None:
             return
@@ -112,13 +131,89 @@ class SkillManager:
                 continue
             self._active_doc_skills[skill_name] = body
 
+    def cache_activated_skill(self, skill_name: str, body: str) -> str:
+        """Store a skill body activated through the ``skill`` tool.
+
+        Tool guides are keyed by tool name (``tool-read-file`` ->
+        ``read_file``) so the collectors treat them as already loaded and the
+        index no longer advertises them; everything else is a domain/document
+        skill.
+
+        Returns:
+            ``"tool"``, ``"doc"``, or ``""`` when nothing was cached.
+        """
+        name = (skill_name or "").strip().lower()
+        if not name or not body:
+            return ""
+        if name.startswith("tool-"):
+            self._active_tool_skills[name[len("tool-"):].replace("-", "_")] = body
+            return "tool"
+        self._active_doc_skills[name] = body
+        return "doc"
+
+    def render_tool_skill_index(self, tool_names: Iterable[str]) -> str:
+        """Compact index of usage guides for the tools active this turn.
+
+        Tool guides are excluded from the main skill catalogue (there is one
+        per tool and their bodies are long), so without an index the model
+        never learns they exist -- and guidance used to arrive only *after* a
+        tool had already been used.  This lists every active tool that has a
+        guide so the model can activate the exact one before its first call;
+        guides that are already loaded drop out and render in full through
+        :meth:`render_active_tool_skills`.
+        """
+        if not self._skill_registry:
+            return ""
+        entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for raw in tool_names:
+            tool_name = str(raw or "").strip()
+            if not tool_name or tool_name in seen or tool_name in self._active_tool_skills:
+                continue
+            seen.add(tool_name)
+            skill_name = self.tool_skill_name(tool_name)
+            skill = self._skill_registry.lookup(skill_name)
+            if skill is None:
+                continue
+            desc = " ".join(str(getattr(skill, "description", "") or "").split())
+            if len(desc) > self._TOOL_INDEX_DESC_CHARS:
+                desc = desc[: self._TOOL_INDEX_DESC_CHARS - 3].rstrip() + "..."
+            entries.append((skill_name, desc))
+        if not entries:
+            return ""
+        hidden = max(0, len(entries) - self._TOOL_INDEX_CAP)
+        parts = [
+            "## Tool Usage Guides",
+            "",
+            "Each tool below ships a detailed guide (exact parameters, best "
+            "practices, pitfalls). Before the first call to a tool whose "
+            "arguments are not obvious from its schema, load its guide with "
+            "the `skill` tool -- for example `skill(name=\"tool-glob\")`. The "
+            "guide is injected into your next step; guides already loaded are "
+            "expanded under \"Tool Skills (auto-activated)\".",
+            "",
+        ]
+        for skill_name, desc in entries[: self._TOOL_INDEX_CAP]:
+            parts.append(f"- `{skill_name}`: {desc}" if desc else f"- `{skill_name}`")
+        if hidden:
+            parts.extend(
+                [
+                    "",
+                    f"*{hidden} more tool guides are available -- call the "
+                    "`skill` tool with `name=\"list\"` to enumerate them.*",
+                ]
+            )
+        return "\n".join(parts).rstrip()
+
     def render_active_tool_skills(self) -> str:
         if not self._active_tool_skills:
             return ""
         parts = [
             "## Tool Skills (auto-activated)",
             "",
-            "Detailed usage guidance for tools already used this session:",
+            "Detailed usage guides for tools used this session (loaded "
+            "automatically on first use, or on request through the `skill` "
+            "tool):",
             "",
         ]
         for tool_name, body in self._active_tool_skills.items():
@@ -132,17 +227,42 @@ class SkillManager:
         if not self._active_doc_skills:
             return ""
         parts = [
-            "## Document Skills (auto-activated)",
+            "## Active Skills",
             "",
-            "Domain guidance for file types referenced this session:",
+            "Playbooks activated this session (auto-selected by file type, or "
+            "loaded on request through the `skill` tool):",
             "",
         ]
         for skill_name, body in self._active_doc_skills.items():
+            text = body.strip()
+            if len(text) > self._ACTIVE_SKILL_MAX_CHARS:
+                where = ""
+                if self._skill_registry is not None:
+                    skill = self._skill_registry.lookup(skill_name)
+                    path = str(getattr(skill, "file_path", "") or "")
+                    if path:
+                        where = f" Full text: {path}"
+                text = (
+                    text[: self._ACTIVE_SKILL_MAX_CHARS].rstrip()
+                    + "\n\n...[skill truncated to keep context bounded; "
+                    "read the rest from disk if it is needed."
+                    + where
+                    + "]"
+                )
             parts.append(f"### {skill_name}")
             parts.append("")
-            parts.append(body.strip())
+            parts.append(text)
             parts.append("")
         return "\n".join(parts).rstrip()
+
+    # Catalogue sizing.  The list is the model's only map of the skill library:
+    # cutting it in alphabetical order silently makes whole families
+    # unreachable (with 224 skills and a cap of 120 the tail -- travel, video,
+    # wechat, xlsx, youtube ... -- never appeared at all).  Descriptions are
+    # therefore shortened per entry instead, which keeps every skill visible
+    # at roughly the same prompt cost as the old truncated list.
+    _CATALOGUE_CAP = 260
+    _CATALOGUE_DESC_CHARS = 104
 
     def render_skill_catalogue(self) -> str:
         if not self._skill_registry:
@@ -153,35 +273,27 @@ class SkillManager:
         ]
         if not skills:
             return ""
-        groups: dict[str, list[str]] = {}
-        # Cap the inline catalogue so a huge skill library (e.g. 276 built-in
-        # skills) can never push the system prompt past its hard cap and get
-        # truncated mid-list.  The tail stays reachable via the ``skill`` tool
-        # itself, which is how the catalogue instructs the model to discover
-        # anything not listed.
-        _CATALOGUE_CAP = 120
-        for s in sorted(skills, key=lambda x: x.name)[:_CATALOGUE_CAP]:
-            prefix = s.name.split("-", 1)[0] if "-" in s.name else "general"
-            groups.setdefault(prefix, []).append(
-                f"- `/{s.name}`: {s.description.strip()}"
-            )
+        skills.sort(key=lambda s: s.name)
+        shown = skills[: self._CATALOGUE_CAP]
         total = len(skills)
         parts = [
-            "Invoke a skill by typing `/skill-name <args>` (aliases also work), "
-            "or call the `skill` tool with `name` (and optional `args`) to "
-            "activate it yourself when the request matches a skill's purpose.",
-            "Use a skill when the request matches its purpose.",
+            "Skills are reusable playbooks for whole task types (decks, PDFs, "
+            "Redis work, video editing, travel planning ...). Invoke one by "
+            "typing `/skill-name <args>` (aliases also work), or call the "
+            "`skill` tool with `name` (and optional `args`) when the request "
+            "matches a skill's purpose. Descriptions are shortened here -- "
+            "activate a skill to read the full playbook.",
             "",
         ]
-        for group_name in sorted(groups):
-            parts.append(f"**{group_name}**")
-            parts.extend(groups[group_name])
+        for s in shown:
+            desc = " ".join(str(getattr(s, "description", "") or "").split())
+            if len(desc) > self._CATALOGUE_DESC_CHARS:
+                desc = desc[: self._CATALOGUE_DESC_CHARS - 3].rstrip(" ,.;:-") + "..."
+            parts.append(f"- `/{s.name}`: {desc}" if desc else f"- `/{s.name}`")
+        if total > len(shown):
             parts.append("")
-        if total > _CATALOGUE_CAP:
             parts.append(
-                f"*{total - _CATALOGUE_CAP} more skills are available 鈥?call the "
-                "`skill` tool with `list` to enumerate them, or guess a "
-                "`/skill-name` for a purpose-matched skill.*"
+                f"*{total - len(shown)} more skills are available — call the "
+                "`skill` tool with `list` to enumerate them.*"
             )
-            parts.append("")
         return "\n".join(parts).rstrip()

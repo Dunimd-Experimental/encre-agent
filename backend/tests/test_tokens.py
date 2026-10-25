@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for token estimation utilities: estimate_tokens, count_message_tokens."""
+"""Tests for the token estimation utilities in encre.utils.tokens.
+
+The suite covers estimate_tokens and its estimate_tokens_simple alias on
+plain, long, Unicode, code, and whitespace inputs, count_message_tokens over
+the OpenAI-style message shapes the agent loop emits, and the
+is_tiktoken_available detection helper that selects between estimators.
+"""
 
 
 from encre.utils.tokens import (
@@ -35,9 +41,9 @@ from encre.utils.tokens import (
 
 
 class TestEstimateTokens:
-    """Engineered to validate the estimate_tokens utility across input types and edge cases.
+    """Validate the estimate_tokens utility across input types and edge cases.
 
-    This test class exercises empty string, short string, long string, integer return
+    This class exercises empty string, short string, long string, integer return
     type, non-negative guarantee, length proportionality, model kwarg acceptance,
     Unicode text, code snippets, special characters, and pure whitespace across
     11 scenarios to ensure the estimator returns stable, monotonic, non-negative
@@ -45,7 +51,7 @@ class TestEstimateTokens:
     text without raising. The design uses a character-count heuristic so that
     token estimation remains fast and deterministic without requiring tiktoken.
     """
-    """Verify estimate_tokens() returns sensible integer counts."""
+    """Estimate the token cost of a single string for budget accounting."""
 
     def test_verify_empty_string_returns_zero(self):
         """Validate that estimate_tokens('') returns 0.
@@ -126,19 +132,20 @@ class TestEstimateTokens:
         """Validate that passing model='gpt-4' does not raise and returns a positive integer.
 
         The test asserts isinstance(count, int) and count > 0 because the estimator
-        must accept any model string without error so that callers can pass
-        the resolved model name from the config layer without pre-filtering.
+        must accept any model string without error so that callers can pass the
+        resolved model name from the config layer without pre-filtering.
         """
         count = estimate_tokens("hello", model="gpt-4")
         assert isinstance(count, int)
         assert count > 0
 
     def test_verify_unicode_text_returns_positive_integer(self):
-        """Validate that estimate_tokens handles CJK Unicode characters without error.
+        """Validate that estimate_tokens handles multi-byte CJK Unicode text without error.
 
-        The test passes '浣犲ソ涓栫晫' and asserts isinstance(count, int) and count > 0
-        because the estimator must handle multi-byte characters; an error or zero
-        would break token accounting for non-ASCII agent conversations.
+        The test passes a four-character CJK string and asserts
+        isinstance(count, int) and count > 0 because the estimator must handle
+        multi-byte characters; an error or zero would break token accounting
+        for non-ASCII agent conversations.
         """
         count = estimate_tokens("浣犲ソ涓栫晫")
         assert isinstance(count, int)
@@ -178,14 +185,14 @@ class TestEstimateTokens:
 
 
 class TestEstimateTokensSimple:
-    """Engineered to validate the estimate_tokens_simple compatibility wrapper.
+    """Validate the estimate_tokens_simple compatibility wrapper.
 
-    This test class exercises return type, empty-string behavior, and
-    consistency with the main estimate_tokens function across 3 scenarios
-    to ensure the simple wrapper is a drop-in alias that preserves the
-    same contract as the primary estimation function.
+    This class exercises return type, empty-string behavior, and consistency
+    with the main estimate_tokens function across 3 scenarios to ensure the
+    simple wrapper is a drop-in alias that preserves the same contract as the
+    primary estimation function.
     """
-    """Verify estimate_tokens_simple() compatibility wrapper."""
+    """Backward-compatible alias for estimate_tokens."""
 
     def test_verify_simple_wrapper_returns_an_integer(self):
         """Validate that estimate_tokens_simple('hello') returns an int.
@@ -210,9 +217,9 @@ class TestEstimateTokensSimple:
     def test_verify_simple_wrapper_is_consistent_with_estimate_tokens(self):
         """Validate that estimate_tokens_simple and estimate_tokens return the same value for identical input.
 
-        The test asserts c1 == c2 because the simple wrapper must be a
-        strict alias; any divergence would indicate a regression in the
-        wrapper implementation that could silently change cost estimates.
+        The test asserts c1 == c2 because the simple wrapper must be a strict
+        alias; any divergence would indicate a regression in the wrapper
+        implementation that could silently change cost estimates.
         """
         c1 = estimate_tokens_simple("hello world")
         c2 = estimate_tokens("hello world")
@@ -220,15 +227,15 @@ class TestEstimateTokensSimple:
 
 
 class TestCountMessageTokens:
-    """Engineered to validate the count_message_tokens utility for structured message dicts.
+    """Validate the count_message_tokens utility for structured message dicts.
 
-    This test class exercises single message, empty list, multiple messages,
-    empty content, missing content key, list-content blocks, tool calls,
-    model kwarg acceptance, and batch monotonic growth across 9 scenarios
-    to ensure the message-level estimator handles the full range of
-    OpenAI-style message shapes that the agent loop produces.
+    This class exercises single message, empty list, multiple messages, empty
+    content, missing content key, list-content blocks, tool calls, model kwarg
+    acceptance, and batch monotonic growth across 9 scenarios to ensure the
+    message-level estimator handles the full range of OpenAI-style message
+    shapes that the agent loop produces.
     """
-    """Verify count_message_tokens() for message dicts."""
+    """Estimate the total token cost of a conversation message list."""
 
     def test_verify_single_message_returns_positive_integer(self):
         """Validate that count_message_tokens on a single user message returns a positive int.
@@ -272,8 +279,8 @@ class TestCountMessageTokens:
 
         The test asserts count >= 4 because the OpenAI chat format attaches
         role and delimiter tokens even when content is blank, and the estimator
-        must account for this fixed overhead so that empty-content messages
-        do not cost zero and bypass budget limits.
+        must account for this fixed overhead so that empty-content messages do
+        not cost zero and bypass budget limits.
         """
         msgs = [{"role": "user", "content": ""}]
         count = count_message_tokens(msgs)
@@ -285,8 +292,8 @@ class TestCountMessageTokens:
 
         The test passes [{'role': 'user'}] and asserts isinstance(count, int)
         because malformed messages can appear in wild input and the estimator
-        must degrade safely rather than raising KeyError, which would crash
-        the budget calculation mid-turn.
+        must degrade safely rather than raising KeyError, which would crash the
+        budget calculation mid-turn.
         """
         msgs = [{"role": "user"}]
         count = count_message_tokens(msgs)
@@ -360,21 +367,21 @@ class TestCountMessageTokens:
 
 
 class TestTiktokenAvailability:
-    """Engineered to validate the is_tiktoken_available detection helper.
+    """Validate the is_tiktoken_available detection helper.
 
-    This test class exercises the import-path check across 1 scenario to
-    ensure the helper returns a bool regardless of whether tiktoken is
-    installed, because callers branch on this value to select the accurate
-    tiktoken-backed estimator versus the fast heuristic estimator.
+    This class exercises the import-path check across 1 scenario to ensure the
+    helper returns a bool regardless of whether tiktoken is installed, because
+    callers branch on this value to select the accurate tiktoken-backed
+    estimator versus the fast heuristic estimator.
     """
-    """Verify is_tiktoken_available() reports truthfully."""
+    """Report whether the accurate tiktoken backend is importable."""
 
     def test_verify_is_tiktoken_available_returns_a_bool(self):
         """Validate that is_tiktoken_available() returns a bool without raising.
 
-        The test asserts isinstance(available, bool) because the helper is
-        used in conditional branches throughout the token estimation layer;
-        a non-bool return or an exception would break the estimator selection
+        The test asserts isinstance(available, bool) because the helper is used
+        in conditional branches throughout the token estimation layer; a
+        non-bool return or an exception would break the estimator selection
         logic and force every caller to wrap the call in try/except.
         """
         available = is_tiktoken_available()

@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 Shared SSE (Server-Sent Events) streaming backend for OpenAI-compatible APIs.
@@ -45,8 +47,8 @@ event types:
 Tool call buffering
 -------------------
 Tool call arguments arrive as a sequence of string deltas that must be
-concatenated and parsed as JSON.  The backend buffers these deltas in
-:attr:`_tool_call_buffers`, keyed by tool call index, and emits a complete
+concatenated and parsed as JSON.  The backend buffers these deltas in a
+per-request buffer, keyed by tool call index, and emits a complete
 :class:`BackendToolCall` only when the stream finishes or the choice ends.
 
 Non-stream fallback
@@ -66,7 +68,7 @@ from typing import Any
 import httpx
 
 from encre.backends.auth import AuthManager
-from encre.backends.base import BaseBackend
+from encre.backends.base import BaseBackend, normalize_usage
 from encre.backends.connection import (
     ConnectionHealthMonitor,
     format_connection_error,
@@ -83,48 +85,8 @@ from encre.utils.types import (
 )
 
 
-def _normalize_usage(raw: dict[str, Any] | None) -> dict[str, Any]:
-    """Normalize provider-specific usage fields to standard keys.
-
-    OpenAI-compatible APIs return ``prompt_tokens`` / ``completion_tokens``,
-    while Anthropic uses ``input_tokens`` / ``output_tokens``.  This function
-    maps both conventions to the standard ``input_tokens`` / ``output_tokens`` /
-    ``total_tokens`` triplet.
-
-    Cache hit tokens are also normalized to the standard
-    ``cache_read_input_tokens`` key so the router's cost tracker can compute
-    cache hit ratios and savings:
-
-    * OpenAI reports ``prompt_tokens_details.cached_tokens`` (a subset of
-      ``prompt_tokens``).
-    * DeepSeek reports ``prompt_cache_hit_tokens`` (a subset of
-      ``prompt_tokens``).
-    * Anthropic-style payloads already use ``cache_read_input_tokens``
-      (reported separately from ``input_tokens``).
-    """
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, Any] = {}
-    for src, dst in [
-        ("prompt_tokens", "input_tokens"),
-        ("completion_tokens", "output_tokens"),
-        ("total_tokens", "total_tokens"),
-        ("input_tokens", "input_tokens"),
-        ("output_tokens", "output_tokens"),
-        ("cache_read_input_tokens", "cache_read_input_tokens"),
-    ]:
-        if src in raw:
-            out[dst] = raw[src]
-    cached = 0
-    # OpenAI: prompt_tokens_details.cached_tokens
-    details = raw.get("prompt_tokens_details")
-    if isinstance(details, dict):
-        cached += details.get("cached_tokens", 0) or 0
-    # DeepSeek: prompt_cache_hit_tokens
-    cached += raw.get("prompt_cache_hit_tokens", 0) or 0
-    if cached > 0:
-        out["cache_read_input_tokens"] = cached + (out.get("cache_read_input_tokens", 0) or 0)
-    return out
+# ``normalize_usage`` (the single canonical usage normalizer) lives in
+# ``encre.backends.base`` and is shared by all backends.
 
 
 # Field names that different providers use for chain-of-thought / reasoning
@@ -171,6 +133,138 @@ def _extract_reasoning_text(obj: Any) -> str:
     return ""
 
 
+# ── Outbound message sanitization (single source of truth) ────────────
+
+# Protocol fields each OpenAI-format role accepts.  Encre-internal fields
+# (``id``, ``branch_id``, ``seq_in_branch``, ``parent_id``, ``usage``,
+# ``segments``, ``created_at``, ``_client_id``, ``is_error``,
+# ``sub_agent_messages``, ``errorMessage`` ...) must never reach the wire:
+# strict providers reject unknown message fields with HTTP 400.
+# ``reasoning_content`` is kept on assistant messages when thinking is
+# enabled -- official provider rules (api-docs.deepseek.com "Thinking
+# Mode", docs.bigmodel.cn "Thinking Mode", platform.kimi.ai "Thinking
+# Models"): assistant messages that carry tool_calls MUST have their
+# ``reasoning_content`` passed back in all subsequent requests (HTTP 400
+# "must be passed back" otherwise), and every provider that emits it
+# tolerates or ignores it elsewhere.
+_OPENAI_MSG_FIELDS: dict[str, frozenset[str]] = {
+    "system": frozenset({"role", "content", "name"}),
+    "user": frozenset({"role", "content", "name"}),
+    "assistant": frozenset({"role", "content", "name", "tool_calls", "reasoning_content"}),
+    "tool": frozenset({"role", "content", "tool_call_id"}),
+}
+
+# Fields allowed inside an OpenAI ``tool_calls`` item.
+_OPENAI_TOOL_CALL_FIELDS: frozenset[str] = frozenset({"id", "type", "function"})
+
+
+def _coerce_openai_content(content: Any) -> Any:
+    """Return a string or list content block; replace ``None`` with ``""``.
+
+    ``None`` content is accepted by OpenAI but rejected by several
+    OpenAI-compatible providers (DeepSeek rejects it on assistant
+    messages that carry ``tool_calls``).
+    """
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        return content
+    if isinstance(content, str):
+        return content
+    return str(content)
+
+
+def sanitize_openai_messages(
+    messages: list[dict[str, Any]],
+    keep_reasoning: bool = True,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Project Encre history onto the strict OpenAI wire format.
+
+    The single choke point shared by every OpenAI-protocol backend
+    (OpenAI, DeepSeek, Kimi, GLM, Volcengine, Groq, Ollama, generic
+    compatible endpoints, ...).  For each message it keeps only the
+    protocol fields of its role, coerces ``None`` content to ``""``,
+    and rebuilds ``tool_calls`` items down to ``id`` / ``type`` /
+    ``function`` (with string arguments, ``"{}"`` when missing).
+
+    ``keep_reasoning`` controls whether the assistant ``reasoning_content``
+    field is forwarded.  It must be True whenever the request enables
+    thinking: DeepSeek requires the reasoning of tool-call assistants to
+    be passed back in ALL subsequent requests and returns HTTP 400
+    "The ``reasoning_content`` in the thinking mode must be passed back
+    to the API" otherwise; GLM interleaved thinking and Kimi Preserved
+    Thinking have the same requirement.  Non-thinking requests keep it
+    stripped because legacy reasoning endpoints reject the field.
+
+    Returns ``(projected_messages, effective_keep_reasoning)``.  The
+    effective flag widens to True when the history itself carries
+    reasoning: reasoning in the stored session proves the conversation
+    has been running server-side thinking (possibly on a previous
+    backend -- model switches keep the session, so the flag must
+    survive backend changes), and stripping it then would 400 the very
+    endpoints that require the replay.
+
+    Internal-only fields (``reasoning_blocks``, ``segments``,
+    ``branch_id``, ``usage``, ``_client_id``, ...) never pass through:
+    only whitelisted role fields survive, so a session written by a
+    native-protocol backend (Anthropic ``reasoning_blocks``) can be
+    replayed on any OpenAI-protocol backend without leaking foreign
+    shapes.
+
+    The input list is never mutated; unknown-role dicts pass through
+    unchanged so exotic message shapes are not silently destroyed.
+    """
+    if not keep_reasoning:
+        keep_reasoning = any(
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and (m.get("reasoning_content") or m.get("reasoning_blocks"))
+            for m in messages
+        )
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", ""))
+        allowed = _OPENAI_MSG_FIELDS.get(role)
+        if allowed is None:
+            out.append(msg)
+            continue
+        clean: dict[str, Any] = {k: v for k, v in msg.items() if k in allowed}
+        clean["role"] = role
+        clean["content"] = _coerce_openai_content(msg.get("content"))
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                clean_calls: list[dict[str, Any]] = []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    clean_tc = {k: v for k, v in tc.items() if k in _OPENAI_TOOL_CALL_FIELDS}
+                    func = tc.get("function")
+                    if isinstance(func, dict):
+                        args = func.get("arguments")
+                        if args is None:
+                            args = "{}"
+                        elif not isinstance(args, str):
+                            args = str(args)
+                        clean_tc["function"] = {
+                            "name": str(func.get("name", "")),
+                            "arguments": args,
+                        }
+                    clean_calls.append(clean_tc)
+                clean["tool_calls"] = clean_calls
+            else:
+                # Drop empty/absent tool_calls: several providers reject an
+                # assistant message carrying an empty ``tool_calls: []``.
+                clean.pop("tool_calls", None)
+            reasoning = msg.get("reasoning_content")
+            if keep_reasoning and isinstance(reasoning, str) and reasoning:
+                clean["reasoning_content"] = reasoning
+        out.append(clean)
+    return out, keep_reasoning
+
+
 class OpenAISSEBackend(MultimodalMixin, BaseBackend):
     """Base backend for OpenAI-protocol SSE streaming.
 
@@ -207,6 +301,7 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
         fallback_keys: list[str] | None = None,
         reasoning_effort: str = "",
         thinking_enabled: bool = True,
+        extra_headers: dict[str, str] | None = None,
         **_kwargs: Any,
     ) -> None:
         """Initialise the SSE backend.
@@ -240,8 +335,19 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
         self.http_timeout = http_timeout
         self.reasoning_effort = reasoning_effort
         self.thinking_enabled = thinking_enabled
+        # Runtime observation: True once any response from this provider
+        # carried thinking content (``reasoning_content`` / ``reasoning`` /
+        # ``thinking`` / ``thought``).  This is the only reliable signal
+        # that the server-side thinking mode is active -- model-name
+        # heuristics break the moment a user aliases a model (e.g. points
+        # "PRO5" at a MiniMax endpoint), so thinking replay is driven by
+        # what the server actually does, never by hardcoded names.
+        self._server_thinking_observed = False
+        # Custom per-provider HTTP headers (OpenCode's ``options.headers``
+        # equivalent).  Merged into every request with user values winning
+        # over the built-in defaults (Content-Type / Authorization).
+        self.extra_headers: dict[str, str] = dict(extra_headers or {})
         self._client: httpx.AsyncClient | None = None
-        self._tool_call_buffers: dict[int, dict[str, Any]] = {}
 
         # -- Auth management --
         if auth_manager is not None:
@@ -293,7 +399,7 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
             await self._client.aclose()
             self._client = None
 
-    # 鈹€鈹€ Model listing 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Model listing ──────────────────────────────────────────────────
 
     async def list_models(self) -> list[str]:
         """Fetch available models from the provider's GET /models endpoint.
@@ -353,7 +459,9 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
         Includes the ``Authorization`` header when ``self.api_key`` is set,
         and always includes ``Content-Type: application/json``.
         When an :class:`AuthManager` is configured, the current active key
-        is used (allowing key rotation to take effect).
+        is used (allowing key rotation to take effect).  Custom
+        ``extra_headers`` are merged last, so user values override the
+        built-in defaults per-header.
         """
         headers: dict[str, str] = {
             "Content-Type": "application/json",
@@ -365,7 +473,30 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
         )
         if current_key:
             headers["Authorization"] = f"Bearer {current_key}"
+        if self.extra_headers:
+            headers.update(self.extra_headers)
         return headers
+
+    @property
+    def _keep_reasoning_content(self) -> bool:
+        """Whether assistant ``reasoning_content`` is forwarded upstream.
+
+        Driven purely by runtime facts, never by model-name heuristics:
+
+        * the user's thinking toggle is on, or
+        * a previous response from this provider actually carried thinking
+          content (:attr:`_server_thinking_observed`) -- providers whose
+          server-side thinking cannot be disabled (or ignore the toggle)
+          are covered by this observation automatically, whatever the
+          model is named in the user's config.
+
+        When both are false the request runs non-thinking, and legacy
+        reasoning endpoints reject the ``reasoning_content`` field, so it
+        stays stripped.
+        """
+        return bool(getattr(self, "thinking_enabled", False)) or bool(
+            getattr(self, "_server_thinking_observed", False)
+        )
 
     def _build_request_data(
         self,
@@ -389,6 +520,14 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
         Returns:
             A dictionary ready to be serialised as JSON for the API request body.
         """
+        # Project Encre history onto the strict OpenAI wire format at this
+        # single choke point: strip internal fields, coerce content, rebuild
+        # tool_calls, and forward ``reasoning_content`` when thinking is on
+        # (DeepSeek/GLM/Kimi thinking rules).  Every OpenAI-protocol backend
+        # goes through here (DeepSeek/Kimi/Volcengine overrides call super).
+        messages, _keep = sanitize_openai_messages(
+            messages, keep_reasoning=self._keep_reasoning_content
+        )
         data: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -396,6 +535,13 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
             "max_tokens": max(max_tokens, 1),
             "stream": stream,
         }
+        # Provider "advanced config" sampling overrides win over the loop's
+        # internal defaults (some relay servers force-require these fields).
+        self._merge_sampling_overrides(data)
+        if stream and self._include_stream_usage:
+            # Ask the provider to emit a final usage frame.  Providers that
+            # reject unknown fields must keep ``_include_stream_usage`` off.
+            data["stream_options"] = {"include_usage": True}
         if tools:
             data["tools"] = tools
             data["tool_choice"] = tool_choice
@@ -449,6 +595,13 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                 "type": "enabled" if self.thinking_enabled else "disabled",
             }
         }
+
+    # Whether to send ``stream_options: {"include_usage": true}`` on
+    # streaming requests so the final usage frame is emitted.  Only
+    # providers known to accept this OpenAI-spec field enable it; generic
+    # OpenAI-compatible endpoints keep it off because some strict providers
+    # reject unknown body fields with HTTP 400.
+    _include_stream_usage: bool = False
 
     @staticmethod
     def _apply_prompt_caching_openai(
@@ -667,9 +820,16 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                         response=response,
                     )
                 response.raise_for_status()
-                self._tool_call_buffers.clear()
+                # Per-request tool call buffer -- never shared across
+                # concurrent chats (an instance-level dict would leak
+                # partial tool calls between requests).
+                tool_call_buffers: dict[int, dict[str, Any]] = {}
 
                 _stream_usage: dict[str, Any] | None = None
+                # Buffer the finish reason: usage typically arrives in the
+                # final choices-less frame, so Finish is emitted only after
+                # the stream has ended and usage has been captured.
+                _finish_reason: str | None = None
                 _t_first = time.time()
                 _first_event = True
 
@@ -682,18 +842,11 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
 
                     payload = line[6:].strip()
 
-                    # End-of-stream sentinel.
+                    # End-of-stream sentinel.  Break so Finish is emitted
+                    # once after the loop, with any late usage frame already
+                    # captured.
                     if payload == "[DONE]":
-                        # Flush any buffered tool calls.
-                        for tc in self._tool_call_buffers.values():
-                            yield BackendToolCall(
-                                id=tc["id"],
-                                name=tc["name"],
-                                arguments=tc["arguments"],
-                            )
-                        self._tool_call_buffers.clear()
-                        yield BackendFinish(reason="stop", usage=_stream_usage)
-                        return
+                        break
 
                     try:
                         chunk = json.loads(payload)
@@ -710,7 +863,7 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                     if not choices:
                         # Usage may appear in a choices-less final chunk
                         if "usage" in chunk:
-                            _stream_usage = _normalize_usage(chunk["usage"])
+                            _stream_usage = normalize_usage(chunk["usage"])
                         continue
 
                     delta = choices[0].get("delta", {})
@@ -718,7 +871,7 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
 
                     # Capture usage from final chunk
                     if "usage" in chunk:
-                        _stream_usage = _normalize_usage(chunk["usage"])
+                        _stream_usage = normalize_usage(chunk["usage"])
 
                     # Extra events (reasoning_content, etc.)
                     # Most providers put reasoning text under
@@ -732,6 +885,11 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                         _extra_events = self._extract_extra_stream_events(choices[0])
                     if not _extra_events:
                         _extra_events = self._extract_extra_stream_events(chunk)
+                    if _extra_events:
+                        # The server is actually thinking -- remember it so
+                        # follow-up requests replay ``reasoning_content``
+                        # (DeepSeek/GLM/Kimi thinking rules).
+                        self._server_thinking_observed = True
                     for extra in _extra_events:
                         yield extra
 
@@ -745,13 +903,13 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                     if tool_calls:
                         for tc in tool_calls:
                             idx = tc.get("index", 0)
-                            if idx not in self._tool_call_buffers:
-                                self._tool_call_buffers[idx] = {
+                            if idx not in tool_call_buffers:
+                                tool_call_buffers[idx] = {
                                     "id": tc.get("id") or f"call_{idx}",
                                     "name": "",
                                     "arguments": "",
                                 }
-                            buf = self._tool_call_buffers[idx]
+                            buf = tool_call_buffers[idx]
 
                             func = tc.get("function", {})
                             func_name = func.get("name", "")
@@ -771,16 +929,29 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                                     index=idx, key="arguments", value=func_args
                                 )
 
-                    # Finish reason signals the end of this choice.
+                    # Finish reason signals the end of this choice.  Flush
+                    # buffered tool calls now, but defer Finish until the
+                    # stream ends so the final usage frame is included.
                     if finish_reason:
-                        for tc in self._tool_call_buffers.values():
+                        _finish_reason = finish_reason
+                        for tc in tool_call_buffers.values():
                             yield BackendToolCall(
                                 id=tc["id"],
                                 name=tc["name"],
                                 arguments=tc["arguments"],
                             )
-                        self._tool_call_buffers.clear()
-                        yield BackendFinish(reason=finish_reason, usage=_stream_usage)
+                        tool_call_buffers.clear()
+
+                # Stream ended: flush any remaining buffered tool calls and
+                # emit Finish with the usage captured from the final frame.
+                for tc in tool_call_buffers.values():
+                    yield BackendToolCall(
+                        id=tc["id"],
+                        name=tc["name"],
+                        arguments=tc["arguments"],
+                    )
+                tool_call_buffers.clear()
+                yield BackendFinish(reason=_finish_reason or "stop", usage=_stream_usage)
             finally:
                 await response.aclose()
 
@@ -833,7 +1004,7 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                 return
 
             choices = result.get("choices", [])
-            _non_stream_usage = _normalize_usage(result["usage"]) if result.get("usage") else None
+            _non_stream_usage = normalize_usage(result["usage"]) if result.get("usage") else None
             if not choices:
                 yield BackendFinish(reason="stop", usage=_non_stream_usage)
                 return
@@ -850,6 +1021,10 @@ class OpenAISSEBackend(MultimodalMixin, BaseBackend):
                 _extra_events = self._extract_extra_non_stream_events(choice)
             if not _extra_events:
                 _extra_events = self._extract_extra_non_stream_events(result)
+            if _extra_events:
+                # The server is actually thinking -- remember it so
+                # follow-up requests replay ``reasoning_content``.
+                self._server_thinking_observed = True
             for extra in _extra_events:
                 yield extra
 

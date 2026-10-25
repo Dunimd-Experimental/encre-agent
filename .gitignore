@@ -178,6 +178,48 @@ ehthumbs.db
 .cache/
 *.log
 
+# Local scratch space — one-off UI demos, throwaway scripts, probe output,
+# stray logs, displaced build artifacts and backup snapshots. Not source,
+# never commit.
+/tmp/
+
+# Research papers (personal reference material, unrelated to the build)
+/pdres_work/
+
+# Unrelated side project (HTML article + CSDN doc)
+/pelican-bike/
+
+# =============================================================================
+# Local scratch & misplaced files — not project source, never commit
+# =============================================================================
+# One-off UI demo page + screenshots captured while prototyping
+/.demo/
+# Refactor snapshots (*.bak copies of renderer / harness sources)
+/.refactor-backup/
+# Trae HTML-share tool packages (zip bundles produced by the IDE plugin)
+/.trae-html-share-packages/
+# Theme experiment sandbox: a full copy of the desktop renderer
+# (sources + vendored Monaco / fonts / assets + compiled bundles)
+/theme-lab/
+# Misplaced copy of core/encre/gateway/platforms/__init__.py dropped in the
+# repo root — the real module lives under core/. Root-anchored so genuine
+# package __init__.py files elsewhere stay tracked.
+/__init__.py
+
+# Live runtime session data emitted under the harness tree (data dir resolved
+# there by the harness) — same class of data as the root /data/, never commit.
+/harness/data/
+
+# Generated tray icon — written by scripts/gen_icon.js at build time, referenced
+# by no module and excluded from the packaged app (electron-builder ships
+# dist/** + renderer/** only).
+/desktop/tray-icon.png
+
+# Nested sub-repositories — they have their own .git and are published
+# independently (ea-plugin-cli / ea-cwh). Never commit them here.
+/cli/
+/ea-cwh/
+
 # =============================================================================
 # Database
 # =============================================================================

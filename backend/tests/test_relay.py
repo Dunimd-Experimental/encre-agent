@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -59,10 +59,15 @@ from encre.gateway.relay.transport import RelayTransport
 from encre.gateway.relay.ws_transport import _ws_dial_url
 
 
-# 鈹€鈹€ CapabilityDescriptor 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- CapabilityDescriptor -------------------------------------------------
 
 
 def _descriptor(**overrides):
+    """Build a fully-populated descriptor, optionally overriding fields.
+
+    The defaults mirror a realistic Discord connector contract so each test
+    can focus on a single field instead of re-declaring the whole payload.
+    """
     base = dict(
         contract_version=CONTRACT_VERSION,
         platform="discord",
@@ -79,11 +84,10 @@ def _descriptor(**overrides):
 
 
 def test_verify_descriptor_round_trip():
-    """Validate that to_json/from_json round-trip preserves all descriptor fields.
+    """to_json/from_json round-trip preserves all descriptor fields.
 
-    The test exercises serialization of a fully-populated descriptor and
-    deserializes it via from_json, asserting equality because the contract
-    version and platform metadata must survive JSON encoding losslessly.
+    The contract version and platform metadata must survive JSON encoding
+    losslessly, so a fully-populated descriptor is encoded and decoded back.
     """
     d = _descriptor()
     d2 = CapabilityDescriptor.from_json(d.to_json())
@@ -91,11 +95,10 @@ def test_verify_descriptor_round_trip():
 
 
 def test_verify_descriptor_unknown_keys_ignored():
-    """Validate that from_dict tolerates unknown keys without raising.
+    """from_dict tolerates unknown keys without raising.
 
-    The test exercises from_dict with extra keys (future_field, another)
-    and asserts the known fields are still populated correctly because
-    forward-compat requires the decoder to ignore unrecognised fields.
+    Forward compatibility requires the decoder to ignore fields it does not
+    recognise, so extra keys must not disturb the known values.
     """
     d = _descriptor()
     raw = {**d.to_dict(), "future_field": "x", "another": 123}
@@ -105,11 +108,10 @@ def test_verify_descriptor_unknown_keys_ignored():
 
 
 def test_verify_descriptor_max_length_zero_defaults():
-    """Validate that a zero max_message_length is replaced by the DEFAULT constant.
+    """A zero max_message_length is replaced by the DEFAULT constant.
 
-    The test exercises from_dict with max_message_length=0 and asserts the
-    result equals DEFAULT_MAX_MESSAGE_LENGTH because zero is used as the
-    sentinel value meaning "unset".
+    Zero is the sentinel meaning "unset", so decoding must substitute the
+    documented default length.
     """
     d = _descriptor(max_message_length=0)
     d2 = CapabilityDescriptor.from_dict(d.to_dict())
@@ -117,70 +119,66 @@ def test_verify_descriptor_max_length_zero_defaults():
 
 
 def test_verify_descriptor_is_frozen():
-    """Validate that CapabilityDescriptor instances are immutable after construction.
+    """CapabilityDescriptor instances are immutable after construction.
 
-    The test exercises attribute assignment on a constructed descriptor
-    and asserts that an exception is raised because the class uses a
-    frozen dataclass to prevent runtime mutation of contract fields.
+    The frozen dataclass must reject runtime mutation of contract fields,
+    otherwise two sides of the connector could silently disagree.
     """
     d = _descriptor()
     with pytest.raises(Exception):
         d.platform = "telegram"  # type: ignore[misc]
 
 
-# 鈹€鈹€ auth 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- auth -----------------------------------------------------------------
 
 
 def test_verify_upgrade_token_round_trip():
-    """Validate that make_upgrade_token produces a token that verify_token accepts.
+    """make_upgrade_token produces a token that verify_token accepts.
 
-    The test exercises upgrade-token creation with a TTL and asserts the
-    subject ("gw-1") round-trips through verify_token because the upgrade
-    path requires the GW to prove its identity to the connector.
+    The upgrade path requires the GW to prove its identity to the
+    connector, so the subject must round-trip through verification.
     """
     tok = make_upgrade_token("gw-1", "secret", ttl_seconds=60)
     assert verify_token(tok, ["secret"]) == "gw-1"
 
 
 def test_verify_upgrade_token_wrong_secret_rejected():
-    """Validate that a token signed with one secret is rejected by a different secret.
+    """A token signed with one secret is rejected by a different secret.
 
-    The test exercises verify_token with the wrong secret list and asserts
-    None is returned because HMAC signature verification must reject
-    tokens signed with an unrelated key.
+    HMAC verification must reject tokens signed with an unrelated key, so
+    the verifier has to return None rather than the subject.
     """
     tok = make_upgrade_token("gw-1", "secret")
     assert verify_token(tok, ["wrong"]) is None
 
 
 def test_verify_token_multi_secret_rotation():
-    """Validate that a token signed with an old secret validates against a rotated secret list.
+    """A token signed with an old secret validates against a rotated secret list.
 
-    The test exercises verify_token with a rotation list ["new-secret", "old-secret"]
-    and asserts the token is accepted because secret rotation requires
-    the verifier to try each candidate in order until one matches.
+    Secret rotation requires the verifier to try each candidate in order
+    until one matches, so an old token must still verify during the
+    overlap window.
     """
     tok = make_token("gw-1", "old-secret", ttl_seconds=60)
     assert verify_token(tok, ["new-secret", "old-secret"]) == "gw-1"
 
 
 def test_verify_token_payload_may_contain_colons():
-    """Validate that verify_token handles payloads containing colon characters.
+    """verify_token handles payloads containing colon characters.
 
-    The test exercises make_token with a payload containing colons and
-    asserts the round-trip succeeds because the token decoder splits from
-    the right edge, not the left, so embedded colons do not confuse parsing.
+    The token decoder splits from the right edge rather than the left, so
+    colons embedded in the subject must not confuse parsing.
     """
     tok = make_token("gw:with:colons", "secret", ttl_seconds=60)
     assert verify_token(tok, ["secret"]) == "gw:with:colons"
 
 
 def test_verify_token_expired_rejected(monkeypatch):
-    """Validate that expired tokens are rejected by verify_token.
+    """Expired tokens are rejected by verify_token.
 
-    The test exercises monkeypatched time to simulate passage of 60 seconds
-    past a 1-second TTL token and asserts None is returned because the
-    token's exp claim must be checked against the current clock.
+    The token's exp claim must be checked against the current clock, so a
+    1-second token is signed and then the clock is advanced past its
+    expiry.
     """
     base = int(time.time())
     monkeypatch.setattr("encre.gateway.relay.auth.time.time", lambda: base)
@@ -191,22 +189,20 @@ def test_verify_token_expired_rejected(monkeypatch):
 
 
 def test_verify_token_no_ttl_never_expires():
-    """Validate that a token with ttl_seconds=0 has no expiry and always verifies.
+    """A token with ttl_seconds=0 has no expiry and always verifies.
 
-    The test exercises make_token with ttl_seconds=0 and asserts
-    verify_token returns the subject because zero-ttl tokens are
-    deliberately designed to never expire.
+    Zero-ttl tokens are deliberately designed to live forever, so the
+    expiry check must be skipped entirely.
     """
     tok = make_token("gw-1", "secret", ttl_seconds=0)
     assert verify_token(tok, ["secret"]) == "gw-1"
 
 
 def test_verify_delivery_signature_round_trip():
-    """Validate that sign/verify_delivery_signature form a correct HMAC pair.
+    """sign/verify_delivery_signature form a correct HMAC pair.
 
-    The test exercises sign with a timestamp and body then passes the
-    result to verify_delivery_signature and asserts True because the
-    delivery-signature path is the authenticated outbound channel.
+    The delivery-signature path is the authenticated outbound channel, so
+    a freshly signed timestamp and body must verify.
     """
     ts = int(time.time())
     body = '{"event":"inbound"}'
@@ -215,11 +211,10 @@ def test_verify_delivery_signature_round_trip():
 
 
 def test_verify_delivery_signature_wrong_key_rejected():
-    """Validate that verify_delivery_signature rejects signatures made with a different key.
+    """verify_delivery_signature rejects signatures made with a different key.
 
-    The test exercises sign with "delivery-key" and verifies with ["wrong"]
-    and asserts False because HMAC verification must fail when the key
-    set does not contain the signing key.
+    HMAC verification must fail when the candidate key set does not
+    contain the signing key.
     """
     ts = int(time.time())
     body = '{"event":"inbound"}'
@@ -228,11 +223,11 @@ def test_verify_delivery_signature_wrong_key_rejected():
 
 
 def test_verify_delivery_signature_replay_window():
-    """Validate that verify_delivery_signature rejects signatures outside the 300s replay window.
+    """verify_delivery_signature rejects signatures outside the 300s replay window.
 
-    The test exercises sign with a timestamp 9999 seconds in the past
-    and asserts False because the replay-window check prevents replay
-    of old delivery signatures.
+    The replay-window check prevents reuse of old delivery signatures, so
+    a timestamp from 9999 seconds ago must be refused even with a valid
+    key.
     """
     ts = int(time.time()) - 9999  # outside the 300s window
     body = '{"event":"inbound"}'
@@ -241,55 +236,56 @@ def test_verify_delivery_signature_replay_window():
 
 
 def test_verify_delivery_signature_missing_headers_rejected():
-    """Validate that verify_delivery_signature rejects requests with missing headers.
+    """verify_delivery_signature rejects requests with missing headers.
 
-    The test exercises verify_delivery_signature with None timestamp and
-    signature and asserts False because both headers are required for
-    HMAC verification.
+    Both the timestamp and the signature are mandatory for HMAC
+    verification, so either being absent must fail closed.
     """
     assert verify_delivery_signature("{}", None, None, ["k"]) is False
 
 
-# 鈹€鈹€ ws_transport dial URL 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- ws_transport dial URL ------------------------------------------------
 
 
 def test_verify_ws_dial_url_https_to_wss():
-    """Validate that _ws_dial_url converts HTTPS URLs to WSS endpoints.
+    """_ws_dial_url converts HTTPS URLs to WSS endpoints.
 
-    The test exercises the URL transformation with an HTTPS input and
-    asserts the output is a WSS URL with "/relay" appended because the
-    relay endpoint is conventionally exposed at that path.
+    The relay endpoint is conventionally exposed at /relay, so the dialer
+    must upgrade the scheme and append that path.
     """
     assert _ws_dial_url("https://connector.example.com") == "wss://connector.example.com/relay"
 
 
 def test_verify_ws_dial_url_http_to_ws_with_path():
-    """Validate that _ws_dial_url converts HTTP URLs to WS endpoints preserving the base path.
+    """_ws_dial_url converts HTTP URLs to WS endpoints preserving the base path.
 
-    The test exercises the URL transformation with an HTTP URL that has
-    an existing path component and asserts the "/relay" suffix is appended
-    after the existing path because the dialer must preserve base paths.
+    The dialer must not clobber an existing path component; the /relay
+    suffix goes after it.
     """
     assert _ws_dial_url("http://localhost:8080/api") == "ws://localhost:8080/api/relay"
 
 
 def test_verify_ws_dial_url_already_relay_path():
-    """Validate that _ws_dial_url leaves a URL already ending in /relay unchanged.
+    """_ws_dial_url leaves a URL already ending in /relay unchanged.
 
-    The test exercises the function with a WSS URL that already has the
-    relay path and asserts idempotency because double-appending "/relay"
-    must not occur when the path is already correct.
+    The transformation must be idempotent so double-appending /relay never
+    happens when the path is already correct.
     """
     assert _ws_dial_url("wss://x/relay") == "wss://x/relay"
 
 
-# 鈹€鈹€ fake transport for adapter tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- fake transport for adapter tests ------------------------------------
 
 
 class _FakeTransport:
-    """In-memory transport double implementing the RelayTransport Protocol."""
+    """In-memory transport double implementing the RelayTransport Protocol.
+
+    Records every action the adapter sends and serves canned responses, so
+    adapter behaviour can be asserted without opening a real WebSocket.
+    """
 
     def __init__(self, descriptor):
+        """Bind the connector descriptor and reset all recorded state."""
         self._descriptor = descriptor
         self.connected = False
         self.was_revoked = False
@@ -299,56 +295,69 @@ class _FakeTransport:
         self.chat_info: dict[str, dict] = {}
 
     async def connect(self):
+        """Mark the transport connected and report success."""
         self.connected = True
         return True
 
     async def disconnect(self):
+        """Mark the transport disconnected."""
         self.connected = False
 
     async def handshake(self):
+        """Return the connector descriptor as the handshake result."""
         return self._descriptor
 
     def set_inbound_handler(self, h):
+        """Store the callback that receives inbound connector frames."""
         self.inbound_handler = h
 
     def set_passthrough_handler(self, h):
+        """Store the callback that receives passthrough frames."""
         self.passthrough_handler = h
 
     async def send_outbound(self, action, *, platform=None):
+        """Record an outbound action and return a canned success payload.
+
+        The get_chat_info operation is answered from the seeded
+        ``chat_info`` map; everything else yields a generic message id.
+        """
         self.sent.append({"kind": "outbound", "action": action, "platform": platform})
         if action.get("op") == "get_chat_info":
             return {"success": True, "chat_info": self.chat_info.get(action["chat_id"], {"name": action["chat_id"], "type": "dm"})}
         return {"success": True, "message_id": "m-fake"}
 
     async def send_follow_up(self, action, *, platform=None):
+        """Record a follow-up action and return a canned message id."""
         self.sent.append({"kind": "follow_up", "action": action, "platform": platform})
         return {"success": True, "message_id": "fu-1"}
 
     async def get_chat_info(self, chat_id):
+        """Return the seeded chat metadata, or a derived default entry."""
         return self.chat_info.get(chat_id, {"name": chat_id, "type": "dm"})
 
     async def send_interrupt(self, session_key, reason=None):
+        """Record an interrupt action without returning a payload."""
         self.sent.append({"kind": "interrupt", "session_key": session_key, "reason": reason})
 
     async def go_idle(self, timeout_s=10.0):
+        """Report that the transport is idle."""
         return True
 
     @property
     def is_connected(self):
+        """Report whether the transport is currently connected."""
         return self.connected
 
 
-# 鈹€鈹€ RelayAdapter 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- RelayAdapter ---------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_verify_relay_adapter_connect_and_send():
-    """Validate that RelayAdapter.send transmits an outbound action to the transport.
+    """RelayAdapter.send transmits an outbound action to the transport.
 
-    The test exercises connect followed by send with content "hello" and
-    asserts the SendResult is successful, the message_id matches the fake,
-    and the last sent action has op="send" with the correct content because
-    the adapter must translate high-level send calls into transport actions.
+    The adapter must translate a high-level send call into a transport
+    action carrying op="send" plus the message content.
     """
     desc = _descriptor()
     transport = _FakeTransport(desc)
@@ -369,11 +378,10 @@ async def test_verify_relay_adapter_connect_and_send():
 
 @pytest.mark.asyncio
 async def test_verify_relay_adapter_get_chat_info():
-    """Validate that RelayAdapter.get_chat_info returns the transport's chat metadata.
+    """RelayAdapter.get_chat_info returns the transport's chat metadata.
 
-    The test exercises pre-population of chat_info on the fake transport
-    and asserts the adapter returns the stored name and type because
-    the adapter delegates chat-info lookups to the transport layer.
+    The adapter delegates chat-info lookups to the transport layer, so the
+    seeded name and type must come back unchanged.
     """
     desc = _descriptor()
     transport = _FakeTransport(desc)
@@ -386,11 +394,10 @@ async def test_verify_relay_adapter_get_chat_info():
 
 @pytest.mark.asyncio
 async def test_verify_relay_adapter_send_follow_up_tokenless():
-    """Validate that send_follow_up omits the token field from the follow-up action.
+    """send_follow_up omits the token field from the follow-up action.
 
-    The test exercises send_follow_up with a session key and kind and
-    asserts the recorded action contains session_key and kind but no
-    "token" key because the relay protocol sends tokens separately.
+    The relay protocol sends tokens separately, so the recorded action must
+    carry the session key and kind but no "token" key.
     """
     desc = _descriptor()
     transport = _FakeTransport(desc)
@@ -407,13 +414,12 @@ async def test_verify_relay_adapter_send_follow_up_tokenless():
 
 @pytest.mark.asyncio
 async def test_verify_relay_adapter_inbound_bridge_routes_to_handler():
-    """Validate that an inbound frame is rebuilt into a MessageEvent and routed to the injected handler.
+    """An inbound frame is rebuilt into a MessageEvent and routed to the injected handler.
 
-    The test exercises transport.inbound_handler with a raw event dict
-    and asserts the handler received a MessageEvent with correct text,
-    source platform, scope_id, and that the chat-to-platform mapping
-    is recorded in adapter._platform_by_chat because the bridge layer
-    is responsible for normalising connector frames into the gateway schema.
+    The bridge layer is responsible for normalising connector frames into
+    the gateway schema, so the delivered event must carry the original
+    text, platform and scope id, and the chat-to-platform mapping must be
+    recorded for outbound replies.
     """
     desc = _descriptor()
     transport = _FakeTransport(desc)
@@ -423,6 +429,7 @@ async def test_verify_relay_adapter_inbound_bridge_routes_to_handler():
     seen = []
 
     async def handler(adapter, event):
+        """Collect every MessageEvent the adapter routes to the handler."""
         seen.append(event)
 
     adapter.set_message_handler(handler)
@@ -458,11 +465,10 @@ async def test_verify_relay_adapter_inbound_bridge_routes_to_handler():
 
 @pytest.mark.asyncio
 async def test_verify_relay_adapter_authorization_is_upstream():
-    """Validate that RelayAdapter reports authorization_is_upstream=True.
+    """RelayAdapter reports authorization_is_upstream=True.
 
-    The test exercises direct attribute access on a fresh adapter and
-    asserts True because the relay adapter defers auth checks to the
-    upstream connector rather than performing its own 5-layer check.
+    The relay adapter defers auth checks to the upstream connector rather
+    than performing its own 5-layer check.
     """
     adapter = RelayAdapter.__new__(RelayAdapter)
     assert adapter.authorization_is_upstream is True
@@ -470,12 +476,10 @@ async def test_verify_relay_adapter_authorization_is_upstream():
 
 @pytest.mark.asyncio
 async def test_verify_relay_adapter_no_transport_fatals():
-    """Validate that constructing RelayAdapter with transport=None causes a fatal on connect.
+    """Constructing RelayAdapter with transport=None causes a fatal on connect.
 
-    The test exercises connect on an adapter with no transport and
-    asserts ok=False, has_fatal_error=True, and the fatal code equals
-    RELAY_DISABLED_CODE because a missing transport is a permanent
-    configuration error, not a transient one.
+    A missing transport is a permanent configuration error rather than a
+    transient one, so it must be reported with the disabled code.
     """
     adapter = RelayAdapter(transport=None)
     ok = await adapter.connect()
@@ -486,11 +490,10 @@ async def test_verify_relay_adapter_no_transport_fatals():
 
 @pytest.mark.asyncio
 async def test_verify_relay_adapter_send_when_disconnected_returns_transient():
-    """Validate that send without an active connection returns a transient failure.
+    """Send without an active connection returns a transient failure.
 
-    The test exercises send on a disconnected adapter and asserts
-    success=False, retryable=True, and error_kind="transient" because
-    a missing connection is recoverable by reconnecting and retrying.
+    A missing connection is recoverable by reconnecting and retrying, so
+    the result must be marked retryable with the transient error kind.
     """
     desc = _descriptor()
     transport = _FakeTransport(desc)
@@ -502,16 +505,15 @@ async def test_verify_relay_adapter_send_when_disconnected_returns_transient():
     assert result.error_kind == "transient"
 
 
-# 鈹€鈹€ config-driven activation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- config-driven activation ---------------------------------------------
 
 
 def test_verify_relay_not_configured_without_env(monkeypatch):
-    """Validate that relay_is_configured is False when GATEWAY_RELAY_URL is absent.
+    """relay_is_configured is False when GATEWAY_RELAY_URL is absent.
 
-    The test exercises env-stripping and asserts the combined condition
-    that either relay_url is None or relay_is_configured is True, and
-    when relay_url is None it must also be that relay_is_configured
-    is False because configuration requires an explicit URL.
+    Configuration requires an explicit URL, so with the env var stripped
+    the relay must report as unconfigured.  The guard also tolerates a
+    leaked settings-sourced URL by requiring the two to agree.
     """
     monkeypatch.delenv("GATEWAY_RELAY_URL", raising=False)
     from encre.gateway.relay import relay_is_configured, relay_url
@@ -523,11 +525,10 @@ def test_verify_relay_not_configured_without_env(monkeypatch):
 
 
 def test_verify_relay_configured_with_env(monkeypatch):
-    """Validate that setting GATEWAY_RELAY_URL enables relay_is_configured.
+    """Setting GATEWAY_RELAY_URL enables relay_is_configured.
 
-    The test exercises env-setting with a HTTPS URL and asserts
-    relay_is_configured() is True and relay_url() returns the same
-    string because the config reader must surface the env var value.
+    The config reader must surface the env var value verbatim, so the
+    enabled flag and the returned URL are both asserted.
     """
     monkeypatch.setenv("GATEWAY_RELAY_URL", "https://connector.example.com")
     from encre.gateway.relay import relay_is_configured, relay_url
@@ -536,11 +537,11 @@ def test_verify_relay_configured_with_env(monkeypatch):
 
 
 def test_verify_relay_relevance_policy_default_none(monkeypatch):
-    """Validate that relay_relevance_policy returns None when no relevance knobs are set.
+    """relay_relevance_policy returns None when no relevance knobs are set.
 
-    The test exercises env-stripping and asserts the policy is None or
-    contains "platform" because the default relevance policy is unconstrained
-    unless the user explicitly sets a relevance filter.
+    The default relevance policy is unconstrained unless the user
+    explicitly sets a relevance filter, so the result must be either None
+    or a policy that still contains the platform key.
     """
     monkeypatch.delenv("GATEWAY_RELAY_URL", raising=False)
     from encre.gateway.relay import relay_relevance_policy

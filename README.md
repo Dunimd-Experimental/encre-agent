@@ -6,10 +6,10 @@ English | [简体中文](README.zh.md)
 
 [Documentation](https://dunimd.github.io/encre) | [Changelog](docs/CHANGELOG.md) | [Security](docs/SECURITY.md) | [Contributing](docs/CONTRIBUTING.md) | [Code of Conduct](docs/CODE_OF_CONDUCT.md)
 
-<a href="https://github.com/mf2023/Encre" target="_blank">
+<a href="https://github.com/Dunimd/encre-agent" target="_blank">
     <img alt="GitHub" src="https://img.shields.io/badge/GitHub-encre-181717?style=flat-square&logo=github"/>
 </a>
-<a href="https://gitee.com/dunimd/encre" target="_blank">
+<a href="https://gitee.com/dunimd/encre-agent" target="_blank">
     <img alt="Gitee" src="https://img.shields.io/badge/Gitee-encre-C71D23?style=flat-square&logo=gitee"/>
 </a>
 
@@ -30,7 +30,7 @@ English | [简体中文](README.zh.md)
     <img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square"/>
 </a>
 
-**Encre Agent** — A powerful AI Agent platform that supports 31 mainstream LLM providers, 84+ built-in tools, and 26+ chat platform integrations. Whether it's coding, desktop automation, cross-platform messaging, or multi-agent collaboration, Encre Agent gets the job done.
+**Encre Agent** — A powerful AI Agent platform that supports 51 mainstream LLM providers, 74 built-in tools, 24 chat platform integrations, and a plugin market with 256 official packages. Whether it's coding, desktop automation, cross-platform messaging, or multi-agent collaboration, Encre Agent gets the job done.
 
 </div>
 
@@ -46,13 +46,13 @@ Encre Agent is an AI Agent platform — tell it what you want to do, and it will
 
 | Capability | Description |
 |:------|:------|
-| 🧠 **31 AI Models** | Supports OpenAI, Anthropic Claude, Google Gemini, DeepSeek, Qwen, GLM, local models, and more — switch freely |
-| 🛠️ **84+ Built-in Tools** | File operations, shell execution, browser automation (CDP engine), code editing, web search, databases, scheduling, Docker, Git, image gen, email — ready to use |
-| 💬 **26+ Chat Platforms** | Integrate with Telegram, Discord, Slack, Feishu, DingTalk, WeChat, WhatsApp, email, QQ Bot, Matrix, and more — chat with Agent wherever you are |
+| 🧠 **51 AI Models** | Supports OpenAI, Anthropic Claude, Google Gemini, DeepSeek, Qwen, GLM, local models, and more — switch freely |
+| 🛠️ **74 Built-in Tools** | File operations, shell execution, browser automation (CDP engine), code editing, web search, databases, scheduling, Docker, Git, image gen, email — ready to use |
+| 💬 **24 Chat Platforms** | Integrate with Telegram, Discord, Slack, DingTalk, WeChat, WhatsApp, email, QQ Bot, Matrix, and more — chat with Agent wherever you are |
 | 🖥️ **Desktop Automation** | Control desktop apps, operate browsers, read screenshots — simulates human operations |
 | 🤝 **Multi-Agent Collaboration** | Multiple Agents work simultaneously, dividing tasks and cooperating on complex projects |
 | 💾 **Persistent Memory** | Agent remembers your preferences, habits, and project info — gets smarter with use |
-| 🛡️ **Safety & Control** | 6 permission modes to precisely control what Agent can and cannot do |
+| 🛡️ **Safety & Control** | 7 permission modes to precisely control what Agent can and cannot do |
 
 </div>
 
@@ -68,9 +68,9 @@ Encre Agent is an AI Agent platform — tell it what you want to do, and it will
 
 <h2 align="center">⭐ Key Features</h2>
 
-#### 🧠 31 AI Backends, Choose Freely
+#### 🧠 51 AI Backends, Choose Freely
 
-Supports **31 mainstream AI models** including OpenAI, Anthropic Claude, Google Gemini, DeepSeek, Alibaba Qwen, Tencent Hunyuan, Xiaomi MiMo, Moonshot Kimi, Zhipu GLM, MiniMax, and more.
+Supports **51 mainstream AI providers** including OpenAI, Anthropic Claude, Google Gemini, DeepSeek, Alibaba Qwen, Tencent Hunyuan, Xiaomi MiMo, Moonshot Kimi, Zhipu GLM, MiniMax, and more.
 
 - **Global Leaders**: OpenAI, Anthropic, Google, Groq, AWS Bedrock, GitHub Copilot
 - **Chinese Providers**: Alibaba Qwen, Tencent, Xiaomi MiMo, Moonshot, Zhipu, MiniMax
@@ -78,16 +78,15 @@ Supports **31 mainstream AI models** including OpenAI, Anthropic Claude, Google 
 - **Aggregation Services**: OpenRouter, AI Gateway, Kilocode, OpenCode
 - **Advanced Features**: Automatic failover, cost-based routing, transparent retry
 
-#### 🤖 9 Built-in Agent Roles
+#### 🤖 6 Built-in Agent Roles
 
 Encre Agent comes with specialized roles, each with dedicated prompts and capabilities:
 
 - **General Mode**: `coder`, `researcher`, `critic`
 - **Workspace Mode**: `architect`, `planner`
 - **Plan/Spec Mode**: `spec-writer`
-- **Automation Mode**: `monitor`, `executor`, `scheduler`
 
-#### 🛠️ 84+ Ready-to-use Tools
+#### 🛠️ 74 Ready-to-use Tools
 
 | Category | Tools |
 |:------|:------|
@@ -100,19 +99,19 @@ Encre Agent comes with specialized roles, each with dedicated prompts and capabi
 | **Desktop** | Desktop control (pyautogui), image recognition (OCR), browser automation (CDP) |
 | **Integration** | Git, REST API, MCP external protocols |
 
-#### 💬 26+ Chat Platform Integrations
+#### 💬 24 Chat Platform Integrations
 
 Connect Encre Agent to your favorite messaging platforms:
 
-**International**: Discord, Slack, Telegram, WhatsApp, Signal, Matrix, Microsoft 365, Home Assistant
+**International**: Discord, Slack, Telegram, WhatsApp, Signal, Matrix, Microsoft Teams, Google Chat, Mattermost, Line, IRC, ntfy, SimpleX, Photon, Raft, Home Assistant
 
-**China**: Feishu (Lark), DingTalk, WeCom, WeChat, Tencent Yuanbao, QQ Bot, iMessage
+**China**: DingTalk, WeCom, WeChat, QQ Bot
 
-**Universal**: Email (IMAP+SMTP), Webhook
+**Universal**: Email (IMAP+SMTP), SMS, Webhook, iMessage (BlueBubbles)
 
 Each platform has a dedicated adapter that normalizes messages before sending them to the Agent.
 
-#### 🛡️ 6-Level Safety Control
+#### 🛡️ 7-Level Safety Control
 
 | Mode | Description |
 |:------|:------|
@@ -120,6 +119,7 @@ Each platform has a dedicated adapter that normalizes messages before sending th
 | `dont_ask` | Auto-allow (no confirmation needed) |
 | `accept_edits` | Auto-allow file edits |
 | `plan` | Plan before executing |
+| `spec` | Write a structured spec before implementing |
 | `auto` | AI smart judgment |
 | `default` | **Recommended** — asks you every time |
 
@@ -133,18 +133,18 @@ Additional protections:
 
 Encre Agent has its own memory system — it gets to know you better over time:
 
-- Memories stored as Markdown files with metadata (creation time, update time, importance)
-- **Smart Aging**: Outdated memories automatically lose weight, important info retained long-term
+- Memories stored as a weighted knowledge graph — episodes, facts, preferences, decisions, and lessons, each with a confidence score
+- **Confidence Decay & Reinforcement**: unused memories fade over time; task outcomes reinforce or correct existing beliefs
 - **Semantic Search**: Quickly find relevant memories through semantic understanding
-- **Working + Long-term Memory**: Short-term task memory and long-term project memory layered management
+- **Entity Hubs & Cross-links**: Related memories are wired by co-occurrence and semantic similarity for one-hop recall
 
-#### 🎯 11 Professional Skills
+#### 🎯 9 Professional Skills
 
-Agent has 11 callable skills:
+Agent has 9 callable skills:
 
-`debug`, `loop`, `batch`, `verify`, `stuck-recovery`, `code-review`, `refactor`, `gen-test`, `web-research`, `data-viz`, `write-docs`
+`debug`, `loop`, `stuck`, `code-review`, `refactor`, `gen-test`, `verify`, `write-docs`, `chart-visualization`
 
-**Priority Override**: Admin > User-defined > Project-level > Bundled — meets your personalization needs.
+**Priority Override**: Managed > User > Project > Bundled — meets your personalization needs.
 
 #### 🤝 Multi-Agent Collaboration
 
@@ -152,11 +152,11 @@ Agent has 11 callable skills:
 - **Shared Blackboard**: All Agents share state with full transparency
 - **Consensus Protocol**: Multiple Agents vote on proposals to select the best solution
 - **Task Planner**: Automatically decomposes complex tasks into sub-task trees
-- **9 Built-in Roles**: Each role has dedicated prompts and capabilities
+- **6 Built-in Roles**: Each role has dedicated prompts and capabilities
 
-#### 🧱 Rust Native Core
+#### 🧱 Encre Agent Core (Rust Native)
 
-Performance-critical modules written in Rust for blazing speed and memory safety:
+Encre Agent Core — performance-critical modules written in Rust for blazing speed and memory safety:
 
 - Blazing fast file I/O with offset/limit support
 - Regex search & Glob for quick content finding
@@ -166,30 +166,38 @@ Performance-critical modules written in Rust for blazing speed and memory safety
 - Kernel-level filesystem restrictions via Linux Landlock
 - Smart Token counting (English/Chinese/numbers/code)
 - Semantic similarity for text comparison
-- BM25 code search engine
 - LSP protocol parsing (JSON-RPC 2.0)
 
-#### 🖥️ Encre Agent Desktop App
+#### 🖥️ Encre Agent Desktop
 
 A full-featured AI chat desktop application built with Electron + React 19:
 
 - **Chat Interface**: Markdown rendering, syntax highlighting, file attachments
 - **Multi-session**: Concurrent chats with branching and fuzzy search
-- **Settings Panel**: Model config, gateway, agent, MCP servers, skills, rules, memory, code index
+- **Settings Panel**: Model config, gateway, agent, MCP servers, skills, rules, memory
 - **iClaw Mode**: Automation runner with batch operations
 - **Embedded Terminal**: xterm.js + node-pty with working directory browser
 - **Code Editor**: Monaco Editor with 16+ language support (TypeScript, JavaScript, Python, Rust, Go, Java, C/C++, PHP, Ruby, Swift, Kotlin, SQL, etc.)
-- **Bilingual**: English and Chinese localization with runtime switching
+- **11 UI Languages**: English, Simplified/Traditional Chinese, Japanese, Korean, German, Spanish, Portuguese, Turkish, Arabic, Hebrew — with runtime switching
 - **Git Integration**: Status and diff with caching
 - **System Tray**: Notifications + voice input support
 - **Encrypted Storage**: AES-256-GCM encrypted browser cookies
 - **Cross-platform**: Windows (NSIS), macOS (.pkg), Linux (.deb/.rpm)
 
+#### 🧩 Plugin Market & Central Registry
+
+An open plugin ecosystem backed by a PyPI-based central registry — install skills and tools directly from the built-in market:
+
+- **One Wheel, Any Python**: Every market package is a universal pure-Python wheel supporting **Python 3.11+** — build once, install anywhere
+- **ea-plugin-cli**: The unified toolchain that scaffolds, builds, verifies, and publishes plugins — [ea-plugin-cli](https://github.com/mf2023/ea-plugin-cli)
+- **ea-cwh Central Registry**: The authoritative plugin catalog shipped as a PyPI data package; the market UI reads it fully offline — [ea-cwh](https://github.com/mf2023/ea-cwh)
+- **256 Official Packages**: `ea-skill-*` / `ea-tool-*` / `ea-connector-*` packages covering data, media, web, dev, travel, finance, and messaging platforms
+- **Verified Lifecycle**: sha256 digest verification, sandboxed install verification, and CI-gated catalog merges — a plugin can only reach the market through validated pipelines
+
 #### ⚙️ Developer Toolchain
 
 - **Context Compaction**: 9 strategies to intelligently manage conversation context
 - **LSP Client**: 16+ language servers auto-discovered for real-time code diagnostics
-- **Codebase Indexer**: BM25 search + dependency graph for project-wide understanding
 - **Evolution System**: Meta-cognition, reflex loop, strategy optimizer
 - **Feedback Learner**: Jaccard similarity-based error correction
 - **Interactive Notebook**: IPython kernel for live code execution
@@ -205,8 +213,8 @@ A full-featured AI chat desktop application built with Electron + React 19:
 **Step 1: Clone the repository**
 
 ```bash
-git clone https://github.com/mf2023/Encre.git
-cd encre
+git clone https://github.com/Dunimd/encre-agent.git
+cd encre-agent
 ```
 
 **Step 2: Build everything**
@@ -215,68 +223,70 @@ cd encre
 python build.py
 ```
 
-This builds the Rust extension, installs the Python package, and bundles the desktop app — all in one command.
+This builds the Rust extension, installs the Python package, and bundles the Encre Agent Desktop — all in one command.
 
 **Step 3: Launch**
 
 ```bash
-# Desktop app
+# Encre Agent Desktop
 cd desktop && npm start
 
-# Or use the CLI (iClaw automation mode)
+# Or use the CLI (iClaw mode)
 python -m encre.iclaw --help
 ```
 
 ### Basic Usage
 
-Start chatting with your Agent through the desktop app, or connect it to your preferred chat platform. Configure your AI model provider, set the permission mode, and you're ready to go.
+Start chatting with your Agent through the Encre Agent Desktop, or connect it to your preferred chat platform. Configure your AI model provider, set the permission mode, and you're ready to go.
 
 ### Configuration
 
-Edit `config.yaml` to customize:
+Configuration is stored as encrypted JSON files under the data directory (`~/.dunimd/encre/config/`) and is normally managed from the Encre Agent Desktop settings panel:
 
-```yaml
-backend: "openai"
-model: "gpt-4o"
-api_key: "${OPENAI_API_KEY}"
-
-safety:
-  tool_permission_mode: "default"   # Recommended: ask before each action
-
-memory:
-  enabled: true
-
-tools:
-  enabled:
-    - file_read
-    - file_write
-    - bash
-    - web_fetch
+```json
+{
+  "providers": [
+    {
+      "backend_type": "openai",
+      "name": "OpenAI",
+      "api_key": "<your-api-key>",
+      "models": [
+        { "name": "GPT-6 Astra", "model_id": "gpt-6-astra", "enabled": true },
+        { "name": "GPT-6 Luna", "model_id": "gpt-6-luna", "enabled": true },
+        { "name": "GPT-6 Sol", "model_id": "gpt-6-sol", "enabled": true }
+      ]
+    }
+  ]
+}
 ```
 
-Configuration sources (lowest to highest priority):
-1. Built-in defaults
-2. Configuration files (YAML, TOML)
-3. Environment variables (prefixed with `ENCRE_`)
-4. Runtime parameters
+Config files under `<data_dir>/config/`:
+1. `models.json` — model endpoints, active model, failover
+2. `agents.json` — agent personas, sub-agents, system prompt, skills
+3. `adapters.json` — platform adapter credentials
+4. `mcp.json` — MCP server definitions
+5. `ui.json` — presentation preferences
+6. `runtime.json` — behaviour flags, permissions, and other runtime fields
+
+Environment variables use the `ENCRE_` prefix (e.g. `ENCRE_DATA_DIR`, `ENCRE_PROFILE`) and override data-directory and profile selection.
 
 <h2 align="center">❓ Frequently Asked Questions</h2>
 
 **Q: Which AI models does Encre Agent support?**
 
-A: **31 providers** including OpenAI, Anthropic Claude, Google Gemini, DeepSeek, Alibaba Qwen, Tencent Hunyuan, Xiaomi MiMo, Moonshot Kimi, Zhipu GLM, MiniMax, Ollama, LM Studio, HuggingFace, AWS Bedrock, OpenRouter, and more. Encre Agent is built from scratch — not a fork of Codex or any other project.
+A: **51 providers** including OpenAI, Anthropic Claude, Google Gemini, DeepSeek, Alibaba Qwen, Tencent Hunyuan, Xiaomi MiMo, Moonshot Kimi, Zhipu GLM, MiniMax, Ollama, LM Studio, HuggingFace, AWS Bedrock, OpenRouter, and more. Encre Agent is built from scratch — not a fork of Codex or any other project.
 
 **Q: What can Encre Agent do?**
 
-A: Everything a skilled assistant can do — read/write/edit code, run shell commands, open a browser to do research, automate your desktop, manage files, schedule tasks, collaborate with other Agents, and much more. It has **84+ built-in tools** and **275+ skills** to handle almost any task.
+A: Everything a skilled assistant can do — read/write/edit code, run shell commands, open a browser to do research, automate your desktop, manage files, schedule tasks, collaborate with other Agents, and much more. It has **74 built-in tools** and **185 skill packages** to handle almost any task.
 
 **Q: Can I use Encre Agent with my favorite chat platform?**
 
-A: Yes! Encre Agent supports **26+ chat platforms** including Telegram, Discord, Slack, Feishu, DingTalk, WeCom, WeChat, WhatsApp, QQ Bot, Email, Matrix, and more. Each platform has a dedicated adapter.
+A: Yes! Encre Agent supports **24 chat platforms** including Telegram, Discord, Slack, DingTalk, WeCom, WeChat, WhatsApp, QQ Bot, Email, Matrix, and more. Each platform has a dedicated adapter.
 
 **Q: Is Encre Agent safe to use?**
 
-A: Safety is a top priority. Encre Agent offers **6 permission modes** ranging from fully open to asking for confirmation on every action. Additional protections include SSRF guards, Docker sandboxing, Landlock kernel restrictions, and AI-powered risk classification.
+A: Safety is a top priority. Encre Agent offers **7 permission modes** ranging from fully open to asking for confirmation on every action. Additional protections include SSRF guards, Docker sandboxing, Landlock kernel restrictions, and AI-powered risk classification.
 
 **Q: Does Encre Agent remember things between sessions?**
 
@@ -286,7 +296,7 @@ A: Yes. Encre Agent has a **persistent memory system** that stores important inf
 
 A: Absolutely. Encre Agent supports **multi-agent collaboration** through its Swarm system. You can spawn multiple Agents with different roles (coder, researcher, critic, etc.) that share information and cooperate on complex tasks.
 
-**Q: Is there a desktop app?**
+**Q: Is there an Encre Agent Desktop?**
 
 A: Yes! **Encre Agent Desktop** is a full-featured Electron + React application with chat interface, code editor (Monaco), embedded terminal, file browser, settings panel, and more. Available for Windows, macOS, and Linux.
 
@@ -297,9 +307,9 @@ A: Yes. You can use any OpenAI-compatible API, self-host models via Ollama/LM St
 <h2 align="center">🌏 Community & License</h2>
 
 - Issues and PRs are welcome!
-- GitHub: https://github.com/mf2023/Encre
-- Gitee: https://gitee.com/dunimd/encre
-- GitCode: https://gitcode.com/dunimd/encre
+- GitHub: https://github.com/Dunimd/encre-agent
+- Gitee: https://gitee.com/dunimd/encre-agent
+- GitCode: https://gitcode.com/dunimd/encre-agent
 
 <div align="center">
 
@@ -317,7 +327,7 @@ This project uses **Apache License 2.0**. See [LICENSE](LICENSE) for the full te
 
 ### Dependency Licenses
 
-The dependency license list below reflects the packages used by the **Python framework**, the **Rust core**, and the **Electron desktop app**. Versions and exact license texts are not pinned here; consult each upstream project for the authoritative license.
+The dependency license list below reflects the packages used by the **Python gateway**, **Encre Agent Core** (Rust native engine), and **Encre Agent Desktop** (Electron app). Versions and exact license texts are not pinned here; consult each upstream project for the authoritative license.
 
 <div align="center">
 

@@ -1,0 +1,59 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-tool-hash-crypto"
+version = "0.5.0"
+description = "EA (Encre Agent) — system-default hash_crypto tool(s)."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "tool",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.entry-points."ea.plugins"]
+hash-crypto = "ea_tool_hash_crypto.plugin:create_plugin"
+
+[project.optional-dependencies]
+all = [
+    "pycryptodome>=3.19",
+]
+
+[tool.ea]
+icon = "hash"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_tool_hash_crypto*",
+]
+
+[tool.setuptools.package-data]
+ea_tool_hash_crypto = [
+    "skills/**/*.md",
+]

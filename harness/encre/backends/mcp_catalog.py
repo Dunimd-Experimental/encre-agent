@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """MCP server provider catalog.
 
 Each entry is a real service provider that offers an MCP server, with its
@@ -33,7 +35,7 @@ To extend: add to ``MCP_PROVIDERS`` below.
 from typing import Any
 
 MCP_PROVIDERS: list[dict[str, Any]] = [
-    # 鈹€鈹€ GitHub 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── GitHub ──────────────────────────────────────────────────────────
     {
         "id": "github",
         "label": "GitHub",
@@ -46,7 +48,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"GITHUB_TOKEN": {"label": "GitHub Personal Access Token", "secret": True}},
         "docs": "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
     },
-    # 鈹€鈹€ GitLab 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── GitLab ──────────────────────────────────────────────────────────
     {
         "id": "gitlab",
         "label": "GitLab",
@@ -62,7 +64,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         },
         "docs": "https://github.com/manuelmhtr/mcp-server-gitlab",
     },
-    # 鈹€鈹€ Brave Search 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Brave Search ────────────────────────────────────────────────────
     {
         "id": "brave-search",
         "label": "Brave Search",
@@ -75,7 +77,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"BRAVE_API_KEY": {"label": "Brave Search API Key", "secret": True}},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/brave-search",
     },
-    # 鈹€鈹€ Stripe 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Stripe ──────────────────────────────────────────────────────────
     {
         "id": "stripe",
         "label": "Stripe",
@@ -88,7 +90,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"STRIPE_SECRET_KEY": {"label": "Stripe Secret Key (sk_...)", "secret": True}},
         "docs": "https://github.com/stripe/ai",
     },
-    # 鈹€鈹€ Supabase 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Supabase ────────────────────────────────────────────────────────
     {
         "id": "supabase",
         "label": "Supabase",
@@ -101,7 +103,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"SUPABASE_ACCESS_TOKEN": {"label": "Supabase Personal Access Token (sbp_...)", "secret": True}},
         "docs": "https://supabase.com/docs/guides/integration/mcp",
     },
-    # 鈹€鈹€ Vercel 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Vercel ──────────────────────────────────────────────────────────
     {
         "id": "vercel",
         "label": "Vercel",
@@ -114,7 +116,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"VERCEL_TOKEN": {"label": "Vercel API Token", "secret": True}},
         "docs": "https://www.npmjs.com/package/@vercel/sdk",
     },
-    # 鈹€鈹€ Cloudflare 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Cloudflare ──────────────────────────────────────────────────────
     {
         "id": "cloudflare",
         "label": "Cloudflare",
@@ -127,7 +129,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"CLOUDFLARE_API_TOKEN": {"label": "Cloudflare API Token", "secret": True}},
         "docs": "https://github.com/cloudflare/mcp-server-cloudflare",
     },
-    # 鈹€鈹€ Sentry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Sentry ──────────────────────────────────────────────────────────
     {
         "id": "sentry",
         "label": "Sentry",
@@ -140,7 +142,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"SENTRY_AUTH_TOKEN": {"label": "Sentry Auth Token", "secret": True}},
         "docs": "https://github.com/getsentry/sentry-mcp-stdio",
     },
-    # 鈹€鈹€ Prisma 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Prisma ──────────────────────────────────────────────────────────
     {
         "id": "prisma",
         "label": "Prisma",
@@ -153,7 +155,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://www.prismagraphql.com/blog/prisma-orm-6-6-0-esm-support-d1-migrations-and-prisma-mcp-server",
     },
-    # 鈹€鈹€ Notion 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Notion ──────────────────────────────────────────────────────────
     {
         "id": "notion",
         "label": "Notion",
@@ -166,7 +168,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"NOTION_TOKEN": {"label": "Notion Integration Token (ntn_...)", "secret": True}},
         "docs": "https://www.npmjs.com/package/@notionhq/notion-mcp-server",
     },
-    # 鈹€鈹€ Figma 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Figma ───────────────────────────────────────────────────────────
     {
         "id": "figma",
         "label": "Figma",
@@ -179,7 +181,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"FIGMA_API_KEY": {"label": "Figma Personal Access Token", "secret": True}},
         "docs": "https://github.com/GLips/Figma-Context-MCP",
     },
-    # 鈹€鈹€ Slack 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Slack ───────────────────────────────────────────────────────────
     {
         "id": "slack",
         "label": "Slack",
@@ -195,7 +197,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         },
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/slack",
     },
-    # 鈹€鈹€ Obsidian 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Obsidian ────────────────────────────────────────────────────────
     {
         "id": "obsidian",
         "label": "Obsidian",
@@ -208,10 +210,10 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/bitbonsai/mcpvault",
     },
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    # NEW 鈥?2026 Q2 additions
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    # 鈹€鈹€ Filesystem 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ══════════════════════════════════════════════════════════════════════
+    # NEW — 2026 Q2 additions
+    # ══════════════════════════════════════════════════════════════════════
+    # ── Filesystem ──────────────────────────────────────────────────────
     {
         "id": "filesystem",
         "label": "Filesystem",
@@ -224,7 +226,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
     },
-    # 鈹€鈹€ PostgreSQL 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── PostgreSQL ──────────────────────────────────────────────────────
     {
         "id": "postgres",
         "label": "PostgreSQL",
@@ -237,7 +239,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"DATABASE_URL": {"label": "PostgreSQL connection string (postgresql://...)", "secret": True}},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/postgres",
     },
-    # 鈹€鈹€ SQLite 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── SQLite ──────────────────────────────────────────────────────────
     {
         "id": "sqlite",
         "label": "SQLite",
@@ -250,7 +252,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
     },
-    # 鈹€鈹€ Docker 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Docker ──────────────────────────────────────────────────────────
     {
         "id": "docker",
         "label": "Docker",
@@ -263,7 +265,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/docker",
     },
-    # 鈹€鈹€ Kubernetes 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Kubernetes ──────────────────────────────────────────────────────
     {
         "id": "kubernetes",
         "label": "Kubernetes",
@@ -276,7 +278,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/kubernetes",
     },
-    # 鈹€鈹€ AWS 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── AWS ─────────────────────────────────────────────────────────────
     {
         "id": "aws",
         "label": "AWS",
@@ -289,7 +291,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/aws",
     },
-    # 鈹€鈹€ Google Cloud 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Google Cloud ────────────────────────────────────────────────────
     {
         "id": "gcp",
         "label": "Google Cloud",
@@ -302,7 +304,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/gcp",
     },
-    # 鈹€鈹€ Jira 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Jira ────────────────────────────────────────────────────────────
     {
         "id": "jira",
         "label": "Jira",
@@ -319,7 +321,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         },
         "docs": "https://github.com/sooperset/mcp-atlassian",
     },
-    # 鈹€鈹€ Linear 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Linear ──────────────────────────────────────────────────────────
     {
         "id": "linear",
         "label": "Linear",
@@ -332,7 +334,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"LINEAR_API_KEY": {"label": "Linear API Key", "secret": True}},
         "docs": "https://github.com/ibraheem4/mcp-linear",
     },
-    # 鈹€鈹€ Sequential Thinking 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Sequential Thinking ─────────────────────────────────────────────
     {
         "id": "sequential-thinking",
         "label": "Sequential Thinking",
@@ -345,7 +347,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/sequential-thinking",
     },
-    # 鈹€鈹€ Tavily (web search) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Tavily (web search) ─────────────────────────────────────────────
     {
         "id": "tavily",
         "label": "Tavily Search",
@@ -358,7 +360,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"TAVILY_API_KEY": {"label": "Tavily API Key", "secret": True}},
         "docs": "https://github.com/tavily-ai/tavily-mcp",
     },
-    # 鈹€鈹€ Airtable 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Airtable ────────────────────────────────────────────────────────
     {
         "id": "airtable",
         "label": "Airtable",
@@ -371,7 +373,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"AIRTABLE_TOKEN": {"label": "Airtable Personal Access Token", "secret": True}},
         "docs": "https://github.com/domdomegg/airtable-mcp-server",
     },
-    # 鈹€鈹€ Redis 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Redis ───────────────────────────────────────────────────────────
     {
         "id": "redis",
         "label": "Redis",
@@ -384,7 +386,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"REDIS_URL": {"label": "Redis connection string (redis://localhost:6379)", "secret": True}},
         "docs": "https://github.com/prajwalnayak7/mcp-server-redis",
     },
-    # 鈹€鈹€ Elasticsearch 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Elasticsearch ───────────────────────────────────────────────────
     {
         "id": "elasticsearch",
         "label": "Elasticsearch",
@@ -400,7 +402,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         },
         "docs": "https://github.com/cr7258/elasticsearch-mcp-server",
     },
-    # 鈹€鈹€ ClickUp 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── ClickUp ─────────────────────────────────────────────────────────
     {
         "id": "clickup",
         "label": "ClickUp",
@@ -413,7 +415,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"CLICKUP_API_KEY": {"label": "ClickUp API Token (pk_...)", "secret": True}},
         "docs": "https://github.com/nguyenvanduocit/clickup-mcp-server",
     },
-    # 鈹€鈹€ YouTube 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── YouTube ─────────────────────────────────────────────────────────
     {
         "id": "youtube",
         "label": "YouTube",
@@ -426,7 +428,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"YOUTUBE_API_KEY": {"label": "YouTube Data API Key", "secret": True}},
         "docs": "https://github.com/ZubeidHendricks/mcp-youtube",
     },
-    # 鈹€鈹€ Hacker News 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Hacker News ─────────────────────────────────────────────────────
     {
         "id": "hackernews",
         "label": "Hacker News",
@@ -439,7 +441,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {},
         "docs": "https://github.com/anthropics/anthropic-quickstarts/tree/main/mcp/hackernews",
     },
-    # 鈹€鈹€ Exa Search 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Exa Search ──────────────────────────────────────────────────────
     {
         "id": "exa",
         "label": "Exa (Web Search)",
@@ -452,7 +454,7 @@ MCP_PROVIDERS: list[dict[str, Any]] = [
         "env_fields": {"EXA_API_KEY": {"label": "Exa API Key", "secret": True}},
         "docs": "https://github.com/exa-labs/exa-mcp-server",
     },
-    # 鈹€鈹€ Mem0 (memory layer) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Mem0 (memory layer) ─────────────────────────────────────────────
     {
         "id": "mem0",
         "label": "Mem0 (Memory)",

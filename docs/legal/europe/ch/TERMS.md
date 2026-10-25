@@ -32,7 +32,7 @@
 | Dienstleistung | Beschreibung | Verfügbarkeit |
 |---|---|---|
 | **Encre Agent Desktop** | Desktop-Anwendung für lokale KI-Agenten | Windows, macOS, Linux |
-| **Encre Agent Framework** | Python-Framework mit Rust-Nativkern | Open Source, github.com/mf2023/Encre |
+| **Encre Agent** | Python-Gateway mit Rust-Nativkern | Open Source, github.com/mf2023/Encre |
 | **Chat-Plattform-Integrationen** | Konnektoren zu 18 Chat-Plattformen | je nach Plattform |
 | **PiscesLx** | Gehostetes LLM-Inference (optional) | Abo |
 | **StadionOS** | Betriebssystemprojekt | eigene Lizenz |
@@ -52,7 +52,7 @@
 
 ## 4. Softwarelizenz
 
-4.1 Die Open-Source-Komponenten (Encre Agent Framework, Rust-Nativkern) stehen unter den im Repository github.com/mf2023/Encre jeweils angegebenen Lizenzen.
+4.1 Die Open-Source-Komponenten (Encre Agent, Rust-Nativkern) stehen unter den im Repository github.com/mf2023/Encre jeweils angegebenen Lizenzen.
 
 4.2 Proprietäre Komponenten werden – soweit nicht anders schriftlich vereinbart – einfach, nicht ausschliesslich, nicht unterlizenzierbar und nicht übertragbar zur Nutzung überlassen.
 

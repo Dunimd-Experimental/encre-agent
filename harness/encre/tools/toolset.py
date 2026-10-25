@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -21,10 +20,10 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-"""Declarative ToolSet system 鈥?group tools into named scenario sets.
+"""Declarative ToolSet system — group tools into named scenario sets.
 
 This module defines **only** tool groupings.  The actual tool selection
-logic lives in ``encre.tools.discovery.ToolDiscovery`` 鈥?this module
+logic lives in ``encre.tools.discovery.ToolDiscovery`` — this module
 just provides the declaration format and resolver that discovery uses.
 
 Usage
@@ -32,7 +31,7 @@ Usage
 
     from encre.tools.toolset import TOOLSETS, resolve_toolset
 
-    # Resolve "coding" 鈫?{"file_read", "file_write", "bash", ...}
+    # Resolve "coding" → {"file_read", "file_write", "bash", ...}
     tools = resolve_toolset("coding")
 """
 
@@ -41,8 +40,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
-# 鈹€鈹€ ToolSet definition 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ------------------------------- ToolSet definition -------------------------------
 
 
 @dataclass(frozen=True)
@@ -87,7 +85,7 @@ class ToolSet:
         return frozenset(result)
 
 
-# 鈹€鈹€ Default tool sets 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ------------------------------- Default tool sets ------------------------------
 #
 # Convention:
 #   - "default":   always-available primitives (the new BASE_TOOLS)
@@ -101,16 +99,18 @@ class ToolSet:
 
 _TOOLSETS_DEF: dict[str, dict[str, Any]] = {
     "default": {
-        "description": "Always-available primitives 鈥?file, shell, search, communication",
+        "description": "Always-available primitives — file, shell, search, manage, memory",
+        # Synced with discovery.BASE_TOOLS (the harness hardcoded set).
+        # With register-as-activate this list is informational: the
+        # model-facing payload always contains every registered tool.
         "tools": [
             "file_read", "file_write", "file_edit",
             "bash",
-            "grep", "glob",
-            "web_search", "web_fetch",
-            "skill", "agent", "manage", "question", "info",
+            "web_search",
+            "manage",
             "memory_create", "memory_read", "memory_update",
-            "memory_delete", "memory_search", "memory_profile",
-            "todo",
+            "memory_search", "memory_link", "memory_status",
+            "memory_profile",
         ],
         "includes": [],
     },
@@ -118,20 +118,20 @@ _TOOLSETS_DEF: dict[str, dict[str, Any]] = {
         "description": "File I/O and search tools",
         "tools": [
             "file_read", "file_write", "file_edit", "apply_patch",
-            "grep", "glob", "codebase_search", "codebase_context",
+            "grep", "glob",
             "archive", "diff",
         ],
         "includes": [],
     },
     "coding": {
-        "description": "Full development tool set 鈥?build, test, debug, LSP, git",
+        "description": "Full development tool set — build, test, debug, LSP, git",
         "tools": [
             "bash",
             "bash_output", "bash_kill", "bash_list",
+            "process_list", "process_kill",
             "lsp", "git",
             "lint_format", "test_run",
-            "task_create", "task_list", "task_get", "task_update",
-            "task_stop", "task_output",
+            "task", "cron",
         ],
         "includes": ["file", "agent"],
     },
@@ -186,7 +186,7 @@ _TOOLSETS_DEF: dict[str, dict[str, Any]] = {
         "includes": [],
     },
     "all": {
-        "description": "All available tools (use sparingly 鈥?large context cost)",
+        "description": "All available tools (use sparingly — large context cost)",
         "tools": [],
         "includes": [
             "default", "file", "coding", "research", "devops",
@@ -196,7 +196,7 @@ _TOOLSETS_DEF: dict[str, dict[str, Any]] = {
 }
 
 
-# 鈹€鈹€ Build the ToolSet registry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# --------------------------- Build the ToolSet registry -------------------------
 
 def _build_toolsets() -> dict[str, ToolSet]:
     registry: dict[str, ToolSet] = {}
@@ -213,7 +213,7 @@ def _build_toolsets() -> dict[str, ToolSet]:
 TOOLSETS: dict[str, ToolSet] = _build_toolsets()
 
 
-# 鈹€鈹€ Resolution helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ------------------------------ Resolution helpers ------------------------------
 
 
 def resolve_toolset(name: str) -> frozenset[str]:
@@ -258,8 +258,8 @@ def list_available_sets() -> list[str]:
 
 
 __all__ = [
-    "ToolSet",
     "TOOLSETS",
-    "resolve_toolset",
+    "ToolSet",
     "list_available_sets",
+    "resolve_toolset",
 ]

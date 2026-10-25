@@ -114,8 +114,23 @@ export function buildTraySessionData(
   iworkSessions: readonly SessionEntryData[],
   workspaces?: readonly { path: string; name: string; icon_data?: string }[],
 ): TraySessionData {
-  const active = (sessions: readonly SessionEntryData[]) =>
-    dedupeSessions(sessions).filter((session) => (session.message_count || 0) > 0);
+  // Only sessions with at least one message count as history — brand-new
+  // empty sessions must not appear in the tray, mirroring the sidebar. The
+  // tray is a quick-switch surface, not an archive: shipping thousands of
+  // rows over IPC on every state change is pure structured-clone cost.
+  const active = (sessions: readonly SessionEntryData[]) => {
+    const out: SessionEntryData[] = [];
+    const seen = new Set<string>();
+    for (const session of sessions) {
+      const sid = session.session_id;
+      if (!sid || seen.has(sid)) continue;
+      seen.add(sid);
+      if ((session.message_count || 0) <= 0) continue;
+      out.push(session);
+      if (out.length >= 100) break;
+    }
+    return out;
+  };
   return {
     normal: active(normalSessions),
     iwork: active(iworkSessions),

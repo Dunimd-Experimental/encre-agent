@@ -139,6 +139,32 @@ export class ChatScrollIndicator {
     this.thumb.style.top = `${current * spacing + offset + spacing / 2}px`;
   }
 
+  /** Drops every rendered tick plus the bookkeeping that decides whether a
+   *  rebuild is due, and clears the transient inline styles.
+   *
+   *  Callers that blank the indicator on a session / view switch MUST go
+   *  through this. Emptying `.chat-scroll-track` from the outside used to
+   *  leave `lastKey` / `tickCount` stale, so the next `update()` concluded
+   *  the turn set was unchanged, skipped `rebuildTicks` and left the ruler
+   *  blank until a new user turn happened to arrive. The `hidden` class the
+   *  same reset put on the thumb was never taken back off either -- and
+   *  `.hidden` is `display:none !important` -- so the progress thumb stayed
+   *  invisible for the rest of the window's life.
+   */
+  reset(): void {
+    this.lastKey = "";
+    this.tickCount = 0;
+    this.ticks = [];
+    this.spacing = 0;
+    this.lastCurrent = -1;
+    this.track.innerHTML = "";
+    this.track.style.top = "";
+    this.track.style.height = "";
+    this.thumb.classList.remove("hidden");
+    this.thumb.style.top = "";
+    this.root.classList.add("hidden");
+  }
+
   private onPointerDown(e: MouseEvent): void {
     e.preventDefault();
     this.dragging = true;

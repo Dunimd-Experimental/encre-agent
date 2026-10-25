@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,11 +25,11 @@ from __future__ import annotations
 
 """Tests for the append-only event ledger (:mod:`encre.events.ledger`).
 
-Covers the public surface of :class:`EventSourcedBus` and
-:class:`LedgerEvent`: monotonic sequencing, encrypted persistence + replay,
-replay idempotency, observer failure isolation, the phase-hook-compatible
-``emit`` semantics, read-model projection, serialisation fallback, and the
-closed-bus contract.
+Exercises the public surface of :class:`EventSourcedBus` and
+:class:`LedgerEvent`: monotonic sequencing and unique ids, encrypted persistence
+plus replay, replay idempotency, observer failure isolation, the
+phase-hook-compatible ``emit`` contract, read-model projection, serialisation
+fallback, and the closed-bus behaviour.
 """
 
 import asyncio
@@ -46,7 +46,11 @@ def _publish(
     payload: dict | None = None,
     refs: list[str] | None = None,
 ) -> LedgerEvent:
-    """Publish an event with a default payload and assert it was accepted."""
+    """Publish ``kind`` to ``bus`` and return the accepted :class:`LedgerEvent`.
+
+    Falls back to ``{"seed": kind}`` when no explicit payload is supplied and
+    asserts that the bus accepted the event rather than rejecting it.
+    """
     event = bus.publish(
         kind,
         session_id=session_id,
@@ -58,10 +62,11 @@ def _publish(
 
 
 class TestSequencingAndIdentity:
-    """seq is monotonic and event ids are unique."""
+    """Sequence numbers climb monotonically and event ids stay unique."""
 
     def test_seq_increments_from_one(self):
-        bus = EventSourcedBus("no-persist")  # in-memory, no ledger file
+        """Publishes receive seq values 1, 2, 3 in the order they were sent."""
+        bus = EventSourcedBus("no-persist")  # in-memory bus with no ledger file
         e1 = _publish(bus, "turn_started")
         e2 = _publish(bus, "state_changed")
         e3 = _publish(bus, "phase:pre_model_request", session_id="")
@@ -71,6 +76,7 @@ class TestSequencingAndIdentity:
         assert e3.session_id == ""
 
     def test_event_ids_are_unique(self):
+        """Twenty distinct events yield twenty distinct non-empty ids."""
         bus = EventSourcedBus("no-persist")
         ids = {_publish(bus, f"kind-{i}").event_id for i in range(20)}
         assert len(ids) == 20
@@ -81,6 +87,7 @@ class TestPersistenceAndReplay:
     """Encrypted on-disk persistence round-trips and replay is idempotent."""
 
     def test_replay_round_trip_after_fresh_bus(self, tmp_path: Path):
+        """A new bus over the same ledger file reads the flushed events back."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("persist", ledger_path=path)
         e1 = _publish(bus, "turn_started", session_id="session-A")
@@ -100,6 +107,7 @@ class TestPersistenceAndReplay:
         assert fresh.replay("session-B")[0].event_id == e3.event_id
 
     def test_ledger_is_encrypted_at_rest(self, tmp_path: Path):
+        """Neither the kind nor the payload plaintext appears in the raw file."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("persist", ledger_path=path)
         _publish(bus, "secret_kind", session_id="s", payload={"token": "plaintext-marker"})
@@ -109,6 +117,7 @@ class TestPersistenceAndReplay:
         assert "plaintext-marker" not in raw
 
     def test_replay_is_idempotent(self, tmp_path: Path):
+        """Repeated replays return the same events without publishing anything."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("persist", ledger_path=path)
         for i in range(5):
@@ -124,6 +133,7 @@ class TestPersistenceAndReplay:
         assert fresh.count == 0
 
     def test_flush_batch_buffers_until_flush(self, tmp_path: Path):
+        """Batched events stay in memory until flush() writes them to disk."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("batch", ledger_path=path, flush_batch=100)
         _publish(bus, "a", session_id="s")
@@ -135,6 +145,7 @@ class TestPersistenceAndReplay:
         assert [ev.kind for ev in fresh.replay("s")] == ["a", "b"]
 
     async def test_aflush_writes_without_blocking(self, tmp_path: Path):
+        """The async flush writes the buffered event without blocking."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("aflush", ledger_path=path, flush_batch=100)
         _publish(bus, "a", session_id="s")
@@ -142,6 +153,7 @@ class TestPersistenceAndReplay:
         assert [rec["kind"] for rec in read_jsonl(path)] == ["a"]
 
     def test_persist_false_never_writes(self, tmp_path: Path):
+        """persist=False keeps the bus fully in memory; no file is created."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("nopersist", ledger_path=path, persist=False)
         _publish(bus, "a", session_id="s")
@@ -150,6 +162,7 @@ class TestPersistenceAndReplay:
         assert EventSourcedBus("x", ledger_path=path).replay("s") == []
 
     def test_no_ledger_path_is_pure_memory(self):
+        """A bus with no ledger path is ephemeral: flush is a no-op, replay empty."""
         bus = EventSourcedBus("mem")
         _publish(bus, "turn_started", session_id="s")
         bus.flush()  # no-op
@@ -160,13 +173,16 @@ class TestObserverIsolation:
     """A raising observer never blocks other observers or the publisher."""
 
     def test_sync_observer_raise_is_isolated(self):
+        """A throwing sync observer does not stop the next observer from running."""
         bus = EventSourcedBus("iso")
         seen: list[str] = []
 
         def boom(_event: LedgerEvent) -> None:
+            """Observer that always raises to simulate a failing subscriber."""
             raise RuntimeError("observer exploded")
 
         def collector(event: LedgerEvent) -> None:
+            """Observer that records the kinds it successfully receives."""
             seen.append(event.kind)
 
         bus.subscribe("target", boom)
@@ -176,6 +192,7 @@ class TestObserverIsolation:
         assert event is not None
 
     def test_wildcard_subscriber_receives_everything(self):
+        """A '*' subscription is delivered every published event."""
         bus = EventSourcedBus("iso")
         kinds: list[str] = []
         bus.subscribe("*", lambda ev: kinds.append(ev.kind))
@@ -184,13 +201,16 @@ class TestObserverIsolation:
         assert kinds == ["a", "b"]
 
     async def test_async_observer_raise_is_isolated(self):
+        """A raising async observer does not prevent later async observers."""
         bus = EventSourcedBus("iso")
         received: list[int] = []
 
         async def boom(_event: LedgerEvent) -> None:
+            """Async observer that always raises to simulate a failing subscriber."""
             raise RuntimeError("async boom")
 
         async def collector(event: LedgerEvent) -> None:
+            """Async observer that records the seq numbers it receives."""
             received.append(event.seq)
 
         bus.subscribe("target", boom)
@@ -204,15 +224,19 @@ class TestEmitPhaseSemantics:
     """emit keeps phase-hook behaviour: last non-None result, isolated failures."""
 
     async def test_emit_returns_last_non_none(self):
+        """emit returns the last non-None handler result, ignoring earlier Nones."""
         bus = EventSourcedBus("phases")
 
         async def none_handler(**kw):
+            """Handler that contributes nothing by returning None."""
             return None
 
         async def first(**kw):
+            """First real handler, returning a result that gets superseded."""
             return {"a": 1}
 
         async def second(**kw):
+            """Last handler, whose result wins the emit() aggregation."""
             return {"b": 2}
 
         bus.on("pre_model_request", none_handler)
@@ -222,14 +246,17 @@ class TestEmitPhaseSemantics:
         assert result == {"b": 2}
 
     async def test_emit_isolates_raising_handler(self):
+        """A raising handler is swallowed so later handlers still run."""
         bus = EventSourcedBus("phases")
         calls: list[str] = []
 
         async def boom(**kw):
+            """Handler that raises after recording that it was called."""
             calls.append("boom")
             raise ValueError("bad handler")
 
         async def after(**kw):
+            """Handler that runs after boom and supplies the final result."""
             calls.append("after")
             return "ok"
 
@@ -240,10 +267,12 @@ class TestEmitPhaseSemantics:
         assert calls == ["boom", "after"]
 
     async def test_emit_records_phase_on_ledger(self, tmp_path: Path):
+        """emit() appends a phase:<name> event that replay can read back."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("phases", ledger_path=path)
 
         async def handler(**kw):
+            """Phase handler; only its registration is required for the event."""
             return None
 
         bus.on("pre_model_request", handler)
@@ -253,9 +282,11 @@ class TestEmitPhaseSemantics:
         assert [ev.kind for ev in fresh.replay("")] == ["phase:pre_model_request"]
 
     async def test_has_listeners(self):
+        """has_listeners reflects on/off registration state."""
         bus = EventSourcedBus("phases")
 
         async def h(**kw):
+            """Minimal phase handler used only to test listener bookkeeping."""
             return None
 
         assert bus.has_listeners("tool_call") is False
@@ -269,6 +300,7 @@ class TestProjection:
     """project folds replayed events into the documented read-model shape."""
 
     def test_project_counts(self, tmp_path: Path):
+        """The projection counts events, kinds, turns, and tool calls per session."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("proj", ledger_path=path)
         _publish(bus, "turn_started", session_id="sess-A")
@@ -293,6 +325,7 @@ class TestProjection:
         assert sorted(proj["tool_calls"]) == ["call_1", "call_2"]
 
     def test_project_empty_session(self, tmp_path: Path):
+        """Projecting an unknown session yields the empty read-model shape."""
         path = tmp_path / "ledger" / "events.jsonl"
         EventSourcedBus("proj", ledger_path=path).flush()
         proj = EventSourcedBus("proj", ledger_path=path).project("ghost")
@@ -310,6 +343,7 @@ class TestSerialisationFallback:
     """Non-JSON payload values degrade safely without raising."""
 
     def test_unsafe_payload_degrades_without_raising(self, tmp_path: Path):
+        """A non-serialisable payload value becomes its repr string on replay."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("fallback", ledger_path=path)
         bus.publish("opaque", session_id="s", payload={"marker": object(), "ok": 1})
@@ -324,6 +358,7 @@ class TestSerialisationFallback:
         assert "object at 0x" in payload["marker"]
 
     def test_nested_unsafe_value_degrades(self, tmp_path: Path):
+        """Serialisation fallback works for values nested inside lists."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("fallback", ledger_path=path)
         bus.publish("nested", session_id="s", payload={"l": [{1, 2, 3}, "x"]})
@@ -337,6 +372,7 @@ class TestClosedBus:
     """close() refuses new events; replay/projection keep working."""
 
     def test_close_then_publish_returns_none(self, tmp_path: Path):
+        """A closed bus rejects new publishes while preserving existing records."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("close", ledger_path=path)
         _publish(bus, "turn_started", session_id="s")
@@ -347,9 +383,11 @@ class TestClosedBus:
         assert len(read_jsonl(path)) == 1
 
     async def test_close_blocks_emit(self):
+        """emit() on a closed bus returns None without invoking any handler."""
         bus = EventSourcedBus("close")
 
         async def h(**kw):
+            """Handler that must never run; asserting here would fail the test."""
             raise AssertionError("handler must not run on a closed bus")
 
         bus.on("p", h)
@@ -359,6 +397,7 @@ class TestClosedBus:
         assert bus.count == 0
 
     def test_close_forces_flush(self, tmp_path: Path):
+        """close() drains the batch buffer so no event is lost."""
         path = tmp_path / "ledger" / "events.jsonl"
         bus = EventSourcedBus("close", ledger_path=path, flush_batch=100)
         _publish(bus, "turn_started", session_id="s")

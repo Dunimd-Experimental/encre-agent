@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -64,22 +63,11 @@ def _reexport(name: str):
     return getattr(_native, name, _missing_native(name))
 
 
-def _reexport_default(name: str, default):
-    if _native is None:
-        return default
-    return getattr(_native, name, default)
-
-
-Bm25Index = _reexport("Bm25Index")
 apply_diff = _reexport("apply_diff")
-build_code_context = _reexport("build_code_context")
-build_code_index = _reexport("build_code_index")
-count_code_index_candidates = _reexport("count_code_index_candidates")
 build_content_length_header = _reexport("build_content_length_header")
 build_lsp_request = _reexport("build_lsp_request")
 compute_diff = _reexport("compute_diff")
 cosine_similarity = _reexport("cosine_similarity")
-build_embedding_slices = _reexport("build_embedding_slices")
 count_tokens = _reexport("count_tokens")
 execute_shell = _reexport("execute_shell")
 glob = _reexport("glob")
@@ -90,14 +78,30 @@ landlock_full_sandbox = _reexport("landlock_full_sandbox")
 landlock_restrict_network = _reexport("landlock_restrict_network")
 landlock_restrict_read_only = _reexport("landlock_restrict_read_only")
 landlock_workspace_sandbox = _reexport("landlock_workspace_sandbox")
-load_code_index = _reexport("load_code_index")
-load_embedding_index = _reexport("load_embedding_index")
-update_code_index = _reexport("update_code_index")
 parse_diagnostics = _reexport("parse_diagnostics")
 parse_lsp_message = _reexport("parse_lsp_message")
 permission_check = _reexport("permission_check")
 permission_check_mode = _reexport("permission_check_mode")
 permission_check_dangerous = _reexport("permission_check_dangerous")
+permission_dangerous_verdict = _reexport("permission_dangerous_verdict")
+permission_dangerous_matches = _reexport("permission_dangerous_matches")
+permission_check_immune = _reexport("permission_check_immune")
+permission_check_immune_path = _reexport("permission_check_immune_path")
+permission_capability_policy = _reexport("permission_capability_policy")
+permission_add_plugin_policy = _reexport("permission_add_plugin_policy")
+permission_remove_plugin_policies = _reexport("permission_remove_plugin_policies")
+permission_plugin_vote = _reexport("permission_plugin_vote")
+permission_get_plugin_policies = _reexport("permission_get_plugin_policies")
+permission_set_plugin_resources = _reexport("permission_set_plugin_resources")
+permission_remove_plugin_resources = _reexport("permission_remove_plugin_resources")
+permission_check_plugin_resource = _reexport("permission_check_plugin_resource")
+permission_check_plugin_ui = _reexport("permission_check_plugin_ui")
+permission_get_plugin_resources = _reexport("permission_get_plugin_resources")
+permission_register_plugin_tool = _reexport("permission_register_plugin_tool")
+permission_remove_plugin_ui = _reexport("permission_remove_plugin_ui")
+permission_set_plugin_tools_active = _reexport("permission_set_plugin_tools_active")
+permission_set_plugin_ui = _reexport("permission_set_plugin_ui")
+permission_plugin_tool_owner = _reexport("permission_plugin_tool_owner")
 permission_get_policies = _reexport("permission_get_policies")
 permission_get_learned_policies = _reexport("permission_get_learned_policies")
 permission_record_decision = _reexport("permission_record_decision")
@@ -105,14 +109,21 @@ permission_set_dangerous_patterns = _reexport("permission_set_dangerous_patterns
 permission_set_learned_policies = _reexport("permission_set_learned_policies")
 permission_set_mode = _reexport("permission_set_mode")
 permission_set_policies = _reexport("permission_set_policies")
+permission_set_tool_danger_levels = _reexport("permission_set_tool_danger_levels")
+plugin_sandbox_prepare_env = _reexport("plugin_sandbox_prepare_env")
+plugin_sandbox_resolve_limits = _reexport("plugin_sandbox_resolve_limits")
 read_file = _reexport("read_file")
 sandbox_execute = _reexport("sandbox_execute")
 sandbox_read_file = _reexport("sandbox_read_file")
 sandbox_write_file = _reexport("sandbox_write_file")
-save_embedding_index = _reexport("save_embedding_index")
-search_embedding_index = _reexport("search_embedding_index")
-search_code_index = _reexport("search_code_index")
 search_codebase = _reexport("search_codebase")
+# Native pyclass: the Rust module registers it as ``PySandboxSession``
+# (m.add_class::<PySandboxSession>() with no #[pyclass(name)] rename), so the
+# symbol lookup must use that exact name; it is aliased to ``SandboxSession``
+# for the Python side.  A wrong name here would silently fall back to the
+# raiser function and surface later as "'function' object has no attribute
+# 'spawn'" in spawn_confined.
+SandboxSession = _reexport("PySandboxSession")
 
 
 def _with_default_args(fn, *defaults_by_pos):
@@ -141,42 +152,16 @@ simd_memmem = _reexport("simd_memmem")
 text_similarity = _reexport("text_similarity")
 write_file = _reexport("write_file")
 
-ast_available = _reexport_default("ast_available", lambda: False)
-ast_backend_name = _reexport_default("ast_backend_name", lambda: None)
-ast_find_references = _reexport("ast_find_references")
-ast_find_relevant = _reexport("ast_find_relevant")
-ast_get_outline = _reexport("ast_get_outline")
-ast_get_symbol = _reexport("ast_get_symbol")
-ast_goto_definition = _reexport("ast_goto_definition")
-ast_list_files = _reexport("ast_list_files")
-build_ast_index = _reexport("build_ast_index")
-load_ast_index = _reexport("load_ast_index")
-update_ast_index = _reexport("update_ast_index")
-
 # Backward-compatible alias
 glob_pattern = glob
 
 
 __all__ = [
-    "Bm25Index",
     "apply_diff",
-    "ast_available",
-    "ast_backend_name",
-    "ast_find_references",
-    "ast_find_relevant",
-    "ast_get_outline",
-    "ast_get_symbol",
-    "ast_goto_definition",
-    "ast_list_files",
-    "build_ast_index",
-    "build_code_context",
-    "build_code_index",
     "build_content_length_header",
-    "build_embedding_slices",
     "build_lsp_request",
     "compute_diff",
     "cosine_similarity",
-    "count_code_index_candidates",
     "count_tokens",
     "execute_shell",
     "glob",
@@ -188,34 +173,48 @@ __all__ = [
     "landlock_restrict_network",
     "landlock_restrict_read_only",
     "landlock_workspace_sandbox",
-    "load_ast_index",
-    "load_code_index",
-    "load_embedding_index",
     "parse_diagnostics",
     "parse_lsp_message",
+    "permission_add_plugin_policy",
+    "permission_capability_policy",
     "permission_check",
     "permission_check_dangerous",
+    "permission_check_immune",
+    "permission_check_immune_path",
     "permission_check_mode",
+    "permission_check_plugin_resource",
+    "permission_check_plugin_ui",
+    "permission_dangerous_matches",
+    "permission_dangerous_verdict",
     "permission_get_learned_policies",
+    "permission_get_plugin_policies",
+    "permission_get_plugin_resources",
     "permission_get_policies",
+    "permission_plugin_tool_owner",
+    "permission_plugin_vote",
     "permission_record_decision",
+    "permission_register_plugin_tool",
+    "permission_remove_plugin_policies",
+    "permission_remove_plugin_resources",
+    "permission_remove_plugin_ui",
     "permission_set_dangerous_patterns",
     "permission_set_learned_policies",
     "permission_set_mode",
+    "permission_set_plugin_resources",
+    "permission_set_plugin_tools_active",
+    "permission_set_plugin_ui",
     "permission_set_policies",
+    "permission_set_tool_danger_levels",
+    "plugin_sandbox_prepare_env",
+    "plugin_sandbox_resolve_limits",
     "read_file",
     "sandbox_execute",
     "sandbox_read_file",
     "sandbox_write_file",
-    "save_embedding_index",
-    "search_code_index",
     "search_codebase",
-    "search_embedding_index",
     "simd_contains",
     "simd_find_all",
     "simd_memmem",
     "text_similarity",
-    "update_ast_index",
-    "update_code_index",
     "write_file",
 ]

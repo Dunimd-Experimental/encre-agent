@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,13 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
 
 """
 Local backend -- Hugging Face Transformers (CPU/GPU inference).
@@ -248,7 +255,7 @@ class LocalBackend(BaseBackend):
                         "arguments": json.dumps(func.get("arguments", {})),
                     })
             except json.JSONDecodeError:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
             pos = end
         return tool_calls
 
@@ -384,7 +391,7 @@ class LocalBackend(BaseBackend):
                 for text in streamer:
                     loop.call_soon_threadsafe(queue.put_nowait, text)
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
@@ -428,7 +435,7 @@ class LocalBackend(BaseBackend):
                     messages, tokenize=False, add_generation_prompt=True
                 )
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
 
         formatted = ""
         for msg in messages:
@@ -484,7 +491,7 @@ class LocalBackend(BaseBackend):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
         self._model = None
         self._tokenizer = None
 

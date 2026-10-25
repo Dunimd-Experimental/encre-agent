@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,15 +21,17 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Tool output budget management -- per-result and aggregate per-turn caps.
 
 Mirrors Claude Code's ``toolLimits.ts``:
 
 1. **Per-result cap**: each tool result is truncated if it exceeds the
-   tool's ``max_result_size_chars`` (default 20鈥?00 chars).
+   tool's ``max_result_size_chars`` (default 20‑000 chars).
 
 2. **Aggregate per-turn cap**: the total size of all tool results in a
-   single turn is bounded (default 500鈥?00 chars).  When exceeded, older
+   single turn is bounded (default 500‑000 chars).  When exceeded, older
    results are truncated first so the most recent information survives.
 
 The pipeline calls :func:`apply_tool_result_budget` **before** the API
@@ -79,7 +81,7 @@ def apply_tool_result_budget(
     if not enabled or not messages:
         return list(messages)
 
-    # 鈹€鈹€ Stage 1: per-result cap 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Stage 1: per-result cap ──────────────────────────────────────
     capped: list[dict[str, Any]] = []
     for msg in messages:
         if msg.get("role") == "tool":
@@ -92,7 +94,7 @@ def apply_tool_result_budget(
                 msg["content"] = content
         capped.append(msg)
 
-    # 鈹€鈹€ Stage 2: aggregate per-turn cap 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Stage 2: aggregate per-turn cap ──────────────────────────────
     # Find contiguous tool-message blocks (one per assistant turn).
     result: list[dict[str, Any]] = list(capped)
     i = 0

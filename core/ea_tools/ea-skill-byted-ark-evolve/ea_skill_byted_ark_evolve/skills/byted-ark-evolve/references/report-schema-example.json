@@ -1,0 +1,62 @@
+{
+  "date": "2026-03-12",
+  "summary": "本次处理了 6 条反馈，产生 2 条变更——主要改进了 Agent 的执行流程，让它在提问前先做调研、不主动调取用户记忆。",
+  "stats": {
+    "signals": 6,
+    "changes": 2,
+    "rejected": 0
+  },
+  "changes": [
+    {
+      "file": "AGENTS.md",
+      "description": "新增「先调研再提问」规则",
+      "reason": "你纠正了直接提问的行为——\"请你下次问我之前先搜索一下\"",
+      "status": "applied",
+      "before": "（无相关规则）",
+      "after": "## 调研优先原则\n收到创建类需求时，先搜索行业通用做法，再结合调研结果提问。"
+    },
+    {
+      "file": "SOUL.md",
+      "description": "新增「记忆访问边界」规则",
+      "reason": "你明确要求\"如果我不发起请求，不要调取我的记忆\"（高优先级）",
+      "status": "applied",
+      "before": "（无相关规则）",
+      "after": "## 记忆访问边界\n用户画像/记忆仅在用户主动请求时调取，Agent 不得主动引用。"
+    }
+  ],
+  "signals_by_layer": {
+    "protocol": 4,
+    "capability": 2
+  },
+  "high_severity_signals": [
+    {
+      "text": "如果我不发起请求，不要调取我的记忆"
+    }
+  ],
+  "all_signals": [
+    {"text": "请你下次问我之前先搜索一下", "type": "correction"},
+    {"text": "如果我不发起请求，不要调取我的记忆", "type": "correction"},
+    {"text": "只要中文，英文不要了", "type": "correction"},
+    {"text": "进化报告应该自动产出", "type": "suggestion"},
+    {"text": "变更前后标明文件名", "type": "suggestion"},
+    {"text": "术语要加灰色解释", "type": "suggestion"}
+  ],
+  "next_steps": [
+    "下次创建类任务时 → 观察是否先调研再提问",
+    "下次分析类任务时 → 观察是否主动引用记忆"
+  ],
+  "trajectory": {
+    "golden": 1,
+    "correction": 2
+  },
+  "saturation": {
+    "is_saturated": false,
+    "added": 2,
+    "modified": 0
+  },
+  "cost": {
+    "analysis_cost": 0.2,
+    "roi_percent": 25
+  },
+  "user_direct_changes": 1
+}

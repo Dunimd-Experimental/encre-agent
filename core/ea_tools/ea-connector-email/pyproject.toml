@@ -1,0 +1,53 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-connector-email"
+version = "0.5.0"
+description = "EA (Encre Agent) — system-default Email connector plugin."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "connector",
+    "email",
+    "imap",
+    "smtp",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+    "encre-core>=0.5.0",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.entry-points."ea.plugins"]
+email = "ea_connector_email.plugin:create_plugin"
+
+[tool.ea]
+icon = "mail"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_connector_email*",
+]

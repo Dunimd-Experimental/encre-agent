@@ -32,9 +32,14 @@
 import { t, getLocale, getIntlLocale, onLocaleChange } from "../features/i18n.js";
 import { send } from "../core/ws.js";
 import { Dialog } from "../ui/dialog.js";
-import { getState, subscribe, restoreMessages, setAutomationHistory } from "../core/state.js";
+import { PERMISSION_MODES, permissionModeGroup, permissionModeLabel, permissionModeIcon, guardPermissionMode, dialogPermissionConfirm } from "../core/permission_mode.js";
+import { getState, subscribe, restoreMessages, setAutomationHistory, locateModelInProviders } from "../core/state.js";
+import { scheduleRender } from "../core/render_scheduler.js";
+import { guardRender } from "../core/ui_boundary.js";
 import { showSessionContextMenu, showRenameDialog } from "./session.js";
-import { clampIntoViewport, showContextMenu } from "../ui/context-menu.js";
+import { clampIntoViewport, showContextMenu, renderContextMenuItems } from "../ui/context-menu.js";
+import { pluginMenuSpecs } from "../features/plugin_contributions.js";
+import { removeAnimated } from "../ui/animate.js";
 import {
   onAutomationJobCreated,
   onAutomationJobUpdated,
@@ -71,6 +76,10 @@ interface BackendJob {
   max_failures: number;
   tag: string;
   model_index: number;
+  /** Workspace path the job is pinned to; empty/absent keeps the default sandbox. */
+  workspace?: string;
+  /** Permission preset the job runs under; empty/absent keeps the ambient agent permission. */
+  permission_mode?: string;
   push_gateways?: string[];
 }
 
@@ -284,6 +293,7 @@ private createDropdown: HTMLElement;
   private _rebindTask: (() => void) | null = null;
   private _dateFromText: HTMLElement | null = null;
   private _dateToText: HTMLElement | null = null;
+  private _syncDateClearVisibility: (() => void) | null = null;
   // Cached filtered history for export (set by renderHistory)
   private currentFilteredHistory: HistoryEntry[] = [];
 
@@ -322,6 +332,21 @@ private createDropdown: HTMLElement;
           dd.classList.remove("open");
         });
       }
+    });
+
+    // History rows: one delegated listener each for activate / context menu.
+    // Bound once here (not per item inside `renderHistory`) so no re-render can
+    // ever drop them — see the note at the end of `renderHistory`.
+    this.historyTimelineEl.addEventListener("click", (e) => {
+      const item = (e.target as HTMLElement).closest(".history-timeline-item") as HTMLElement | null;
+      if (!item || !this.historyTimelineEl.contains(item)) return;
+      this.onHistoryItemClick(item);
+    });
+    this.historyTimelineEl.addEventListener("contextmenu", (e: MouseEvent) => {
+      const item = (e.target as HTMLElement).closest(".history-timeline-item") as HTMLElement | null;
+      if (!item || !this.historyTimelineEl.contains(item)) return;
+      e.preventDefault();
+      this.onHistoryItemContextMenu(item, e.clientX, e.clientY);
     });
 
     // Re-render an open detail view when the locale changes so the
@@ -394,7 +419,7 @@ private createDropdown: HTMLElement;
       } else {
         const errorCode = data.error_code || "AUTOMATION_EXECUTION_FAILED";
         const errDetail = data.result && data.result.trim() ? data.result.trim().slice(0, 500) : "";
-        this.detailContentEl.innerHTML = `<div class="si-panel-empty" style="flex:1;gap:14px;"><i data-lucide="ban" class="lucide" style="width:32px;height:32px;color:var(--text-muted);opacity:0.35;"></i><div class="si-panel-empty-title">${this.escapeHtml(t("automation.executionFailed") || "Execution failed")}</div><div class="si-panel-empty-sub">${this.escapeHtml(errorCode)}${errDetail ? `<br><span style="opacity:0.75;word-break:break-word;">${this.escapeHtml(errDetail)}</span>` : ""}</div></div>`;
+        this.detailContentEl.innerHTML = `<div class="si-empty-center" style="flex:1;gap:14px;"><i data-lucide="ban" class="lucide" style="width:32px;height:32px;color:var(--text-muted);opacity:0.35;"></i><div class="si-empty-title">${this.escapeHtml(t("automation.executionFailed") || "Execution failed")}</div><div class="si-empty-sub">${this.escapeHtml(errorCode)}${errDetail ? `<br><span style="opacity:0.75;word-break:break-word;">${this.escapeHtml(errDetail)}</span>` : ""}</div></div>`;
         if (typeof (window as any).lucide !== "undefined") (window as any).lucide.createIcons({ root: this.detailContentEl });
       }
     } else if (data.messages && data.messages.length > 0) {
@@ -500,10 +525,22 @@ private createDropdown: HTMLElement;
 
   // ── Rendering ───────────────────────────────────────────────────
 
-  /** Refreshes the panel by requesting the jobs list and run history. */
+  /** Renders the panel from the state store, without network requests.
+   *
+   *  The unified backend snapshot (`_push_all_data`) fills both
+   *  `automationJobs` and `automationHistory` at boot and on every mode /
+   *  config / workspace change, and the state subscription in
+   *  {@linkcode bindCallbacks} re-renders on every subsequent plane update —
+   *  so entering the view renders instantly from data that is already in
+   *  memory. Live freshness is kept by the job lifecycle events
+   *  (created / updated / cancelled / deleted), which re-request exactly the
+   *  plane that changed. */
   render(): void {
-    this.requestJobsList();
-    this.requestHistory();
+    this.jobs = getState().automationJobs;
+    // Configured jobs and run history are independent lists: a failure in
+    // one must still leave the other rendered.
+    guardRender("automation", "configured", () => this.renderConfigured());
+    guardRender("automation", "history", () => this.renderHistory());
   }
 
   private bindCallbacks(): void {
@@ -514,19 +551,20 @@ private createDropdown: HTMLElement;
     subscribe(() => {
       const jobs = getState().automationJobs;
       const history = getState().automationHistory;
+      let dirty = false;
       if (jobs !== lastJobsRef) {
         lastJobsRef = jobs;
         this.jobs = jobs;
-        this.renderConfigured();
         this.onHistoryFiltersRebind?.();
-        this.renderHistory();
+        dirty = true;
       }
       if (history !== lastHistoryRef) {
         lastHistoryRef = history;
         this.onHistoryFiltersRebind?.();
-        this.renderHistory();
+        dirty = true;
       }
-    });
+      if (dirty) scheduleRender("automation", () => this.render(), 60);
+    }, ["automationJobs", "automationHistory"]);
     onAutomationJobCreated(() => {
       this.requestJobsList();
     });
@@ -589,8 +627,8 @@ private createDropdown: HTMLElement;
             </div>
             <div class="model-form-row">
               <label class="model-form-label">${t("automation.triggerTime")}</label>
-              <div class="model-form-dropdown-row">
-                <div class="settings-dropdown-wrap" id="auto-dlg-schedule-wrap">
+              <div class="model-form-dropdown-row auto-trigger-row" id="auto-dlg-trigger-row">
+                <div class="settings-dropdown-wrap auto-trigger-sched" id="auto-dlg-schedule-wrap">
                   <button class="settings-dropdown-trigger" id="auto-dlg-schedule-trigger" type="button">
                     <i data-lucide="${parsed.scheduleType === "hourly" ? "clock" : "calendar"}" class="lucide auto-trigger-icon"></i>
                     <span>${parsed.scheduleType === "daily" ? t("automation.everyDay") : parsed.scheduleType === "weekly" ? t("automation.everyWeek") : t("automation.everyHour")}</span>
@@ -602,12 +640,9 @@ private createDropdown: HTMLElement;
                     <div class="settings-dropdown-item" data-value="hourly"><span>${t("automation.everyHour")}</span></div>
                   </div>
                 </div>
-              </div>
-              <div class="model-form-dropdown-row" id="auto-dlg-time-row" style="margin-top:8px">
-                <div class="settings-dropdown-wrap" id="auto-dlg-time-wrap">
-                  <button class="settings-dropdown-trigger" id="auto-dlg-time-trigger" type="button">
-                    <i data-lucide="clock" class="lucide auto-trigger-icon"></i>
-                    <span>${escapeHtml(parsed.time)}</span>
+                <div class="settings-dropdown-wrap auto-trigger-time" id="auto-dlg-time-wrap">
+                  <button class="settings-dropdown-trigger auto-time-trigger" id="auto-dlg-time-trigger" type="button">
+                    <span class="auto-time-value">${escapeHtml(parsed.time)}</span>
                     <i data-lucide="chevron-down" class="lucide settings-dropdown-chevron"></i>
                   </button>
                   <div class="settings-dropdown time-picker-dropdown" id="auto-dlg-time-dropdown">
@@ -619,19 +654,46 @@ private createDropdown: HTMLElement;
                 </div>
               </div>
             </div>
-          <div class="model-form-row">
-            <label class="model-form-label">${t("automation.modelLabel")}</label>
-            <div class="model-form-dropdown-row">
-              <div class="settings-dropdown-wrap" id="auto-dlg-model-wrap">
-                <button class="settings-dropdown-trigger" id="auto-dlg-model-trigger" type="button">
-                  <span>${(_dlgModels[initModelIndex]?.name) || "—"}</span>
-                  <i data-lucide="chevron-down" class="lucide settings-dropdown-chevron"></i>
-                </button>
-                <div class="settings-dropdown" id="auto-dlg-model-dropdown"></div>
+          <div class="model-form-row auto-model-perm-row">
+            <div class="auto-model-perm-col">
+              <label class="model-form-label">${t("automation.modelLabel")}</label>
+              <div class="model-form-dropdown-row">
+                <div class="settings-dropdown-wrap" id="auto-dlg-model-wrap">
+                  <button class="settings-dropdown-trigger" id="auto-dlg-model-trigger" type="button">
+                    <span>${(_dlgModels[initModelIndex]?.name) || "—"}</span>
+                    <i data-lucide="chevron-down" class="lucide settings-dropdown-chevron"></i>
+                  </button>
+                  <div class="settings-dropdown" id="auto-dlg-model-dropdown"></div>
+                </div>
+              </div>
+            </div>
+            <div class="auto-model-perm-col">
+              <label class="model-form-label">${t("input.permissionMode")}</label>
+              <div class="model-form-dropdown-row">
+                <div class="settings-dropdown-wrap" id="auto-dlg-perm-wrap">
+                  <button class="settings-dropdown-trigger" id="auto-dlg-perm-trigger" type="button">
+                    <span class="auto-perm-mode-icon" id="auto-dlg-perm-mode-icon"></span>
+                    <span class="auto-perm-mode-label"></span>
+                    <i data-lucide="chevron-down" class="lucide settings-dropdown-chevron"></i>
+                  </button>
+                  <div class="settings-dropdown" id="auto-dlg-perm-dropdown"></div>
+                </div>
               </div>
             </div>
           </div>
-          <div class="settings-card" style="margin-bottom:12px;margin-top:8px;overflow:hidden">
+          <div class="model-form-row">
+            <label class="model-form-label">${t("automation.workspaceLabel")}</label>
+            <div class="model-form-dropdown-row">
+              <div class="settings-dropdown-wrap" id="auto-dlg-workspace-wrap">
+                <button class="settings-dropdown-trigger" id="auto-dlg-workspace-trigger" type="button">
+                  <span></span>
+                  <i data-lucide="chevron-down" class="lucide settings-dropdown-chevron"></i>
+                </button>
+                <div class="settings-dropdown" id="auto-dlg-workspace-dropdown"></div>
+              </div>
+            </div>
+          </div>
+          <div class="settings-card model-selection-card" style="margin-bottom:12px;overflow:hidden">
             <div class="settings-item-row">
               <div class="settings-item-info">
                 <div class="settings-item-title">
@@ -646,10 +708,12 @@ private createDropdown: HTMLElement;
                 </label>
               </div>
             </div>
-            <div id="auto-dlg-push-gateways-row" style="${editJob?.push_gateways?.length ? "" : "display:none"}">
-              <div class="auto-push-gateways">
-                <div class="auto-push-gateways-label">${t("automation.pushGateways")}</div>
-                <div id="auto-dlg-push-gateways"></div>
+            <div id="auto-dlg-push-gateways-row" class="model-selection-row${editJob?.push_gateways?.length ? " model-selection-row--open" : ""}">
+              <div class="model-selection-row-inner">
+                <div class="auto-push-gateways">
+                  <div class="auto-push-gateways-label">${t("automation.pushGateways")}</div>
+                  <div id="auto-dlg-push-gateways" class="model-selection-list"></div>
+                </div>
               </div>
             </div>
           </div>
@@ -666,7 +730,10 @@ private createDropdown: HTMLElement;
         </div>
       </div>`;
 
-    document.body.appendChild(overlay);
+    // Dock inside the automation view: the overlay covers only this panel
+    // (absolute positioning, see styles.css) and disappears with the view —
+    // in-view isolation, same idea as tab-scoped dialogs in session_inner.
+    this.el.appendChild(overlay);
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: overlay });
     }
@@ -690,13 +757,31 @@ private createDropdown: HTMLElement;
 
     let scheduleValue = parsed.scheduleType;
     let timeValue = parsed.time;
-    const timeRow = overlay.querySelector("#auto-dlg-time-row") as HTMLElement;
+    const triggerRow = overlay.querySelector("#auto-dlg-trigger-row") as HTMLElement;
+    const timeWrap = overlay.querySelector("#auto-dlg-time-wrap") as HTMLElement;
     const timeTrigger = overlay.querySelector("#auto-dlg-time-trigger") as HTMLElement;
     const timeDropdown = overlay.querySelector("#auto-dlg-time-dropdown") as HTMLElement;
     const scheduleTrigger = overlay.querySelector("#auto-dlg-schedule-trigger") as HTMLElement;
     const scheduleDropdown = overlay.querySelector("#auto-dlg-schedule-dropdown") as HTMLElement;
 
     const pad2 = (n: number): string => n.toString().padStart(2, "0");
+
+    /** Reflect the picked time into the trigger label. */
+    const setTimeValue = (v: string) => {
+      timeValue = v;
+      timeTrigger.querySelector(".auto-time-value")!.textContent = v;
+    };
+
+    /** Scroll each column so its selected cell sits centred (no visible scrollbar). */
+    const centerTimeSelection = () => {
+      [ "#auto-dlg-time-hours", "#auto-dlg-time-mins" ].forEach((sel) => {
+        const col = overlay.querySelector(sel) as HTMLElement | null;
+        const cell = col?.querySelector(".settings-dropdown-item.selected") as HTMLElement | null;
+        if (!col || !cell) return;
+        col.scrollTop = Math.max(0, cell.offsetTop - (col.clientHeight - cell.offsetHeight) / 2);
+      });
+    };
+
     const buildTimeOptions = () => {
       const hoursCol = overlay.querySelector("#auto-dlg-time-hours") as HTMLElement;
       const minsCol = overlay.querySelector("#auto-dlg-time-mins") as HTMLElement;
@@ -717,16 +802,14 @@ private createDropdown: HTMLElement;
       };
       renderCol(hoursCol, 24, curH, (h) => {
         const m = parseInt((timeValue || "09:00").split(":")[1] ?? "0", 10);
-        timeValue = `${pad2(h)}:${pad2(m)}`;
-        timeTrigger.querySelector("span")!.textContent = timeValue;
+        setTimeValue(`${pad2(h)}:${pad2(m)}`);
         hoursCol.querySelectorAll(".settings-dropdown-item").forEach((item) => {
           item.classList.toggle("selected", parseInt(item.getAttribute("data-value") || "0", 10) === h);
         });
       });
       renderCol(minsCol, 60, curM, (m) => {
         const h = parseInt((timeValue || "09:00").split(":")[0] ?? "9", 10);
-        timeValue = `${pad2(h)}:${pad2(m)}`;
-        timeTrigger.querySelector("span")!.textContent = timeValue;
+        setTimeValue(`${pad2(h)}:${pad2(m)}`);
         minsCol.querySelectorAll(".settings-dropdown-item").forEach((item) => {
           item.classList.toggle("selected", parseInt(item.getAttribute("data-value") || "0", 10) === m);
         });
@@ -734,7 +817,11 @@ private createDropdown: HTMLElement;
     };
 
     const showTimePicker = (show: boolean) => {
-      timeRow.style.display = show ? "" : "none";
+      // One row: the schedule control sits left, the time control right.
+      // Hourly runs have no wall-clock time, so the row collapses to a single
+      // full-width schedule control instead of leaving a hole.
+      timeWrap.style.display = show ? "" : "none";
+      triggerRow.classList.toggle("auto-trigger-row--single", !show);
     };
 
     scheduleTrigger.addEventListener("click", (e) => {
@@ -777,12 +864,34 @@ private createDropdown: HTMLElement;
       document.querySelectorAll(".settings-dropdown.open").forEach((dd) => dd.classList.remove("open"));
       buildTimeOptions();
       timeDropdown.classList.add("open");
+      // Columns are display:none until `.open` lands — centre only afterwards.
+      requestAnimationFrame(centerTimeSelection);
     });
     document.addEventListener("click", closeTimeOutside);
 
     let selectedModelIndex = initModelIndex;
     const modelTrigger = overlay.querySelector("#auto-dlg-model-trigger") as HTMLElement;
     const modelDropdown = overlay.querySelector("#auto-dlg-model-dropdown") as HTMLElement;
+
+    /**
+     * Display name of the provider owning a flat `modelConfigs` index — the
+     * right-hand label of each dropdown row.  Mirrors the provider naming used
+     * by the model picker: custom providers show their user-defined name, the
+     * rest their catalog label.  "" when the provider snapshot is out of sync
+     * (callers then fall back to the model id).
+     */
+    const providerNameFor = (flatIdx: number): string => {
+      const loc = locateModelInProviders(flatIdx);
+      const providers = getState().providers || [];
+      const provider = loc ? providers[loc.providerIdx] : undefined;
+      if (!provider) return "";
+      const catalog = getState().modelCatalog;
+      const label = catalog?.providers?.find((c) => c.id === provider.backend_type)?.label
+        || provider.backend_type || "";
+      return provider.backend_type === "openai_compatible"
+        ? (provider.name?.trim() || label)
+        : label;
+    };
 
     const buildModelOptions = () => {
       const allModels = getState().modelConfigs;
@@ -793,9 +902,12 @@ private createDropdown: HTMLElement;
       }
       modelDropdown.innerHTML = models.map((m) => {
         const origIdx = allModels.indexOf(m);
+        // Right-hand label = provider, NOT the model id: `name` defaults to
+        // `model_id`, so showing the id too read as the model name twice.
+        const provider = providerNameFor(origIdx) || m.model_id;
         return `<div class="settings-dropdown-item${origIdx === selectedModelIndex ? " selected" : ""}" data-index="${origIdx}">
           <span>${escapeHtml(m.name)}</span>
-          <span style="opacity:0.5;margin-inline-start:6px;font-size:11px">${escapeHtml(m.model_id)}</span>
+          <span style="opacity:0.5;margin-inline-start:6px;font-size:11px">${escapeHtml(provider)}</span>
         </div>`;
       }).join("");
       modelDropdown.querySelectorAll(".settings-dropdown-item").forEach((item) => {
@@ -818,6 +930,112 @@ private createDropdown: HTMLElement;
       document.querySelectorAll(".settings-dropdown.open").forEach((dd) => dd.classList.remove("open"));
       buildModelOptions();
       modelDropdown.classList.add("open");
+    });
+
+    // ── Permission mode selector ──
+    // The same permission system every other mode uses: the four preset
+    // groups the safety engine dispatches on (manual / auto / full / custom).
+    // The raw value rides the job's agent config and is applied to the
+    // sub-agent config at schedule time, so approval really takes effect.
+    const permTrigger = overlay.querySelector("#auto-dlg-perm-trigger") as HTMLElement;
+    const permDropdown = overlay.querySelector("#auto-dlg-perm-dropdown") as HTMLElement;
+    let selectedPermission = permissionModeGroup(editJob?.permission_mode || "default");
+    // The collapsed trigger mirrors the mode list: current mode's icon + name,
+    // repainted on every applied switch.
+    const permLabelEl = permTrigger.querySelector(".auto-perm-mode-label") as HTMLElement;
+    const permIconEl = permTrigger.querySelector(".auto-perm-mode-icon") as HTMLElement;
+    const paintPermTrigger = () => {
+      permLabelEl.textContent = permissionModeLabel(selectedPermission);
+      permIconEl.innerHTML = `<i data-lucide="${permissionModeIcon(selectedPermission)}" class="lucide"></i>`;
+      if (typeof (window as any).lucide !== "undefined") {
+        (window as any).lucide.createIcons({ root: permIconEl });
+      }
+    };
+    paintPermTrigger();
+
+    const buildPermOptions = () => {
+      // Same catalogue and icons as every other mode list (shared module).
+      permDropdown.innerHTML = PERMISSION_MODES.map((m) =>
+        `<div class="settings-dropdown-item${m.id === selectedPermission ? " selected" : ""}" data-perm-mode="${m.id}"><i data-lucide="${m.icon}" class="lucide"></i><span>${escapeHtml(t(m.labelKey))}</span></div>`
+      ).join("");
+      if (typeof (window as any).lucide !== "undefined") {
+        (window as any).lucide.createIcons({ root: permDropdown });
+      }
+      permDropdown.querySelectorAll(".settings-dropdown-item").forEach((item) => {
+        item.addEventListener("click", (e) => {
+          e.stopPropagation();
+          void (async () => {
+            // Shared guarded path: "bypass" requires the danger confirmation,
+            // rejection keeps the previous selection.
+            const applied = await guardPermissionMode(
+              (item as HTMLElement).getAttribute("data-perm-mode") || "default",
+              dialogPermissionConfirm,
+            );
+            permDropdown.classList.remove("open");
+            if (applied === null) return;
+            selectedPermission = applied;
+            paintPermTrigger();
+          })();
+        });
+      });
+    };
+
+    permTrigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isOpen = permDropdown.classList.contains("open");
+      if (isOpen) { permDropdown.classList.remove("open"); return; }
+      document.querySelectorAll(".settings-dropdown.open").forEach((dd) => dd.classList.remove("open"));
+      buildPermOptions();
+      permDropdown.classList.add("open");
+    });
+
+    // ── Workspace selector (optional execution context) ──
+    // Empty selection keeps the backend's default execution sandbox; a picked
+    // workspace is pinned into the job's agent config at schedule time.
+    const wsTrigger = overlay.querySelector("#auto-dlg-workspace-trigger") as HTMLElement;
+    const wsDropdown = overlay.querySelector("#auto-dlg-workspace-dropdown") as HTMLElement;
+    let selectedWorkspace = editJob?.workspace || "";
+
+    const wsLabelFor = (path: string): string => {
+      if (!path) return t("automation.workspaceNone");
+      const ws = (getState().workspaces || []).find((w) => w.path === path);
+      return ws?.name || path;
+    };
+    wsTrigger.querySelector("span")!.textContent = wsLabelFor(selectedWorkspace);
+
+    const buildWorkspaceOptions = () => {
+      const list = (getState().workspaces || []).slice();
+      // Keep a stale binding selectable so editing a job whose workspace was
+      // later removed never silently rewrites it to "none".
+      if (selectedWorkspace && !list.some((w) => w.path === selectedWorkspace)) {
+        list.push({ id: "", path: selectedWorkspace, name: selectedWorkspace, opened_at: 0 });
+      }
+      if (list.length === 0) {
+        wsDropdown.innerHTML = `<div class="settings-dropdown-item" style="opacity:0.5;cursor:default">${t("workspace.noWorkspaces")}</div>`;
+        return;
+      }
+      wsDropdown.innerHTML = [
+        `<div class="settings-dropdown-item${selectedWorkspace ? "" : " selected"}" data-ws-path="">${escapeHtml(t("automation.workspaceNone"))}</div>`,
+        ...list.map((w) => `<div class="settings-dropdown-item${w.path === selectedWorkspace ? " selected" : ""}" data-ws-path="${escapeHtml(w.path)}"><span>${escapeHtml(w.name)}</span></div>`),
+      ].join("");
+      wsDropdown.querySelectorAll(".settings-dropdown-item").forEach((item) => {
+        item.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const path = (item as HTMLElement).getAttribute("data-ws-path") || "";
+          selectedWorkspace = path;
+          wsTrigger.querySelector("span")!.textContent = wsLabelFor(path);
+          wsDropdown.classList.remove("open");
+        });
+      });
+    };
+
+    wsTrigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isOpen = wsDropdown.classList.contains("open");
+      if (isOpen) { wsDropdown.classList.remove("open"); return; }
+      document.querySelectorAll(".settings-dropdown.open").forEach((dd) => dd.classList.remove("open"));
+      buildWorkspaceOptions();
+      wsDropdown.classList.add("open");
     });
 
     if (parsed.scheduleType === "hourly") showTimePicker(false);
@@ -866,12 +1084,11 @@ private createDropdown: HTMLElement;
     };
 
     pushToggle.addEventListener("change", () => {
-      if (pushToggle.checked) {
-        buildPushGateways();
-        pushGatewaysRow.style.display = "";
-      } else {
-        pushGatewaysRow.style.display = "none";
-      }
+      // `.model-selection-row--open` (grid-template-rows 0fr → 1fr) is the shared
+      // expand motion — never flip `display` here, that is what made this row
+      // snap while the gateway card's own pool glided.
+      if (pushToggle.checked) buildPushGateways();
+      pushGatewaysRow.classList.toggle("model-selection-row--open", pushToggle.checked);
     });
 
     // In edit mode with push enabled, populate gateways immediately
@@ -879,7 +1096,7 @@ private createDropdown: HTMLElement;
       buildPushGateways();
     }
 
-    const close = () => overlay.remove();
+    const close = () => removeAnimated(overlay);
     overlay.querySelector("#auto-dlg-cancel")?.addEventListener("click", close);
 
     overlay.querySelector("#auto-dlg-ok")?.addEventListener("click", () => {
@@ -913,7 +1130,7 @@ private createDropdown: HTMLElement;
         }
       }
 
-      overlay.remove();
+      removeAnimated(overlay);
 
       if (isEdit && editJob) {
         send({
@@ -924,6 +1141,8 @@ private createDropdown: HTMLElement;
           cron,
           tag: editJob.tag || "",
           model_index: selectedModelIndex,
+          workspace: selectedWorkspace,
+          permission_mode: selectedPermission,
           push_gateways: selectedPushGateways,
         } as any);
       } else {
@@ -934,6 +1153,8 @@ private createDropdown: HTMLElement;
           cron,
           tag: template.titleKey ? t(template.titleKey) : "",
           model_index: selectedModelIndex,
+          workspace: selectedWorkspace,
+          permission_mode: selectedPermission,
           push_gateways: selectedPushGateways,
         } as any);
       }
@@ -1018,10 +1239,9 @@ private createDropdown: HTMLElement;
     const wrap = this.configuredListEl;
 
     if (this.jobs.length === 0) {
-      wrap.innerHTML = `<div class="si-panel-empty">
+      wrap.innerHTML = `<div class="si-empty-center">
         <i data-lucide="calendar" class="lucide"></i>
-        <div class="si-panel-empty-title">${t("automation.noTasks")}</div>
-        <div class="si-panel-empty-sub">${t("automation.noTasksHint")}</div>
+        <span class="si-empty-title">${t("automation.noTasks")}</span>
       </div>`;
       if (typeof (window as any).lucide !== "undefined") {
         (window as any).lucide.createIcons({ root: wrap });
@@ -1109,6 +1329,35 @@ private createDropdown: HTMLElement;
         this.onConfiguredToggle(jobId);
       });
     });
+  }
+
+  /**
+   * Keep the date range sane: the start date must never be after the end
+   * date. When an out-of-order pick happens the counterpart field is moved
+   * so the range stays valid (picking a start after the end moves the end;
+   * picking an end before the start moves the start). Also refreshes the
+   * visible date labels, hidden inputs and the clear button.
+   */
+  private clampDateRange(changed: "from" | "to"): void {
+    const from = this.historyDateFrom;
+    const to = this.historyDateTo;
+    if (from && to && from > to) {
+      if (changed === "from") {
+        this.historyDateTo = from;
+      } else {
+        this.historyDateFrom = to;
+      }
+    }
+    const fromHidden = document.getElementById("history-date-from") as HTMLInputElement | null;
+    const toHidden = document.getElementById("history-date-to") as HTMLInputElement | null;
+    const fromText = document.getElementById("history-date-from-text");
+    const toText = document.getElementById("history-date-to-text");
+    if (fromHidden) fromHidden.value = this.historyDateFrom;
+    if (toHidden) toHidden.value = this.historyDateTo;
+    if (fromText) fromText.textContent = this.historyDateFrom || t("automation.dateStart");
+    if (toText) toText.textContent = this.historyDateTo || t("automation.dateEnd");
+    this._syncDateClearVisibility?.();
+    this.renderHistory();
   }
 
   private bindHistoryFilters(): void {
@@ -1269,8 +1518,8 @@ private createDropdown: HTMLElement;
       });
     }
 
-    bindDateField(dateFromBtn, dateFromDD, dateFromText, dateFromHidden, (v) => { this.historyDateFrom = v; this.renderHistory(); });
-    bindDateField(dateToBtn, dateToDD, dateToText, dateToHidden, (v) => { this.historyDateTo = v; this.renderHistory(); });
+    bindDateField(dateFromBtn, dateFromDD, dateFromText, dateFromHidden, (v) => { this.historyDateFrom = v; this.clampDateRange("from"); });
+    bindDateField(dateToBtn, dateToDD, dateToText, dateToHidden, (v) => { this.historyDateTo = v; this.clampDateRange("to"); });
 
     // Close calendar dropdowns when clicking outside
     document.addEventListener("click", () => {
@@ -1278,6 +1527,15 @@ private createDropdown: HTMLElement;
     });
 
     const dateClear = document.getElementById("history-date-clear");
+    // The clear (×) button only makes sense once a date has actually been
+    // picked — hide it until then so the empty filter row stays clean.
+    const syncDateClearVisibility = () => {
+      if (!dateClear) return;
+      const hasDate = !!(this.historyDateFrom || this.historyDateTo);
+      dateClear.classList.toggle("hidden", !hasDate);
+    };
+    this._syncDateClearVisibility = syncDateClearVisibility;
+    syncDateClearVisibility();
     if (dateClear) {
       dateClear.setAttribute("title", t("automation.clearDate"));
       dateClear.addEventListener("click", () => {
@@ -1287,6 +1545,7 @@ private createDropdown: HTMLElement;
         if (dateToHidden) dateToHidden.value = "";
         if (dateFromText) dateFromText.textContent = t("automation.dateStart");
         if (dateToText) dateToText.textContent = t("automation.dateEnd");
+        syncDateClearVisibility();
         this.renderHistory();
       });
     }
@@ -1413,7 +1672,7 @@ private createDropdown: HTMLElement;
     onChange: (val: string) => void,
   ): void {
     const trigger = document.getElementById(`${id}-trigger`);
-    const labelEl = document.getElementById(`${id}-label`);
+    let labelEl = document.getElementById(`${id}-label`);
     const dropdown = document.getElementById(`${id}-dropdown`);
     if (!trigger || !dropdown || !labelEl) return;
 
@@ -1425,9 +1684,13 @@ private createDropdown: HTMLElement;
       <div class="settings-dropdown-item${o.id === currentId ? " selected" : ""}" data-value="${escapeHtml(o.id)}">${escapeHtml(o.label)}</div>
     `).join("");
 
-    // Re-bind trigger click (replace node to clear old listeners)
+    // Re-bind trigger click (replace node to clear old listeners). The clone
+    // copies the child <span id="…-label">, so the previously captured
+    // `labelEl` becomes detached — re-query it after the swap so label
+    // updates land on the node that is actually in the DOM.
     const freshTrigger = trigger.cloneNode(true) as HTMLElement;
     trigger.parentNode!.replaceChild(freshTrigger, trigger);
+    labelEl = document.getElementById(`${id}-label`);
 
     freshTrigger.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -1444,7 +1707,7 @@ private createDropdown: HTMLElement;
       e.stopPropagation();
       const val = item.getAttribute("data-value") || "";
       const label = item.textContent || "";
-      labelEl.textContent = label;
+      if (labelEl) labelEl.textContent = label;
       dropdown.classList.remove("open");
       dropdown.querySelectorAll(".settings-dropdown-item").forEach((el) => el.classList.remove("selected"));
       item.classList.add("selected");
@@ -1462,8 +1725,15 @@ private createDropdown: HTMLElement;
     let displayHistory = [...getState().automationHistory];
 
     // ── Apply filters ──
-    const fromTs = this.historyDateFrom ? new Date(this.historyDateFrom + "T00:00:00").getTime() / 1000 : null;
-    const toTs = this.historyDateTo ? new Date(this.historyDateTo + "T23:59:59").getTime() / 1000 : null;
+    // Defensive: never let a reversed range silently hide everything. If the
+    // two dates are out of order, treat them as their sorted bounds.
+    let fromDate = this.historyDateFrom;
+    let toDate = this.historyDateTo;
+    if (fromDate && toDate && fromDate > toDate) {
+      [fromDate, toDate] = [toDate, fromDate];
+    }
+    const fromTs = fromDate ? new Date(fromDate + "T00:00:00").getTime() / 1000 : null;
+    const toTs = toDate ? new Date(toDate + "T23:59:59").getTime() / 1000 : null;
     displayHistory = displayHistory.filter((h) => {
       if (this.historyStatus && h.state !== this.historyStatus) return false;
       if (this.historyTaskId && h.job_id !== this.historyTaskId) return false;
@@ -1477,10 +1747,9 @@ private createDropdown: HTMLElement;
 
     if (displayHistory.length === 0 && getState().automationHistory.length === 0) {
       filtersEl.style.display = "none";
-      this.historyTimelineEl.innerHTML = `<div class="si-panel-empty">
+      this.historyTimelineEl.innerHTML = `<div class="si-empty-center">
         <i data-lucide="history" class="lucide"></i>
-        <div class="si-panel-empty-title">${t("automation.noHistory")}</div>
-        <div class="si-panel-empty-sub">${t("automation.noHistoryHint")}</div>
+        <span class="si-empty-title">${t("automation.noHistory")}</span>
       </div>`;
       if (typeof (window as any).lucide !== "undefined") {
         (window as any).lucide.createIcons({ root: this.historyTimelineEl });
@@ -1490,9 +1759,9 @@ private createDropdown: HTMLElement;
     filtersEl.style.display = "";
 
     if (displayHistory.length === 0) {
-      this.historyTimelineEl.innerHTML = `<div class="si-panel-empty">
+      this.historyTimelineEl.innerHTML = `<div class="si-empty-center">
         <i data-lucide="search-x" class="lucide"></i>
-        <div class="si-panel-empty-title">${t("automation.noMatchingHistory")}</div>
+        <span class="si-empty-title">${t("automation.noMatchingHistory")}</span>
       </div>`;
       if (typeof (window as any).lucide !== "undefined") {
         (window as any).lucide.createIcons({ root: this.historyTimelineEl });
@@ -1541,72 +1810,74 @@ private createDropdown: HTMLElement;
       (window as any).lucide.createIcons({ root: this.historyTimelineEl });
     }
 
-    this.historyTimelineEl.querySelectorAll(".history-timeline-item").forEach((item) => {
-      item.addEventListener("click", () => {
-        const entryId = (item as HTMLElement).getAttribute("data-entry-id");
-        const entry = getState().automationHistory.find(h => h.id === entryId);
-        if (!entry) return;
-        const job = this.jobs.find(j => j.id === entry.job_id);
-        const data: AutomationViewResult = {
-          id: entry.id,
-          name: entry.name,
-          prompt: (entry as any).prompt || job?.prompt || entry.name,
-          result: entry.last_result || "",
-          tag: entry.tag,
-          messages: entry.messages || [],
-          state: entry.state,
-          job_id: entry.job_id,
-          session_id: entry.session_id,
-};
-        this.openExecution(data);
-      });
-    });
+    // Click / right-click on a history row are DELEGATED on the timeline
+    // container (bound once in the constructor) rather than attached per item:
+    // `renderHistory()` rewrites the container's innerHTML on every history
+    // broadcast, so per-item listeners had to be re-attached on each pass and
+    // any row that survived a partial re-render (or a render that was
+    // interrupted) silently lost its handlers — which is exactly what made
+    // right-click appear dead.  Delegation cannot be lost by a re-render.
+  }
 
-    this.historyTimelineEl.querySelectorAll(".history-timeline-item").forEach((item) => {
-      (item as HTMLElement).addEventListener("contextmenu", (e: MouseEvent) => {
-        e.preventDefault();
-        const sid = (item as HTMLElement).getAttribute("data-sid");
-        const entryId = (item as HTMLElement).getAttribute("data-entry-id");
-        const entry = getState().automationHistory.find(h => h.id === entryId);
-        const isFailed = !!entry && entry.state === "FAILED";
-        const doRename = () => {
-          if (!entry) return;
-          showRenameDialog(entry.name || "", (newName) => {
-            if (entryId) {
-              send({ type: "automation_rename_execution", entry_id: entryId, new_name: newName });
-            }
-          });
-        };
-        const doDelete = () => {
-          if (entryId) {
-            Dialog.confirm(t("automation.confirmDeleteRecord") || "Delete this record?", "", { container: document.getElementById("app") ?? undefined }).then((confirmed) => {
-              if (confirmed) {
-                // Optimistically remove the entry from local state so the UI
-                // updates instantly, matching the session delete pattern.
-                const history = getState().automationHistory.filter((h: any) => h.id !== entryId);
-                setAutomationHistory(history);
-                send({ type: "automation_delete_execution", entry_id: entryId });
-              }
-            });
-          }
-        };
-        if (sid && !isFailed) {
-          // Completed entries with a real sub-agent session: keep export
-          // and session delete, but map rename to the execution record.
-          // Archiving is meaningless for automation history entries.
-          showSessionContextMenu(sid, e.clientX, e.clientY, true, false, undefined, doRename, true);
-        } else if (sid && isFailed) {
-          // Failed entries: reuse session context menu but hide export
-          // (no session data to export) and override delete/remove to the
-          // execution record. Rename also targets the execution record.
-          // Archiving is meaningless for automation history entries.
-          showSessionContextMenu(sid, e.clientX, e.clientY, true, true, doDelete, doRename, true);
-        } else if (entryId) {
-          // No sub-agent session — only rename/delete the execution record.
-          this.showAutomationHistoryContextMenu(e.clientX, e.clientY, doRename, doDelete);
+  private onHistoryItemClick(item: HTMLElement): void {
+    const entryId = item.getAttribute("data-entry-id");
+    const entry = getState().automationHistory.find(h => h.id === entryId);
+    if (!entry) return;
+    const job = this.jobs.find(j => j.id === entry.job_id);
+    const data: AutomationViewResult = {
+      id: entry.id,
+      name: entry.name,
+      prompt: (entry as any).prompt || job?.prompt || entry.name,
+      result: entry.last_result || "",
+      tag: entry.tag,
+      messages: entry.messages || [],
+      state: entry.state,
+      job_id: entry.job_id,
+      session_id: entry.session_id,
+    };
+    this.openExecution(data);
+  }
+
+  private onHistoryItemContextMenu(item: HTMLElement, x: number, y: number): void {
+    const sid = item.getAttribute("data-sid");
+    const entryId = item.getAttribute("data-entry-id");
+    const entry = getState().automationHistory.find(h => h.id === entryId);
+    const isFailed = !!entry && entry.state === "FAILED";
+    const doRename = () => {
+      if (!entry) return;
+      showRenameDialog(entry.name || "", (newName) => {
+        if (entryId) {
+          send({ type: "automation_rename_execution", entry_id: entryId, new_name: newName });
         }
       });
-    });
+    };
+    const doDelete = () => {
+      if (!entryId) return;
+      Dialog.confirm(t("automation.confirmDeleteRecord") || "Delete this record?", "", { scope: "app" }).then((confirmed) => {
+        if (confirmed) {
+          // Optimistically remove the entry from local state so the UI
+          // updates instantly, matching the session delete pattern.
+          const history = getState().automationHistory.filter((h: any) => h.id !== entryId);
+          setAutomationHistory(history);
+          send({ type: "automation_delete_execution", entry_id: entryId });
+        }
+      });
+    };
+    if (sid && !isFailed) {
+      // Completed entries with a real sub-agent session: keep export
+      // and session delete, but map rename to the execution record.
+      // Archiving is meaningless for automation history entries.
+      showSessionContextMenu(sid, x, y, true, false, undefined, doRename, true, item);
+    } else if (sid && isFailed) {
+      // Failed entries: reuse session context menu but hide export
+      // (no session data to export) and override delete/remove to the
+      // execution record. Rename also targets the execution record.
+      // Archiving is meaningless for automation history entries.
+      showSessionContextMenu(sid, x, y, true, true, doDelete, doRename, true, item);
+    } else if (entryId) {
+      // No sub-agent session — only rename/delete the execution record.
+      this.showAutomationHistoryContextMenu(x, y, doRename, doDelete, item);
+    }
   }
 
   private showAutomationHistoryContextMenu(
@@ -1614,32 +1885,19 @@ private createDropdown: HTMLElement;
     y: number,
     doRename: () => void,
     doDelete: () => void,
+    target?: HTMLElement | null,
   ): void {
     const menuEl = document.getElementById("session-context-menu")!;
-    menuEl.innerHTML = `
-      <div class="context-menu-item" id="ctx-automation-rename">
-        <i data-lucide="pencil" class="lucide lucide-sm"></i>
-        <span>${this.escapeHtml(t("session.rename"))}</span>
-      </div>
-      <div class="context-menu-divider"></div>
-      <div class="context-menu-item context-menu-item-danger" id="ctx-automation-delete">
-        <i data-lucide="trash-2" class="lucide lucide-sm"></i>
-        <span>${this.escapeHtml(t("session.delete"))}</span>
-      </div>`;
-    showContextMenu(menuEl, x, y);
-
-    document.getElementById("ctx-automation-rename")?.addEventListener("click", () => {
-      menuEl.classList.add("hidden");
-      doRename();
-    });
-    document.getElementById("ctx-automation-delete")?.addEventListener("click", () => {
-      menuEl.classList.add("hidden");
-      doDelete();
-    });
-
-    if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons({ root: menuEl });
-    }
+    renderContextMenuItems(
+      [
+        { id: "ctx-automation-rename", icon: "pencil", label: this.escapeHtml(t("session.rename")), onClick: doRename },
+        ...pluginMenuSpecs("automation_history"),
+        { divider: true },
+        { id: "ctx-automation-delete", icon: "trash-2", danger: true, label: this.escapeHtml(t("session.delete")), onClick: doDelete },
+      ],
+      { container: menuEl },
+    );
+    showContextMenu(menuEl, x, y, { target });
   }
 
   private onConfiguredAction(id: string, action: string): void {
@@ -1649,7 +1907,7 @@ private createDropdown: HTMLElement;
       Dialog.confirm(
         t("automation.confirmDeleteTaskTitle") || "Delete Task",
         t("automation.confirmDeleteTask", { name }) || `Delete task "${name}"? This cannot be undone.`,
-        { container: document.getElementById("app") ?? undefined },
+        { scope: "app" },
       ).then((confirmed) => {
         if (!confirmed) return;
         send({ type: "automation_delete_job", job_id: id });

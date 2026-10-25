@@ -49,7 +49,9 @@
 import { getFileIcon } from "../features/files.js";
 import { t } from "../features/i18n.js";
 
-const MAX_RENDER_LINES = 4000;
+// No cap on rendered rows. Diffs from file_write / file_edit carry the whole
+// file, so any limit silently hides part of the change the user asked to see.
+const MAX_RENDER_LINES = Number.POSITIVE_INFINITY;
 
 // Counter for generating unique split-view scroll container IDs
 let splitIdCounter = 0;
@@ -161,9 +163,32 @@ function parseDiff(diffText: string): {
   const out: DiffLine[] = [];
   let newLn = 0;
   let oldLn = 0;
-  let inHunk = false;
-  for (const rawLine of lines) {
-    const line = rawLine.replace(/\t/g, "    ");
+  // Diffs from the native `compute_diff` carry no `diff --git` / `@@` headers
+  // at all — every line is already prefixed content. Starting in a hunk for
+  // that shape is what keeps the leading unchanged lines from being dropped;
+  // for real `git diff` text the first header opens the hunk instead.
+  const headerless = !/^(?:diff --git |@@ |--- )/m.test(diffText);
+  let inHunk = headerless;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\t/g, "    ");
+    // Trailing "" is the artifact of the final newline, not a content line.
+    const isTrailingBlank = i === lines.length - 1 && line === "";
+    if (headerless) {
+      if (isTrailingBlank) continue;
+      if (line.startsWith("+")) {
+        newLn++;
+        out.push({ kind: "add", text: line.slice(1), ln: newLn, oldLn: 0 });
+      } else if (line.startsWith("-")) {
+        oldLn++;
+        out.push({ kind: "del", text: line.slice(1), ln: 0, oldLn });
+      } else {
+        newLn++;
+        oldLn++;
+        const text = line.startsWith(" ") ? line.slice(1) : line;
+        out.push({ kind: "ctx", text, ln: newLn, oldLn });
+      }
+      continue;
+    }
     if (line.startsWith("+++ ")) {
       if (!line.startsWith("+++ /dev/null")) {
         const m = line.match(/^\+\+\+ (?:[ab]\/)?(.+)$/);
@@ -262,6 +287,10 @@ function isWhitespaceOnly(text: string): boolean {
 
 export interface DiffRenderOptions {
   fileNameFallback?: string;
+  /** Explicit file name shown in the diff header, overriding whatever
+   *  parseDiff extracts from the diff text (use when the diff carries no
+   *  parseable file header, e.g. artifact diffs). */
+  fileName?: string;
   /** Truncate after this many content lines (default MAX_RENDER_LINES). */
   maxLines?: number;
   /** Inline word-level <del>/<ins> highlighting. */
@@ -295,7 +324,7 @@ export function renderDiffHtml(
 
   const maxLines = opts.maxLines ?? MAX_RENDER_LINES;
   const { fileName, lines } = parseDiff(diffText);
-  const fileLabel = fileName || opts.fileNameFallback || "";
+  const fileLabel = opts.fileName || fileName || opts.fileNameFallback || "";
 
   const adds = lines.filter((l) => l.kind === "add").length;
   const dels = lines.filter((l) => l.kind === "del").length;

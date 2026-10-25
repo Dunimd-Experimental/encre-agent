@@ -24,13 +24,18 @@
  * WebSocket transport layer.
  *
  * Manages the renderer ↔ backend WebSocket connection (default port 7110):
- * connection lifecycle, auto-reconnect, a keep-alive ping, transparent
- * AES-GCM encryption of outbound messages, and decryption of inbound events.
+ * connection lifecycle, auto-reconnect, a keep-alive ping, and AES-GCM
+ * encryption of every frame in both directions.
+ *
+ * Transport encryption is mandatory: the backend closes any connection whose
+ * first frame is not ciphertext, and this module never sends plaintext as a
+ * fallback. If the master key is unavailable the socket is simply not opened.
  * Outbound messages are queued until the socket is open.
  */
 
 import { ClientMessage, ServerEvent } from "./types.js";
 import { initCrypto, encrypt, decrypt, isReady } from "./crypto.js";
+import { reportUiFault } from "./ui_boundary.js";
 import { setConnected, getState, showToast } from "./state.js";
 
 type EventHandler = (event: ServerEvent) => void;
@@ -44,11 +49,20 @@ const CONNECT_TIMEOUT_MS = 45_000;
  *  background scheduleReconnect() path so it cannot double-connect. */
 let _initialConnect = false;
 
+/** Set by abortConnect() to cut the initial connect retry loop short (e.g.
+ *  when the backend process is known to have died — retrying a dead port is
+ *  just wasted time before the error UI can appear). */
+let _connectAborted = false;
+
+/** Cancels the current initial connect() retry loop early. */
+export function abortConnect(): void {
+  _connectAborted = true;
+}
+
 let ws: WebSocket | null = null;
 let handler: EventHandler | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
-let _cryptoInitDone = false;
 let pendingQueue: ClientMessage[] = [];
 
 /**
@@ -84,22 +98,24 @@ async function drainQueue(): Promise<void> {
 export async function connect(onEvent: EventHandler): Promise<void> {
   handler = onEvent;
 
-  // Initialise the crypto layer before the first connection. The keyfile is
-  // written by the backend, which may not have finished booting yet, so a
-  // failed attempt is retried on later connects instead of latching the
-  // session into permanent plaintext.
-  if (!_cryptoInitDone || !isReady()) {
-    await initCrypto();
-    _cryptoInitDone = true;
-  }
-
   const url = `ws://localhost:${WS_PORT}/ws`;
   _initialConnect = true;
+  _connectAborted = false;
   try {
     const deadline = Date.now() + CONNECT_TIMEOUT_MS;
     for (;;) {
-      const opened = await openSocket(url);
-      if (opened) break;
+      // The backend rejects any connection whose first frame is plaintext, so
+      // opening a socket before the master key is unwrapped is pointless. The
+      // keyfile is written by the backend at startup, so retry the unwrap
+      // alongside the connect until either succeeds or the deadline passes.
+      if (!isReady()) {
+        await initCrypto();
+      }
+      if (isReady()) {
+        const opened = await openSocket(url);
+        if (opened) break;
+      }
+      if (_connectAborted) break;
       if (Date.now() >= deadline) break;
       await new Promise<void>((r) => setTimeout(r, 400));
     }
@@ -132,32 +148,60 @@ function openSocket(url: string): Promise<boolean> {
       setConnected(true);
       startPing();
       drainQueue();
+      // The backend's handshake peek waits briefly for a first frame and then
+      // closes the socket if none arrived, so open with an encrypted frame
+      // rather than staying silent until the 25s keep-alive. The backend's
+      // pong reply doubles as a round-trip probe.
+      void send({ type: "ping" });
       resolve(true);
     });
 
-    socket.addEventListener("message", async (evt: MessageEvent<string>) => {
-      try {
-        let raw = evt.data;
-        let event: ServerEvent;
-
-        if (isReady() && raw && typeof raw === "string" && !raw.startsWith("{")) {
-          // Encrypted ciphertext — decrypt then parse
-          try {
-            const decrypted = await decrypt(raw);
-            event = JSON.parse(decrypted) as ServerEvent;
-          } catch {
-            // Fallback: try plaintext parse
-            event = JSON.parse(raw) as ServerEvent;
+    // Frames arrive in order, but `await decrypt()` resolves on the microtask
+    // queue: independent async listeners could finish out of order and apply
+    // events backwards (text rewinds, stale tool status wins). Chain them so
+    // decryption stays async while application stays strictly ordered.
+    let inboundChain: Promise<void> = Promise.resolve();
+    let sliceStart = performance.now();
+    socket.addEventListener("message", (evt: MessageEvent<string>) => {
+      const raw = evt.data;
+      inboundChain = inboundChain
+        .then(async () => {
+          if (!raw || typeof raw !== "string") {
+            throw new Error("[ws] received non-text frame");
           }
-        } else {
-          // Plaintext (legacy or crypto unavailable)
-          event = JSON.parse(raw) as ServerEvent;
-        }
-
-        handler?.(event);
-      } catch (e) {
-        console.warn("[ws] malformed message:", e);
-      }
+          // Every server frame is ciphertext. A decrypt/parse failure means
+          // the peer violated the protocol — surface it loudly.
+          const _decodeStarted = performance.now();
+          const decrypted = await decrypt(raw);
+          const event = JSON.parse(decrypted) as ServerEvent;
+          const _decodeMs = performance.now() - _decodeStarted;
+          if (_decodeMs >= 30) {
+            console.warn(`[perf] ws decode ${event.type} ${Math.round(_decodeMs)}ms`);
+          }
+          try {
+            handler?.(event);
+          } catch (handlerErr) {
+            // One bad event must not tear down a healthy transport or the
+            // inbound chain; it is recorded by the shared UI boundary.
+            reportUiFault("event", (event as { type?: string }).type || "event", handlerErr);
+          }
+          // The connect snapshot arrives as a burst of frames. Promise-chain
+          // continuations are microtasks, so without an explicit yield the
+          // whole burst (and any DOM work it triggers) runs before the
+          // browser handles a click or paints. Yielding every ~8 ms keeps the
+          // title bar and sidebar responsive while boot data streams in.
+          if (performance.now() - sliceStart >= 8) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+            sliceStart = performance.now();
+          }
+        })
+        .catch((e) => {
+          reportUiFault("transport", "decode", e);
+          // Fail closed: tear the socket down rather than keep a connection
+          // whose framing we no longer understand. The normal reconnect path
+          // will re-establish it once both sides agree again.
+          socket.close();
+        });
     });
 
     socket.addEventListener("close", () => {
@@ -179,32 +223,38 @@ function openSocket(url: string): Promise<boolean> {
 }
 
 /**
- * Sends a client message, encrypting it when the crypto layer is ready.
+ * Sends a client message, encrypted with AES-GCM. There is no plaintext path:
+ * an open socket implies the master key was unwrapped before connecting.
  *
  * @param msg - The client message to transmit. Queued if the socket is not open.
  */
-export async function send(msg: ClientMessage): Promise<void> {
+let sendChain: Promise<void> = Promise.resolve();
+
+async function deliver(msg: ClientMessage): Promise<void> {
+  if (ws?.readyState !== WebSocket.OPEN) {
+    pendingQueue.push(msg);
+    return;
+  }
+  const encrypted = await encrypt(JSON.stringify(msg));
+  ws.send(encrypted);
+}
+
+export function send(msg: ClientMessage): Promise<void> {
   // Record workspace intent before the (possibly queued) send so a late
   // response can be recognised as stale even if the socket was reconnecting.
   if (msg.type === "open_workspace") _workspaceIntent = "open";
   else if (msg.type === "close_workspace") _workspaceIntent = "close";
 
-  if (ws?.readyState !== WebSocket.OPEN) {
-    pendingQueue.push(msg);
-    return;
-  }
-  try {
-    const payload = JSON.stringify(msg);
-    if (isReady()) {
-      const encrypted = await encrypt(payload);
-      ws.send(encrypted);
-    } else {
-      ws.send(payload);
-    }
-  } catch (err) {
-    console.warn("[ws] send failed:", err);
-    showToast("Send failed", "", "error", "WebSocket");
-  }
+  // Encryption is async, so two callers racing would otherwise reach
+  // `ws.send` in completion order rather than call order (e.g. a cancel
+  // overtaking the run it was meant to stop). Chain them.
+  sendChain = sendChain
+    .then(() => deliver(msg))
+    .catch((err) => {
+      console.warn("[ws] send failed:", err);
+      showToast("Send failed", "", "error", "WebSocket");
+    });
+  return sendChain;
 }
 
 /** Sends a `retry` request for a given branch/message index. */
@@ -217,9 +267,11 @@ export function sendSwitchBranch(branch_id: string): void {
   send({ type: "switch_branch", branch_id, session_id: getState().sessionId });
 }
 
-/** Sends a `rollback` request to revert to an earlier message in a branch. */
-export function sendRollback(branch_id: string, message_id: string): void {
-  send({ type: "rollback", branch_id, message_id });
+/** Sends a `rollback` request to revert to an earlier message in a branch.
+ *  Always carries session_id -- see ClientRollback, the backend binds an
+ *  omitted one to the connection's last session. */
+export function sendRollback(branch_id: string, message_id: string, session_id?: string): void {
+  send({ type: "rollback", branch_id, message_id, session_id: session_id || getState().sessionId });
 }
 
 /** Sends the CDP WebSocket URL for the internal browser webview to the backend. */

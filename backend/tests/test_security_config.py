@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,17 @@
 
 from __future__ import annotations
 
-"""Tests for SSRF guard, rate limiter, config, telemetry, sandbox types."""
+"""Tests for the security-related building blocks and configuration surface.
+
+Covers the SSRF guard (URL validation, private-IP and metadata blocking,
+hostname classification, safe-hostname extraction and DNS-cache clearing),
+the per-key sliding-window rate limiter, the EncreConfig defaults and custom
+construction, and the sandbox config/result data types.
+
+Also exercises the telemetry record types and accumulator (tool calls, turns,
+retries, summary, flush, reset, disabled mode) and the logging setup helpers,
+so that a regression in any of these safety primitives is caught in one suite.
+"""
 
 import os
 import tempfile
@@ -31,8 +41,8 @@ import tempfile
 from encre.config import EncreConfig
 from encre.logging_config import get_logger, setup_logging
 
-# Redirect telemetry data to a temp directory so tests never pollute
-# the real production telemetry directory (~/.dunimd/encre/telemetry/).
+# Redirect telemetry data to a temporary directory so the test run never
+# pollutes the real production telemetry directory.
 _test_telemetry_dir = tempfile.mkdtemp(prefix="encre_test_telemetry_")
 os.environ["ENCRE_DATA_DIR"] = _test_telemetry_dir
 from encre.ratelimit import EncreRateLimiter, RateLimitResult
@@ -41,15 +51,16 @@ from encre.telemetry import EncreTelemetry, RetryRecord, ToolCallRecord, TurnRec
 
 
 class TestSSRFGuard:
-    """Engineered to validate the SSRF guard URL validation and hostname blocking logic.
+    """Validate the SSRF guard's URL validation and hostname-blocking logic.
 
-    This test class exercises EncreSSRFGuard across 10 scenarios covering
-    public URL acceptance, private-IP blocking, cloud-metadata blocking,
-    non-HTTP rejection, invalid-URL rejection, hostname private/public
-    classification, safe hostname extraction, blocked hostname extraction,
-    and DNS-cache clearing. The design ensures SSRF mitigation is effective
-    against both IP-based and hostname-based attack vectors.
+    Exercises EncreSSRFGuard across ten scenarios: public URL acceptance,
+    private-IP blocking, cloud-metadata blocking, non-HTTP rejection,
+    invalid-URL rejection, private and public hostname classification,
+    safe-hostname extraction, blocked-hostname extraction, and DNS-cache
+    clearing. Together these cover both IP-based and hostname-based SSRF
+    attack vectors.
     """
+
     def setup_method(self):
         """Create a fresh EncreSSRFGuard instance before each test method.
 
@@ -61,9 +72,8 @@ class TestSSRFGuard:
     def test_verify_validate_url_allows_public(self):
         """Validate that validate_url accepts a public HTTPS URL.
 
-        The test exercises validate_url with "https://example.com/resource"
-        and asserts True because public HTTPS URLs are the normal case the
-        guard must allow through.
+        Public HTTPS URLs are the normal case the guard must allow through,
+        so the call with "https://example.com/resource" must return True.
         """
         result = self.guard.validate_url("https://example.com/resource")
         assert result is True
@@ -71,19 +81,17 @@ class TestSSRFGuard:
     def test_verify_validate_url_blocks_private_ip(self):
         """Validate that validate_url rejects URLs targeting private IP ranges.
 
-        The test exercises validate_url with "http://127.0.0.1/admin" and
-        asserts False because localhost addresses are SSRF attack targets
-        that must be blocked.
+        Localhost addresses are SSRF attack targets and must be blocked, so
+        the call with "http://127.0.0.1/admin" must return False.
         """
         result = self.guard.validate_url("http://127.0.0.1/admin")
         assert result is False
 
     def test_verify_validate_url_blocks_metadata(self):
-        """Validate that validate_url rejects URLs targeting cloud metadata endpoints.
+        """Validate that validate_url rejects cloud metadata endpoints.
 
-        The test exercises validate_url with the AWS metadata IP 169.254.169.254
-        and asserts False because metadata-service access is a well-known
-        SSRF exploitation path.
+        Metadata-service access is a well-known SSRF exploitation path, so
+        the AWS metadata IP 169.254.169.254 must be blocked.
         """
         result = self.guard.validate_url("http://169.254.169.254/metadata")
         assert result is False
@@ -91,27 +99,24 @@ class TestSSRFGuard:
     def test_verify_validate_url_rejects_non_http(self):
         """Validate that validate_url rejects non-HTTP schemes such as FTP.
 
-        The test exercises validate_url with "ftp://example.com/file" and
-        asserts False because only HTTP and HTTPS are permitted by the
-        SSRF guard policy.
+        Only HTTP and HTTPS are permitted by the SSRF guard policy, so an
+        FTP URL must be rejected.
         """
         assert self.guard.validate_url("ftp://example.com/file") is False
 
     def test_verify_validate_url_rejects_invalid(self):
         """Validate that validate_url rejects syntactically invalid URLs.
 
-        The test exercises validate_url with "not-a-url" and asserts False
-        because the parser must reject strings that do not resolve to a
-        valid URL structure.
+        The parser must reject strings that do not resolve to a valid URL
+        structure, so a bare non-URL string returns False.
         """
         assert self.guard.validate_url("not-a-url") is False
 
     def test_verify_is_blocked_hostname_private(self):
-        """Validate that is_blocked_hostname returns True for private IP ranges.
+        """Validate that is_blocked_hostname returns True for private IPs.
 
-        The test exercises is_blocked_hostname against 127.0.0.1, 10.0.0.1,
-        and 192.168.1.1 and asserts True for all because RFC 1918 private
-        ranges must be blocked to prevent internal-network SSRF.
+        RFC 1918 private ranges must be blocked to prevent internal-network
+        SSRF, so loopback, 10/8 and 192.168/16 addresses all return True.
         """
         assert self.guard.is_blocked_hostname("127.0.0.1") is True
         assert self.guard.is_blocked_hostname("10.0.0.1") is True
@@ -120,17 +125,16 @@ class TestSSRFGuard:
     def test_verify_is_blocked_hostname_public(self):
         """Validate that is_blocked_hostname returns False for public IPs.
 
-        The test exercises is_blocked_hostname against 8.8.8.8 and asserts
-        False because public DNS-server addresses are legitimate targets.
+        Public DNS-server addresses are legitimate targets, so 8.8.8.8 must
+        be reported as unblocked.
         """
         assert self.guard.is_blocked_hostname("8.8.8.8") is False
 
     def test_verify_extract_safe_hostname(self):
-        """Validate that extract_safe_hostname returns the host component of a URL.
+        """Validate that extract_safe_hostname returns the URL's host component.
 
-        The test exercises extract_safe_hostname with "https://example.com/path"
-        and asserts "example.com" is returned because URL parsing must isolate
-        the hostname for subsequent blocking checks.
+        URL parsing must isolate the hostname for the subsequent blocking
+        checks, so "https://example.com/path" yields "example.com".
         """
         hostname = self.guard.extract_safe_hostname("https://example.com/path")
         assert hostname == "example.com"
@@ -138,9 +142,8 @@ class TestSSRFGuard:
     def test_verify_extract_safe_hostname_blocked(self):
         """Validate that extract_safe_hostname returns None for blocked hosts.
 
-        The test exercises extract_safe_hostname with "http://127.0.0.1/admin"
-        and asserts None because the hostname is a private IP and the guard
-        must signal rejection at the extraction stage.
+        The guard must signal rejection at the extraction stage when the
+        host is a private IP, so "http://127.0.0.1/admin" yields None.
         """
         hostname = self.guard.extract_safe_hostname("http://127.0.0.1/admin")
         assert hostname is None
@@ -148,38 +151,35 @@ class TestSSRFGuard:
     def test_verify_clear_dns_cache(self):
         """Validate that clear_dns_cache empties the internal DNS cache.
 
-        The test exercises clear_dns_cache and asserts len(_dns_cache) == 0
-        because cache clearing must remove all cached resolutions to force
-        fresh DNS lookups on the next request.
+        Cache clearing must drop every cached resolution so the next request
+        performs a fresh DNS lookup, leaving _dns_cache at length zero.
         """
         self.guard.clear_dns_cache()
         assert len(self.guard._dns_cache) == 0
 
 
 class TestRateLimiter:
-    """Engineered to validate the EncreRateLimiter construction and per-key rate tracking.
+    """Validate EncreRateLimiter construction and per-key rate tracking.
 
-    This test class exercises rate limiter configuration and request checking
-    across 6 scenarios covering construction, defaults, result structure,
-    allowed requests, and per-key independence. The design ensures the
-    limiter isolates rate windows per tool key.
+    Covers configuration, production defaults, the RateLimitResult contract
+    for both allowed and denied outcomes, first-request allowance, and
+    independence of rate windows across distinct tool keys.
     """
+
     def test_verify_create(self):
         """Validate that EncreRateLimiter stores the per_minute parameter.
 
-        The test exercises construction with per_minute=60 and asserts
-        rl.per_minute == 60 because the constructor must preserve the
-        configured rate limit.
+        The constructor must preserve the configured rate limit rather than
+        normalising it away.
         """
         rl = EncreRateLimiter(per_minute=60)
         assert rl.per_minute == 60
 
     def test_verify_defaults(self):
-        """Validate that EncreRateLimiter uses documented default rate limits.
+        """Validate that EncreRateLimiter uses the documented default limits.
 
-        The test exercises default construction and asserts per_minute=60,
-        per_hour=500, and max_concurrent=10 because these are the
-        production defaults for the rate-limiting policy.
+        Default construction must yield the production defaults for the
+        rate-limiting policy.
         """
         rl = EncreRateLimiter()
         assert rl.per_minute == 60
@@ -189,20 +189,18 @@ class TestRateLimiter:
     def test_verify_rate_limit_result(self):
         """Validate that RateLimitResult stores allowed and remaining fields.
 
-        The test exercises construction with allowed=True and remaining=5
-        and asserts both fields are preserved because the result object
-        is the contract between the limiter and the caller.
+        The result object is the contract between the limiter and its caller,
+        so both fields must survive construction unchanged.
         """
         rr = RateLimitResult(allowed=True, remaining=5)
         assert rr.allowed is True
         assert rr.remaining == 5
 
     def test_verify_rate_limit_result_denied(self):
-        """Validate that RateLimitResult stores denied state and retry_after.
+        """Validate that RateLimitResult stores the denied state and retry_after.
 
-        The test exercises construction with allowed=False and retry_after=10.0
-        and asserts both fields are preserved because denied results must
-        communicate when the caller may retry.
+        Denied results must communicate when the caller may retry, so the
+        retry_after value must be preserved.
         """
         rr = RateLimitResult(allowed=False, remaining=0, retry_after=10.0)
         assert rr.allowed is False
@@ -211,9 +209,8 @@ class TestRateLimiter:
     def test_verify_first_request_allowed(self):
         """Validate that the first request within the rate window is allowed.
 
-        The test exercises check("tool_a") on a limiter with a high per_minute
-        ceiling and asserts allowed=True because a single request must never
-        be blocked by the rate limiter itself.
+        A single request must never be blocked by the limiter itself, so the
+        check on an unused key returns allowed=True.
         """
         rl = EncreRateLimiter(per_minute=999)
         result = rl.check("tool_a")
@@ -222,9 +219,8 @@ class TestRateLimiter:
     def test_verify_different_keys_independent(self):
         """Validate that rate limits are tracked independently per key.
 
-        The test exercises check on "tool_a" then on "tool_b" with a high
-        ceiling and asserts the second request is allowed because each key
-        has its own sliding window.
+        Each key owns its own sliding window, so a request on a different
+        key is unaffected by traffic on the first key.
         """
         rl = EncreRateLimiter(per_minute=999)
         rl.check("tool_a")
@@ -233,19 +229,19 @@ class TestRateLimiter:
 
 
 class TestConfig:
-    """Engineered to validate EncreConfig default values and custom construction.
+    """Validate EncreConfig default values and custom construction.
 
-    This test class exercises config construction across 6 scenarios covering
-    defaults, custom model/backend/turns/tokens, backend kwargs, permission
-    mode, sandbox enabled flag, and tool_result_max_chars. The design ensures
-    the config object is the single source of truth for runtime parameters.
+    Covers defaults, custom model/backend/turns/tokens, backend kwargs, the
+    permission mode, the sandbox-enabled flag, and the tool result size cap,
+    treating the config object as the single source of truth for runtime
+    parameters.
     """
+
     def test_verify_defaults(self):
         """Validate that EncreConfig() initializes with expected default values.
 
-        The test exercises default construction and asserts max_tokens > 0,
-        max_turns == 0 (unlimited), and model == "" because these are the
-        documented baseline configuration values.
+        Default construction must match the documented baseline: a positive
+        token budget, zero turns to mean unlimited, and no model selected.
         """
         cfg = EncreConfig()
         # max_turns=0 means unlimited; model="" until a ModelConfig is selected.
@@ -254,11 +250,10 @@ class TestConfig:
         assert cfg.model == ""
 
     def test_verify_custom_config(self):
-        """Validate that EncreConfig accepts and preserves custom model and backend settings.
+        """Validate that EncreConfig preserves custom model and backend settings.
 
-        The test exercises construction with explicit model, backend_type,
-        max_turns, and max_tokens and asserts each field matches the input
-        because custom configuration must not be silently overwritten.
+        Custom configuration must not be silently overwritten, so each
+        supplied field has to round-trip to the same value.
         """
         cfg = EncreConfig(
             model="claude-sonnet-4-20250514",
@@ -271,11 +266,10 @@ class TestConfig:
         assert cfg.max_turns == 25
 
     def test_verify_backend_kwargs(self):
-        """Validate that EncreConfig stores backend_kwargs dictionary intact.
+        """Validate that EncreConfig stores backend_kwargs intact.
 
-        The test exercises construction with backend_kwargs={"temperature": 0.7}
-        and asserts the temperature value is preserved because backend-specific
-        parameters must pass through unchanged to the model provider.
+        Backend-specific parameters must pass through unchanged to the model
+        provider, so the temperature value is preserved verbatim.
         """
         cfg = EncreConfig(backend_kwargs={"temperature": 0.7})
         assert cfg.backend_kwargs["temperature"] == 0.7
@@ -283,9 +277,8 @@ class TestConfig:
     def test_verify_permission_mode_default(self):
         """Validate that the default permission_mode is 'bypass'.
 
-        The test exercises default construction and asserts permission_mode
-        == "bypass" because the default policy allows all tool executions
-        without user confirmation.
+        The default policy allows all tool executions without user
+        confirmation, so 'bypass' is expected out of default construction.
         """
         cfg = EncreConfig()
         assert cfg.permission_mode == "bypass"
@@ -293,8 +286,8 @@ class TestConfig:
     def test_verify_sandbox_enabled_default(self):
         """Validate that sandbox_enabled defaults to True.
 
-        The test exercises default construction and asserts sandbox_enabled
-        is True because sandbox isolation is enabled by default for safety.
+        Sandbox isolation is enabled by default for safety, so the flag must
+        be True without any explicit configuration.
         """
         cfg = EncreConfig()
         assert cfg.sandbox_enabled is True
@@ -302,22 +295,21 @@ class TestConfig:
     def test_verify_tool_result_max_chars(self):
         """Validate that tool_result_max_chars is stored and retrievable.
 
-        The test exercises construction with tool_result_max_chars=50000
-        and asserts the value is preserved because the truncation threshold
-        must be configurable per deployment.
+        The truncation threshold must be configurable per deployment, so a
+        custom value round-trips through the constructor.
         """
         cfg = EncreConfig(tool_result_max_chars=50000)
         assert cfg.tool_result_max_chars == 50000
 
 
 class TestTelemetry:
-    """Engineered to validate the EncreTelemetry recording and summary pipeline.
+    """Validate the EncreTelemetry record types and summary pipeline.
 
-    This test class exercises telemetry records and methods across 10 scenarios
-    covering ToolCallRecord, TurnRecord, RetryRecord construction, recording,
-    summary generation, flush, reset, and disabled-mode behavior. The design
-    ensures telemetry data is accurately accumulated and reportable.
+    Covers ToolCallRecord, TurnRecord and RetryRecord construction, the three
+    record_* appenders, get_summary aggregation, flush serialisation, reset,
+    and the no-op behaviour of a disabled telemetry instance.
     """
+
     def setup_method(self):
         """Create a fresh EncreTelemetry instance before each test method.
 
@@ -329,9 +321,8 @@ class TestTelemetry:
     def test_verify_tool_call_record(self):
         """Validate that ToolCallRecord stores all fields correctly.
 
-        The test exercises construction with tool_name="bash", latency_ms=1500.0,
-        success=True, and tokens_used=100 and asserts each field is preserved
-        because the record object is the atomic unit of telemetry data.
+        The record is the atomic unit of telemetry data, so tool name,
+        latency, success flag and token count must all be preserved.
         """
         tcr = ToolCallRecord(
             tool_name="bash", latency_ms=1500.0, success=True, tokens_used=100
@@ -342,11 +333,10 @@ class TestTelemetry:
         assert tcr.tokens_used == 100
 
     def test_verify_turn_record(self):
-        """Validate that TurnRecord stores turn_number, event_count, and latency_ms.
+        """Validate that TurnRecord stores turn_number, event_count, latency_ms.
 
-        The test exercises construction with turn_number=1, event_count=2,
-        and latency_ms=3000.0 and asserts each field is preserved because
-        turn-level aggregation depends on accurate counting.
+        Turn-level aggregation depends on accurate counting, so all three
+        fields must survive construction.
         """
         tr = TurnRecord(turn_number=1, event_count=2, latency_ms=3000.0)
         assert tr.turn_number == 1
@@ -354,11 +344,10 @@ class TestTelemetry:
         assert tr.latency_ms == 3000.0
 
     def test_verify_retry_record(self):
-        """Validate that RetryRecord stores attempt, error_type, error_detail, and delay_s.
+        """Validate that RetryRecord stores attempt, error_type, error_detail, delay_s.
 
-        The test exercises construction with attempt=2, error_type="http_status",
-        error_detail="429", and delay_s=1.0 and asserts all fields are
-        preserved because retry records must capture the full error context.
+        Retry records must capture the full error context for later
+        error-rate analysis, so every field is asserted.
         """
         rr = RetryRecord(
             attempt=2, error_type="http_status", error_detail="429", delay_s=1.0
@@ -371,9 +360,8 @@ class TestTelemetry:
     def test_verify_record_tool_call(self):
         """Validate that record_tool_call appends to the tool_calls list.
 
-        The test exercises record_tool_call("bash", 2000.0, True, 100) and
-        asserts len(tool_calls) == 1 because each recorded call must be
-        appended to the accumulator list.
+        Each recorded call must land in the accumulator, so one call yields
+        exactly one entry.
         """
         self.tel.record_tool_call("bash", 2000.0, True, 100)
         assert len(self.tel.tool_calls) == 1
@@ -381,9 +369,8 @@ class TestTelemetry:
     def test_verify_record_turn(self):
         """Validate that record_turn appends to the turns list.
 
-        The test exercises record_turn(1, 2, 3000.0) and asserts len(turns)
-        == 1 because each turn must be recorded for latency and event-count
-        aggregation.
+        Every turn must be recorded so latency and event counts can be
+        aggregated later.
         """
         self.tel.record_turn(1, 2, 3000.0)
         assert len(self.tel.turns) == 1
@@ -391,19 +378,16 @@ class TestTelemetry:
     def test_verify_record_retry(self):
         """Validate that record_retry appends to the retries list.
 
-        The test exercises record_retry(1, "http_status", "429", 1.0) and
-        asserts len(retries) == 1 because retry events must be captured
-        for error-rate analysis.
+        Retry events must be captured to support error-rate analysis.
         """
         self.tel.record_retry(1, "http_status", "429", 1.0)
         assert len(self.tel.retries) == 1
 
     def test_verify_get_summary(self):
-        """Validate that get_summary returns a dict with total_tool_calls count.
+        """Validate that get_summary returns a dict with total_tool_calls.
 
-        The test exercises record_tool_call followed by get_summary and
-        asserts the result is a dict with total_tool_calls == 1 because
-        the summary must aggregate recorded calls into a reportable format.
+        The summary must aggregate the recorded calls into a reportable
+        format, so the count reflects the single recorded tool call.
         """
         self.tel.record_tool_call("bash", 1000.0, True, 100)
         summary = self.tel.get_summary()
@@ -413,9 +397,8 @@ class TestTelemetry:
     def test_verify_flush(self):
         """Validate that flush persists recorded data and returns a summary dict.
 
-        The test exercises record_tool_call followed by flush and asserts
-        the result is a dict with total_tool_calls == 1 because flush must
-        serialize the in-memory buffer into an external store.
+        Flush must serialise the in-memory buffer into an external store and
+        still report the aggregated totals.
         """
         self.tel.record_tool_call("bash", 1000.0, True, 100)
         result = self.tel.flush()
@@ -425,9 +408,8 @@ class TestTelemetry:
     def test_verify_reset(self):
         """Validate that reset clears all recorded telemetry data.
 
-        The test exercises record_tool_call followed by reset and asserts
-        len(tool_calls) == 0 because reset must provide a clean slate
-        for a new session without restarting the process.
+        Reset must provide a clean slate for a new session without restarting
+        the process.
         """
         self.tel.record_tool_call("bash", 1000.0, True, 100)
         self.tel.reset()
@@ -436,9 +418,8 @@ class TestTelemetry:
     def test_verify_disabled_telemetry(self):
         """Validate that telemetry is discarded when enabled=False.
 
-        The test exercises record_tool_call on a telemetry instance with
-        enabled=False and asserts len(tool_calls) == 0 because disabled
-        telemetry must not accumulate any data.
+        A disabled instance must not accumulate any data, so recording a
+        tool call leaves the list empty.
         """
         tel = EncreTelemetry(enabled=False)
         tel.record_tool_call("bash", 1000.0, True, 100)
@@ -446,17 +427,17 @@ class TestTelemetry:
 
 
 class TestLoggingConfig:
-    """Engineered to validate logging setup and logger retrieval.
+    """Validate logging setup and logger retrieval.
 
-    This test class exercises setup_logging and get_logger across 2
-    scenarios to ensure the logging subsystem is functional.
+    Covers setup_logging and get_logger to confirm the logging subsystem is
+    functional and hands out usable logger objects.
     """
+
     def test_verify_setup_logging(self):
         """Validate that setup_logging completes without raising.
 
-        The test exercises setup_logging(level="WARNING") and asserts nothing
-        is raised because the function configures global state and returns
-        None on success.
+        The call configures global state and returns None on success, so
+        reaching the end of the test means the setup succeeded.
         """
         setup_logging(level="WARNING")
         # setup_logging returns None (configures global state)
@@ -464,27 +445,25 @@ class TestLoggingConfig:
     def test_verify_get_logger(self):
         """Validate that get_logger returns a non-None Logger instance.
 
-        The test exercises get_logger("test.module") and asserts the result
-        is not None because every module must be able to obtain a logger
-        for structured output.
+        Every module must be able to obtain a logger for structured output.
         """
         logger = get_logger("test.module")
         assert logger is not None
 
 
 class TestSandboxTypes:
-    """Engineered to validate SandboxConfig and SandboxResult types imported from encre.sandbox.types.
+    """Validate the sandbox data types imported from encre.sandbox.types.
 
-    This test class exercises these types across 4 scenarios covering
-    custom construction, defaults, basic result, and error result to
-    ensure the types module provides a stable API surface.
+    Covers SandboxConfig custom construction and defaults, plus a successful
+    and an error SandboxResult, to confirm the types module exposes a stable
+    API surface.
     """
+
     def test_verify_sandbox_config(self):
         """Validate that SandboxConfig accepts custom image and timeout values.
 
-        The test exercises construction with image="ubuntu:22.04" and
-        timeout=30 and asserts both fields are preserved because the
-        config types must support deployment-specific overrides.
+        The config types must support deployment-specific overrides, so both
+        fields round-trip through the constructor.
         """
         from encre.sandbox.types import SandboxConfig
 
@@ -493,11 +472,10 @@ class TestSandboxTypes:
         assert cfg.timeout == 30
 
     def test_verify_sandbox_config_defaults(self):
-        """Validate that SandboxConfig() exposes the documented default image and network policy.
+        """Validate that SandboxConfig() exposes the documented defaults.
 
-        The test exercises default construction and asserts image == "python:3.11-slim",
-        network.policy == NetworkPolicy.NONE, and resource.memory_limit == "512m"
-        because the defaults define the baseline sandbox configuration.
+        The defaults define the baseline sandbox configuration: a slim Python
+        image, no network access, and a modest memory ceiling.
         """
         from encre.sandbox.types import NetworkPolicy, SandboxConfig
 
@@ -507,11 +485,11 @@ class TestSandboxTypes:
         assert cfg.resource.memory_limit == "512m"
 
     def test_verify_sandbox_result(self):
-        """Validate that SandboxResult stores stdout, stderr, exit_code, and duration_ms.
+        """Validate that SandboxResult stores stdout, stderr, exit_code, duration_ms.
 
-        The test exercises construction with a successful execution and
-        asserts exit_code == 0 and stdout == "success" because the result
-        object is the primary contract between the sandbox and the caller.
+        The result is the primary contract between the sandbox and its
+        caller, so a successful execution must report code zero and its
+        stdout payload.
         """
         from encre.sandbox.types import SandboxResult
 
@@ -522,10 +500,8 @@ class TestSandboxTypes:
     def test_verify_sandbox_result_error(self):
         """Validate that SandboxResult stores error diagnostics correctly.
 
-        The test exercises construction with stderr="command not found",
-        exit_code=1, and timed_out=True and asserts exit_code == 1 and
-        timed_out is True because error results must preserve all
-        diagnostic fields for downstream logging and reporting.
+        Error results must preserve every diagnostic field so downstream
+        logging and reporting can explain the failure.
         """
         from encre.sandbox.types import SandboxResult
 

@@ -157,6 +157,10 @@ function renderText(text: string, icon?: string): void {
   const tip = ensureTooltip();
   const body = tipBody(tip);
   tip.className = "encre-tooltip";
+  // Clear the structured variant's inline geometry — the one-liner sizes
+  // itself from content again.
+  tip.style.width = "";
+  tip.style.maxWidth = "";
   body.className = "encre-tooltip-body";
   body.textContent = "";
   const img = icon ? makeIcon(icon, "encre-tooltip-icon") : null;
@@ -169,6 +173,37 @@ function renderText(text: string, icon?: string): void {
 }
 
 /**
+ * JS-side truncation, one mechanism for every line of the panel.
+ *
+ * The CSS `text-overflow: ellipsis` chain stays in place, but it leans on
+ * several rules cooperating; when any of them loses the race the line either
+ * hard-clips with no glyph or smears past the panel. This measures the real
+ * rendered box and binary-searches the longest prefix that fits, appending
+ * the same "…" the CSS would — so title and URL always cut identically no
+ * matter what the stylesheet ends up doing.
+ */
+function hardEllipsis(el: HTMLElement, text: string): void {
+  el.textContent = text;
+  // +1px tolerance for sub-pixel rounding between scrollWidth/clientWidth.
+  if (el.scrollWidth <= el.clientWidth + 1) return;
+  const chars = Array.from(text);
+  let lo = 1;
+  let hi = chars.length;
+  let best = 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    el.textContent = chars.slice(0, mid).join("") + "…";
+    if (el.scrollWidth <= el.clientWidth + 1) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  el.textContent = chars.slice(0, best).join("") + "…";
+}
+
+/**
  * Structured layout. Everything is flush left, values never wrap (an
  * ellipsis takes over instead) and the permission chips always close the
  * tooltip — so two tab hovers are always the same shape.
@@ -177,44 +212,69 @@ function renderModel(model: TooltipModel): void {
   const tip = ensureTooltip();
   const body = tipBody(tip);
   tip.className = "encre-tooltip encre-tooltip--model";
+  // Inline geometry: the fixed panel size must not depend on a stylesheet
+  // rule surviving the cascade — this IS the authoritative size.
+  tip.style.width = "340px";
+  tip.style.maxWidth = "min(340px, calc(100vw - 16px))";
   body.className = "encre-tooltip-body encre-tooltip-body--stack";
+  body.style.cssText = "display:flex;flex-direction:column;gap:6px;width:100%;min-width:0;";
   body.textContent = "";
 
   // ── header: icon + title ─────────────────────────────────────────
+  // The measurement-critical boxes carry their layout inline: even with a
+  // fully dead stylesheet every line still has a real box, one shared left
+  // inset (icon 14px + gap 6px) and one shared right edge — so the JS cut
+  // below lands on the same vertical line for title and URL.
   const head = document.createElement("div");
   head.className = "tt-head";
+  head.style.cssText =
+    "display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;";
   const headIcon = model.icon ? makeIcon(model.icon, "tt-head-icon") : null;
-  if (headIcon) head.appendChild(headIcon);
+  if (headIcon) {
+    headIcon.style.cssText = "width:14px;height:14px;flex-shrink:0;";
+    head.appendChild(headIcon);
+  }
   const title = document.createElement("span");
   title.className = "tt-title";
-  title.textContent = model.title;
+  title.style.cssText =
+    "display:block;flex:1;min-width:0;overflow:hidden;white-space:nowrap;font-weight:600;";
   head.appendChild(title);
   body.appendChild(head);
+  hardEllipsis(title, model.title);
 
   // ── fields: one `label | value` line each, columns aligned ───────
   if (model.rows.length) {
     const grid = document.createElement("div");
     grid.className = "tt-rows";
+    grid.style.cssText = "display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:10px;row-gap:1px;";
     for (const row of model.rows) {
       const line = document.createElement("div");
       line.className = "tt-row";
+      line.style.cssText = "display:contents;";
       if (row.label) {
         const label = document.createElement("span");
         label.className = "tt-label";
+        label.style.cssText = "white-space:nowrap;opacity:0.55;";
         label.textContent = row.label;
         line.appendChild(label);
       }
       const value = document.createElement("span");
-      // No label → the value owns the whole row (URLs, absolute paths).
+      // No label → the value owns the whole row (URLs, absolute paths) and
+      // starts 20px in, exactly where the header title's text starts.
       value.className = row.label ? "tt-value" : "tt-value tt-value--full";
-      value.textContent = row.value;
+      value.style.cssText = row.label
+        ? "display:block;min-width:0;overflow:hidden;white-space:nowrap;"
+        : "display:block;grid-column:1/-1;min-width:0;overflow:hidden;white-space:nowrap;padding-inline-start:20px;";
       line.appendChild(value);
       grid.appendChild(line);
+      hardEllipsis(value, row.value);
     }
     body.appendChild(grid);
   }
 
   // ── permissions: always the last block ───────────────────────────
+  // Icon-only chips: the icon alone identifies the permission (camera,
+  // location, mic…); a text caption next to every icon is noise.
   if (model.permissions && model.permissions.length) {
     const perms = document.createElement("div");
     perms.className = "tt-perms";
@@ -225,10 +285,6 @@ function renderModel(model: TooltipModel): void {
       icon.setAttribute("data-lucide", perm.icon);
       icon.className = "lucide";
       chip.appendChild(icon);
-      const label = document.createElement("span");
-      label.className = "tt-perm-label";
-      label.textContent = perm.label;
-      chip.appendChild(label);
       perms.appendChild(chip);
     }
     body.appendChild(perms);

@@ -23,7 +23,7 @@
 /**
  * Agents view module.
  *
- * Renders the read-only "active agents" panel of the Encre desktop client.
+ * Renders the read-only "active agents" panel of the Encre Agent Desktop client.
  * The view is currently a static placeholder that explains how to spawn and
  * manage agents; it is mounted once and re-rendered by the {@link Agents}
  * class whenever the view is (re)opened.
@@ -76,7 +76,7 @@ export class Agents {
     `;
 
     if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons();
+      (window as any).lucide.createIcons({ root: this.el });
     }
   }
 }

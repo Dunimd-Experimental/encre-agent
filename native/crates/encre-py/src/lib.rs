@@ -22,12 +22,9 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::types::PyList;
-use encre::ast;
-use encre::codebase;
 use encre::diff;
 use encre::embedding;
 use encre::fs;
-use encre::indexer;
 use encre::landlock;
 use encre::lsp_proto;
 use encre::permission;
@@ -134,138 +131,22 @@ fn lsp_diagnostics_to_py(py: Python, diags: &[lsp_proto::LspDiagnostic]) -> PyRe
 // Existing Python-facing functions
 // ---------------------------------------------------------------------------
 
+/// Vendor application secret injected at build time via GitHub Actions
+/// (`ENCRE_EA_SECRET`).  Returns `None` in builds compiled without the
+/// secret (local development), in which case Python falls back to the
+/// runtime environment variable.
+#[pyfunction]
+fn ea_build_secret() -> Option<String> {
+    option_env!("ENCRE_EA_SECRET")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 #[pyfunction]
 fn search_codebase(py: Python, query: &str, path: Option<&str>) -> PyResult<Vec<PyObject>> {
     let p = path.unwrap_or(".");
     let results = search::search_codebase(query, p);
     search_results_to_py(py, &results)
-}
-
-#[pyfunction]
-fn build_code_index(workspace: &str) -> PyResult<String> {
-    let data = codebase::build_code_index(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn count_code_index_candidates(workspace: &str) -> PyResult<usize> {
-    codebase::count_code_index_candidates(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
-}
-
-#[pyfunction]
-fn load_code_index(workspace: &str) -> PyResult<String> {
-    let data = codebase::load_code_index(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn update_code_index(workspace: &str) -> PyResult<String> {
-    let data = codebase::update_code_index(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn search_code_index(workspace: &str, query: &str, limit: Option<usize>) -> PyResult<String> {
-    let results = codebase::search_code_index(workspace, query, limit.unwrap_or(10))
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&results)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn build_code_context(workspace: &str, file_path: &str) -> PyResult<String> {
-    codebase::build_code_context(workspace, file_path)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
-}
-
-#[pyfunction]
-fn ast_available() -> bool {
-    ast::ast_available()
-}
-
-#[pyfunction]
-fn ast_backend_name() -> String {
-    ast::ast_backend_name().to_string()
-}
-
-#[pyfunction]
-fn build_ast_index(workspace: &str) -> PyResult<String> {
-    let data = ast::build_ast_index(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn load_ast_index(workspace: &str) -> PyResult<String> {
-    let data = ast::load_ast_index(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn update_ast_index(workspace: &str) -> PyResult<String> {
-    let data = ast::update_ast_index(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn ast_get_symbol(workspace: &str, name: &str) -> PyResult<String> {
-    let data = ast::ast_get_symbol(workspace, name)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn ast_get_outline(workspace: &str, file: &str) -> PyResult<String> {
-    let data = ast::ast_get_outline(workspace, file)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn ast_list_files(workspace: &str) -> PyResult<String> {
-    let data = ast::ast_list_files(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-#[pyo3(signature = (workspace, name, limit=10))]
-fn ast_find_relevant(workspace: &str, name: &str, limit: usize) -> PyResult<String> {
-    let data = ast::ast_find_relevant(workspace, name, limit)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn ast_find_references(workspace: &str, name: &str) -> PyResult<String> {
-    let data = ast::ast_find_references(workspace, name)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn ast_goto_definition(workspace: &str, file: &str, line: usize, col: usize) -> PyResult<String> {
-    let data = ast::ast_goto_definition(workspace, file, line, col)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
 }
 
 #[pyfunction]
@@ -365,7 +246,7 @@ fn execute_shell(py: Python, command: &str, cwd: Option<&str>, timeout: Option<u
 }
 
 // ---------------------------------------------------------------------------
-// New: embedding.rs bindings
+// Similarity scoring (embedding.rs)
 // ---------------------------------------------------------------------------
 
 /// Compute cosine similarity between two f32 slices.
@@ -378,51 +259,6 @@ fn cosine_similarity(a: Vec<f32>, b: Vec<f32>) -> f32 {
 #[pyfunction]
 fn text_similarity(a: &str, b: &str) -> f32 {
     embedding::text_similarity(a, b)
-}
-
-#[pyfunction]
-#[pyo3(signature = (workspace, max_chars=4000))]
-fn build_embedding_slices(workspace: &str, max_chars: usize) -> PyResult<String> {
-    let data = embedding::build_embedding_slices(workspace, max_chars)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn load_embedding_index(workspace: &str) -> PyResult<String> {
-    let data = embedding::load_embedding_index(workspace)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-#[pyfunction]
-fn save_embedding_index(
-    workspace: &str,
-    slices_json: &str,
-    vectors_json: &str,
-    file_mtimes_json: &str,
-    embedding_dim: usize,
-) -> PyResult<()> {
-    let slices: Vec<embedding::EmbeddingSlice> = serde_json::from_str(slices_json)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-    let vectors: Vec<Vec<f32>> = serde_json::from_str(vectors_json)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-    let file_mtimes: std::collections::HashMap<String, f64> = serde_json::from_str(file_mtimes_json)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-    embedding::save_embedding_index(workspace, slices, vectors, file_mtimes, embedding_dim)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
-}
-
-#[pyfunction]
-fn search_embedding_index(workspace: &str, query_vector_json: &str, k: usize) -> PyResult<String> {
-    let query_vector: Vec<f32> = serde_json::from_str(query_vector_json)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-    let data = embedding::search_embedding_index(workspace, query_vector, k)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    serde_json::to_string(&data)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +307,15 @@ fn landlock_restrict_network() -> PyResult<()> {
 fn landlock_full_sandbox(workspace: &str) -> PyResult<()> {
     landlock::landlock_full_sandbox(workspace)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+}
+
+/// Plugin worker sandbox: read-only runtime/package paths, read-write state
+/// paths, no network.  Exposed for tests/diagnostics; normal plugin workers
+/// use ``SandboxSession.spawn_confined`` directly.
+#[pyfunction]
+fn landlock_plugin_sandbox(read_paths: Vec<String>, write_paths: Vec<String>) -> PyResult<()> {
+    landlock::landlock_plugin_sandbox(&read_paths, &write_paths)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 
 /// Workspace sandbox: read-write access under workspace, no network, no exec.
@@ -526,68 +371,6 @@ fn build_lsp_request(id: u64, method: &str, params: &str) -> PyResult<String> {
 #[pyfunction]
 fn build_content_length_header(content: &str) -> String {
     lsp_proto::build_content_length_header(content)
-}
-
-// ---------------------------------------------------------------------------
-// BM25 Indexer (PyO3 class)
-// ---------------------------------------------------------------------------
-
-/// BM25-powered code search index.
-///
-/// Usage from Python::
-///
-///     from encre._native import Bm25Index
-///     idx = Bm25Index()
-///     idx.build([("path.py", "def foo(): pass")])
-///     results = idx.search("foo", 10)
-#[pyclass]
-struct Bm25Index {
-    inner: indexer::Bm25Index,
-}
-
-#[pymethods]
-impl Bm25Index {
-    #[new]
-    fn new() -> Self {
-        Bm25Index {
-            inner: indexer::Bm25Index::new(),
-        }
-    }
-
-    /// Build or rebuild the index from a list of (path, content) pairs.
-    fn build(&mut self, files: Vec<(String, String)>) {
-        self.inner.build(files);
-    }
-
-    /// Search with BM25 ranking. Returns list of (path, score).
-    fn search(&self, query: &str, limit: Option<usize>) -> Vec<(String, f64)> {
-        self.inner
-            .search(query, limit.unwrap_or(10), 1.5, 0.75, 2.0)
-    }
-
-    /// Add or update a single document.
-    fn add_document(&mut self, path: &str, content: &str) {
-        self.inner.add_document(path, content);
-    }
-
-    /// Remove a document by path.
-    fn remove_document(&mut self, path: &str) {
-        self.inner.remove_document(path);
-    }
-
-    /// Clear the entire index.
-    fn clear(&mut self) {
-        self.inner.clear();
-    }
-
-    /// Number of indexed documents.
-    fn __len__(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn __bool__(&self) -> bool {
-        !self.inner.is_empty()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +487,399 @@ fn permission_check_dangerous(tool_name: &str, args: &str) -> PyResult<Option<St
     Ok(permission::permission_check_dangerous(tool_name, args))
 }
 
+/// Blacklist verdict with classification: ``{"pattern", "severity",
+/// "category"}`` when a subcommand hits, else ``None``.
+///
+/// This is what lets ``dangerous_commands.txt`` be the only definition of
+/// danger -- the Python side reads severity/category off the engine instead of
+/// carrying a second blacklist of its own.
+#[pyfunction]
+#[pyo3(signature = (tool_name, args, all_sections=false))]
+fn permission_dangerous_matches(
+    py: Python,
+    tool_name: &str,
+    args: &str,
+    all_sections: bool,
+) -> PyResult<Vec<Py<PyDict>>> {
+    permission::permission_dangerous_matches(tool_name, args, all_sections)
+        .into_iter()
+        .map(|(pattern, severity, category)| {
+            let d = PyDict::new(py);
+            d.set_item("pattern", pattern)?;
+            d.set_item("severity", severity)?;
+            d.set_item("category", category)?;
+            Ok(d.into())
+        })
+        .collect()
+}
+
+/// Blacklist verdict with classification: ``{"pattern", "severity",
+/// "category"}`` for the first hit, else ``None``.
+#[pyfunction]
+fn permission_dangerous_verdict(
+    py: Python,
+    tool_name: &str,
+    args: &str,
+) -> PyResult<Option<Py<PyDict>>> {
+    let Some((pattern, severity, category)) =
+        permission::permission_dangerous_verdict(tool_name, args)
+    else {
+        return Ok(None);
+    };
+    let out = PyDict::new(py);
+    out.set_item("pattern", pattern)?;
+    out.set_item("severity", severity)?;
+    out.set_item("category", category)?;
+    Ok(Some(out.into()))
+}
+
+/// Merge dynamic per-tool danger levels for plugin tools into the permission
+/// engine.  ``levels`` maps a plugin tool name to ``"safe" | "high" |
+/// "critical"``; any other value is ignored.
+#[pyfunction]
+fn permission_set_tool_danger_levels(levels: std::collections::HashMap<String, String>) -> PyResult<()> {
+    permission::permission_set_tool_danger_levels(levels);
+    Ok(())
+}
+
+/// Immune-path check for one tool call.  Extracts candidate target paths
+/// from the JSON ``args`` (path fields, patch markers, shell redirect / mv /
+/// cp / rm / sed -i targets) and matches each against the immune set
+/// (.git/.claude/.ssh/shell-init).  Only the write-tool family is inspected.
+/// Returns the matched fragment when the call must be refused, else ``None``.
+#[pyfunction]
+fn permission_check_immune(tool_name: &str, args: &str) -> PyResult<Option<String>> {
+    Ok(permission::permission_check_immune(tool_name, args))
+}
+
+/// Immune-path check for a single path string.  Returns the matched immune
+/// fragment when the path is protected, else ``None``.
+#[pyfunction]
+fn permission_check_immune_path(path: &str) -> PyResult<Option<String>> {
+    Ok(permission::permission_check_immune_path(path))
+}
+
+/// Resolve the effective user-managed policy for one capability key across
+/// all configuration sources.  Returns ``"allow" | "deny" | "ask" |
+/// "default"``.  Used by the plugin layer as the authorization oracle for
+/// surface registration gating.
+#[pyfunction]
+fn permission_capability_policy(capability: &str) -> PyResult<String> {
+    Ok(permission::permission_capability_policy(capability))
+}
+
+/// Register declarative permission rules for a plugin.  ``rules`` is a JSON
+/// mapping ``{"<tool|prefix*>": "allow" | "deny"}``; malformed entries are
+/// skipped.  Returns the number of accepted rules.  Call again with the same
+/// plugin name to replace that plugin's rule set.
+#[pyfunction]
+fn permission_add_plugin_policy(plugin: &str, rules: &str) -> PyResult<usize> {
+    Ok(permission::permission_add_plugin_policy(plugin, rules))
+}
+
+/// Remove every rule contributed by *plugin* (deactivate / uninstall).
+/// Returns the number of rules dropped.
+#[pyfunction]
+fn permission_remove_plugin_policies(plugin: &str) -> PyResult<usize> {
+    Ok(permission::permission_remove_plugin_policies(plugin))
+}
+
+/// Plugin-policy verdict for one tool, computed inside the engine: deny
+/// beats allow, exact rule beats wildcard.  Returns ``True`` / ``False`` /
+/// ``None`` (no rule applies).
+#[pyfunction]
+fn permission_plugin_vote(tool_name: &str) -> PyResult<Option<bool>> {
+    Ok(permission::permission_plugin_vote(tool_name))
+}
+
+/// Dump the current plugin policy table as a JSON object
+/// ``{"<plugin>": {"<tool|*>": "allow" | "deny"}}``.
+#[pyfunction]
+fn permission_get_plugin_policies() -> PyResult<String> {
+    Ok(permission::permission_get_plugin_policies())
+}
+
+/// Register the manifest-declared resource grants of a plugin (replaces any
+/// previous grants).  ``resources_json`` shape:
+/// ``{"network": [hosts], "file_read": [globs], "file_write": [globs],
+/// "system_info": true | false | [keys]}``.  Returns the number of
+/// recognised kinds.
+#[pyfunction]
+fn permission_set_plugin_resources(plugin: &str, resources_json: &str) -> PyResult<usize> {
+    Ok(permission::permission_set_plugin_resources(
+        plugin,
+        resources_json,
+    ))
+}
+
+/// Drop the resource grants of *plugin* (deactivate / uninstall).  Returns
+/// true when an entry existed.
+#[pyfunction]
+fn permission_remove_plugin_resources(plugin: &str) -> PyResult<bool> {
+    Ok(permission::permission_remove_plugin_resources(plugin))
+}
+
+/// Arbitrate one resource access for *plugin*: kind is ``"network"`` (URL /
+/// host), ``"file_read"`` / ``"file_write"`` (path) or ``"system_info"``
+/// (key).  Returns ``"allow"`` or ``"deny"``; unknown kinds and unknown
+/// plugins always deny (fail-closed).
+#[pyfunction]
+fn permission_check_plugin_resource(plugin: &str, kind: &str, target: &str) -> PyResult<String> {
+    Ok(permission::permission_check_plugin_resource(
+        plugin, kind, target,
+    ))
+}
+
+/// Dump the current resource grant table as a JSON object
+/// ``{"<plugin>": {"network": [...], "file_read": [...], "file_write":
+/// [...], "system_info": true | [keys] | false}}``.
+#[pyfunction]
+fn permission_get_plugin_resources() -> PyResult<String> {
+    Ok(permission::permission_get_plugin_resources())
+}
+
+/// Record *tool* as owned by *plugin* and mark it active.  Returns true on
+/// success (both names non-empty).
+#[pyfunction]
+fn permission_register_plugin_tool(tool: &str, plugin: &str) -> PyResult<bool> {
+    Ok(permission::permission_register_plugin_tool(tool, plugin))
+}
+
+/// Flip every tool owned by *plugin* to *active* (deactivate = false,
+/// re-activate = true).  Returns the number of affected tools.
+#[pyfunction]
+fn permission_set_plugin_tools_active(plugin: &str, active: bool) -> PyResult<usize> {
+    Ok(permission::permission_set_plugin_tools_active(plugin, active))
+}
+
+/// Return the owning plugin of *tool* (``""`` = host tool or unknown).
+#[pyfunction]
+fn permission_plugin_tool_owner(tool: &str) -> PyResult<String> {
+    Ok(permission::permission_plugin_tool_owner(tool))
+}
+
+/// Record the frontend surface grants for *plugin* (trusted = bundled /
+/// mandatory: unset fields default to allow; third-party defaults to deny).
+#[pyfunction]
+fn permission_set_plugin_ui(plugin: &str, payload: &str, trusted: bool) -> PyResult<bool> {
+    Ok(permission::permission_set_plugin_ui(plugin, payload, trusted))
+}
+
+/// Remove the frontend grants of *plugin* (deactivate / uninstall undo).
+#[pyfunction]
+fn permission_remove_plugin_ui(plugin: &str) -> PyResult<bool> {
+    Ok(permission::permission_remove_plugin_ui(plugin))
+}
+
+/// Arbitrate one frontend surface: face = "providers" | "tool_meta" |
+/// "contribution" (kind = contribution kind).  Fail-closed.
+#[pyfunction]
+fn permission_check_plugin_ui(plugin: &str, face: &str, kind: &str) -> PyResult<bool> {
+    Ok(permission::permission_check_plugin_ui(plugin, face, kind))
+}
+
+/// Build the sanitised environment for a plugin worker process.  Sensitive
+/// variables (TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL) are stripped from the
+/// parent environment; *extra* entries are applied last and unfiltered.
+#[pyfunction]
+fn plugin_sandbox_prepare_env(
+    extra: std::collections::HashMap<String, String>,
+) -> PyResult<std::collections::HashMap<String, String>> {
+    Ok(encre::plugin_sandbox::plugin_sandbox_prepare_env(extra))
+}
+
+/// Resolve manifest resource limits into concrete per-OS values.
+///
+/// Returns ``(memory_bytes, cpu_rate, cpu_fraction)``: the Job memory cap /
+/// POSIX ``RLIMIT_AS`` value (0 = unlimited), the Windows CPU rate
+/// (1..=10000, 0 = unlimited) and the normalised core fraction for the
+/// software watchdog (0.0 = unlimited).
+#[pyfunction]
+fn plugin_sandbox_resolve_limits(
+    memory_mb: Option<f64>,
+    cpu: Option<f64>,
+) -> PyResult<(u64, u64, f64)> {
+    let limits = encre::plugin_sandbox::plugin_sandbox_resolve_limits(memory_mb, cpu);
+    Ok((limits.memory_bytes, limits.cpu_rate, limits.cpu_fraction))
+}
+
+// ---------------------------------------------------------------------------
+// SandboxSession — persistent sandboxed subprocess (confinement owned by Rust)
+// ---------------------------------------------------------------------------
+
+/// A long-lived sandboxed child process with piped stdio.
+///
+/// All OS-level confinement (Landlock on Linux, sandbox_init(3) on macOS,
+/// a kill-on-close Job Object on Windows) is applied INSIDE this Rust type at
+/// spawn time.  Python only drives the pipes; there is no privilege decision
+/// left on the Python side for a child to bypass.
+#[pyclass]
+struct PySandboxSession {
+    /// Mutex so blocking waits can run with the GIL released.
+    inner: std::sync::Mutex<sandbox::SandboxSession>,
+}
+
+#[pymethods]
+impl PySandboxSession {
+    /// Spawn *argv* under the platform sandbox.
+    ///
+    /// Returns ``(session, isolation_level)`` where the level is one of
+    /// ``"landlock"``, ``"sandbox_init"``, ``"job_object"`` or ``"none"``
+    /// (reported honestly: spawn never claims isolation it did not get).
+    #[staticmethod]
+    fn spawn(
+        argv: Vec<String>,
+        cwd: Option<String>,
+        workspace: Option<String>,
+    ) -> PyResult<(PySandboxSession, String)> {
+        let (session, level) = sandbox::SandboxSession::spawn(
+            &argv,
+            cwd.as_deref(),
+            workspace.as_deref(),
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+        Ok((
+            PySandboxSession { inner: std::sync::Mutex::new(session) },
+            level.to_string(),
+        ))
+    }
+
+    /// Spawn *argv* under the platform sandbox with an explicit environment
+    /// and a profile:
+    ///   - `workspace` -> legacy workspace confinement;
+    ///   - non-empty `read_paths` / `write_paths` -> plugin worker profile
+    ///     (read-only runtime/package, read-write state, no network);
+    ///   - all empty -> no filesystem confinement.
+    #[staticmethod]
+    fn spawn_confined(
+        argv: Vec<String>,
+        cwd: Option<String>,
+        env: std::collections::HashMap<String, String>,
+        workspace: Option<String>,
+        read_paths: Vec<String>,
+        write_paths: Vec<String>,
+    ) -> PyResult<(PySandboxSession, String)> {
+        let profile = if !read_paths.is_empty() || !write_paths.is_empty() {
+            encre::sandbox::SandboxProfile::Plugin { read_paths, write_paths }
+        } else if let Some(ws) = workspace {
+            encre::sandbox::SandboxProfile::Workspace(ws)
+        } else {
+            encre::sandbox::SandboxProfile::None
+        };
+        let (session, level) = sandbox::SandboxSession::spawn_with_env(
+            &argv,
+            cwd.as_deref(),
+            Some(&env),
+            profile,
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+        Ok((
+            PySandboxSession { inner: std::sync::Mutex::new(session) },
+            level.to_string(),
+        ))
+    }
+
+    /// The honest isolation level reported at spawn time.
+    fn isolation_level(&self) -> String {
+        match self.inner.lock() {
+            Ok(s) => s.isolation_level().to_string(),
+            Err(_) => "none".to_string(),
+        }
+    }
+
+    /// The confined child's OS process id.
+    fn pid(&self) -> PyResult<u32> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))?
+            .pid())
+    }
+
+    /// Write bytes to the child's stdin; returns the byte count written.
+    fn write_stdin(&self, data: Vec<u8>) -> PyResult<usize> {
+        self.inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))?
+            .write_stdin(&data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Close the child's stdin (end-of-input for shells).
+    fn close_stdin(&self) -> PyResult<()> {
+        self.inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))?
+            .close_stdin();
+        Ok(())
+    }
+
+    /// Drain pending stdout bytes (waits up to *timeout_ms* for data).
+    /// Blocks with the GIL released, so other threads keep running.
+    fn drain_stdout<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let bytes = py.allow_threads(|| {
+            self.inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))
+                .map(|s| s.drain_stdout(max_bytes, timeout_ms))
+        })?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
+    }
+
+    /// Drain pending stderr bytes (waits up to *timeout_ms* for data).
+    /// Blocks with the GIL released, so other threads keep running.
+    fn drain_stderr<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let bytes = py.allow_threads(|| {
+            self.inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))
+                .map(|s| s.drain_stderr(max_bytes, timeout_ms))
+        })?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
+    }
+
+    /// Wait for exit up to *timeout_ms*: exit code, or ``None`` on timeout.
+    /// Blocks with the GIL released.
+    fn wait(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<i32>> {
+        py.allow_threads(|| {
+            self.inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))
+                .map(|mut s| s.wait(timeout_ms))
+        })
+    }
+
+    /// Whether the child has exited.
+    fn is_running(&self) -> PyResult<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))?
+            .is_running())
+    }
+
+    /// Kill the whole process tree.  On Windows the retained Job Object
+    /// handle reaps surviving descendants when the session is dropped.
+    fn kill(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.inner
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("session poisoned"))
+                .map(|mut s| s.kill())
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
@@ -712,23 +888,6 @@ fn permission_check_dangerous(tool_name: &str, args: &str) -> PyResult<Option<St
 fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Existing functions
     m.add_function(wrap_pyfunction!(search_codebase, m)?)?;
-    m.add_function(wrap_pyfunction!(count_code_index_candidates, m)?)?;
-    m.add_function(wrap_pyfunction!(build_code_index, m)?)?;
-    m.add_function(wrap_pyfunction!(load_code_index, m)?)?;
-    m.add_function(wrap_pyfunction!(update_code_index, m)?)?;
-    m.add_function(wrap_pyfunction!(search_code_index, m)?)?;
-    m.add_function(wrap_pyfunction!(build_code_context, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_available, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_backend_name, m)?)?;
-    m.add_function(wrap_pyfunction!(build_ast_index, m)?)?;
-    m.add_function(wrap_pyfunction!(load_ast_index, m)?)?;
-    m.add_function(wrap_pyfunction!(update_ast_index, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_get_symbol, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_get_outline, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_list_files, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_find_relevant, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_find_references, m)?)?;
-    m.add_function(wrap_pyfunction!(ast_goto_definition, m)?)?;
     m.add_function(wrap_pyfunction!(read_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_file, m)?)?;
     m.add_function(wrap_pyfunction!(grep, m)?)?;
@@ -740,14 +899,11 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sandbox_read_file, m)?)?;
     m.add_function(wrap_pyfunction!(sandbox_write_file, m)?)?;
     m.add_function(wrap_pyfunction!(execute_shell, m)?)?;
+    m.add_class::<PySandboxSession>()?;
 
     // New: embedding
     m.add_function(wrap_pyfunction!(cosine_similarity, m)?)?;
     m.add_function(wrap_pyfunction!(text_similarity, m)?)?;
-    m.add_function(wrap_pyfunction!(build_embedding_slices, m)?)?;
-    m.add_function(wrap_pyfunction!(load_embedding_index, m)?)?;
-    m.add_function(wrap_pyfunction!(save_embedding_index, m)?)?;
-    m.add_function(wrap_pyfunction!(search_embedding_index, m)?)?;
 
     // New: simd_search
     m.add_function(wrap_pyfunction!(simd_contains, m)?)?;
@@ -759,6 +915,7 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(landlock_restrict_network, m)?)?;
     m.add_function(wrap_pyfunction!(landlock_full_sandbox, m)?)?;
     m.add_function(wrap_pyfunction!(landlock_workspace_sandbox, m)?)?;
+    m.add_function(wrap_pyfunction!(landlock_plugin_sandbox, m)?)?;
     m.add_function(wrap_pyfunction!(landlock_available, m)?)?;
     m.add_function(wrap_pyfunction!(landlock_abi_version, m)?)?;
 
@@ -778,10 +935,31 @@ fn _native(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(permission_record_decision, m)?)?;
     m.add_function(wrap_pyfunction!(permission_set_mode, m)?)?;
     m.add_function(wrap_pyfunction!(permission_set_dangerous_patterns, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_set_tool_danger_levels, m)?)?;
     m.add_function(wrap_pyfunction!(permission_check_dangerous, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_dangerous_verdict, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_dangerous_matches, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_check_immune, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_check_immune_path, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_capability_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_add_plugin_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_remove_plugin_policies, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_plugin_vote, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_get_plugin_policies, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_set_plugin_resources, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_remove_plugin_resources, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_check_plugin_resource, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_get_plugin_resources, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_register_plugin_tool, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_set_plugin_tools_active, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_plugin_tool_owner, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_set_plugin_ui, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_remove_plugin_ui, m)?)?;
+    m.add_function(wrap_pyfunction!(permission_check_plugin_ui, m)?)?;
+    m.add_function(wrap_pyfunction!(plugin_sandbox_prepare_env, m)?)?;
+    m.add_function(wrap_pyfunction!(plugin_sandbox_resolve_limits, m)?)?;
+    m.add_function(wrap_pyfunction!(ea_build_secret, m)?)?;
 
-    // BM25 indexer
-    m.add_class::<Bm25Index>()?;
 
     Ok(())
 }

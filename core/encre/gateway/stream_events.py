@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -83,7 +83,7 @@ class Commentary:
 
     Unlike ``MessageChunk`` this is already-complete text rather than an
     incremental delta. The consumer renders it as its own standalone message so
-    it reads as a distinct beat (e.g. "Let me check the repository鈥?) before the
+    it reads as a distinct beat (e.g. "Let me check the repository--) before the
     next tool call.
 
     Attributes:

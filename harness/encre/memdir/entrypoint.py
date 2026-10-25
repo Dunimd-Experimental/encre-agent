@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 import os
 
@@ -66,18 +68,14 @@ def _read_file(filepath: str) -> str:
 
 
 def _write_file(filepath: str, content: str) -> None:
-    """Write a file with encryption."""
+    """Write a file with encryption (fail closed: no plaintext fallback)."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    try:
-        from encre.crypto import encrypt
-        # Persist ciphertext so memory at rest is not readable as plaintext
-        encrypted = encrypt(content)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(encrypted)
-    except Exception:
-        # Fallback: write plaintext if encryption fails
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+    from encre.crypto import encrypt
+    # Persist ciphertext so memory at rest is not readable as plaintext.
+    # If encryption fails the exception propagates -- never write plaintext.
+    encrypted = encrypt(content)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(encrypted)
 
 
 def load_entrypoint_raw(memory_dir: str) -> dict:

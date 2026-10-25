@@ -290,6 +290,52 @@ mod linux_impl {
 
     // --- Public API ---
 
+    /// Plugin worker profile: read/execute only under ``read_paths``,
+    /// read-write only under ``write_paths``, and no network.
+    ///
+    /// This is deliberately separate from the workspace profile: a Python
+    /// worker must read its interpreter/stdlib/package (read-only) and write
+    /// only its state directory.  Missing paths are skipped so a platform
+    /// without one of the standard dirs still gets the remaining rules.
+    pub fn landlock_plugin_sandbox(read_paths: &[String], write_paths: &[String]) -> Result<(), String> {
+        if !landlock_available() {
+            return Err("Landlock is not available on this kernel (requires 5.13+)".to_string());
+        }
+        ensure_no_new_privs()?;
+
+        let read_access = fs_access::READ_FILE
+            | fs_access::READ_DIR
+            | fs_access::EXECUTE;
+        let write_access = read_access
+            | fs_access::WRITE_FILE
+            | fs_access::MAKE_REG
+            | fs_access::MAKE_DIR
+            | fs_access::REMOVE_FILE
+            | fs_access::REMOVE_DIR
+            | fs_access::TRUNCATE;
+        let handled = read_access | write_access;
+        let net_handled = if landlock_abi_version() >= LANDLOCK_ABI_V2 {
+            net_access::BIND_TCP | net_access::CONNECT_TCP
+        } else {
+            0
+        };
+
+        let ruleset_fd = create_ruleset(handled, net_handled)?;
+        for path in read_paths {
+            if !std::path::Path::new(path).exists() {
+                continue;
+            }
+            add_path_beneath_rule(ruleset_fd, path, read_access)?;
+        }
+        for path in write_paths {
+            if !std::path::Path::new(path).exists() {
+                continue;
+            }
+            add_path_beneath_rule(ruleset_fd, path, write_access)?;
+        }
+        enforce_ruleset(ruleset_fd)
+    }
+
     /// Restrict the current thread to **read-only** filesystem access under
     /// the given paths.  After this call, the thread cannot write, execute,
     /// or create files anywhere except the listed directories (and even those
@@ -414,6 +460,9 @@ mod linux_impl {
     pub fn landlock_workspace_sandbox(_workspace: &str) -> Result<(), String> {
         Err("Landlock is only available on Linux".to_string())
     }
+    pub fn landlock_plugin_sandbox(_read_paths: &[String], _write_paths: &[String]) -> Result<(), String> {
+        Err("Landlock is only available on Linux".to_string())
+    }
     pub fn landlock_available() -> bool {
         false
     }
@@ -451,6 +500,12 @@ pub fn landlock_full_sandbox(workspace: &str) -> Result<(), String> {
 /// no exec outside workspace.  Suitable for build tools.
 pub fn landlock_workspace_sandbox(workspace: &str) -> Result<(), String> {
     linux_impl::landlock_workspace_sandbox(workspace)
+}
+
+/// Plugin worker sandbox: read-only runtime/package paths, read-write state
+/// paths, no network.  Used by every process-transported plugin.
+pub fn landlock_plugin_sandbox(read_paths: &[String], write_paths: &[String]) -> Result<(), String> {
+    linux_impl::landlock_plugin_sandbox(read_paths, write_paths)
 }
 
 /// Check whether Landlock is available on the current kernel.

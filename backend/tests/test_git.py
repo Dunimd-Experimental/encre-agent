@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,37 +23,38 @@
 
 from __future__ import annotations
 
-"""Tests for encre.git.repo (EncreGitRepo, GitState) and encre.git.diff (EncreGitDiff, GitDiffResult)."""  # noqa: E501
+"""Tests for encre.git.repo and encre.git.diff.
+
+Covers the GitState and GitDiffResult dataclasses, the EncreGitRepo wrapper
+over git CLI operations (state queries, diff capture, numstat parsing, stash
+and unstash), and the EncreGitDiff static helpers for pure content-to-content
+diff computation, application, stats aggregation, and transient-state checks.
+"""  # noqa: E501
 
 import os
 import tempfile
 
 import pytest
 
-# ===========================================================================
-# GitState dataclass
-# ===========================================================================
+# ---- GitState dataclass ----
 
 class TestGitState:
-    """Engineered to validate the GitState dataclass as the canonical representation of repository status.
+    """Validate the GitState dataclass as the canonical repository-status snapshot.
 
-    This test class exercises GitState across 4 scenarios to ensure that all
-    fields (in_repo, commit_hash, branch, remote_url, is_clean, changed_files,
-    untracked_files, has_unpushed, worktree_count) are correctly stored, that
-    default values represent a clean non-repo state, and that the class is
-    recognized as a dataclass. The design provides a frozen-like snapshot of
-    git metadata used by the agent to make decisions about stash/unstash,
-    diff capture, and worktree awareness.
+    Exercises GitState across default, full-construction, dataclass-identity,
+    and field-type scenarios to ensure every field (in_repo, commit_hash,
+    branch, remote_url, is_clean, changed_files, untracked_files,
+    has_unpushed, worktree_count) is stored correctly and that the defaults
+    describe a safe non-repository condition for the agent's stash and diff
+    decisions.
     """
 
     def test_verify_default_state_represents_non_repo_condition(self):
-        """Validate that GitState(in_repo=False) produces safe defaults for all fields.
+        """Validate that GitState(in_repo=False) yields safe defaults everywhere.
 
-        The test constructs a GitState with in_repo=False and asserts in_repo
-        is False, commit_hash/branch/remote_url are empty strings, is_clean
-        is True, changed_files/untracked_files are [], has_unpushed is False,
-        and worktree_count is 1 because the default state must represent a
-        safe non-repository condition without triggering false positives.
+        Asserts in_repo is False, the identifier fields are empty strings,
+        is_clean is True, file lists are empty, has_unpushed is False, and
+        worktree_count is 1, so the default never triggers a false positive.
         """
         from encre.git.repo import GitState
         gs = GitState(in_repo=False)
@@ -68,11 +69,11 @@ class TestGitState:
         assert gs.worktree_count == 1
 
     def test_verify_full_state_stores_all_fields_correctly(self):
-        """Validate that GitState stores all provided constructor arguments without modification.
+        """Validate that GitState stores every constructor argument unchanged.
 
-        The test constructs a GitState with all 9 fields set and asserts each
-        field matches because the dataclass must preserve all repository state
-        data for downstream consumers (diff capture, stash decisions, etc.).
+        Builds a state with all nine fields set and asserts each one matches,
+        because downstream consumers (diff capture, stash decisions) rely on
+        this data being preserved exactly.
         """
         from encre.git.repo import GitState
         gs = GitState(
@@ -98,23 +99,21 @@ class TestGitState:
         assert gs.worktree_count == 2
 
     def test_verify_gitstate_is_dataclass(self):
-        """Validate that GitState is recognized as a dataclass by the standard library.
+        """Validate that GitState is a standard-library dataclass.
 
-        The test asserts is_dataclass(GitState) is True because the class
-        relies on dataclass-generated methods for correct equality, repr,
-        and immutable field semantics across state transitions.
+        Asserts is_dataclass(GitState) is True, since generated equality, repr,
+        and field semantics are part of the class contract.
         """
         from dataclasses import is_dataclass
         from encre.git.repo import GitState
         assert is_dataclass(GitState)
 
     def test_verify_field_types_match_expected_types(self):
-        """Validate that all GitState fields have the correct runtime types.
+        """Validate that GitState fields have the expected runtime types.
 
-        The test constructs a GitState and asserts commit_hash and branch are
-        str, is_clean and has_unpushed are bool, changed_files is list, and
-        worktree_count is int because type correctness is essential for
-        downstream serialization and conditional logic in the agent.
+        Asserts identifiers are str, flags are bool, changed_files is a list,
+        and worktree_count is int, since downstream serialization and branching
+        logic depend on exact types.
         """
         from encre.git.repo import GitState
         gs = GitState(in_repo=True, changed_files=["a.py"])
@@ -126,26 +125,22 @@ class TestGitState:
         assert isinstance(gs.worktree_count, int)
 
 
-# ===========================================================================
-# EncreGitRepo
-# ===========================================================================
+# ---- EncreGitRepo ----
 
 class TestEncreGitRepo:
-    """Engineered to validate the EncreGitRepo wrapper around Git operations for agent decision-making.
+    """Validate the EncreGitRepo wrapper over git operations for agent decisions.
 
-    This test class exercises the repo wrapper across 16 scenarios covering
-    construction, state queries, diff capture, stats parsing, and safe-default
-    behavior when not inside a git repository. The design provides a thin
-    OOP layer over git CLI commands so that the agent can query repository
-    status, compute diffs, and manage worktree state (stash/unstash) without
-    directly invoking subprocess calls.
+    Covers construction, state queries, diff capture, stats parsing, and
+    safe-default behavior outside a repository. The wrapper is a thin layer
+    over git CLI commands so the agent can query status, compute diffs, and
+    manage stash state without issuing subprocess calls itself.
     """
 
     def test_verify_construction_stores_workspace_path(self):
-        """Validate that EncreGitRepo stores the workspace path from the constructor.
+        """Validate that EncreGitRepo stores the workspace path it was given.
 
-        The test constructs a repo with workspace='.' and asserts workspace
-        is '.' because the wrapper must preserve the target directory path.
+        Constructs a repo with workspace="." and asserts it is preserved,
+        since the wrapper must remember its target directory.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -153,11 +148,11 @@ class TestEncreGitRepo:
         assert repo.workspace == "."
 
     def test_verify_construction_with_absolute_path(self):
-        """Validate that EncreGitRepo resolves and stores an absolute workspace path.
+        """Validate that EncreGitRepo stores an absolute workspace path.
 
-        The test constructs a repo with os.path.abspath('.') and asserts the
-        stored workspace matches because path normalization is required for
-        consistent subprocess invocation across operating systems.
+        Constructs a repo with os.path.abspath(".") and asserts the stored path
+        matches, because normalized paths keep subprocess calls consistent
+        across operating systems.
         """
         from encre.git.repo import EncreGitRepo
         abs_path = os.path.abspath(".")
@@ -165,10 +160,10 @@ class TestEncreGitRepo:
         assert repo.workspace == abs_path
 
     def test_verify_is_in_repo_returns_bool(self):
-        """Validate that is_in_repo() returns a Python bool indicating git repository membership.
+        """Validate that is_in_repo() returns a real Python bool.
 
-        The test asserts isinstance(result, bool) because the method is a
-        predicate used throughout the agent to guard git-dependent operations.
+        Asserts the result is a bool, since the method is a predicate guarding
+        every git-dependent operation in the agent.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -176,11 +171,10 @@ class TestEncreGitRepo:
         assert isinstance(result, bool)
 
     def test_verify_get_state_returns_GitState_instance(self):
-        """Validate that get_state() returns a GitState dataclass instance.
+        """Validate that get_state() returns a GitState instance.
 
-        The test asserts isinstance(state, GitState) because the state object
-        is the structured contract between the repo wrapper and the agent
-        for all repository metadata queries.
+        Asserts isinstance(state, GitState), because the state object is the
+        structured contract for all repository metadata queries.
         """
         from encre.git.repo import EncreGitRepo, GitState
         repo = EncreGitRepo(workspace=".")
@@ -188,11 +182,11 @@ class TestEncreGitRepo:
         assert isinstance(state, GitState)
 
     def test_verify_get_state_not_in_repo_returns_defaults(self):
-        """Validate that get_state() returns in_repo=False defaults when not inside a git repository.
+        """Validate that get_state() returns in_repo=False defaults outside git.
 
-        The test creates a temp directory (no git repo), constructs a repo,
-        and asserts is_in_repo is False, commit_hash and branch are empty
-        strings because get_state must return safe defaults outside a repo.
+        Creates an empty temp directory, builds a repo there, and asserts
+        in_repo is False with empty commit_hash and branch, so the wrapper
+        degrades safely when no repository is present.
         """
         from encre.git.repo import EncreGitRepo
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -204,11 +198,11 @@ class TestEncreGitRepo:
             assert state.branch == ""
 
     def test_verify_get_diff_returns_str_when_in_repo(self):
-        """Validate that get_diff() returns a string when the workspace is a git repository with commits.
+        """Validate that get_diff() returns a string inside a repo with commits.
 
-        The test skips if not in a git repo or if HEAD does not exist, then
-        asserts isinstance(result, str) because get_diff must return a valid
-        diff string (possibly empty) for any commit-capable repository.
+        Skips when not in a repo or when HEAD is missing, then asserts the
+        result is a str, since get_diff must always return valid diff text
+        (possibly empty).
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -222,11 +216,10 @@ class TestEncreGitRepo:
             assert isinstance(result, str)
 
     def test_verify_get_diff_with_file_path_returns_str(self):
-        """Validate that get_diff(file_path=...) returns a string scoped to the given file.
+        """Validate that get_diff(file_path=...) returns a file-scoped string.
 
-        The test skips if not in a git repo or if HEAD does not exist, then
-        asserts isinstance(result, str) because file-scoped diff must return
-        a valid diff string for the specified path.
+        Skips when not in a repo or when HEAD is missing, then asserts the
+        result is a str, so file-scoped diffs are always usable text.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -240,11 +233,11 @@ class TestEncreGitRepo:
             assert isinstance(result, str)
 
     def test_verify_get_diff_stats_returns_dict_with_required_keys(self):
-        """Validate that get_diff_stats() returns a dict with files, insertions, and deletions keys.
+        """Validate that get_diff_stats() returns a dict with the key metrics.
 
-        The test skips if not in a git repo or if HEAD does not exist, then
-        asserts the result is a dict containing 'files', 'insertions', and
-        'deletions' because stats must always include these three aggregate metrics.
+        Skips when not in a repo or when HEAD is missing, then asserts the dict
+        carries "files", "insertions", and "deletions", because those three
+        aggregates are always required.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -261,10 +254,10 @@ class TestEncreGitRepo:
             assert "deletions" in stats
 
     def test_verify_get_changed_files_returns_list(self):
-        """Validate that get_changed_files() returns a list of changed file paths.
+        """Validate that get_changed_files() returns a list.
 
-        The test asserts isinstance(files, list) because the method must
-        always return a list (possibly empty) for downstream iteration.
+        Asserts the result is a list (possibly empty) so downstream code can
+        iterate it unconditionally.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -272,10 +265,10 @@ class TestEncreGitRepo:
         assert isinstance(files, list)
 
     def test_verify_get_commit_hash_returns_str(self):
-        """Validate that get_commit_hash() returns a string (possibly empty when no commits exist).
+        """Validate that get_commit_hash() returns a string.
 
-        The test asserts isinstance(result, str) because the commit hash
-        must always be a string for consistent type handling.
+        Asserts the result is a str even when no commits exist, so an empty
+        hash is always typed consistently.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -283,10 +276,10 @@ class TestEncreGitRepo:
         assert isinstance(result, str)
 
     def test_verify_get_branch_returns_str(self):
-        """Validate that get_branch() returns a string (possibly empty when not in a repo).
+        """Validate that get_branch() returns a string.
 
-        The test asserts isinstance(result, str) because branch name must
-        always be a string for consistent type handling.
+        Asserts the result is a str even outside a repository, so an empty
+        branch name is always typed consistently.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -296,8 +289,8 @@ class TestEncreGitRepo:
     def test_verify_has_unpushed_commits_returns_bool(self):
         """Validate that has_unpushed_commits() returns a boolean.
 
-        The test asserts isinstance(result, bool) because the method is a
-        predicate used to decide whether to warn about unpushed changes.
+        Asserts the result is a bool, since the method is a predicate used to
+        decide whether to warn about unpushed changes.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -307,9 +300,8 @@ class TestEncreGitRepo:
     def test_verify_is_transient_state_returns_bool(self):
         """Validate that is_transient_state() returns a boolean.
 
-        The test asserts isinstance(result, bool) because the method is a
-        predicate indicating whether the working tree is in a risky state
-        (e.g., uncommitted changes that could be lost).
+        Asserts the result is a bool, since the method is a predicate for
+        risky working-tree states such as changes that could be lost.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -317,11 +309,10 @@ class TestEncreGitRepo:
         assert isinstance(result, bool)
 
     def test_verify_stash_to_clean_state_returns_string_or_none(self):
-        """Validate that stash_to_clean_state() returns a stash name string or None.
+        """Validate that stash_to_clean_state() returns a stash name or None.
 
-        The test asserts result is None or a str because the method either
-        creates a stash (returning its name) or finds nothing to stash
-        (returning None).
+        Asserts the result is None or a str, since the method either creates a
+        stash and reports its name or finds nothing to stash.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -329,24 +320,21 @@ class TestEncreGitRepo:
         assert result is None or isinstance(result, str)
 
     def test_verify_unstash_does_not_raise(self):
-        """Validate that unstash() is safe to call even when no stash exists.
+        """Validate that unstash() is safe when no stash exists.
 
-        The test calls unstash() and asserts no exception is raised because
-        the method must be idempotent and safe for agents that call it
-        unconditionally before resuming work.
+        Calls unstash() and asserts nothing is raised, because agents may call
+        it unconditionally before resuming work and it must be idempotent.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
         repo.unstash()
 
     def test_verify_not_in_repo_methods_return_safe_defaults(self):
-        """Validate that all query methods return safe default values when not in a git repository.
+        """Validate that every query method degrades gracefully outside git.
 
-        The test constructs a repo in a temp directory (no git), and asserts
-        get_diff() == '', get_diff_stats() == zero-count dict, get_changed_files()
-        == [], get_commit_hash() == '', get_branch() == '', has_unpushed_commits()
-        is False, is_transient_state() is False, and stash_to_clean_state()
-        is None because all methods must degrade gracefully outside a repo.
+        Builds a repo in an empty temp directory and asserts get_diff is empty,
+        stats are all zeros, changed files are empty, commit hash and branch are
+        empty, unpushed and transient flags are False, and stash returns None.
         """
         from encre.git.repo import EncreGitRepo
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -361,12 +349,10 @@ class TestEncreGitRepo:
             assert repo.stash_to_clean_state() is None
 
     def test_verify_get_state_has_all_expected_attributes_in_actual_repo(self):
-        """Validate that GitState returned from get_state() in a real repo has all 9 expected attributes.
+        """Validate that a real-repo GitState exposes all nine attributes.
 
-        The test asserts hasattr for in_repo, commit_hash, branch, remote_url,
-        is_clean, changed_files, untracked_files, has_unpushed, and
-        worktree_count because the dataclass contract requires all fields
-        to be present for downstream pattern-matching and serialization.
+        Asserts hasattr for every documented field, since downstream
+        serialization and pattern matching require the full field set.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -382,11 +368,10 @@ class TestEncreGitRepo:
         assert hasattr(state, "worktree_count")
 
     def test_verify_get_changed_files_includes_tracked_modifications(self):
-        """Validate that get_changed_files() returns a list in a real git repository.
+        """Validate that get_changed_files() returns a list inside a real repo.
 
-        The test skips if not in a git repo and asserts the result is a list
-        because changed files must always be returned as a list, even when
-        empty in a clean working tree.
+        Skips when not in a repository and asserts the result is a list, since
+        changed files are always returned as a list even for a clean tree.
         """
         from encre.git.repo import EncreGitRepo
         repo = EncreGitRepo(workspace=".")
@@ -396,11 +381,11 @@ class TestEncreGitRepo:
         assert isinstance(files, list)
 
     def test_verify_parse_numstat_counts_insertions_and_deletions_across_files(self):
-        """Validate that _parse_numstat correctly aggregates insertions and deletions from numstat output.
+        """Validate that _parse_numstat aggregates insertions and deletions.
 
-        The test passes a two-line numstat string and asserts files==2,
-        insertions==13 (3+10), deletions==7 (2+5) because numstat parsing
-        must correctly sum per-file change counts into aggregate statistics.
+        Passes two numstat lines and asserts files is 2, insertions is 13
+        (3+10), and deletions is 7 (2+5), so per-file counts are summed
+        correctly.
         """
         from encre.git.repo import EncreGitRepo
         output = "3\t2\tREADME.md\n10\t5\tsrc/main.py\n"
@@ -408,22 +393,21 @@ class TestEncreGitRepo:
         assert parsed == {"files": 2, "insertions": 13, "deletions": 7}
 
     def test_verify_parse_numstat_empty_string_returns_zero_counts(self):
-        """Validate that _parse_numstat('') returns zero counts for all fields.
+        """Validate that _parse_numstat("") returns all-zero counts.
 
-        The test asserts parsed == {files:0, insertions:0, deletions:0} because
-        an empty numstat string represents no changes and must not raise.
+        Asserts zero counts for every field, because an empty numstat means no
+        changes and must not raise.
         """
         from encre.git.repo import EncreGitRepo
         parsed = EncreGitRepo._parse_numstat("")
         assert parsed == {"files": 0, "insertions": 0, "deletions": 0}
 
     def test_verify_parse_numstat_skips_binary_files(self):
-        """Validate that _parse_numstat treats '-' entries as binary and counts only text file changes.
+        """Validate that _parse_numstat treats "-" entries as binary files.
 
-        The test passes a numstat string with one binary file ('-') and one
-        text file (5 insertions, 3 deletions) and asserts files==2,
-        insertions==5, deletions==3 because binary entries must contribute
-        to the file count but not to the insertion/deletion totals.
+        Passes one binary line ("-" counts) and one text line (5 insertions, 3
+        deletions) and asserts files is 2, insertions is 5, and deletions is 3,
+        so binary files count as files but not toward line totals.
         """
         from encre.git.repo import EncreGitRepo
         output = "-\t-\timage.png\n5\t3\tcode.py\n"
@@ -431,25 +415,21 @@ class TestEncreGitRepo:
         assert parsed == {"files": 2, "insertions": 5, "deletions": 3}
 
 
-# ===========================================================================
-# GitDiffResult dataclass
-# ===========================================================================
+# ---- GitDiffResult dataclass ----
 
 class TestGitDiffResult:
-    """Engineered to validate the GitDiffResult dataclass as the structured diff statistics container.
+    """Validate the GitDiffResult dataclass as the diff-statistics container.
 
-    This test class exercises GitDiffResult across 4 scenarios to ensure
-    that construction stores all three fields (files, insertions, deletions)
-    correctly, that zero values are accepted, that large values do not
-    overflow, and that the class is recognized as a dataclass. The design
-    provides a typed return value for diff statistics queries.
+    Exercises construction with normal, zero, and large values plus
+    dataclass-identity checks to ensure files, insertions, and deletions are
+    stored without transformation or truncation.
     """
 
     def test_verify_creation_stores_all_fields(self):
-        """Validate that GitDiffResult stores files, insertions, and deletions correctly.
+        """Validate that GitDiffResult stores all three fields correctly.
 
-        The test constructs with known values and asserts each field matches
-        because the dataclass must preserve statistics without transformation.
+        Builds a result with known values and asserts each field matches, so
+        statistics pass through untouched.
         """
         from encre.git.diff import GitDiffResult
         result = GitDiffResult(files=3, insertions=50, deletions=10)
@@ -458,11 +438,10 @@ class TestGitDiffResult:
         assert result.deletions == 10
 
     def test_verify_zero_values_are_accepted(self):
-        """Validate that GitDiffResult accepts all-zero values without error.
+        """Validate that GitDiffResult accepts all-zero values.
 
-        The test constructs with files=0, insertions=0, deletions=0 and asserts
-        each field is zero because a repo with no changes must produce a
-        zero-count diff result.
+        Builds a result with every field at zero and asserts they stay zero,
+        since an unchanged repository must produce a zero-count result.
         """
         from encre.git.diff import GitDiffResult
         result = GitDiffResult(files=0, insertions=0, deletions=0)
@@ -471,11 +450,11 @@ class TestGitDiffResult:
         assert result.deletions == 0
 
     def test_verify_large_values_are_stored_correctly(self):
-        """Validate that GitDiffResult stores large integer values without truncation.
+        """Validate that GitDiffResult stores large integers without truncation.
 
-        The test constructs with files=1000, insertions=50000, deletions=30000
-        and asserts each field matches because large repositories must not
-        lose precision in diff statistics.
+        Builds a result with 1000 files, 50000 insertions, and 30000 deletions
+        and asserts each value survives, so large repositories do not lose
+        precision in their stats.
         """
         from encre.git.diff import GitDiffResult
         result = GitDiffResult(files=1000, insertions=50000, deletions=30000)
@@ -484,35 +463,32 @@ class TestGitDiffResult:
         assert result.deletions == 30000
 
     def test_verify_gitdiffresult_is_dataclass(self):
-        """Validate that GitDiffResult is recognized as a dataclass by the standard library.
+        """Validate that GitDiffResult is a standard-library dataclass.
 
-        The test asserts is_dataclass(GitDiffResult) is True because the class
-        relies on dataclass-generated methods for correct equality and repr.
+        Asserts is_dataclass(GitDiffResult) is True, since generated equality
+        and repr are part of the contract.
         """
         from dataclasses import is_dataclass
         from encre.git.diff import GitDiffResult
         assert is_dataclass(GitDiffResult)
 
 
-# ===========================================================================
-# EncreGitDiff static methods
-# ===========================================================================
+# ---- EncreGitDiff static methods ----
 
 class TestEncreGitDiff:
-    """Engineered to validate the EncreGitDiff static utility methods for diff computation and application.
+    """Validate the EncreGitDiff static helpers for diff work.
 
-    This test class exercises compute_diff, apply_diff, parse_diff_stats, and
-    is_transient_git_state across 12 scenarios. The design provides pure
-    static functions for diff operations that do not require a GitRepo instance,
-    enabling diff computation on arbitrary old/new content pairs without
-    filesystem or git subprocess dependencies.
+    Exercises compute_diff, apply_diff, parse_diff_stats, and
+    is_transient_git_state. These are pure static functions that need neither a
+    GitRepo instance nor git subprocess calls, so diffs can be computed over
+    arbitrary old/new content pairs.
     """
 
     def test_verify_compute_diff_returns_str(self):
-        """Validate that compute_diff returns a string for two different content inputs.
+        """Validate that compute_diff returns a string for differing inputs.
 
-        The test passes two strings differing by one modified line and asserts
-        the result is a str because diff output must always be a text string.
+        Passes two contents differing by one modified line and asserts the
+        result is a str, since diff output is always text.
         """
         from encre.git.diff import EncreGitDiff
         diff = EncreGitDiff.compute_diff(
@@ -522,10 +498,10 @@ class TestEncreGitDiff:
         assert isinstance(diff, str)
 
     def test_verify_compute_diff_no_changes_returns_str(self):
-        """Validate that compute_diff returns a string even when old and new are identical.
+        """Validate that compute_diff returns a string for identical inputs.
 
-        The test passes identical content and asserts isinstance(diff, str)
-        because a no-op diff must still return a valid (empty) string.
+        Passes the same content twice and asserts the result is a str, so a
+        no-op diff is still a valid (empty) string.
         """
         from encre.git.diff import EncreGitDiff
         content = "hello world\nfoo bar\n"
@@ -533,10 +509,10 @@ class TestEncreGitDiff:
         assert isinstance(diff, str)
 
     def test_verify_compute_diff_empty_to_content_produces_nonempty_diff(self):
-        """Validate that compute_diff produces a non-empty string when going from empty to content.
+        """Validate that going from empty to content produces a non-empty diff.
 
-        The test passes old='' and new='line1\nline2\n' and asserts the diff
-        is a non-empty string because adding content must produce a visible diff.
+        Passes old="" and a two-line new content and asserts the diff is a
+        non-empty string, so additions are visibly represented.
         """
         from encre.git.diff import EncreGitDiff
         diff = EncreGitDiff.compute_diff(old="", new="line1\nline2\n")
@@ -546,19 +522,18 @@ class TestEncreGitDiff:
     def test_verify_compute_diff_content_to_empty_returns_str(self):
         """Validate that compute_diff returns a string when content is removed.
 
-        The test passes old='line1\nline2\n' and new='' and asserts the result
-        is a str because removal diffs must also produce valid text output.
+        Passes two lines as old and "" as new and asserts the result is a str,
+        so deletion diffs are valid text too.
         """
         from encre.git.diff import EncreGitDiff
         diff = EncreGitDiff.compute_diff(old="line1\nline2\n", new="")
         assert isinstance(diff, str)
 
     def test_verify_apply_diff_returns_str(self):
-        """Validate that apply_diff returns a string when applied to original content.
+        """Validate that apply_diff returns a string.
 
-        The test computes a diff and then applies it to the original content,
-        asserting the result is a str because apply_diff must return the
-        transformed content as text.
+        Computes a diff and applies it to the original content, asserting the
+        result is a str, so the transformed content is always text.
         """
         from encre.git.diff import EncreGitDiff
         original = "line1\nline2\nline3\n"
@@ -570,11 +545,10 @@ class TestEncreGitDiff:
         assert isinstance(result, str)
 
     def test_verify_apply_diff_noop_returns_original_content(self):
-        """Validate that apply_diff with a no-op diff returns the original content unchanged.
+        """Validate that applying a no-op diff still returns a string.
 
-        The test computes a diff between identical content (no-op), applies
-        it, and asserts the result is a str because even no-op application
-        must return a valid string.
+        Computes a diff between identical content, applies it, and asserts the
+        result is a str, so no-op application never breaks the type contract.
         """
         from encre.git.diff import EncreGitDiff
         content = "hello\nworld\n"
@@ -583,11 +557,11 @@ class TestEncreGitDiff:
         assert isinstance(result, str)
 
     def test_verify_parse_diff_stats_returns_dict_with_required_keys(self):
-        """Validate that parse_diff_stats returns a dict with total_files, total_insertions, total_deletions.
+        """Validate that parse_diff_stats returns the three required keys.
 
-        The test passes a single numstat line and asserts the result is a dict
-        containing all three required keys because stats parsing must always
-        produce a structured result for downstream aggregation.
+        Passes a single numstat line and asserts the dict contains
+        total_files, total_insertions, and total_deletions, so stats parsing
+        always yields a structured result.
         """
         from encre.git.diff import EncreGitDiff
         stats = EncreGitDiff.parse_diff_stats("3\t2\tfile.py\n")
@@ -597,22 +571,21 @@ class TestEncreGitDiff:
         assert "total_deletions" in stats
 
     def test_verify_parse_diff_stats_empty_string_returns_zero_counts(self):
-        """Validate that parse_diff_stats('') returns zero counts for all fields.
+        """Validate that parse_diff_stats("") returns all-zero counts.
 
-        The test asserts the result equals {total_files:0, total_insertions:0,
-        total_deletions:0} because an empty input must not raise and must
-        produce zero aggregates.
+        Asserts zero totals for every field, since empty input must not raise
+        and must aggregate to zero.
         """
         from encre.git.diff import EncreGitDiff
         stats = EncreGitDiff.parse_diff_stats("")
         assert stats == {"total_files": 0, "total_insertions": 0, "total_deletions": 0}
 
     def test_verify_parse_diff_stats_multiple_files_aggregates_correctly(self):
-        """Validate that parse_diff_stats sums insertions and deletions across multiple files.
+        """Validate that parse_diff_stats sums counts across multiple files.
 
-        The test passes two numstat lines and asserts total_files==2,
-        total_insertions==7 (5+2), total_deletions==8 because multi-file
-        stats must be correctly aggregated from individual line entries.
+        Passes two numstat lines and asserts total_files is 2,
+        total_insertions is 7 (5+2), and total_deletions is 8, so multi-file
+        stats aggregate correctly.
         """
         from encre.git.diff import EncreGitDiff
         output = "5\t0\tsrc/new.py\n2\t8\tsrc/changed.py\n"
@@ -622,32 +595,31 @@ class TestEncreGitDiff:
         assert stats["total_deletions"] == 8
 
     def test_verify_is_transient_git_state_returns_bool_for_current_workspace(self):
-        """Validate that is_transient_git_state returns a boolean for the current workspace.
+        """Validate that is_transient_git_state returns a bool for the workspace.
 
-        The test asserts isinstance(result, bool) because the method is a
-        predicate indicating whether the workspace has uncommitted changes.
+        Asserts the result is a bool, since the method is a predicate for
+        whether the workspace has uncommitted changes.
         """
         from encre.git.diff import EncreGitDiff
         result = EncreGitDiff.is_transient_git_state(workspace=".")
         assert isinstance(result, bool)
 
     def test_verify_is_transient_git_state_returns_false_for_nonexistent_directory(self):
-        """Validate that is_transient_git_state returns False for a path that does not exist.
+        """Validate that is_transient_git_state returns False for a missing path.
 
-        The test asserts result is False because a nonexistent directory
-        cannot be a transient git state and must return a safe default.
+        Asserts False for a nonexistent directory, because a missing path
+        cannot be transient and must fall back to a safe default.
         """
         from encre.git.diff import EncreGitDiff
         result = EncreGitDiff.is_transient_git_state(workspace="/nonexistent/path/xyz")
         assert result is False
 
     def test_verify_roundtrip_compute_and_apply_produces_valid_string(self):
-        """Validate that compute_diff followed by apply_diff produces a valid string output.
+        """Validate that compute_diff then apply_diff yields a valid string.
 
-        The test computes a diff between two Python function bodies and applies
-        it to the original, asserting the result is a str because the roundtrip
-        must produce valid text content even if the applied diff differs from
-        the intended new content (the test verifies type safety, not semantic equality).
+        Computes a diff between two Python function bodies, applies it to the
+        original, and asserts the result is a str; this checks type safety of
+        the round trip rather than semantic equality of the applied output.
         """
         from encre.git.diff import EncreGitDiff
         original = "def foo():\n    return 1\n\n\ndef bar():\n    return 2\n"

@@ -1,7 +1,6 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
-# Copyright 漏 2025-2026 Wenze Wei. All Rights Reserved.
+# Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
 # This file is part of Encre.
 # The Encre project belongs to the Dunimd Team.
@@ -27,6 +26,7 @@ from typing import Any
 
 from encre.search.manager import EncreSearchManager
 from encre.tools.base import build_tool
+from encre.tools.tool_ui import ui_dict
 
 _manager: EncreSearchManager | None = None
 
@@ -97,8 +97,12 @@ web_search_tool = build_tool(
         "required": ["query"],
     },
     execute=_web_search_execute,
+    ui=ui_dict(icon="globe", label="Web Search", body="web-results", keys=("query", "q")).as_dict(),
     intents=["general", "research"], category="web",
     triggers=["search web", "internet search", "google", "lookup"],
     semantic_type="network", cost_level="medium", retryability="auto",
     is_concurrency_safe=lambda _: True, is_readonly=True,
 )
+
+
+

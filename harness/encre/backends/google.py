@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -59,13 +57,14 @@ requests.
 
 import asyncio
 import json
+import logging
 import random
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
 
-from encre.backends.base import BaseBackend
+from encre.backends.base import BaseBackend, normalize_usage
 from encre.utils.types import (
     BackendEvent,
     create_backend_error,
@@ -75,6 +74,8 @@ from encre.utils.types import (
     create_backend_tool_call,
     create_backend_tool_call_delta,
 )
+
+logger = logging.getLogger("encre.backends.google")
 
 
 class GoogleBackend(BaseBackend):
@@ -166,14 +167,27 @@ class GoogleBackend(BaseBackend):
             system prompt (or None).
         """
         contents: list[dict[str, Any]] = []
-        system_instruction: dict[str, Any] | None = None
+        system_texts: list[str] = []
 
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
             if role == "system":
-                system_instruction = {"parts": [{"text": content}]}
+                # Collect every system message; multiple system messages are
+                # merged so none is silently dropped.
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = "\n".join(
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                else:
+                    text = json.dumps(content) if content else ""
+                if text:
+                    system_texts.append(text)
                 continue
 
             parts: list[dict[str, Any]] = []
@@ -250,6 +264,9 @@ class GoogleBackend(BaseBackend):
 
             contents.append({"role": mapped_role, "parts": parts})
 
+        system_instruction: dict[str, Any] | None = (
+            {"parts": [{"text": "\n\n".join(system_texts)}]} if system_texts else None
+        )
         return contents, system_instruction
 
     def _convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -324,6 +341,11 @@ class GoogleBackend(BaseBackend):
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
         }
+        # Provider "advanced config" sampling overrides -- Gemini uses
+        # camelCase generationConfig keys.
+        self._merge_sampling_overrides(
+            generation_config, mapping={"top_p": "topP", "top_k": "topK"},
+        )
 
         if tool_choice == "any":
             generation_config["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
@@ -575,15 +597,13 @@ class GoogleBackend(BaseBackend):
 
             _usage = None
             if _usage_metadata:
-                _usage = {
-                    "input_tokens": _usage_metadata.get("promptTokenCount", 0),
-                    "output_tokens": _usage_metadata.get("candidatesTokenCount", 0),
-                }
                 # Gemini implicit caching: cachedContentTokenCount is the
                 # portion of promptTokenCount served from cache.
-                _cached = _usage_metadata.get("cachedContentTokenCount", 0) or 0
-                if _cached:
-                    _usage["cache_read_input_tokens"] = _cached
+                _usage = normalize_usage({
+                    "input_tokens": _usage_metadata.get("promptTokenCount", 0),
+                    "output_tokens": _usage_metadata.get("candidatesTokenCount", 0),
+                    "cachedContentTokenCount": _usage_metadata.get("cachedContentTokenCount", 0) or 0,
+                })
             yield create_backend_finish(finish_reason, usage=_usage)
 
     async def _do_non_stream(self, url: str, body: dict[str, Any]) -> AsyncGenerator[BackendEvent, None]:
@@ -647,15 +667,13 @@ class GoogleBackend(BaseBackend):
         usage_meta = data.get("usageMetadata", {})
         _usage = None
         if usage_meta:
-            _usage = {
-                "input_tokens": usage_meta.get("promptTokenCount", 0),
-                "output_tokens": usage_meta.get("candidatesTokenCount", 0),
-            }
             # Gemini implicit caching: cachedContentTokenCount is the
             # portion of promptTokenCount served from cache.
-            _cached = usage_meta.get("cachedContentTokenCount", 0) or 0
-            if _cached:
-                _usage["cache_read_input_tokens"] = _cached
+            _usage = normalize_usage({
+                "input_tokens": usage_meta.get("promptTokenCount", 0),
+                "output_tokens": usage_meta.get("candidatesTokenCount", 0),
+                "cachedContentTokenCount": usage_meta.get("cachedContentTokenCount", 0) or 0,
+            })
         yield create_backend_finish(mapped_reason, usage=_usage)
 
     def _map_finish_reason(self, reason: str) -> str:
@@ -753,7 +771,7 @@ class GoogleBackend(BaseBackend):
         """Gemini 2.5 models support thinking/reasoning tokens."""
         return True
 
-    # 鈹€鈹€ Multimodal capability declarations 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Multimodal capability declarations ───────────────────────────────
     # The Google Generative Language API exposes embeddings, files,
     # batches and supervised fine-tuning on Gemini models.  Image
     # generation, TTS and STT are only available via Vertex AI and
@@ -778,7 +796,7 @@ class GoogleBackend(BaseBackend):
     def supports_vision_input(self) -> bool:
         return True
 
-    # 鈹€鈹€ Embeddings 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Embeddings ───────────────────────────────────────────────────────
 
     async def create_embeddings(
         self,
@@ -834,7 +852,7 @@ class GoogleBackend(BaseBackend):
             usage={},
         )
 
-    # 鈹€鈹€ Files 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Files ────────────────────────────────────────────────────────────
 
     async def upload_file(
         self,
@@ -1001,7 +1019,7 @@ class GoogleBackend(BaseBackend):
         response = await self._client.delete(url, params={"key": self.api_key})
         return not response.status_code >= 400
 
-    # 鈹€鈹€ Batch 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Batch ────────────────────────────────────────────────────────────
 
     async def create_batch(
         self,
@@ -1072,7 +1090,7 @@ class GoogleBackend(BaseBackend):
             else {},
         )
 
-    # 鈹€鈹€ Fine-tuning (tuning) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Fine-tuning (tuning) ─────────────────────────────────────────────
 
     async def create_fine_tuning_job(
         self,
@@ -1128,7 +1146,7 @@ class GoogleBackend(BaseBackend):
             provider="google",
         )
 
-    # 鈹€鈹€ Realtime (Gemini Live) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Realtime (Gemini Live) ───────────────────────────────────────────
 
     async def create_realtime_session(
         self,

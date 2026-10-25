@@ -1,10 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright 漏 2025-2026 Wenze Wei. All Rights Reserved.
+# Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # You may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from __future__ import annotations
+#
+# DISCLAIMER: Users must comply with applicable AI regulations.
+# Non-compliance may result in service termination or legal liability.
 
 from __future__ import annotations
 
@@ -93,8 +94,8 @@ async def summarize_milestone(
     detail = "\n".join(events[-12:])[:_LINE_CAP * 12]
     outcome = "in progress"
     tail = (last_assistant_text or "").lower()
-    if any(k in tail for k in ("done", "complete", "finished", "final", "delivered", "success", "鎴愬姛", "瀹屾垚")):
+    if any(k in tail for k in ("done", "complete", "finished", "final", "delivered", "success", "成功", "完成")):
         outcome = "completed"
-    elif any(k in tail for k in ("fail", "error", "stuck", "failure", "澶辫触", "閿欒")):
+    elif any(k in tail for k in ("fail", "error", "stuck", "failure", "失败", "错误")):
         outcome = "needs attention"
     return {"outcome": outcome, "detail": detail}

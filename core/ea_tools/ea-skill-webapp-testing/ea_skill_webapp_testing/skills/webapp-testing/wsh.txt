@@ -1,0 +1,13 @@
+﻿usage: with_server.py [-h] --server SERVERS --port PORTS [--timeout TIMEOUT]
+                      ...
+
+Run command with one or more servers
+
+positional arguments:
+  command            Command to run after server(s) ready
+
+options:
+  -h, --help         show this help message and exit
+  --server SERVERS   Server command (can be repeated)
+  --port PORTS       Port for each server (must match --server count)
+  --timeout TIMEOUT  Timeout in seconds per server (default: 30)

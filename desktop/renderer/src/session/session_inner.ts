@@ -29,11 +29,16 @@
  * terminal instances. Width is persisted to `localStorage`.
  */
 
-import { getState, subscribe, addAttachments, showToast } from "../core/state.js";
+import { getState, subscribe, addAttachments, showToast, openRoutedLink, isEnabled } from "../core/state.js";
+import { scheduleRender } from "../core/render_scheduler.js";
+import { guardHtml, safeCreateIcons } from "../core/ui_boundary.js";
+import { runScheduledRenderNow } from "../core/render_scheduler.js";
+import { registerSurface, unregisterSurface } from "../core/scope.js";
 import type { ArtifactItem, AttachmentMeta, ReferenceItem } from "../core/types.js";
-import { getFileIcon } from "../features/files.js";
+import { getFileIcon, getFolderIcon, getTerminalIcon } from "../features/files.js";
 import { applyTabTooltip, baseName } from "../ui/tab-tooltip.js";
 import { t, onLocaleChange, getIntlLocale } from "../features/i18n.js";
+import { EALoader } from "../features/ealoader.js";
 import { send } from "../core/ws.js";
 import { getMonaco, monacoLang, registerEditor, unregisterEditor } from "../features/monaco.js";
 import { Dialog } from "../ui/dialog.js";
@@ -43,12 +48,23 @@ import { Dialog } from "../ui/dialog.js";
 //   - xterm            -> setupTerminalPanel()  (terminal tabs)
 //   - mammoth / xlsx   -> _renderOfficeDocx() / _renderOfficeXlsx()
 //   - pptx-to-html     -> _renderOfficePptx()
-import { renderDiffHtml, setupSplitViewScrollSync, expandDiffToFullFile } from "../chat/diff_render.js";
-import { clampElLeft, clampElRight, showContextMenu } from "../ui/context-menu.js";
+import { renderDiffHtml, setupSplitViewScrollSync, expandDiffToFullFile, type DiffRenderOptions } from "../chat/diff_render.js";
+import { showAnchoredDropdown, showContextMenu, hideContextMenu, renderContextMenuItems, type ContextMenuItemSpec } from "../ui/context-menu.js";
+import { pluginMenuSpecs } from "../features/plugin_contributions.js";
 import { BrowserView } from "../features/browser.js";
 import { getDefaultHomepage } from "../features/browser.js";
 import { MarkdownPreviewView } from "../chat/markdown_preview.js";
 import { MediaViewer } from "../chat/media-viewer.js";
+import { isSubappView, mountSubappView, subappTabIcon } from "../features/subapp.js";
+import { hideAnimated, showAnimated } from "../ui/animate.js";
+import { showSelectionActionBarFor } from "../ui/selection-action-bar.js";
+
+/** True in the Encre Agent Desktop Subwindow (ESD). That window has no session
+ *  and no chat, so everything here that is scoped to a session (tab-state
+ *  swapping, sidebar visibility) must stay out of its way. */
+function inChildWindow(): boolean {
+  return document.body.classList.contains("child-mode");
+}
 
 /** Definition of a sidebar tab. */
 export interface TabDef {
@@ -67,6 +83,145 @@ export interface TabDef {
   state?: string;        /** breathing light: "running" | "awaiting_approval" | "permission" | "" */
 }
 
+/** One user-configurable tile of the home board.  The whole board (content,
+ *  position, per-tile size, visibility) is edited on the drag-and-drop
+ *  preview board in Settings → Assist Panels and persisted as the
+ *  `assist_tiles` setting. */
+export interface AssistTileCfg {
+  id: string;            // "terminal" | "editor" | "review" | "browser" | "custom-*"
+  icon: string;          // lucide icon name
+  label: string;         // display name
+  size: "s" | "w" | "h" | "m"; // legacy bucket: "s" = 1×1, "w" = 2×1, "h" = 1×2, "m" = 2×2
+  w?: number;            // explicit column span (1..3) — wins over `size` when set
+  h?: number;            // explicit row span (1..3) — wins over `size` when set
+  cell?: number;         // explicit top-left cell (0..8) on page 0; absent = auto-packed
+  hidden?: boolean;      // hidden tiles stay configured but leave the board
+}
+
+/** The four built-in launcher ids.  They keep their real panel actions; any
+ *  other id is a custom (plugin-shaped) tile that has no panel behind it yet. */
+export const DEFAULT_TILE_IDS: readonly string[] = ["terminal", "editor", "review", "browser"];
+
+/** Icon palette offered by the tile editor.  Lucide names only — every entry
+ *  must exist in the bundled icon set. */
+export const ASSIST_TILE_ICONS: readonly string[] = [
+  "terminal", "files", "git-compare-arrows", "globe", "puzzle", "layout-dashboard",
+  "folder", "settings", "cpu", "search", "star", "music", "video", "image",
+  "calendar", "clock", "calculator", "book-open", "message-circle", "mail",
+  "camera", "gamepad-2",
+];
+
+/** The shipped board: four standard launchers in a 2×2 square. */
+export function defaultHomeTiles(): AssistTileCfg[] {
+  return [
+    { id: "terminal", icon: "terminal", label: t("sessionInner.tabTerminal"), size: "s" },
+    { id: "editor", icon: "folder", label: t("sessionInner.tabEditor"), size: "s" },
+    { id: "review", icon: "git-compare-arrows", label: t("sessionInner.tabReview"), size: "s" },
+    { id: "browser", icon: "globe", label: t("sessionInner.tabBrowser"), size: "s" },
+  ];
+}
+
+/** Parse the user-configured board from the `assist_tiles` setting (a JSON
+ *  array).  Any malformed entry is dropped; an empty / broken value falls
+ *  back to the defaults — the board must never render blank because of one
+ *  bad write. */
+export function parseAssistTiles(raw: unknown): AssistTileCfg[] {
+  if (typeof raw !== "string" || raw.trim() === "") return defaultHomeTiles();
+  try {
+    const arr: unknown = JSON.parse(raw);
+    if (!Array.isArray(arr)) return defaultHomeTiles();
+    const out: AssistTileCfg[] = [];
+    // Saved name / icon always win — every tile stays manually editable.
+    // Built-in defaults only fill values that were never saved, so fresh
+    // boards pick up the shipped template (renames included).
+    const defaults = defaultHomeTiles();
+    for (const it of arr) {
+      if (!it || typeof it !== "object") continue;
+      const o = it as Record<string, unknown>;
+      const id = typeof o.id === "string" ? o.id.trim() : "";
+      if (id === "") continue;
+      const builtin = defaults.find((d) => d.id === id);
+      out.push({
+        id,
+        icon: typeof o.icon === "string" && o.icon.trim() !== "" ? o.icon.trim() : builtin ? builtin.icon : "files",
+        label: typeof o.label === "string" && o.label.trim() !== "" ? o.label : builtin ? builtin.label : "",
+        size: o.size === "w" || o.size === "h" || o.size === "m" ? o.size : "s",
+        w: typeof o.w === "number" && Number.isInteger(o.w) && o.w >= 1 && o.w <= 3 ? o.w : undefined,
+        h: typeof o.h === "number" && Number.isInteger(o.h) && o.h >= 1 && o.h <= 3 ? o.h : undefined,
+        cell: typeof o.cell === "number" && Number.isInteger(o.cell) && o.cell >= 0 && o.cell <= 8 ? o.cell : undefined,
+        hidden: o.hidden === true,
+      });
+    }
+    return out.length > 0 ? out : defaultHomeTiles();
+  } catch {
+    return defaultHomeTiles();
+  }
+}
+
+/** Geometric placement of one tile on the home board.  `w` / `h` are the
+ *  column / row spans (1..3), `page` the board page the tile sits on. */
+export interface PlacedTile {
+  tile: AssistTileCfg;
+  r: number;
+  c: number;
+  w: number;
+  h: number;
+  page: number;
+}
+
+/** Lay the visible tiles out onto free 3×3 board pages.
+ *
+ *  On page 0 a tile's saved `cell` wins when it is still free, the rest fill
+ *  top-left first (each tile claims its whole shape — any rectangle up to the
+ *  full 3×3 page), and whatever does not fit opens the next page.
+ *  `includeHidden` (the settings preview board) treats hidden tiles as visible
+ *  so the manager can show them greyed out on the slot they will retake when
+ *  re-enabled. */
+export function layoutHomeTiles(tiles: AssistTileCfg[], opts?: { includeHidden?: boolean }): { placed: PlacedTile[] } {
+  const visible = opts?.includeHidden ? tiles.slice() : tiles.filter((tl) => !tl.hidden);
+  const shape = (tl: AssistTileCfg): { w: number; h: number } => {
+    // Explicit spans win — every shape from 1×1 up to 3×3 is allowed.  The
+    // legacy `size` bucket only answers when no explicit span was saved.
+    if (tl.w != null && tl.h != null) return { w: Math.min(3, Math.max(1, tl.w)), h: Math.min(3, Math.max(1, tl.h)) };
+    return tl.size === "m" ? { w: 2, h: 2 } : tl.size === "w" ? { w: 2, h: 1 } : tl.size === "h" ? { w: 1, h: 2 } : { w: 1, h: 1 };
+  };
+  const placed: PlacedTile[] = [];
+  let page = 0;
+  let cells = new Array<boolean>(9).fill(false);
+  const fitsAt = (start: number, w: number, h: number, grid: boolean[]): boolean => {
+    if (Math.floor(start / 3) + h > 3 || (start % 3) + w > 3) return false;
+    for (let i = 0; i < h; i++) {
+      for (let j = 0; j < w; j++) {
+        if (grid[start + i * 3 + j]) return false;
+      }
+    }
+    return true;
+  };
+  const greedy = (w: number, h: number, grid: boolean[]): number => {
+    for (let i = 0; i < 9; i++) {
+      if (fitsAt(i, w, h, grid)) return i;
+    }
+    return -1;
+  };
+  for (const tl of visible) {
+    const sh = shape(tl);
+    let at = -1;
+    if (page === 0 && tl.cell != null && fitsAt(tl.cell, sh.w, sh.h, cells)) at = tl.cell;
+    if (at === -1) at = greedy(sh.w, sh.h, cells);
+    if (at === -1) {
+      page++;
+      cells = new Array<boolean>(9).fill(false);
+      at = greedy(sh.w, sh.h, cells);
+    }
+    if (at === -1) continue; // unreachable: every shape fits an empty 3×3 page
+    for (let i = 0; i < sh.h; i++) {
+      for (let j = 0; j < sh.w; j++) cells[at + i * 3 + j] = true;
+    }
+    placed.push({ tile: tl, r: Math.floor(at / 3), c: at % 3, w: sh.w, h: sh.h, page });
+  }
+  return { placed };
+}
+
 const TABS_STORAGE_KEY = "session-sidebar-tabs";
 
 function _loadTabs(): TabDef[] {
@@ -80,6 +235,140 @@ function _saveTabs(tabs: TabDef[]): void {
   try { localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabs.map(t => ({id: t.id, type: t.type, label: t.label, closable: t.closable})))); } catch {}
 }
 
+// ── Settings → panel option helpers (see Settings "Assist" panel) ────────────
+function _settingBool(key: string, fallback: boolean): boolean {
+  const v = getState().settings[key];
+  if (v === undefined || v === null) return fallback;
+  return isEnabled(v);
+}
+function _settingInt(key: string, fallback: number, min: number, max: number): number {
+  const v = getState().settings[key];
+  const n = typeof v === "number" ? v : parseInt(String(v ?? ""), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+function _settingNum(key: string, fallback: number, min: number, max: number): number {
+  const v = getState().settings[key];
+  const n = typeof v === "number" ? v : parseFloat(String(v ?? ""));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+function _settingStr(key: string, fallback: string): string {
+  const v = getState().settings[key];
+  return typeof v === "string" && v.trim() !== "" ? v : fallback;
+}
+
+/** Terminal font stacks the settings panel can pin the grid to.  Every entry
+ *  ends in the generic `monospace`, so an uninstalled family degrades to the
+ *  system monospace rather than to the proportional UI font. */
+const TERMINAL_FONT_STACKS: Record<string, string> = {
+  default: '"Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", Consolas, monospace',
+  cascadia: '"Cascadia Code", "Cascadia Mono", Consolas, monospace',
+  jetbrains: '"JetBrains Mono", "Cascadia Mono", Consolas, monospace',
+  firacode: '"Fira Code", "Cascadia Mono", Consolas, monospace',
+  sourcecode: '"Source Code Pro", "Cascadia Mono", Consolas, monospace',
+  consolas: "Consolas, monospace",
+  menlo: "Menlo, Monaco, monospace",
+  courier: '"Courier New", monospace',
+};
+function terminalFontFamily(): string {
+  return TERMINAL_FONT_STACKS[_settingStr("terminal_font_family", "default")] || TERMINAL_FONT_STACKS.default;
+}
+/** xterm's cursor enums are closed sets: a stale or hand-edited config value
+ *  would be ignored by the renderer, so each one falls back to the documented
+ *  default instead of reaching `term.options`. */
+function terminalCursorStyle(): "block" | "underline" | "bar" {
+  const v = _settingStr("terminal_cursor_style", "bar");
+  return v === "block" || v === "underline" ? v : "bar";
+}
+function terminalCursorInactiveStyle(): "outline" | "block" | "bar" | "underline" | "none" {
+  const v = _settingStr("terminal_cursor_inactive", "outline");
+  return v === "outline" || v === "block" || v === "bar" || v === "underline" || v === "none" ? v : "outline";
+}
+
+/** The one place Settings → Assist → Editor is turned into Monaco options.
+ *  Both view creation and the live re-apply go through it, so no option can
+ *  end up read-at-creation-only. */
+function editorViewOptions(): Record<string, unknown> {
+  return {
+    fontSize: _settingInt("editor_font_size", 13, 9, 32),
+    wordWrap: _settingBool("editor_word_wrap", false) ? "on" : "off",
+    minimap: { enabled: _settingBool("editor_minimap", false) },
+    lineNumbers: _settingBool("editor_line_numbers", true) ? "on" : "off",
+    tabSize: _settingInt("editor_tab_size", 4, 2, 8),
+    detectIndentation: _settingBool("editor_detect_indentation", true),
+    renderWhitespace: editorRenderWhitespace(),
+    cursorBlink: _settingBool("editor_cursor_blink", true) ? "smooth" : "solid",
+    fontLigatures: _settingBool("editor_font_ligatures", false),
+    stickyScroll: { enabled: _settingBool("editor_sticky_scroll", true) },
+    tabIndent: editorTabIndent(),
+    insertSpaces: _settingBool("editor_use_spaces", true),
+    wordWrapColumn: _settingInt("editor_word_wrap_column", 80, 20, 200),
+    folding: _settingBool("editor_folding", true),
+    glyphMargin: _settingBool("editor_glyph_margin", false),
+    formatOnPaste: _settingBool("editor_format_on_paste", false),
+    // Inline code suggestions were a test-phase experiment and have been
+    // removed from the product; never auto-popup completion candidates.
+    quickSuggestions: false,
+    rulers: _settingBool("editor_rulers", true) ? [120] : [],
+    cursorStyle: editorCursorStyle(),
+    cursorBlinking: editorCursorBlinking(),
+    // Slim, app-consistent scrollbars: 4px like the global ::-webkit-scrollbar,
+    // no overlays/shadows; the thumb colours come from the encre-* theme
+    // definitions in monaco.ts.  The overview ruler strip is dropped so the
+    // gutter edge matches the rest of the app.
+    scrollbar: {
+      verticalScrollbarSize: 4,
+      horizontalScrollbarSize: 4,
+      useShadows: false,
+    },
+    overviewRulerLanes: 0,
+  };
+}
+
+function editorTabIndent(): "none" | "indent" | "indentOutdent" | "outdent" {
+  const v = _settingStr("editor_tab_indent", "indent");
+  return v === "none" || v === "indentOutdent" || v === "outdent" ? v : "indent";
+}
+
+function editorCursorStyle(): "line" | "underline" | "block" | "line-thin" | "block-outline" | "underline-thin" {
+  const v = _settingStr("editor_cursor_style", "line");
+  return v === "underline" || v === "block" || v === "line-thin" || v === "block-outline" || v === "underline-thin"
+    ? v : "line";
+}
+
+function editorCursorBlinking(): "blink" | "smooth" | "phase" | "expand" | "solid" {
+  const v = _settingStr("editor_cursor_blinking", "smooth");
+  return v === "blink" || v === "phase" || v === "expand" || v === "solid" ? v : "smooth";
+}
+
+/** xterm only accepts the two CSS keyword weights; anything else in the
+ *  config is a hand-edit and falls back rather than reaching `term.options`. */
+function terminalFontWeight(): "normal" | "bold" {
+  return _settingStr("terminal_font_weight", "normal") === "bold" ? "bold" : "normal";
+}
+
+/** Monaco rejects unknown enum members here, so the stored id is validated
+ *  rather than passed through. */
+function editorRenderWhitespace(): "none" | "boundary" | "selection" | "all" {
+  const v = _settingStr("editor_render_whitespace", "selection");
+  return v === "none" || v === "boundary" || v === "all" ? v : "selection";
+}
+
+/** Fingerprint of the six Settings-owned review toggles.  The panel compares
+ *  it on every settings push so an unrelated write cannot wipe a toggle the
+ *  user just flipped in the review action menu. */
+function reviewSettingsSig(): string {
+  return [
+    _settingBool("review_split_view", false),
+    _settingBool("review_collapse_unified", false),
+    _settingBool("review_wrap", false),
+    _settingBool("review_word_diff", false),
+    _settingBool("review_hide_whitespace", false),
+    _settingBool("review_full_file", true),
+  ].join("|");
+}
+
 interface NewTabOption {
   id: string;
   icon: string;
@@ -87,8 +376,8 @@ interface NewTabOption {
 
 const NEW_TAB_OPTIONS: NewTabOption[] = [
   { id: "terminal", icon: "terminal" },
-  { id: "editor", icon: "code-2" },
-  { id: "review", icon: "file-search" },
+  { id: "editor", icon: "files" },
+  { id: "review", icon: "git-compare-arrows" },
   { id: "browser", icon: "globe" },
 ];
 
@@ -105,26 +394,22 @@ function tabLabel(id: string): string {
   }
 }
 
-function termIcon(shellPath?: string): string {
-  if (!shellPath) return "terminal";
-  const name = shellPath.split(/[/\\]/).pop()?.toLowerCase().replace(/\.(exe|cmd|bat)$/, "") || "";
-  if (name.includes("powershell") || name === "pwsh") return "terminal";
-  if (name === "cmd") return "monitor";
-  if (name.includes("wsl")) return "linux";
-  if (name === "bash" || name === "zsh" || name === "sh") return "terminal";
-  return "terminal";
+/** Every terminal — regardless of the shell behind it (PowerShell, cmd,
+ *  WSL, bash) — shares the same Material terminal glyph so tabs, cards
+ *  and menus render one consistent icon. */
+function termIcon(_shellPath?: string): string {
+  return getTerminalIcon();
 }
 
+/** Non-file, application-level tab icons (lucide). File-backed tabs
+ *  resolve through `getFileIcon()` and are rendered as `<img>` instead. */
 function tabIcon(type: string, shellPath?: string): string {
   if (type === "terminal") return termIcon(shellPath);
+  if (isSubappView(type)) return subappTabIcon(type);
   switch (type) {
-    case "editor": return "code-2";
-    case "review": return "file-search";
+    case "review": return "git-compare-arrows";
     case "browser": return "globe";
-    case "markdown": return "file-text";
-    case "code": return "file-text";
-    case "media": return "image";
-    case "office": return "file-text";
+    case "editor": return "files";
     default: return "square";
   }
 }
@@ -151,6 +436,9 @@ export class SessionInner {
   private el: HTMLElement;
   private tabBar: HTMLElement;
   private tabList: HTMLElement;
+  /** Where the tab list renders: the sidebar's own bar in the main window, the
+   *  title-row slot `mountTabList` hands over in the subwindow. */
+  private tabStrip: HTMLElement;
   private tabBody: HTMLElement;
   private infoBody!: HTMLElement;
   private tabAddBtn: HTMLButtonElement | null = null;
@@ -163,7 +451,7 @@ export class SessionInner {
   /** Origin → permissions the page asked for, refreshed on a short TTL. */
   private _permCache = new Map<string, { list: Array<{ name: string; granted: boolean }>; at: number }>();
   private _sessionTabs = new Map<string, TabDef[]>();
-  private _sessionTerminals = new Map<string, Map<string, Array<{ ptyId: number; term: any; cleanup: () => void; resizeObs: ResizeObserver }>>>();
+  private _sessionTerminals = new Map<string, Map<string, Array<{ ptyId: number; term: any; cleanup: () => void; resizeObs: ResizeObserver; applySizing: () => void }>>>();
   private _sessionTermActiveIdx = new Map<string, Map<string, number>>();
   private _sessionSidebarVisible = new Map<string, boolean>();
   private _sessionBrowsers = new Map<string, Map<string, BrowserView>>();
@@ -182,14 +470,29 @@ export class SessionInner {
   /** React to state changes: swap tab + terminal state on session/workspace
    * switches, and refresh the live info panels when the same session mutates
    * (plan items, artifacts, references, etc.). */
-  private _onStateChange(): void {
+  private _onStateChange(changed?: ReadonlySet<unknown>): void {
+    // The subwindow owns no session, so a session/workspace change it happens
+    // to hear about must not swap its tab set out from under the open views.
+    if (inChildWindow()) return;
     const newKey = this._tabStorageKey();
     if (newKey === this._tabKey) {
       // Same session/workspace but state mutated (e.g. plan progress, new
       // artifacts, references). Keep the info panels live without rebuilding
       // the whole tab skeleton.
       if (this.activeTab === "info") {
-        this.renderContent();
+        // `messages` mutates on every streamed token, but the info panel only
+        // derives the tool-call and turn counts from it. Rebuilding six panel
+        // strings per token was pure churn (and any real HTML change would
+        // swap the DOM and reset its scroll).
+        const onlyMessages = !!changed && changed.size === 1 && changed.has("messages");
+        if (onlyMessages) {
+          const st = getState();
+          const last = st.messages[st.messages.length - 1];
+          const sig = `${st.messages.length}:${last?.toolCalls?.length ?? 0}`;
+          if (sig === this._panelMsgSig) return;
+          this._panelMsgSig = sig;
+        }
+        this.requestRender();
       }
       return;
     }
@@ -205,7 +508,7 @@ export class SessionInner {
         this.saveSidebarVisibility();
       }
       // Deep-copy terminals map so each session gets its own Map instance.
-      const termCopy = new Map<string, Array<{ ptyId: number; term: any; cleanup: () => void; resizeObs: ResizeObserver }>>();
+      const termCopy = new Map<string, Array<{ ptyId: number; term: any; cleanup: () => void; resizeObs: ResizeObserver; applySizing: () => void }>>();
       for (const [k, arr] of this.panelTerminals) {
         termCopy.set(k, [...arr]);
       }
@@ -260,8 +563,11 @@ export class SessionInner {
     // Switching sessions must rebuild the info panel even if its markup
     // coincidentally matches the previous session's cached HTML.
     this._lastInfoHtml = "";
+    this._panelMsgSig = "";
     this.renderTabs();
-    this.render();
+    // Structural session switch: immediate paint through the scheduler's
+    // immediate mode, so there is one paint path and one fault boundary.
+    runScheduledRenderNow("right-panel", () => this.render(), 30);
     this.restoreSidebarVisibility();
   }
 
@@ -269,8 +575,16 @@ export class SessionInner {
   private dragEl: HTMLElement | null = null;
   private dragIdx: number = -1;
   private dragStartX: number = 0;
-  private dragOverIdx: number = -1;
-  private dragOverAfter = false;
+  /* Untransformed geometry of the dragged tab, sampled once at drag start.
+     The clamp must be relative to these: deriving them per-frame from
+     getBoundingClientRect() minus the raw dx drifts as soon as the transform
+     is clamped (rect already includes the clamped translateX). */
+  private dragBaseLeft: number = 0;
+  private dragBaseWidth: number = 0;
+  private dragSlot: number = -1;
+  /** Orange permission-light pulse timers per browser tab id. */
+  private _permLightTimers = new Map<string, number>();
+  private dragBarEl: HTMLElement | null = null;
   private dragBound = false;
   private wasDragged = false;
 
@@ -283,20 +597,33 @@ export class SessionInner {
   private resizeStartW = 0;
 
   /* terminals �� each panel can have multiple sub-terminals */
-  private panelTerminals = new Map<string, Array<{ ptyId: number; term: any; cleanup: () => void; resizeObs: ResizeObserver }>>();
+  private panelTerminals = new Map<string, Array<{ ptyId: number; term: any; cleanup: () => void; resizeObs: ResizeObserver; applySizing: () => void }>>();
   private panelActiveTermIdx = new Map<string, number>();
   private panelShellPath = new Map<string, string>();
   private panelShellArgs = new Map<string, string[]>();
   private panelBrowsers = new Map<string, BrowserView>();
   private panelMarkdownPreviews = new Map<string, MarkdownPreviewView>();
+  /** Teardowns for the subwindow-only views (legal doc / license / data
+   *  center / nebula) — they own listeners, polls and animation frames. */
+  private panelSubapps = new Map<string, () => void>();
   private panelCodeEditors = new Map<string, any>();
   /** Tracks which code tabs have unsaved edits (true = dirty). */
   private _dirtyTabs = new Map<string, boolean>();
+
+  /** VSCode-style per-root expansion state for the explorer tree: which
+   *  directories each root had expanded, surviving tab close/reopen and
+   *  panel rebuilds.  Keyed by root path so workspaces/sessions keep and
+   *  restore their own fold state independently. */
+  private static _editorExpandState = new Map<string, Set<string>>();
   /** Last rendered info-panel HTML. Lets renderContent() skip DOM rebuilds
    *  when state mutated but the info panel content is unchanged (e.g. every
    *  streaming/status emit while the model answers), so the sidebar does not
    *  visibly flash on every update. */
   private _lastInfoHtml = "";
+  /** Coarse message fingerprint for the info panel. `messages` mutates on
+   *  every streamed token, but the panel only derives two counts from it, so
+   *  a token that changes neither must not rebuild the six panel strings. */
+  private _panelMsgSig = "";
   private panelMediaViewers = new Map<string, MediaViewer>();
   private panelOfficeControllers = new Map<string, HTMLElement>();
   private _terminalCounter = 0;
@@ -308,6 +635,14 @@ export class SessionInner {
   private _editorCounter = 0;
   private _availableShells: Array<{ name: string; path: string; args?: string[] }> = [];
   private _shellsLoaded = false;
+  /** Current page of the home tile board (pagination kicks in above 9 tiles). */
+  private _homePage = 0;
+  /** Wheel accumulator for the home board so trackpad micro-scrolls do not
+   *  flip one page per event. */
+  private _homeWheelAccum = 0;
+  /** Last seen `assist_tiles` JSON, used to repaint the board only when the
+   *  user actually edits it (Settings → Assist Panels). */
+  private _lastTilesRaw: string | null = null;
 /**
    * Constructor: resolves DOM nodes, restores width and wires tabs/resize.
    */
@@ -316,12 +651,16 @@ export class SessionInner {
     this.tabBar = this.el.querySelector(".tab-bar")!;
     this.tabList = document.createElement("div");
     this.tabList.className = "header-tabs";
+    this.tabStrip = this.tabBar;
     this.tabBody = this.el.querySelector(".tab-body")!;
 
     // Start empty �?the home page (terminal/editor/review cards) shows.
     this.tabs = [];
     this.activeTab = "";
 
+    // Width is a user-draggable px value; the hard cap of half the main
+    // content area is enforced live by CSS max-width:50% (see styles.css),
+    // so window resizes re-clamp automatically without JS.
     try {
       const saved = localStorage.getItem("session-sidebar-width");
       if (saved) this.sidebarWidth = parseInt(saved, 10) || 280;
@@ -329,17 +668,28 @@ export class SessionInner {
     this.el.style.setProperty("--sidebar-w", this.sidebarWidth + "px");
     document.getElementById("main-body")?.style.setProperty("--sidebar-w", this.sidebarWidth + "px");
 
-    subscribe(() => this._onStateChange());
-    onLocaleChange(() => this.render());
+    subscribe((changed) => this._onStateChange(changed), ["sessionId", "activeWorkspace", "messages", "telemetry", "planItems", "planModeActive", "planProposals", "artifacts", "references", "branches", "agentState", "planReview", "compactEvents"]);
+    // Settings → Assist rows save instantly, so the panels that consume them
+    // re-read on the same push.  Terminal binds its own; the code editor and
+    // the review panel are pushed from here (see the two `_apply*Settings`).
+    subscribe(() => {
+      this._applyEditorSettings();
+      this._applyReviewSettings();
+      this._applyHomeTiles();
+    }, ["settings"]);
+    onLocaleChange(() => this.requestRender());
     this.renderTabs();
     this.bindAddButton();
     this.bindResize();
 
-    // Auto-open sidebar + browser tab when the model uses the browser tool
+    // Auto-open sidebar + browser tab when the model uses the browser tool.
+    // A manual user collapse is respected: the webview keeps running while
+    // the sidebar is transform-hidden, so the tool works without reopening
+    // the panel — only the user restores it by hand.
     window.addEventListener("browser-tool-call", () => {
       const panel = document.getElementById("session-inner-sidebar");
       const mainBody = document.getElementById("main-body");
-      if (panel && mainBody && panel.classList.contains("hidden")) {
+      if (!this.isUserSidebarCollapsed() && panel && mainBody && panel.classList.contains("hidden")) {
         panel.classList.remove("hidden");
         mainBody.classList.remove("sidebar-hidden");
         document.getElementById("app")?.classList.add("sidebar-collapsed");
@@ -402,6 +752,11 @@ export class SessionInner {
   }
 
   /** Re-renders the active tab's content (reactive to state/locale). */
+  /** Coalesced paint through the shared scheduler (one per frame). */
+  public requestRender(): void {
+    scheduleRender("right-panel", () => this.render(), 30);
+  }
+
   render(): void {
     if (this.tabs.length === 0) {
       this.renderHomePage();
@@ -431,33 +786,50 @@ export class SessionInner {
 
   /* ── Tab Management ─────────────────────────────────────────────── */
 
+  /** Serialised tab rendering: concurrent triggers (state subscription,
+   *  poller, user actions, createTab) used to interleave panel builds —
+   *  double setup for the same panel and late `.active` writes left the
+   *  visible panel out of sync with the tab highlight (the "sometimes stuck
+   *  on the wrong container" symptom).  Calls are now chained: each
+   *  renderTabs() waits for the previous one to finish. */
+  private _tabsGate: Promise<void> = Promise.resolve();
   private async renderTabs(): Promise<void> {
+    const run = this._tabsGate.then(() => this._doRenderTabs());
+    this._tabsGate = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async _doRenderTabs(): Promise<void> {
     this.tabList.innerHTML = this.tabs.map((tab, i) => {
       const activeCls = tab.id === this.activeTab ? " active" : "";
       const isDirty = tab.type === "code" && !!this._dirtyTabs.get(tab.id);
-      const closeSvg = `<svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>`;
-      const closeBtn = tab.closable
-        ? (isDirty
-          ? `<span class="tab-close tab-close--dirty" data-tooltip="${t("sessionInner.closeUnsavedTitle")}"><i data-lucide="circle" class="lucide tab-close-dot"></i></span>`
-          : `<span class="tab-close" data-tooltip="${t("sessionInner.closeTab")}">${closeSvg}</span>`)
-        : "";
       let iconHtml: string;
       if (tab.type === "browser" && tab.favicon) {
         iconHtml = `<img class="tab-favicon" src="${this.esc(tab.favicon)}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display=''"/><i data-lucide="globe" class="lucide lucide-sm" style="flex-shrink:0;display:none"></i>`;
-      } else if (tab.type === "code" || tab.type === "markdown") {
-        iconHtml = `<img src="${getFileIcon(tab.label)}" class="icon" style="width:14px;height:14px;flex-shrink:0">`;
+      } else if (tab.type === "terminal") {
+        iconHtml = `<img src="${termIcon(tab.shellPath)}" class="icon" style="width:14px;height:14px;flex-shrink:0">`;
+      } else if (tab.filePath) {
+        iconHtml = `<img src="${getFileIcon(baseName(tab.filePath) || tab.label)}" class="icon" style="width:14px;height:14px;flex-shrink:0">`;
       } else {
         iconHtml = `<i data-lucide="${tabIcon(tab.type, tab.shellPath)}" class="lucide lucide-xs" style="flex-shrink:0"></i>`;
       }
       const stateCls = tab.state === "running" ? "session-running" : tab.state === "awaiting_approval" ? "session-waiting" : tab.state === "permission" ? "session-orange" : "";
-      return `<button class="tab${activeCls}" data-tab="${tab.id}" data-idx="${i}" draggable="true">
-        <span class="tab-icon-wrap">${stateCls ? `<span class="${stateCls} tab-indicator-pos"></span>` : ""}${iconHtml}</span>
-        <span class="tab-label">${this.esc(tab.label)}</span>${closeBtn}
+      /* mode-chip pattern: NO close element in the DOM.  `closable` arms the
+         × pseudo-element over the icon slot; `dirty` swaps the icon for a
+         pre-rendered `circle` marker in the same slot (CSS gates which one
+         shows).  The icon element itself carries the close click. */
+      const flagCls = `${tab.closable ? " closable" : ""}${isDirty ? " dirty" : ""}`;
+      return `<button class="tab${activeCls}${flagCls}" data-tab="${tab.id}" data-idx="${i}" draggable="true">
+        <span class="tab-icon-wrap">${stateCls ? `<span class="${stateCls} tab-indicator-pos"></span>` : ""}${iconHtml}<i data-lucide="circle" class="lucide tab-dirty-dot"></i></span>
+        <span class="tab-label">${this.esc(tab.label)}</span>
       </button>`;
     }).join("");
 
-    if (!this.tabBar.contains(this.tabList)) {
-      this.tabBar.prepend(this.tabList);
+    if (!this.tabStrip.contains(this.tabList)) {
+      this.tabStrip.prepend(this.tabList);
     }
 
     this.bindTabEvents();
@@ -473,31 +845,34 @@ export class SessionInner {
   }
 
   /**
-   * Sync the close button of a code tab with its dirty state without
-   * rebuilding the whole tab bar / panels.
+   * Sync a code tab's dirty state without rebuilding the whole tab bar /
+   * panels.  The dirty marker is a pre-rendered `circle` icon inside the
+   * icon slot, so dirty state is just a class on the tab button: the icon
+   * dot replaces the file icon at rest and the × takes over on hover.
    */
   private _refreshTabClose(id: string): void {
     const tabEl = this.tabList.querySelector(`.tab[data-tab="${id}"]`) as HTMLElement | null;
     if (!tabEl) return;
-    const isDirty = !!this._dirtyTabs.get(id);
-    const close = tabEl.querySelector(".tab-close") as HTMLElement | null;
-    if (!close) return;
-    if (isDirty) {
-      close.classList.add("tab-close--dirty");
-      close.dataset.tooltip = t("sessionInner.closeUnsavedTitle");
-      close.innerHTML = `<i data-lucide="circle" class="lucide tab-close-dot"></i>`;
-    } else {
-      close.classList.remove("tab-close--dirty");
-      close.dataset.tooltip = t("sessionInner.closeTab");
-      close.innerHTML = `<svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>`;
-    }
-    this.refreshLucide();
+    tabEl.classList.toggle("dirty", !!this._dirtyTabs.get(id));
   }
 
   private refreshLucide(): void {
-    if (typeof (window as any).lucide !== "undefined") {
+    if (typeof (window as any).lucide === "undefined") return;
+    // Two roots because the subwindow renders its tab list on the title row:
+    // the icons there are no longer inside the sidebar's bar.
+    (window as any).lucide.createIcons({ root: this.tabStrip });
+    if (this.tabStrip !== this.tabBar) {
       (window as any).lucide.createIcons({ root: this.tabBar });
     }
+  }
+
+  /** Render the tab list into `host` instead of the sidebar's own bar. The
+   *  Encre Agent Desktop Subwindow calls this to put its strip on the title
+   *  row; the tab engine, its data and its styling stay the single one. */
+  public mountTabList(host: HTMLElement): void {
+    this.tabStrip = host;
+    if (!host.contains(this.tabList)) host.appendChild(this.tabList);
+    void this.renderTabs();
   }
 
   private bindAddButton(): void {
@@ -544,22 +919,28 @@ export class SessionInner {
             } else {
               await this.createTab(type);
             }
-            dropdown.classList.add("hidden");
+            hideAnimated(dropdown);
           });
         });
       }
     };
 
     const toggle = () => {
-      const isHidden = dropdown.classList.toggle("hidden");
+      // Show/hide goes through the unified motion helpers: an exit still in
+      // flight (closed <120ms ago) has to be cancelled, not raced — the
+      // toggle alone would leave `.closing` on and the dropdown invisible.
+      const willShow = dropdown.classList.contains("hidden");
+      if (willShow) {
+        showAnimated(dropdown);
+        registerSurface(dropdown, { scope: "ephemeral", onClose: () => hideAnimated(dropdown) });
+      } else {
+        hideAnimated(dropdown);
+        unregisterSurface(dropdown);
+      }
+      const isHidden = !willShow;
       if (!isHidden) {
         rebuildDropdown();
-        const rect = btn.getBoundingClientRect();
-        dropdown.style.top = (rect.bottom + 4) + "px";
-        // `right` is a physical offset and never mirrors: clamp it so the
-        // menu cannot be pushed out of the window (rtl anchor at the far
-        // inline-start edge, or a narrow window).
-        dropdown.style.right = clampElRight(dropdown, window.innerWidth - rect.right + 4) + "px";
+        showAnchoredDropdown(dropdown, btn);
         if (typeof (window as any).lucide !== "undefined") {
           (window as any).lucide.createIcons({ root: dropdown });
         }
@@ -573,7 +954,7 @@ export class SessionInner {
 
     this.tabAddDocClickHandler = (e: MouseEvent) => {
       if (!btn.contains(e.target as Node) && !dropdown.contains(e.target as Node)) {
-        dropdown.classList.add("hidden");
+        hideAnimated(dropdown);
       }
     };
     document.addEventListener("click", this.tabAddDocClickHandler);
@@ -606,37 +987,45 @@ export class SessionInner {
     shellDropdown.className = "tab-add-dropdown hidden";
     document.body.appendChild(shellDropdown);
 
-    const rect = anchor.getBoundingClientRect();
-    shellDropdown.style.top = (rect.bottom + 4) + "px";
-    shellDropdown.style.right = (window.innerWidth - rect.right + 4) + "px";
-    shellDropdown.style.maxHeight = Math.min(240, window.innerHeight - rect.bottom - 40) + "px";
-    shellDropdown.style.overflowY = "auto";
     shellDropdown.innerHTML = this._availableShells.map((s) => {
       return `<div class="tab-add-item" data-path="${this.esc(s.path)}" data-args="${this.esc(JSON.stringify(s.args || []))}" style="flex-direction:column;align-items:flex-start;gap:2px">
         <span>${this.esc(s.name)}</span>
         ${s.path ? `<span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono,monospace)">${this.esc(s.path)}</span>` : ""}
       </div>`;
     }).join("");
+    let dismissed = false;
+    function dismissShellDropdown(): void {
+      if (dismissed) return;
+      dismissed = true;
+      document.removeEventListener("click", closeHandler);
+      // Play the shared exit motion first so this menu fades out like every
+      // other floating surface instead of snapping away.
+      shellDropdown.classList.add("closing");
+      const onEnd = (ev: AnimationEvent): void => {
+        if (ev.target !== shellDropdown) return;
+        shellDropdown.removeEventListener("animationend", onEnd);
+        shellDropdown.remove();
+      };
+      shellDropdown.addEventListener("animationend", onEnd);
+      setTimeout(() => shellDropdown.remove(), 300);
+    }
     shellDropdown.querySelectorAll(".tab-add-item").forEach((item) => {
       item.addEventListener("click", async () => {
         const el = item as HTMLElement;
         const sp = el.dataset.path || "";
         let sa: string[] = [];
         try { sa = JSON.parse(el.dataset.args || "[]"); } catch {}
-        shellDropdown.remove();
+        dismissShellDropdown();
         await this.createTab("terminal", { shellPath: sp, shellArgs: sa });
       });
     });
-    shellDropdown.classList.remove("hidden");
-    // It was hidden while the position above was computed, so its width was
-    // not measurable then. Now that it is visible, clamp the physical `right`
-    // offset so the menu stays inside the window under rtl / narrow windows.
-    shellDropdown.style.right = clampElRight(shellDropdown, window.innerWidth - rect.right + 4) + "px";
+    showAnimated(shellDropdown);
+    registerSurface(shellDropdown, { scope: "ephemeral", onClose: () => hideAnimated(shellDropdown) });
+    showAnchoredDropdown(shellDropdown, anchor);
 
     const closeHandler = (e: MouseEvent) => {
       if (!shellDropdown.contains(e.target as Node)) {
-        shellDropdown.remove();
-        document.removeEventListener("click", closeHandler);
+        dismissShellDropdown();
       }
     };
     setTimeout(() => document.addEventListener("click", closeHandler), 0);
@@ -666,42 +1055,119 @@ export class SessionInner {
     this.bindAddButton();
   }
 
+  /** The home board: user-configurable tiles (Settings → Assist Panels),
+   *  falling back to the four default launchers. */
   private renderHomePage(): void {
     // Remove any leftover panels
     this.tabBody.querySelectorAll(".tab-panel").forEach((p) => p.remove());
 
-    const cards = [
-      { id: "terminal", icon: "terminal", label: t("sessionInner.tabTerminal") },
-      { id: "editor", icon: "code-2", label: t("sessionInner.tabEditor") },
-      { id: "review", icon: "file-search", label: t("sessionInner.tabReview") },
-      { id: "browser", icon: "globe", label: t("sessionInner.tabBrowser") },
-    ];
+    const raw = String((getState().settings as Record<string, unknown>)["assist_tiles"] ?? "");
+    this._lastTilesRaw = raw;
+    const tiles = parseAssistTiles(raw);
 
-    this.tabBody.innerHTML = `<div class="si-home">${cards.map((c) => `
-      <div class="si-home-card" data-tab="${c.id}">
-        <i data-lucide="${c.icon}" class="lucide si-home-icon"></i>
-        <div class="si-home-label">${this.esc(c.label)}</div>
-        <i data-lucide="chevron-right" class="lucide si-home-arrow"></i>
-      </div>
-    `).join("")}</div>`;
+    // Shared packing (identical to the drag-and-drop preview in Settings):
+    // every board is the free 3×3 grid, honoring each tile's saved cell
+    // before greedy fill; overflow opens the next page.
+    const { placed } = layoutHomeTiles(tiles);
+    const pageCount = Math.max(1, ...placed.map((p) => p.page + 1));
+    if (this._homePage >= pageCount) this._homePage = pageCount - 1;
+    const pageTiles = placed.filter((p) => p.page === this._homePage);
 
-    this.tabBody.querySelectorAll(".si-home-card").forEach((el) => {
+    const tileHtml = (tl: AssistTileCfg, style = "") =>
+      `<button class="si-grid-tile${DEFAULT_TILE_IDS.includes(tl.id) ? "" : " si-grid-tile--custom"}"${style ? ` style="${style}"` : ""} data-tab="${this.esc(tl.id)}">
+        <i data-lucide="${this.esc(tl.icon)}" class="lucide si-grid-icon"></i>
+        <span class="si-grid-label">${this.esc(tl.label || tl.id)}</span>
+      </button>`;
+    // Free 3×3 grid with explicit grid areas for every tile.
+    const cellsHtml = pageTiles
+      .map((p) => tileHtml(p.tile, `grid-area:${p.r + 1} / ${p.c + 1} / span ${p.h} / span ${p.w}`))
+      .join("");
+    const used = pageTiles.reduce((acc, p) => acc + p.w * p.h, 0);
+    const empties = new Array(9 - used).fill(`<div class="si-grid-empty"></div>`).join("");
+    const boardHtml = `<div class="si-grid si-grid--free">${cellsHtml}${empties}</div>`;
+
+    // Pagination dots — pinned to the bottom of the sidebar, one per page.
+    const dotsHtml = pageCount > 1
+      ? `<div class="si-grid-dots">${Array.from({ length: pageCount }, (_, i) =>
+          `<button class="si-grid-dot${i === this._homePage ? " active" : ""}" data-page="${i}" aria-label="${i + 1}"></button>`).join("")}</div>`
+      : "";
+
+    this.tabBody.innerHTML = `<div class="si-home">
+      <div class="si-grid-wrap">${boardHtml}</div>
+      ${dotsHtml}
+    </div>`;
+
+    // Built-in launcher tiles open their panel; custom tiles have no panel
+    // behind them yet (the plugin admission point) and say so on click.
+    this.tabBody.querySelectorAll(".si-grid-tile").forEach((el) => {
       el.addEventListener("click", () => {
         const type = (el as HTMLElement).dataset.tab!;
-        if (type === "terminal") {
-          this._showShellSelector(this.tabAddBtn || this.el);
+        if (DEFAULT_TILE_IDS.includes(type)) {
+          if (type === "terminal") {
+            this._showShellSelector(this.tabAddBtn || this.el);
+          } else {
+            void this.createTab(type);
+          }
         } else {
-          this.createTab(type);
+          showToast(t("sessionInner.tileNotReady"), "", "info");
         }
       });
     });
+
+    // Dots switch pages on click. The wheel flips pages ONLY while hovering
+    // the dots strip at the bottom — scrolling over the board must never
+    // flip pages — with an accumulator so a single trackpad glide does not
+    // skip through every page at once.
+    this.tabBody.querySelectorAll(".si-grid-dot").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._homePage = parseInt((el as HTMLElement).dataset.page || "0", 10) || 0;
+        this.renderHomePage();
+      });
+    });
+    if (pageCount > 1) {
+      const dots = this.tabBody.querySelector(".si-grid-dots") as HTMLElement | null;
+      dots?.addEventListener("wheel", (e: WheelEvent) => {
+        e.preventDefault();
+        this._homeWheelAccum += e.deltaY || e.deltaX;
+        if (Math.abs(this._homeWheelAccum) < 50) return;
+        const dir = this._homeWheelAccum > 0 ? 1 : -1;
+        this._homeWheelAccum = 0;
+        const next = this._homePage + dir;
+        if (next < 0 || next >= pageCount) return;
+        this._homePage = next;
+        this.renderHomePage();
+      }, { passive: false });
+    }
+    this._homeWheelAccum = 0;
 
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: this.tabBody });
     }
   }
 
-  public async createTab(type: string, opts?: { shellPath?: string; shellArgs?: string[]; startUrl?: string; content?: string; title?: string; filePath?: string; mediaType?: string }): Promise<void> {
+  /** Repaint the home board when the user edits the tile configuration in
+   *  Settings → Assist Panels.  Only fires while the board is the active
+   *  view (no panels open); open panels keep their own render paths. */
+  private _applyHomeTiles(): void {
+    const raw = String((getState().settings as Record<string, unknown>)["assist_tiles"] ?? "");
+    const changed = this._lastTilesRaw !== null && raw !== this._lastTilesRaw;
+    this._lastTilesRaw = raw;
+    if (changed && this.tabs.length === 0) this.renderHomePage();
+  }
+
+  public async createTab(type: string, opts?: { shellPath?: string; shellArgs?: string[]; startUrl?: string; content?: string; title?: string; filePath?: string; mediaType?: string; label?: string }): Promise<void> {
+    this.revealPanel();
+    // Subwindow views are one-per-key: re-opening "privacy" from About focuses
+    // the document that is already open instead of stacking a second copy.
+    if (isSubappView(type)) {
+      const open = this.tabs.find((tab) => tab.id === type);
+      if (open) {
+        if (opts?.label !== undefined) open.label = opts.label;
+        this.activeTab = open.id;
+        await this.renderTabs();
+        return;
+      }
+    }
     let id: string;
     let label: string;
     if (type === "terminal") {
@@ -738,6 +1204,8 @@ export class SessionInner {
       id = type;
       label = tabLabel(type);
     }
+    // Explicit label wins over the per-type default (routed child-view tabs).
+    if (opts?.label !== undefined) label = opts.label;
     const tab: TabDef = { id, type, label, closable: true };
     if (opts?.shellPath !== undefined) tab.shellPath = opts.shellPath;
     if (opts?.shellArgs !== undefined) tab.shellArgs = opts.shellArgs;
@@ -776,13 +1244,15 @@ export class SessionInner {
       } else if (t.type === "markdown") {
         this.setupMarkdownPanel(panel, t.id, t.content, t.title, t.filePath);
       } else if (t.type === "binary") {
-        this.setupBinaryPanel(panel, t.filePath!);
+        this.setupBinaryPanel(panel);
       } else if (t.type === "code") {
         await this.setupCodePanel(panel, t.id, t.content || "", t.filePath || "");
       } else if (t.type === "media") {
         this.setupMediaPanel(panel, t.id, t.filePath || "", t.mediaType);
       } else if (t.type === "office") {
         this.setupOfficePanel(panel, t.id, t.filePath || "");
+      } else if (isSubappView(t.type)) {
+        this.panelSubapps.set(t.id, mountSubappView(t.type, panel));
       }
 
       this.tabBody.appendChild(panel);
@@ -805,6 +1275,8 @@ export class SessionInner {
             }
             this.panelTerminals.delete(pid);
             this.panelActiveTermIdx.delete(pid);
+            this._themeUnsubs.get(pid)?.();
+            this._themeUnsubs.delete(pid);
           }
           const dd = document.querySelector(".si-term-shell-dropdown");
           if (dd) dd.remove();
@@ -851,6 +1323,11 @@ export class SessionInner {
           clearInterval((p as any)._siTreeTimer);
           (p as any)._siTreeTimer = null;
         }
+        const subapp = this.panelSubapps.get(pid);
+        if (subapp) {
+          subapp();
+          this.panelSubapps.delete(pid);
+        }
         p.remove();
       } else {
         p.classList.toggle("active", pid === this.activeTab);
@@ -878,7 +1355,7 @@ export class SessionInner {
       if (terms[0]) {
         try { terms[0].term.focus(); } catch {}
       }
-      this._bindTerminalTheme(panelId, panel);
+      this._bindTerminalSettings(panelId);
       return;
     }
 
@@ -889,7 +1366,10 @@ export class SessionInner {
 
     const api = (window as any).electronAPI;
     if (!api) {
-      body.innerHTML = `<div class="si-empty">${t("sessionInner.termNotAvailable")}</div>`;
+      body.innerHTML = `<div class="si-empty-center"><i data-lucide="terminal" class="lucide"></i><span class="si-empty-title">${t("sessionInner.termEmpty")}</span></div>`;
+      if (typeof (window as any).lucide !== "undefined") {
+        (window as any).lucide.createIcons({ root: body });
+      }
       return;
     }
 
@@ -903,33 +1383,20 @@ export class SessionInner {
       shells.push({ name: "Default", path: "" });
     }
 
-    const getShellPath = () => shellPath || shells[0]?.path || "";
-    const getShellArgs = () => shellArgs || shells[0]?.args || [];
-
-    const buildTheme = () => {
-      const st = getState();
-      const isLight = st.theme === "light";
-      return isLight ? {
-        background: "#ffffff", foreground: "#1a1a1a", cursor: "#1a1a1a",
-        selectionBackground: "rgba(0,0,0,0.10)",
-        black: "#000000", red: "#cd3131", green: "#00bc00",
-        yellow: "#949800", blue: "#0451a5", magenta: "#bc05bc",
-        cyan: "#0598bc", white: "#555555",
-        brightBlack: "#666666", brightRed: "#cd3131", brightGreen: "#14ce14",
-        brightYellow: "#b5ba00", brightBlue: "#0451a5", brightMagenta: "#bc05bc",
-        brightCyan: "#0598bc", brightWhite: "#a5a5a5",
-      } : {
-        background: "#000000", foreground: "#f5f5f7", cursor: "#f5f5f7",
-        selectionBackground: "rgba(255,255,255,0.15)",
-        black: "#000000", red: "#cd3131", green: "#0dbc79",
-        yellow: "#e5e510", blue: "#2472c8", magenta: "#bc3fbc",
-        cyan: "#11a8cd", white: "#e5e5e5",
-        brightBlack: "#666666", brightRed: "#f14c4c", brightGreen: "#23d18b",
-        brightYellow: "#f5f543", brightBlue: "#3b8eea", brightMagenta: "#d670d6",
-        brightCyan: "#29b8db", brightWhite: "#ffffff",
-      };
+    // Shell precedence: an explicit caller choice (the shell picker menu) >
+    // the settings panel's default shell > the first detected shell.
+    const settingsShell = () => {
+      const want = _settingStr("terminal_shell", "auto");
+      return want === "auto" ? undefined : shells.find((x) => x.path === want);
     };
-    const applyTheme = (term: any) => { term.options.theme = buildTheme(); };
+    const getShellPath = () => shellPath || settingsShell()?.path || shells[0]?.path || "";
+    const getShellArgs = () => shellArgs || settingsShell()?.args || shells[0]?.args || [];
+    /** New terminals start in the user home (the spawn default) or in the
+     *  workspace root when the settings panel asks for it. */
+    const getSpawnCwd = (): string | undefined =>
+      _settingStr("terminal_start_dir", "home") === "workspace"
+        ? (getState().activeWorkspace || undefined)
+        : undefined;
 
     const sh = getShellPath();
     const args = getShellArgs();
@@ -941,29 +1408,39 @@ export class SessionInner {
     ]);
     let ptyId: number;
     try {
-      const result = await api.terminalSpawn(sh || undefined, args.length ? args : undefined);
+      const result = await api.terminalSpawn(sh || undefined, args.length ? args : undefined, getSpawnCwd());
       if (result.error) {
-        body.innerHTML = `<div class="si-empty">${t("sessionInner.termError")}: ${this.esc(result.error)}</div>`;
+        body.innerHTML = `<div class="si-empty-center"><i data-lucide="alert-triangle" class="lucide"></i><span class="si-empty-title">${t("sessionInner.termError")}: ${this.esc(result.error)}</span></div>`;
+        if (typeof (window as any).lucide !== "undefined") {
+          (window as any).lucide.createIcons({ root: body });
+        }
         return;
       }
       ptyId = result.id as number;
     } catch (e: any) {
-      body.innerHTML = `<div class="si-empty">${t("sessionInner.termError")}: ${this.esc(e?.message || String(e))}</div>`;
+      body.innerHTML = `<div class="si-empty-center"><i data-lucide="alert-triangle" class="lucide"></i><span class="si-empty-title">${t("sessionInner.termError")}: ${this.esc(e?.message || String(e))}</span></div>`;
+      if (typeof (window as any).lucide !== "undefined") {
+        (window as any).lucide.createIcons({ root: body });
+      }
       return;
     }
 
     const term = new Terminal({
-      cursorBlink: true,
-      cursorStyle: "bar",
-      fontSize: 12.5,
-      fontFamily: '"Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", Consolas, monospace',
-      lineHeight: 1.3,
-      theme: buildTheme(),
+      cursorBlink: _settingBool("terminal_cursor_blink", true),
+      cursorStyle: terminalCursorStyle(),
+      cursorInactiveStyle: terminalCursorInactiveStyle(),
+      fontSize: _settingInt("terminal_font_size", 13, 9, 32),
+      fontFamily: terminalFontFamily(),
+      lineHeight: _settingNum("terminal_line_height", 1.3, 0.8, 2),
+      drawBoldTextInBrightColors: _settingBool("terminal_bold_bright", true),
+      rightClickSelectsWord: _settingStr("terminal_right_click", "menu") === "word",
+      theme: this._terminalTheme(),
       cols: 60,
       rows: 16,
       allowProposedApi: true,
       allowTransparency: false,
-      scrollback: 5000,
+      scrollback: _settingInt("terminal_scrollback", 10000, 200, 200000),
+      smoothScrollDuration: 120,
     });
 
     const fitAddon = new FitAddon();
@@ -1010,19 +1487,98 @@ export class SessionInner {
     const ctxMenu = document.createElement("div");
     ctxMenu.className = "context-menu hidden";
     ctxMenu.setAttribute("id", `term-ctx-menu-${tabId}`);
-    ctxMenu.innerHTML = `
-      <div class="context-menu-item" data-action="copy"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("sessionInner.termCopy")}</div>
-      <div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.termPaste")}</div>
-      <div class="context-menu-divider"></div>
-      <div class="context-menu-item" data-action="send"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>`;
     document.body.appendChild(ctxMenu);
     let ctxTermTarget: any = null;
 
+    // Selection strip for the terminal. xterm paints cells onto a canvas and
+    // xterm.css sets `user-select: none`, so a DOM range can never exist here;
+    // the selection lives in xterm's own model. A mouseup ending the drag is
+    // the trigger, and the rect is derived from the selected cell rows.
+    term.element?.addEventListener("mouseup", (e: MouseEvent) => {
+      // Left button only: a right-press is the terminal's own context menu, and
+      // the strip must not ride along with it.
+      if (e.button !== 0) return;
+      const sel = term.getSelection();
+      if (!sel.trim()) return;
+      const el = term.element;
+      const screenEl = el?.querySelector(".xterm-screen") as HTMLElement | null;
+      if (!screenEl) return;
+      const sRect = screenEl.getBoundingClientRect();
+      const cellH = sRect.height / Math.max(1, term.rows);
+      const p = term.getSelectionPosition() as unknown as {
+        startRow?: number;
+        endRow?: number;
+        start?: { y?: number };
+        end?: { y?: number };
+      } | undefined;
+      const startRow = Number(p?.startRow ?? p?.start?.y ?? 0);
+      const endRow = Number(p?.endRow ?? p?.end?.y ?? startRow);
+      const top = sRect.top + startRow * cellH;
+      const bottom = sRect.top + (endRow + 1) * cellH;
+      showSelectionActionBarFor({
+        text: sel,
+        kind: "code",
+        rect: { left: sRect.left, top, right: sRect.right, bottom },
+      });
+    });
+
     term.element?.addEventListener("contextmenu", (ev: MouseEvent) => {
+      // The setting owns the gesture: "word" leaves it to xterm (which then
+      // selects a word under the pointer), "paste" drops straight into the
+      // shell, "menu" opens the copy/paste menu below.
+      const rightClick = _settingStr("terminal_right_click", "menu");
+      if (rightClick === "word") return;
       ev.preventDefault();
+      if (rightClick === "paste") {
+        navigator.clipboard.readText().then((text) => term.paste(text)).catch(() => {});
+        return;
+      }
       ctxTermTarget = term;
-      showContextMenu(ctxMenu, ev.clientX, ev.clientY);
-      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: ctxMenu }));
+      renderContextMenuItems(
+        [
+          {
+            action: "copy",
+            icon: "copy",
+            label: t("sessionInner.termCopy"),
+            onClick: () => {
+              const sel = ctxTermTarget?.getSelection();
+              if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+            },
+          },
+          {
+            action: "paste",
+            icon: "clipboard",
+            label: t("sessionInner.termPaste"),
+            onClick: () => {
+              navigator.clipboard.readText().then((text) => ctxTermTarget?.paste(text)).catch(() => {});
+            },
+          },
+          { divider: true },
+          {
+            action: "send",
+            icon: "send",
+            label: t("sessionInner.termSendToChat"),
+            onClick: () => {
+              const content = getTerminalAllText(ctxTermTarget);
+              if (content) {
+                const shellName = sh.split(/[/\\]/).pop()?.replace(/\.(exe|cmd|bat)$/i, "") || "Terminal";
+                const att: AttachmentMeta = {
+                  name: shellName,
+                  path: `terminal:${Date.now()}`,
+                  content,
+                  mime_type: "text/x-terminal",
+                  size: content.split("\n").length,
+                  is_binary: false,
+                };
+                addAttachments([att]);
+              }
+            },
+          },
+          ...pluginMenuSpecs("terminal"),
+        ],
+        { container: ctxMenu },
+      );
+      showContextMenu(ctxMenu, ev.clientX, ev.clientY, { target: term.element });
     });
 
     term.onData((data: string) => {
@@ -1038,64 +1594,80 @@ export class SessionInner {
       }
     });
 
+    // Keep the PTY size in sync with the rendered grid. xterm v5's
+    // `_renderService.dimensions` carries pixel metrics only (no cols/rows),
+    // so the resize call below must derive the grid from the fit addon —
+    // sending the PTY a wrong (or no) size makes conpty repaint prompts at
+    // stale coordinates, which visually overlaps the command output.
+    const syncPtySize = () => {
+      try {
+        const p = fitAddon.proposeDimensions();
+        if (p && p.cols > 0 && p.rows > 0) {
+          api.terminalResize(ptyId, p.cols, p.rows);
+        }
+      } catch {}
+    };
+    term.onResize(({ cols, rows }: { cols: number; rows: number }) => {
+      if (cols > 0 && rows > 0) api.terminalResize(ptyId, cols, rows);
+    });
+
+    /** Fit the grid to the panel, or pin the column count when the settings
+     *  panel asks for a fixed width.  xterm's own `onResize` forwards the new
+     *  grid to the PTY, so both branches stay in sync without a second call. */
+    const applySizing = () => {
+      const mode = _settingStr("terminal_cols_mode", "auto");
+      const fixed = mode === "80" || mode === "120" ? parseInt(mode, 10) : 0;
+      if (fixed) {
+        if (term.cols !== fixed) term.resize(fixed, term.rows);
+        return;
+      }
+      try {
+        fitAddon.fit();
+        syncPtySize();
+      } catch {}
+    };
+
     let resizeTimer: any = null;
     const obs = new ResizeObserver(() => {
       if (resizeTimer) return;
       resizeTimer = setTimeout(() => {
         resizeTimer = null;
-        try {
-          fitAddon.fit();
-          const dims = (term as any)._core?._renderService?.dimensions;
-          if (dims && dims.cols > 0 && dims.rows > 0) {
-            api.terminalResize(ptyId, dims.cols, dims.rows);
-          }
-        } catch {}
+        applySizing();
       }, 50);
     });
     obs.observe(body);
-    requestAnimationFrame(() => { try { fitAddon.fit(); } catch {} });
+    requestAnimationFrame(() => applySizing());
+
+    // xterm 6 has no `bellStyle` option -- the bell is only an event -- so the
+    // behaviour lives here and reads its setting at ring time: flipping the
+    // switch in the settings panel takes effect on the next bell.
+    term.onBell(() => {
+      if (_settingStr("terminal_bell", "visual") !== "visual") return;
+      body.classList.remove("si-term-bell");
+      void body.offsetWidth;
+      body.classList.add("si-term-bell");
+    });
+
+    term.onSelectionChange(() => {
+      if (!_settingBool("terminal_copy_on_select", false)) return;
+      const sel = term.getSelection();
+      if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+    });
 
     term.focus();
 
     const cleanup = () => { dataCleanup(); exitCleanup(); ctxMenu.remove(); };
     const tms = this.panelTerminals.get(panelId) || [];
-    tms.push({ ptyId, term, cleanup, resizeObs: obs });
+    tms.push({ ptyId, term, cleanup, resizeObs: obs, applySizing });
     this.panelTerminals.set(panelId, tms);
 
-    ctxMenu.querySelectorAll(".context-menu-item").forEach((item) => {
-      item.addEventListener("click", () => {
-        const action = (item as HTMLElement).dataset.action;
-        if (action === "copy" && ctxTermTarget) {
-          const sel = ctxTermTarget.getSelection();
-          if (sel) navigator.clipboard.writeText(sel).catch(() => {});
-        } else if (action === "paste" && ctxTermTarget) {
-          navigator.clipboard.readText().then((text) => ctxTermTarget.paste(text)).catch(() => {});
-        } else if (action === "send") {
-          const content = getTerminalAllText(ctxTermTarget);
-          if (content) {
-            const shellName = sh.split(/[/\\]/).pop()?.replace(/\.(exe|cmd|bat)$/i, "") || "Terminal";
-            const att: AttachmentMeta = {
-              name: shellName,
-              path: `terminal:${Date.now()}`,
-              content,
-              mime_type: "text/x-terminal",
-              size: content.split("\n").length,
-              is_binary: false,
-            };
-            addAttachments([att]);
-          }
-        }
-        ctxMenu.classList.add("hidden");
-        ctxTermTarget = null;
-      });
-    });
     document.addEventListener("click", (e) => {
       if (!ctxMenu.contains(e.target as Node)) {
-        ctxMenu.classList.add("hidden");
+        hideAnimated(ctxMenu);
       }
     });
 
-    this._bindTerminalTheme(panelId, panel);
+    this._bindTerminalSettings(panelId);
 
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: panel });
@@ -1104,42 +1676,162 @@ export class SessionInner {
 
   private killSubTerminal: ((pid: string, idx: number, body: HTMLElement) => void) | undefined;
 
-  private _bindTerminalTheme(panelId: string, panel: HTMLElement): void {
-    const buildTheme = () => {
-      const st = getState();
-      const isLight = st.theme === "light";
-      return isLight ? {
-        background: "#ffffff", foreground: "#1a1a1a", cursor: "#1a1a1a",
-        selectionBackground: "rgba(0,0,0,0.10)",
-        black: "#000000", red: "#cd3131", green: "#00bc00",
-        yellow: "#949800", blue: "#0451a5", magenta: "#bc05bc",
-        cyan: "#0598bc", white: "#555555",
-        brightBlack: "#666666", brightRed: "#cd3131", brightGreen: "#14ce14",
-        brightYellow: "#b5ba00", brightBlue: "#0451a5", brightMagenta: "#bc05bc",
-        brightCyan: "#0598bc", brightWhite: "#a5a5a5",
-      } : {
-        background: "#000000", foreground: "#f5f5f7", cursor: "#f5f5f7",
-        selectionBackground: "rgba(255,255,255,0.15)",
-        black: "#000000", red: "#cd3131", green: "#0dbc79",
-        yellow: "#e5e510", blue: "#2472c8", magenta: "#bc3fbc",
-        cyan: "#11a8cd", white: "#e5e5e5",
-        brightBlack: "#666666", brightRed: "#f14c4c", brightGreen: "#23d18b",
-        brightYellow: "#f5f543", brightBlue: "#3b8eea", brightMagenta: "#d670d6",
-        brightCyan: "#29b8db", brightWhite: "#ffffff",
-      };
+  /** The terminal palette, derived from the app theme only.  There is no
+   *  per-terminal override: a terminal that could be dark while the app is
+   *  light (or the reverse) is exactly the mismatch that made the panel look
+   *  broken, so the palette follows whatever theme is active right now. */
+  private _terminalTheme(): Record<string, string> {
+    const isLight = getState().theme === "light";
+    return isLight ? {
+      background: "#ffffff", foreground: "#1a1a1a", cursor: "#1a1a1a",
+      selectionBackground: "rgba(150, 240, 200, 0.25)",
+      black: "#000000", red: "#cd3131", green: "#00bc00",
+      yellow: "#949800", blue: "#0451a5", magenta: "#bc05bc",
+      cyan: "#0598bc", white: "#555555",
+      brightBlack: "#666666", brightRed: "#cd3131", brightGreen: "#14ce14",
+      brightYellow: "#b5ba00", brightBlue: "#0451a5", brightMagenta: "#bc05bc",
+      brightCyan: "#0598bc", brightWhite: "#a5a5a5",
+    } : {
+      background: "#000000", foreground: "#f5f5f7", cursor: "#f5f5f7",
+      selectionBackground: "rgba(150, 240, 200, 0.25)",
+      black: "#000000", red: "#cd3131", green: "#0dbc79",
+      yellow: "#e5e510", blue: "#2472c8", magenta: "#bc3fbc",
+      cyan: "#11a8cd", white: "#e5e5e5",
+      brightBlack: "#666666", brightRed: "#f14c4c", brightGreen: "#23d18b",
+      brightYellow: "#f5f543", brightBlue: "#3b8eea", brightMagenta: "#d670d6",
+      brightCyan: "#29b8db", brightWhite: "#ffffff",
     };
-    const applyTheme = (term: any) => { term.options.theme = buildTheme(); };
-    subscribe(() => {
-      const terms = this.panelTerminals.get(panelId);
-      if (terms) {
-        for (const tt of terms) applyTheme(tt.term);
-      }
+  }
+
+  // One live-settings subscription per terminal panel.  Each bind replaces the
+  // previous one, so rebuilding a panel can't pile up state subscriptions.
+  private _themeUnsubs = new Map<string, () => void>();
+
+  /** Push the current terminal settings into every live grid of a panel.
+   *  xterm takes all of these at runtime, so a change in the settings panel
+   *  lands on the open terminals immediately -- no re-spawn, no lost
+   *  scrollback, no half-applied state. */
+  private _applyTerminalSettings(panelId: string): void {
+    const terms = this.panelTerminals.get(panelId);
+    if (!terms || terms.length === 0) return;
+    const theme = this._terminalTheme();
+    const rightClick = _settingStr("terminal_right_click", "menu");
+    for (const tt of terms) {
+      const o = tt.term?.options;
+      if (!o) continue;
+      o.fontSize = _settingInt("terminal_font_size", 13, 9, 32);
+      o.fontFamily = terminalFontFamily();
+      o.lineHeight = _settingNum("terminal_line_height", 1.3, 0.8, 2);
+      o.scrollback = _settingInt("terminal_scrollback", 10000, 200, 200000);
+      o.cursorBlink = _settingBool("terminal_cursor_blink", true);
+      o.cursorStyle = terminalCursorStyle();
+      o.cursorInactiveStyle = terminalCursorInactiveStyle();
+      o.drawBoldTextInBrightColors = _settingBool("terminal_bold_bright", true);
+      o.rightClickSelectsWord = rightClick === "word";
+      o.theme = theme;
+      o.cursorWidth = _settingInt("terminal_cursor_width", 1, 1, 2);
+      o.fontWeight = terminalFontWeight();
+      o.fontWeightBold = terminalFontWeight();
+      o.letterSpacing = _settingInt("terminal_letter_spacing", 0, -5, 10);
+      o.minimumContrastRatio = _settingNum("terminal_min_contrast", 1, 1, 21);
+      o.convertEol = _settingBool("terminal_convert_eol", false);
+      o.wordSeparator = _settingStr("terminal_word_separator", "  ()[]{}\",'`");
+      // Column mode is a layout decision, not an xterm option: the terminal's
+      // own sizing helper re-fits or pins the grid and syncs the PTY.
+      tt.applySizing?.();
+    }
+  }
+
+  private _bindTerminalSettings(panelId: string): void {
+    this._themeUnsubs.get(panelId)?.();
+    this._themeUnsubs.delete(panelId);
+    this._themeUnsubs.set(
+      panelId,
+      subscribe(() => this._applyTerminalSettings(panelId), ["theme", "themePreference", "settings"]),
+    );
+    // Re-attaching an existing panel can happen long after the settings were
+    // last touched -- apply once so the reopened grid is never stale.
+    this._applyTerminalSettings(panelId);
+  }
+
+  /** Monaco options owned by Settings → Assist → Editor.  Views are created
+   *  once and then cached per tab, so nothing pushes these on a later change:
+   *  without this the new value would only show up in an editor opened after
+   *  it. */
+  private _applyEditorSettings(): void {
+    if (this.panelCodeEditors.size === 0) return;
+    const opts = editorViewOptions();
+    this.panelCodeEditors.forEach((view) => {
+      view.updateOptions?.(opts);
     });
+  }
+
+  /** Content lines a diff may render before the renderer summarises it.  The
+   *  "show full diff" switch only decides whether the ceiling is the full-file
+   *  budget or the compact one; both numbers come from Settings now. */
+  private _reviewMaxLines(): number {
+    const full = _settingInt("review_max_lines", 4000, 200, 100000);
+    if (this._reviewFullFile) return full;
+    return Math.max(100, Math.round(full / 10));
+  }
+
+  /** The change set the panel opens on.  Without a workspace there is no diff
+   *  to show at all, so the round-based view is the only meaningful default. */
+  private _reviewSeedFilter(): void {
+    const ws = getState().activeWorkspace;
+    if (!ws) {
+      this._reviewFilter = "lastRound";
+      return;
+    }
+    const v = _settingStr("review_default_filter", "all");
+    this._reviewFilter = ["all", "unstaged", "staged", "branch", "commit"].includes(v) ? v : "all";
+  }
+
+  /** Read the six Settings-owned review toggles into the panel's state.  Used
+   *  when the panel mounts, when the reviewed context changes, and on a
+   *  settings push -- so the same six values are the only source of truth. */
+  private _seedReviewToggles(): boolean {
+    const nextSplit = _settingBool("review_split_view", false);
+    const nextCollapsed = _settingBool("review_collapse_unified", false);
+    const nextWrap = _settingBool("review_wrap", false);
+    const nextWordDiff = _settingBool("review_word_diff", false);
+    const nextHideWs = _settingBool("review_hide_whitespace", false);
+    const nextFullFile = _settingBool("review_full_file", true);
+    const changed = nextSplit !== this._reviewSplitView || nextCollapsed !== this._reviewCollapsed
+      || nextWrap !== this._reviewWrap || nextWordDiff !== this._reviewWordDiff
+      || nextHideWs !== this._reviewHideWs || nextFullFile !== this._reviewFullFile;
+    this._reviewSplitView = nextSplit;
+    this._reviewCollapsed = nextCollapsed;
+    this._reviewWrap = nextWrap;
+    this._reviewWordDiff = nextWordDiff;
+    this._reviewHideWs = nextHideWs;
+    this._reviewFullFile = nextFullFile;
+    // Split and word diff are mutually exclusive in the renderer; split wins,
+    // matching what the toolbar's own buttons do.
+    if (this._reviewSplitView) this._reviewWordDiff = false;
+    this._reviewSettingsSig = reviewSettingsSig();
+    return changed;
+  }
+
+  /** Same push for the review panel's Settings-owned toggles.  The signature
+   *  guard keeps an in-panel menu toggle from being clobbered by an unrelated
+   *  settings write: only a real change of the stored values re-applies. */
+  private _applyReviewSettings(): void {
+    const apply = this._reviewApply;
+    if (!apply || !this._reviewDiffEl?.isConnected) return;
+    if (reviewSettingsSig() === this._reviewSettingsSig) return;
+    if (!this._seedReviewToggles()) return;
+    apply();
   }
 
   /* ── Review (Git Diff) ─────────────────────────────────────────── */
 
   private async setupReviewPanel(panel: HTMLElement): Promise<void> {
+    // Seed the panel defaults from the Settings "Assist" panel.
+    this._seedReviewToggles();
+    this._reviewSeedFilter();
+    for (const o of this._reviewObservers) o.disconnect();
+    this._reviewObservers = [];
     panel.innerHTML = `<div class="si-review-toolbar">
       <div class="settings-dropdown-wrap">
         <button class="settings-dropdown-trigger" type="button">
@@ -1177,7 +1869,7 @@ export class SessionInner {
     </div>
   </div>
 </div>
-<div class="si-panel-empty" style="display:none"></div>
+<div class="si-empty-center" style="display:none"></div>
 <div class="si-review-wrap" style="display:none">
       <div class="si-review-body">
         <div class="si-review-diff"></div>
@@ -1218,7 +1910,7 @@ export class SessionInner {
     // statsEl.innerHTML = ... assignments don't throw if re-added.
     const statsEl: { innerHTML: string } = (panel.querySelector(".si-review-stats") as HTMLElement | null)
       || { innerHTML: "" };
-    const emptyEl = panel.querySelector(".si-panel-empty") as HTMLElement;
+    const emptyEl = panel.querySelector(".si-empty-center") as HTMLElement;
     const wrapEl = panel.querySelector(".si-review-wrap") as HTMLElement;
 
     const api = (window as any).electronAPI;
@@ -1254,8 +1946,6 @@ export class SessionInner {
       return { branch, entries };
     };
 
-    const fileIcon = (name: string): string => getFileIcon(name);
-
     const buildTree = (entries: StatusEntry[], activePath?: string): string => {
       const treeCacheKey = `${activePath || ""}\n` + entries.map((e) => `${e.staged}${e.unstaged}:${e.path}`).join("\n");
       const cachedTree = this._reviewTreeCache.get(treeCacheKey);
@@ -1271,7 +1961,7 @@ export class SessionInner {
       for (const [dir, items] of groups) {
         html += `<div class="si-review-tree-group">
           <div class="si-review-tree-folder">
-            <i data-lucide="folder" class="lucide lucide-xs"></i>
+            <img src="${getFolderIcon(dir, true)}" class="icon" style="width:14px;height:14px">
             <span>${this.esc(dir)}</span>
           </div>`;
         for (const item of items) {
@@ -1292,17 +1982,17 @@ export class SessionInner {
         }
         html += `</div>`;
       }
-      this._reviewTreeCache.set(treeCacheKey, html);
+      this.cachePut(this._reviewTreeCache, treeCacheKey, html);
       return html;
     };
 
-    const parseDiffFn = (cacheKey: string, output: string, cacheSalt = ""): string => {
+    const parseDiffFn = (cacheKey: string, output: string, cacheSalt = "", overrides?: Partial<DiffRenderOptions>): string => {
       this._reviewDiffCache ??= new Map<string, string>();
       const saltedKey = cacheKey + cacheSalt;
       const cached = this._reviewDiffCache.get(saltedKey);
       if (cached) return cached;
-      const parsed = this.parseDiff(output);
-      this._reviewDiffCache.set(saltedKey, parsed);
+      const parsed = this.parseDiff(output, overrides);
+      this.cachePut(this._reviewDiffCache, saltedKey, parsed);
       return parsed;
     };
 
@@ -1341,9 +2031,10 @@ export class SessionInner {
       const ctxKey = `${ws || ""}|${st.workspaceMode || ""}|${st.sessionId || ""}`;
       if (ctxKey !== this._reviewContextKey) {
         this._reviewContextKey = ctxKey;
-        const changed = this._reviewCollapsed || this._reviewSplitView;
-        this._reviewCollapsed = false;
-        this._reviewSplitView = false;
+        // Re-seed from Settings rather than forcing `false`: the stored values
+        // are the default this panel opens with, and resetting to `false` here
+        // silently discarded the user's choice on the very first load.
+        const changed = this._seedReviewToggles();
         if (changed) {
           if (this._reviewDiffEl) {
             this._reviewDiffEl.classList.toggle("review-collapsed", false);
@@ -1362,6 +2053,7 @@ export class SessionInner {
         // entirely so its border-bottom divider doesn't render as a stray line.
         toolbar.style.display = ws ? "" : "none";
         toolbar.style.borderBottom = "none";
+        EALoader.destroyMounted(statsEl as HTMLElement);
         statsEl.innerHTML = "";
         if (typeof (window as any).lucide !== "undefined") {
           (window as any).lucide.createIcons({ root: panel });
@@ -1407,13 +2099,36 @@ export class SessionInner {
         toolbar.style.borderBottom = ws ? "" : "none";
         const targetPath = filePath || roundArts[0]?.path || "";
         const currentArtifact = roundArts.find((a: ArtifactItem) => a.path === targetPath) || null;
-        diffEl.innerHTML = currentArtifact
-          ? this.parseArtifactDiff(currentArtifact, targetPath)
-          : this.reviewEmptyMarkup();
-        treeEl.innerHTML = this.buildArtifactTree(roundArts, targetPath);
-        const adds = currentArtifact?.diff_text ? (currentArtifact.diff_text.match(/^\+/gm) || []).length : 0;
-        const dels = currentArtifact?.diff_text ? (currentArtifact.diff_text.match(/^-/gm) || []).length : 0;
-        statsEl.innerHTML = `<span class="si-review-stat-add">+${adds}</span> <span class="si-review-stat-del">-${dels}</span>`;
+        // Workspace-parity rendering: artifacts flow through the exact same
+        // tree + diff pipeline as git changes (buildTree + parseDiffFn), so
+        // both modes look and behave identically. Artifacts without a captured
+        // diff fall back to their real on-disk content rendered as a new-file
+        // diff instead of a bare info card.
+        const artifactEntries: StatusEntry[] = roundArts.map((a: ArtifactItem) => ({
+          path: a.path,
+          staged: a.tool === "file_write" || a.tool === "write_file" || a.tool === "writeFile" ? "?" : " ",
+          unstaged: "M",
+        }));
+        treeEl.innerHTML = buildTree(artifactEntries, targetPath);
+        if (currentArtifact) {
+          diffEl.innerHTML = "";
+          EALoader.mountCentered(diffEl, "96px");
+          const diffText = await this.artifactDiffText(currentArtifact);
+          if (requestSeq !== this._reviewRequestSeq) return;
+          EALoader.destroyMounted(diffEl);
+          diffEl.innerHTML = diffText
+            ? parseDiffFn(`artifact:${currentArtifact.path}`, diffText, [this._reviewSplitView, this._reviewWordDiff, this._reviewFullFile, this._reviewHideWs, this._reviewWrap].join("|"), { fileName: currentArtifact.path })
+            : this.reviewEmptyMarkup();
+          setupSplitViewScrollSync(diffEl);
+          const { adds, dels } = computeStats(artifactEntries, diffText);
+          EALoader.destroyMounted(statsEl as HTMLElement);
+          statsEl.innerHTML = `<span class="si-review-stat-add">+${adds}</span> <span class="si-review-stat-del">-${dels}</span>`;
+        } else {
+          EALoader.destroyMounted(diffEl);
+          diffEl.innerHTML = this.reviewEmptyMarkup();
+          EALoader.destroyMounted(statsEl as HTMLElement);
+          statsEl.innerHTML = "";
+        }
         treeEl.querySelectorAll(".si-review-tree-file").forEach((el) => {
           el.addEventListener("click", () => {
             const path = (el as HTMLElement).dataset.path;
@@ -1431,12 +2146,12 @@ export class SessionInner {
 
       if (!ws) {
         showEmptyState(`<i data-lucide="git-pull-request" class="lucide"></i>
-          <div class="si-panel-empty-title">${t("sessionInner.reviewNoChanges")}</div>`);
+          <span class="si-empty-title">${t("sessionInner.reviewNoChanges")}</span>`);
         return;
       }
       if (!api) {
         showEmptyState(`<i data-lucide="alert-circle" class="lucide"></i>
-          <div class="si-panel-empty-title">${t("sessionInner.apiNotAvailable")}</div>`);
+          <span class="si-empty-title">${t("sessionInner.apiNotAvailable")}</span>`);
         return;
       }
 
@@ -1444,25 +2159,31 @@ export class SessionInner {
       wrapEl.style.display = "flex";
       toolbar.style.borderBottom = "";
       emptyEl.style.display = "none";
-      diffEl.innerHTML = `<div class="si-review-diff-loading">${t("sessionInner.reviewLoading")}</div>`;
+      diffEl.innerHTML = "";
+      EALoader.mountCentered(diffEl, "96px");
       if (!cachedEntries || forceRefresh) {
         treeEl.innerHTML = "";
       }
-      statsEl.innerHTML = `<span class="si-review-loading">${t("sessionInner.reviewLoading")}</span>`;
+      statsEl.innerHTML = "";
+      // statsEl may be the no-op stub (the toolbar stats element was
+      // removed); only mount the loader into a real DOM element.
+      if (statsEl instanceof HTMLElement) {
+        EALoader.mountCentered(statsEl, "96px");
+      }
 
       if (!cachedEntries || forceRefresh) {
         const statusRes = await api.gitStatus(ws);
         if (requestSeq !== this._reviewRequestSeq) return;
         if (statusRes.error) {
             showEmptyState(`<i data-lucide="alert-triangle" class="lucide"></i>
-              <div class="si-panel-empty-title">${this.esc(statusRes.error)}</div>`);
+              <span class="si-empty-title">${this.esc(statusRes.error)}</span>`);
           return;
         }
 
         const { branch, entries } = parseStatus(statusRes.output);
         if (!branch && entries.length === 0) {
           showEmptyState(`<i data-lucide="folder-git-2" class="lucide"></i>
-            <div class="si-panel-empty-title">${t("sessionInner.reviewNoGit")}</div>`);
+            <span class="si-empty-title">${t("sessionInner.reviewNoGit")}</span>`);
           return;
         }
         cachedBranch = branch;
@@ -1497,13 +2218,18 @@ export class SessionInner {
 
       if (filePath) {
         currentReviewPath = filePath;
-        diffEl.innerHTML = `<div class="si-review-diff-loading">${t("sessionInner.reviewLoading")}</div>`;
+        diffEl.innerHTML = "";
+        EALoader.mountCentered(diffEl, "96px");
         // Use gitDiffEx for staged/unstaged/branch/commit filters
         const isEx = this._reviewFilter === "all" || this._reviewFilter === "staged" || this._reviewFilter === "unstaged" || this._reviewFilter === "branch" || this._reviewFilter === "commit";
         const diffRes = isEx ? await api.gitDiffEx(ws, this._reviewFilter, filePath) : await api.gitDiff(ws, filePath);
         if (requestSeq !== this._reviewRequestSeq) return;
         if (diffRes.error) {
-          diffEl.innerHTML = `<div class="si-empty">${this.esc(diffRes.error)}</div>`;
+          EALoader.destroyMounted(diffEl);
+          diffEl.innerHTML = `<div class="si-empty-center"><i data-lucide="alert-triangle" class="lucide"></i><span class="si-empty-title">${this.esc(diffRes.error)}</span></div>`;
+          if (typeof (window as any).lucide !== "undefined") {
+            (window as any).lucide.createIcons({ root: diffEl });
+          }
         } else {
           // "加载完整文件" (default): merge the on-disk file content into the
           // compact diff so unchanged lines are shown as context too.
@@ -1522,6 +2248,7 @@ export class SessionInner {
               }
             } catch { /* fall back to compact diff */ }
           }
+          EALoader.destroyMounted(diffEl);
           diffEl.innerHTML = parseDiffFn(`${ws}:${filePath}`, diffOut, [this._reviewSplitView, this._reviewWordDiff, this._reviewFullFile, this._reviewHideWs, this._reviewWrap].join("|"));
           setupSplitViewScrollSync(diffEl);
           ({ adds, dels } = computeStats(filteredEntries, diffRes.output));
@@ -1529,6 +2256,7 @@ export class SessionInner {
       } else {
         currentReviewPath = undefined;
         ({ adds, dels, label: statsLabel } = computeStats(filteredEntries));
+        EALoader.destroyMounted(diffEl);
         diffEl.innerHTML = this.reviewEmptyMarkup();
       }
 
@@ -1536,6 +2264,7 @@ export class SessionInner {
       // Summary view (no file selected) hides the staged/unstaged/untracked
       // counts - they were noisy and read like line stats. Per-file view still
       // shows +/- line counts.
+      EALoader.destroyMounted(statsEl as HTMLElement);
       statsEl.innerHTML = statsLabel
         ? ""
         : `<span class="si-review-stat-add">+${adds}</span> <span class="si-review-stat-del">-${dels}</span>`;
@@ -1632,6 +2361,7 @@ export class SessionInner {
       setOverflow(need);
     };
     const ro = new ResizeObserver(() => measureOverflow());
+    this._reviewObservers.push(ro);
     ro.observe(panel);
     measureOverflow();
 
@@ -1645,6 +2375,7 @@ export class SessionInner {
       reviewBody.classList.toggle("tree-collapsed", panel.clientWidth < 340);
     };
     const treeRo = new ResizeObserver(() => measureTree());
+    this._reviewObservers.push(treeRo);
     treeRo.observe(panel);
     measureTree();
 
@@ -1708,6 +2439,16 @@ export class SessionInner {
     };
     updateToolIcons();
 
+    // Settings → Assist → Review must land on the mounted panel, not only on
+    // the next one: expose the re-apply closure the settings push calls.
+    this._reviewApply = () => {
+      applyContainerClasses();
+      updateToolIcons();
+      buildActionItems();
+      if (currentReviewPath) load(currentReviewPath, true);
+      else load(undefined, true);
+    };
+
     // Collapse / expand all diff bodies.
     collapseBtn.addEventListener("click", () => {
       this._reviewCollapsed = !this._reviewCollapsed;
@@ -1757,6 +2498,9 @@ export class SessionInner {
     // context (transform) and overflow:clip. Position with fixed coords.
     const moveToBody = (dd: HTMLElement) => {
       if (dd.parentElement !== document.body) document.body.appendChild(dd);
+      // A body-level portal outlives the panel that opened it, so the scope
+      // host has to know to dismiss it when the conversation or view changes.
+      registerSurface(dd, { scope: "ephemeral", onClose: () => dd.classList.remove("open") });
     };
     moveToBody(actionDropdown);
     moveToBody(gitDropdown);
@@ -1764,19 +2508,14 @@ export class SessionInner {
     // `.settings-dropdown-wrap:has(.settings-dropdown.open)` chevron-rotate
     // rule never matches. Mirror the open state onto the wrap so the
     // trigger's chevron flips like every other dropdown.
-    new MutationObserver(() => {
+    const gitOpenObs = new MutationObserver(() => {
       gitWrap.classList.toggle("dd-open", gitDropdown.classList.contains("open"));
-    }).observe(gitDropdown, { attributes: true, attributeFilter: ["class"] });
+    });
+    this._reviewObservers.push(gitOpenObs);
+    gitOpenObs.observe(gitDropdown, { attributes: true, attributeFilter: ["class"] });
     const positionDropdown = (dd: HTMLElement, trigger: HTMLElement) => {
       moveToBody(dd);
-      const r = trigger.getBoundingClientRect();
-      dd.style.position = "fixed";
-      dd.style.top = `${r.bottom + 4}px`;
-      dd.style.left = "auto";
-      const right = window.innerWidth - r.right;
-      // Clamp instead of only flooring at 8: a physical `right` offset also
-      // has to keep the dropdown's inline-start edge on screen.
-      dd.style.right = `${clampElRight(dd, right)}px`;
+      showAnchoredDropdown(dd, trigger);
     };
     // Git trigger: clicking anywhere on the trigger opens/closes the action
     // dropdown (same interaction as the filter dropdown). The action only
@@ -1812,7 +2551,8 @@ export class SessionInner {
       const ws = getState().activeWorkspace;
       if (!ws) return;
       if (this._reviewGitAction === "commit") {
-        commitWrap.classList.remove("hidden");
+        showAnimated(commitWrap);
+        registerSurface(commitWrap, { scope: "ephemeral", onClose: () => hideAnimated(commitWrap) });
         commitInput.value = "";
         commitInput.focus();
         return;
@@ -1839,7 +2579,7 @@ export class SessionInner {
       if (!api) return;
       api.gitCommit(ws, message).then((res: any) => {
         if (res.error) { showToast(res.error, "", "error", "Review"); return; }
-        commitWrap.classList.add("hidden");
+        hideAnimated(commitWrap);
         currentReviewPath = undefined;
         cachedEntries = null;
         cachedBranch = "";
@@ -1851,7 +2591,7 @@ export class SessionInner {
         e.preventDefault();
         commitCommit();
       } else if (e.key === "Escape") {
-        commitWrap.classList.add("hidden");
+        hideAnimated(commitWrap);
         commitInput.value = "";
       }
     });
@@ -1859,7 +2599,7 @@ export class SessionInner {
     // the search overlay's behavior in bindSearchOverlay().
     commitWrap.addEventListener("click", (e: MouseEvent) => {
       if (e.target === commitWrap) {
-        commitWrap.classList.add("hidden");
+        hideAnimated(commitWrap);
         commitInput.value = "";
       }
     });
@@ -2029,7 +2769,9 @@ export class SessionInner {
     const url = startUrl || getDefaultHomepage();
     const bv = new BrowserView(container, {
       startUrl: url,
-      compact: true,
+      // The compact chrome is sized for a 280px side panel. In the subwindow
+      // the page owns the whole window, so it gets the full nav bar.
+      compact: !inChildWindow(),
       onTitleChange: (title: string) => {
         const tab = this.tabs.find(t => t.id === tabId);
         if (tab && title) {
@@ -2061,7 +2803,27 @@ export class SessionInner {
         }
       },
       onPermissionRequest: (_permission, _origin, _request) => {
+        // Session-level permission answers resolve instantly (allowlist /
+        // origin grants), so the orange light is a pulse, not a permanent
+        // stain — clear it shortly after unless a dialog took the tab over.
         this.setTabState(tabId, "permission");
+        const prev = this._permLightTimers.get(tabId);
+        if (prev) window.clearTimeout(prev);
+        this._permLightTimers.set(tabId, window.setTimeout(() => {
+          this._permLightTimers.delete(tabId);
+          const tab = this.tabs.find(t => t.id === tabId);
+          if (tab && tab.state === "permission") this.setTabState(tabId, "");
+        }, 3500));
+      },
+      onBeforeUnload: (respond) => {
+        // "Leave without saving?" — same yellow light + same in-app dialog
+        // family as the page's own alert/confirm prompts above.
+        this.setTabState(tabId, "awaiting_approval");
+        Dialog.confirm(t("browserNav.unloadConfirm"), "", { container: this.el }).then((ok) => {
+          respond(ok);
+          const tab = this.tabs.find(t => t.id === tabId);
+          if (tab && tab.state === "awaiting_approval") this.setTabState(tabId, "");
+        });
       },
     });
     this.panelBrowsers.set(tabId, bv);
@@ -2102,6 +2864,7 @@ export class SessionInner {
       const mp = this.panelMarkdownPreviews.get(existing.id);
       const basePath = filePath ? filePath.replace(/[/\\][^/\\]+$/, "") : "";
       if (mp) mp.setContent(content, basePath || undefined);
+      this.revealPanel();
       await this.renderTabs();
       return;
     }
@@ -2109,9 +2872,16 @@ export class SessionInner {
   }
 
   private _handleMarkdownLink(href: string, tabId: string): void {
-    if (/^https?:\/\//i.test(href)) {
-      const api = (window as any).electronAPI;
-      if (api?.openExternal) api.openExternal(href);
+    // file:// targets (explicit local file links) open in the in-app viewer
+    if (/^file:\/\//i.test(href)) {
+      let p = href.replace(/^file:\/\/\/?/i, "");
+      try { p = decodeURIComponent(p); } catch { /* keep encoded */ }
+      p = p.replace(/^\/([A-Za-z]:)/, "$1"); // /D:/... -> D:/...
+      if (p) void this.openFileInEditor(p);
+      return;
+    }
+    if (/^(https?:\/\/|www\.|mailto:)/i.test(href)) {
+      openRoutedLink(href);
       return;
     }
     // Resolve relative paths against the markdown file's directory
@@ -2121,7 +2891,11 @@ export class SessionInner {
     const basePath = filePath.replace(/[/\\][^/\\]+$/, "");
 
     let fullPath: string;
-    if (href.startsWith("/")) {
+    if (/^[a-zA-Z]:[\\/]/.test(href)) {
+      // Absolute Windows path -- a full location on its own; joining it onto
+      // the document directory would produce garbage like "D:/base/D:/dir".
+      fullPath = href.replace(/\\/g, "/");
+    } else if (href.startsWith("/")) {
       fullPath = href;
     } else {
       const dir = basePath.replace(/\\/g, "/").replace(/\/?$/, "/");
@@ -2133,13 +2907,14 @@ export class SessionInner {
       fullPath = parts.join("/");
     }
     if (/\.md$/i.test(fullPath)) {
-      this._openMdInPreview(fullPath);
+      this.openMarkdownPreviewFile(fullPath);
     } else {
       this.openFileInEditor(fullPath);
     }
   }
 
-  private async _openMdInPreview(filePath: string): Promise<void> {
+  /** Reads a markdown file from disk and opens (or focuses) its preview tab. */
+  public async openMarkdownPreviewFile(filePath: string): Promise<void> {
     const api = (window as any).electronAPI;
     if (!api) return;
     const result = await api.readFile(filePath);
@@ -2436,15 +3211,15 @@ export class SessionInner {
   /** Inner content (icon + title) shared by every "no changes" empty state. */
   private reviewEmptyInner(): string {
     return `<i data-lucide="check-circle-2" class="lucide"></i>
-      <div class="si-panel-empty-title">${t("sessionInner.reviewNoChanges")}</div>`;
+      <span class="si-empty-title">${t("sessionInner.reviewNoChanges")}</span>`;
   }
 
-  /** Full .si-panel-empty block for embedding inside the diff/tree area. */
+  /** Full .si-empty-center block for embedding inside the diff/tree area. */
   private reviewEmptyMarkup(): string {
-    return `<div class="si-panel-empty">${this.reviewEmptyInner().replace(/\n\s*/g, " ")}</div>`;
+    return `<div class="si-empty-center">${this.reviewEmptyInner().replace(/\n\s*/g, " ")}</div>`;
   }
 
-  private parseDiff(output: string): string {
+  private parseDiff(output: string, overrides?: Partial<DiffRenderOptions>): string {
     if (!output.trim()) return this.reviewEmptyMarkup();
 
     // Check if this is a binary/media file — use same extension sets as editor
@@ -2455,102 +3230,50 @@ export class SessionInner {
       SessionInner._mediaExts.has(ext) || SessionInner._binaryExts.has(ext)
     );
     if (isBinary || /Binary files |GIT binary patch/.test(output)) {
-      const name = diffFileName || t("sessionInner.reviewUnknownFile");
-      return `<div class="si-panel-empty">
+      return `<div class="si-empty-center">
         <i data-lucide="file-x-2" class="lucide"></i>
-        <span class="si-panel-empty-title">${this.esc(name)}</span>
-        <span class="si-panel-empty-sub">${t("sessionInner.binaryFileNotShown")}</span>
+        <span class="si-empty-title">${t("sessionInner.binaryFileNotShown")}</span>
       </div>`;
     }
 
     return renderDiffHtml(output, {
       fileNameFallback: t("sessionInner.reviewUnknownFile"),
-      maxLines: this._reviewFullFile ? 4000 : 400,
+      maxLines: this._reviewMaxLines(),
       wordDiff: this._reviewWordDiff,
       hideWhitespace: this._reviewHideWs,
       splitView: this._reviewSplitView,
       truncatedNotice: (n: number) => t("sessionInner.reviewTruncated", { n }),
+      ...overrides,
     });
   }
 
-  private parseArtifactDiff(artifact: ArtifactItem, filePath?: string): string {
-    const diffText = artifact.diff_text;
-    const targetPath = filePath || artifact.path;
-    if (!diffText || !diffText.trim()) {
-      // Show a rich file info card for artifacts without diff (e.g. new files)
-      const isCreated = artifact.tool === "file_write" || artifact.tool === "write_file" || artifact.tool === "writeFile";
-      const sizeStr = artifact.size > 0
-        ? artifact.size >= 1024
-          ? `${(artifact.size / 1024).toFixed(1)} KB`
-          : `${artifact.size} B`
-        : "";
-      return `<div class="si-review-diff-content">
-        <div class="si-review-diff-file-header">
-          <i data-lucide="file-plus" class="lucide lucide-sm" style="margin-inline-end:6px"></i>
-          ${this.esc(targetPath)}
-        </div>
-        <div style="padding:16px 20px;color:var(--text-secondary);font-size:13px;line-height:1.6">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-            <span class="si-review-${isCreated ? "untracked" : "unstaged"}" style="padding:1px 8px;border-radius:3px;font-size:11px;font-weight:500">
-              ${isCreated ? this.esc(t("sessionInner.reviewCreated")) : this.esc(t("sessionInner.reviewModified"))}
-            </span>
-            <span style="font-family:var(--mono);font-size:12px">${this.esc(targetPath)}</span>
-          </div>
-          ${sizeStr ? `<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
-            <i data-lucide="hard-drive" class="lucide lucide-xs" style="opacity:0.6"></i>
-            <span>${this.esc(sizeStr)}</span>
-          </div>` : ""}
-          <div style="display:flex;align-items:center;gap:6px">
-            <i data-lucide="wrench" class="lucide lucide-xs" style="opacity:0.6"></i>
-            <span>${this.esc(artifact.tool)}</span>
-          </div>
-          ${!isCreated ? `<div style="margin-top:8px;color:var(--text-muted);font-style:italic">(${this.esc(t("sessionInner.reviewNoChanges"))})</div>` : ""}
-        </div>
-      </div>`;
+  /** Git-style diff text for one artifact — the single source the artifact
+   *  review pane renders (through the same parseDiff pipeline as git diffs).
+   *  Uses the diff captured by the backend when present; otherwise renders
+   *  the real on-disk content as a new-file diff so the pane always shows
+   *  actual content instead of an info card. */
+  private async artifactDiffText(artifact: ArtifactItem): Promise<string> {
+    if (artifact.diff_text && artifact.diff_text.trim()) return artifact.diff_text;
+    const api = (window as any).electronAPI;
+    if (!api?.readFile) return "";
+    try {
+      const fr = await api.readFile(artifact.path);
+      if (!fr || fr.is_binary || typeof fr.content !== "string" || !fr.content) return "";
+      const lines = fr.content.replace(/\r\n/g, "\n").split("\n");
+      while (lines.length && lines[lines.length - 1] === "") lines.pop();
+      const body = lines.map((l: string) => `+${l}`).join("\n");
+      if (!body) return "";
+      return [
+        `diff --git a/${artifact.path} b/${artifact.path}`,
+        "new file mode 100644",
+        "--- /dev/null",
+        `+++ b/${artifact.path}`,
+        `@@ -0,0 +1,${lines.length} @@`,
+        body,
+      ].join("\n");
+    } catch {
+      return "";
     }
-    return this.renderArtifactDiffView(diffText, targetPath);
-  }
-
-  private renderArtifactDiffView(diffText: string, filePath: string): string {
-    return renderDiffHtml(diffText, {
-      fileNameFallback: filePath,
-      maxLines: this._reviewFullFile ? 4000 : 400,
-      wordDiff: this._reviewWordDiff,
-      hideWhitespace: this._reviewHideWs,
-      splitView: this._reviewSplitView,
-      truncatedNotice: (n: number) => t("sessionInner.reviewTruncated", { n }),
-    });
-  }
-
-  private buildArtifactTree(artifacts: ArtifactItem[], activePath: string): string {
-    if (artifacts.length === 0) return this.reviewEmptyMarkup();
-    // Group by top-level directory (same as git buildTree style)
-    const groups = new Map<string, ArtifactItem[]>();
-    for (const a of artifacts) {
-      const dir = a.path.includes("/") ? a.path.split("/")[0] : "(root)";
-      if (!groups.has(dir)) groups.set(dir, []);
-      groups.get(dir)!.push(a);
-    }
-    let html = "";
-    for (const [dir, items] of groups) {
-      html += `<div class="si-review-tree-group">
-        <div class="si-review-tree-folder">
-          <i data-lucide="folder" class="lucide lucide-xs"></i>
-          <span>${this.esc(dir)}</span>
-        </div>`;
-      for (const a of items) {
-        const active = a.path === activePath ? " si-review-tree-file--active" : "";
-        const toolLabel = a.tool === "file_write" || a.tool === "write_file" || a.tool === "writeFile"
-          ? "created" : "modified";
-        html += `<div class="si-review-tree-file${active}" data-path="${this.esc(a.path)}">
-          <img src="${getFileIcon(a.name)}" class="icon" style="width:14px;height:14px">
-          <span class="si-review-tree-name">${this.esc(a.name)}</span>
-          <span class="si-review-tree-status si-review-${toolLabel === "created" ? "untracked" : "unstaged"}">${toolLabel === "created" ? "U" : "M"}</span>
-        </div>`;
-      }
-      html += `</div>`;
-    }
-    return html;
   }
 
 
@@ -2560,11 +3283,25 @@ export class SessionInner {
   private async setupEditorPanel(panel: HTMLElement): Promise<void> {
     const api = (window as any).electronAPI;
 
+    // Pre-warm Monaco in the background as soon as the Explorer opens: the
+    // editor AMD bundle (~3MB) otherwise loads cold on the FIRST file click,
+    // which makes open look stuck for seconds. While the user browses the
+    // tree, this idle load finishes and clicking a file opens instantly.
+    // Preheat the Monaco engine in the background while the user browses
+    // the tree; failures surface later when a code panel awaits getMonaco.
+    void getMonaco().catch(() => {});
+
     // Always render the tree skeleton. The "no active workspace" empty state
     // is produced by renderTree below (and kept refreshed by the poller), so
     // the tree appears automatically once a workspace becomes active instead
     // of stalling forever until the tab is reopened.
-    panel.innerHTML = `<div class="si-editor-wrap" style="display:flex;height:100%">
+    panel.innerHTML = `<div class="si-editor-wrap" style="display:flex;flex-direction:column;height:100%">
+      <span class="si-editor-head-actions">
+        <button class="si-editor-head-btn" data-act="new-file" data-tooltip="${this.esc(t("sessionInner.newFile"))}"><i data-lucide="file-plus" class="lucide lucide-xs"></i></button>
+        <button class="si-editor-head-btn" data-act="new-folder" data-tooltip="${this.esc(t("sessionInner.newFolder"))}"><i data-lucide="folder-plus" class="lucide lucide-xs"></i></button>
+        <button class="si-editor-head-btn" data-act="refresh" data-tooltip="${this.esc(t("sessionInner.treeRefresh"))}"><i data-lucide="refresh-cw" class="lucide lucide-xs"></i></button>
+        <button class="si-editor-head-btn" data-act="collapse-all" data-tooltip="${this.esc(t("sessionInner.treeCollapseAll"))}"><i data-lucide="chevrons-down" class="lucide lucide-xs"></i></button>
+      </span>
       <div class="si-editor-tree" style="flex:1;overflow:auto;max-width:none;width:100%">
         <div class="si-editor-tree-body"></div>
       </div>
@@ -2572,120 +3309,200 @@ export class SessionInner {
 
     const treeBody = panel.querySelector(".si-editor-tree-body")! as HTMLElement;
 
+    // Ensure the general-mode tree root (session files dir) resolves
+    // immediately instead of waiting for the next backend push: request a
+    // fresh config snapshot when the current session has none yet.
+    const st0 = getState();
+    if (!st0.activeWorkspace && !st0.sessionFilesDirs[st0.sessionId]) {
+      void send({ type: "get_config" });
+    }
+
     /* context menu for tree */
     const treeCtxMenu = document.createElement("div");
     treeCtxMenu.className = "context-menu hidden";
     treeCtxMenu.id = "editor-tree-ctx-menu";
-    let treeCtxPath = "";
-    let treeCtxIsDir = false;
+    const treeApi = (window as any).electronAPI;
     document.body.appendChild(treeCtxMenu);
 
-    const showTreeCtx = (ev: MouseEvent, path: string, isDir: boolean) => {
+    const showTreeCtx = (ev: MouseEvent, path: string, isDir: boolean, target: HTMLElement | null) => {
       ev.preventDefault();
       // Without an active workspace there is no valid root to act on.
       if (!rootPath) return;
-      treeCtxPath = path;
-      treeCtxIsDir = isDir;
+      // Visual affordance: the right-clicked entry becomes the single
+      // selected row, so "the file I right-clicked" is always the file the
+      // menu actions (delete/new/… ) visibly act on — never a stale click
+      // selection from earlier.
+      if (target) {
+        treeBody.querySelectorAll(".si-tree-entry.selected").forEach((s) => s.classList.remove("selected"));
+        target.classList.add("selected");
+      }
+      const api = treeApi;
       const ext = path.split(".").pop()?.toLowerCase() || "";
       const isMd = !isDir && ext === "md";
-      let menu = "";
+      const baseName = path.split(/[/\\]/).pop() || path;
+      const sendToChat = () => {
+        const att: AttachmentMeta = isDir
+          ? { name: baseName, path, content: "", mime_type: "text/x-directory", size: 0, is_binary: false }
+          : { name: baseName, path, content: "", mime_type: "", size: 0, is_binary: false };
+        if (isDir) {
+          addAttachments([att]);
+          return;
+        }
+        void api?.readFile(path).then((result: any) => {
+          if (!result) return;
+          addAttachments([
+            {
+              name: baseName,
+              path,
+              content: result.content,
+              mime_type: result.mime_type || "",
+              size: result.size,
+              is_binary: result.is_binary,
+            },
+          ]);
+        });
+      };
+      const items: ContextMenuItemSpec[] = [];
       if (isDir) {
         // Folder: new file/folder, paste into it, send, delete.
-        menu =
-          `<div class="context-menu-item" data-action="new-file"><i data-lucide="file-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFile")}</div>` +
-          `<div class="context-menu-item" data-action="new-folder"><i data-lucide="folder-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFolder")}</div>` +
-          `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.pasteFile")}</div>` +
-          `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="send-folder"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>` +
-          `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item context-menu-item-danger" data-action="delete"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("sessionInner.delete")}</div>`;
+        items.push({ action: "new-file", icon: "file-plus", label: t("sessionInner.newFile") });
+        items.push({ action: "new-folder", icon: "folder-plus", label: t("sessionInner.newFolder") });
+        items.push({ divider: true });
+        items.push({ action: "paste", icon: "clipboard", label: t("sessionInner.pasteFile") });
+        items.push({ divider: true });
+        items.push({ action: "send-folder", icon: "send", label: t("sessionInner.termSendToChat"), onClick: sendToChat });
+        items.push({ divider: true });
+        items.push({ action: "delete", icon: "trash-2", danger: true, label: t("sessionInner.delete") });
       } else if (!path) {
         // Empty area (no file/folder under the cursor): create + paste into root.
-        menu =
-          `<div class="context-menu-item" data-action="new-file"><i data-lucide="file-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFile")}</div>` +
-          `<div class="context-menu-item" data-action="new-folder"><i data-lucide="folder-plus" class="lucide lucide-sm"></i>${t("sessionInner.newFolder")}</div>` +
-          `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.pasteFile")}</div>`;
+        items.push({ action: "new-file", icon: "file-plus", label: t("sessionInner.newFile") });
+        items.push({ action: "new-folder", icon: "folder-plus", label: t("sessionInner.newFolder") });
+        items.push({ divider: true });
+        items.push({ action: "paste", icon: "clipboard", label: t("sessionInner.pasteFile") });
       } else {
         // File: copy it, send to conversation, preview (.md), delete.
-        menu =
-          `<div class="context-menu-item" data-action="copy"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("sessionInner.copyFile")}</div>` +
-          `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item" data-action="send-file"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>`;
+        items.push({ action: "copy", icon: "copy", label: t("sessionInner.copyFile") });
+        items.push({ divider: true });
+        items.push({ action: "send-file", icon: "send", label: t("sessionInner.termSendToChat"), onClick: sendToChat });
         if (isMd) {
-          menu += `<div class="context-menu-divider"></div><div class="context-menu-item" data-action="preview"><i data-lucide="eye" class="lucide lucide-sm"></i>${t("sessionInner.preview")}</div>`;
+          items.push({
+            divider: true,
+          });
+          items.push({
+            action: "preview",
+            icon: "eye",
+            label: t("sessionInner.preview"),
+            onClick: () => {
+              void api?.readFile(path).then((result: any) => {
+                if (result) this.openMarkdownPreview(result.content, baseName, path);
+              });
+            },
+          });
         }
-        menu +=
-          `<div class="context-menu-divider"></div>` +
-          `<div class="context-menu-item context-menu-item-danger" data-action="delete"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("sessionInner.delete")}</div>`;
+        items.push({ divider: true });
+        items.push({ action: "delete", icon: "trash-2", danger: true, label: t("sessionInner.delete") });
       }
-      treeCtxMenu.innerHTML = menu;
-      showContextMenu(treeCtxMenu, ev.clientX, ev.clientY);
-      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: treeCtxMenu }));
+      // Plugin-contributed items ("workspace_files" surface), spliced through
+      // the one shared helper so plugin rows stay defined in a single place.
+      items.push(...pluginMenuSpecs("workspace_files", { path, is_dir: isDir }));
+      renderContextMenuItems(items, {
+        container: treeCtxMenu,
+        onAction: (spec) => void treeCtxAction(spec.action!, path, isDir),
+      });
+      showContextMenu(treeCtxMenu, ev.clientX, ev.clientY, { target });
     };
 
-    treeCtxMenu.addEventListener("click", async (ev) => {
-      const item = (ev.target as HTMLElement).closest(".context-menu-item") as HTMLElement | null;
-      if (!item) return;
-      const action = item.dataset.action;
-      const api = (window as any).electronAPI;
+    const treeCtxAction = async (action: string, path: string, isDir: boolean): Promise<void> => {
+      const api = treeApi;
       if (action === "send-file" && api) {
-        const result = await api.readFile(treeCtxPath);
+        const result = await api.readFile(path);
         if (result) {
-          const name = treeCtxPath.split(/[/\\]/).pop() || treeCtxPath;
-          const att: AttachmentMeta = {
-            name, path: treeCtxPath,
-            content: result.content,
-            mime_type: result.mime_type || "",
-            size: result.size,
-            is_binary: result.is_binary,
-          };
-          addAttachments([att]);
+          const name = path.split(/[/\\]/).pop() || path;
+          addAttachments([
+            {
+              name,
+              path,
+              content: result.content,
+              mime_type: result.mime_type || "",
+              size: result.size,
+              is_binary: result.is_binary,
+            },
+          ]);
         }
       } else if (action === "send-folder" && api) {
-        const name = treeCtxPath.split(/[/\\]/).pop() || treeCtxPath;
-        const att: AttachmentMeta = {
-          name, path: treeCtxPath,
-          content: "",
-          mime_type: "text/x-directory",
-          size: 0, is_binary: false,
-        };
-        addAttachments([att]);
+        const name = path.split(/[/\\]/).pop() || path;
+        addAttachments([{ name, path, content: "", mime_type: "text/x-directory", size: 0, is_binary: false }]);
       } else if (action === "preview" && api) {
-        const result = await api.readFile(treeCtxPath);
+        const result = await api.readFile(path);
         if (result) {
-          const name = treeCtxPath.split(/[/\\]/).pop() || treeCtxPath;
-          this.openMarkdownPreview(result.content, name, treeCtxPath);
+          const name = path.split(/[/\\]/).pop() || path;
+          this.openMarkdownPreview(result.content, name, path);
         }
       } else if (action === "copy" && api) {
-        await api.copyFilesToClipboard([treeCtxPath]);
+        await api.copyFilesToClipboard([path]);
       } else if (action === "paste" && api) {
         const sources = await api.readFilesFromClipboard();
         if (sources && sources.length > 0) {
-          const destDir = treeCtxIsDir ? treeCtxPath : rootPath;
+          // Same lock rule: paste target is the right-clicked directory, or
+          // the parent of the right-clicked file — never a default root.
+          const destDir = isDir ? path : (path.replace(/[/\\][^/\\]+$/, "") || rootPath);
           const res = await api.pasteFiles(sources, destDir);
           if (res && res.success) await renderTree();
         }
       } else if ((action === "new-file" || action === "new-folder") && api) {
-        treeCtxMenu.classList.add("hidden");
-        const parentDir = treeCtxIsDir ? treeCtxPath : rootPath;
+        // Lock to the right-clicked entry: a directory receives the new item
+        // itself, a file delegates to its own parent folder, empty space
+        // means the tree root. Never fall back to the left-click selection.
+        const parentDir = isDir ? path : (path.replace(/[/\\][^/\\]+$/, "") || rootPath);
         const label = action === "new-file" ? t("sessionInner.newFile") : t("sessionInner.newFolder");
-        const defVal = action === "new-file" ? "untitled.txt" : "untitled";
+        // Offer a default that does not collide with an existing sibling, so
+        // the dialog never suggests the very name dedup would have to rename.
+        const siblings = new Set((await fetchDir(parentDir)).map((e) => e.name.toLowerCase()));
+        const bumpDefault = (base: string): string => {
+          if (!siblings.size || !siblings.has(base.toLowerCase())) return base;
+          const m = base.match(/^(.*?)(\.[^./\\]*)?$/);
+          const stem = m?.[1] || base;
+          const ext = m?.[2] || "";
+          for (let i = 1; i < 1000; i++) {
+            const cand = `${stem} (${i})${ext}`;
+            if (!siblings.has(cand.toLowerCase())) return cand;
+          }
+          return base;
+        };
+        const defVal = bumpDefault(action === "new-file" ? "untitled.txt" : "untitled");
         const name = await Dialog.promptIn(
           this.el,
           label,
-          action === "new-file"
-            ? t("sessionInner.newFileHint")
-            : t("sessionInner.newFolderHint"),
+          action === "new-file" ? t("sessionInner.newFileHint") : t("sessionInner.newFolderHint"),
           defVal,
           { primary: t("dialog.save") },
         );
         if (name && name.trim()) {
+          // Normalise CJK full-width brackets to ASCII: the auto-dedup
+          // suffix ("name (1).ext") uses ASCII and the tree mixes both
+          // conventions otherwise.
+          const cleanedName = name.trim().replace(/（/g, "(").replace(/）/g, ")");
+          // Never silently absorb a forced duplicate: tell the user the
+          // backend will append a numbered suffix and let them cancel.
+          if (siblings.has(cleanedName.toLowerCase())) {
+            const cont = await Dialog.confirmIn(
+              this.el,
+              t("sessionInner.treeNameExists"),
+              t("sessionInner.treeNameExistsMsg", { name: cleanedName }),
+            );
+            if (!cont) return;
+          }
           const res = action === "new-file"
-            ? await api.createFile(parentDir, name.trim())
-            : await api.createFolder(parentDir, name.trim());
+            ? await api.createFile(parentDir, cleanedName)
+            : await api.createFolder(parentDir, cleanedName);
           if (res && res.success) {
+            // The poller keeps dirCache warm: drop the parent's cached
+            // listing or the new entry stays invisible until the cache is
+            // invalidated elsewhere, and expand the parent so it shows.
+            dirCache.delete(parentDir);
+            expandedDirs.add(parentDir);
+            persistExpandState();
+            lastTreeHtml = "";
             await renderTree();
             if (action === "new-file" && res.path) {
               this.openFileInEditor(res.path);
@@ -2693,35 +3510,62 @@ export class SessionInner {
           }
         }
       } else if (action === "delete" && api) {
-        treeCtxMenu.classList.add("hidden");
-        const baseName = treeCtxPath.split(/[/\\]/).pop() || treeCtxPath;
-        if (await Dialog.confirmIn(this.el, t("sessionInner.confirmDeleteTitle"), t("sessionInner.confirmDelete", { name: baseName }))) {
-          const res = await api.deletePath(treeCtxPath);
+        // Show the path RELATIVE to the tree root in the confirm dialog:
+        // long absolute paths are noise and hard to compare at a glance.
+        // Folders get their own wording that states the deletion takes all
+        // contained files/subfolders — a folder must never look like a
+        // plain "file" being asked about.
+        let relPath = path;
+        if (rootPath) {
+          const rootClean = rootPath.replace(/[/\\]+$/, "");
+          if (path === rootClean) {
+            relPath = path.split(/[/\\]/).pop() || path;
+          } else if (path.toLowerCase().startsWith(rootClean.toLowerCase())) {
+            relPath = path.slice(rootClean.length).replace(/^[/\\]+/, "").replace(/[\\/]/g, "/");
+          }
+        }
+        const titleKey = isDir ? "sessionInner.confirmDeleteFolderTitle" : "sessionInner.confirmDeleteTitle";
+        const msgKey = isDir ? "sessionInner.confirmDeleteFolder" : "sessionInner.confirmDelete";
+        if (await Dialog.confirmIn(this.el, t(titleKey), t(msgKey, { name: relPath }))) {
+          const res = await api.deletePath(path);
           if (res && res.success) {
+            // Invalidate the containing directory's cached listing so the
+            // removal shows on the next render instead of from the cache.
+            dirCache.delete(path.replace(/[/\\][^/\\]+$/, "") || rootPath);
+            lastTreeHtml = "";
             await renderTree();
           } else if (res && res.error) {
             Dialog.alert(t("dialog.error"), res.error, { container: this.el });
           }
         }
       }
-      treeCtxMenu.classList.add("hidden");
-    });
+    };
     document.addEventListener("click", (e) => {
       if (!treeCtxMenu.contains(e.target as Node)) {
-        treeCtxMenu.classList.add("hidden");
+        hideAnimated(treeCtxMenu);
       }
     });
 
     // Right-click on empty tree space (not a file/folder): paste into root.
     treeBody.addEventListener("contextmenu", (ev: MouseEvent) => {
       if ((ev.target as HTMLElement).closest(".si-tree-entry")) return;
-      showTreeCtx(ev, "", false);
+      showTreeCtx(ev, "", false, null);
     });
 
     let rootPath = "";
+    let configReqSid = "";
+    let configReqAt = 0;
+    let configReqCount = 0;
     const expandedDirs = new Set<string>();
     const dirCache = new Map<string, DirEntry[]>();
     let lastTreeHtml = "";
+    /* Write-through snapshot of the expansion set: closing the tab rebuilds
+       the panel with an empty instance set, so every fold/unfold must be
+       persisted immediately — persisting only on root switch restored stale
+       state on reopen. */
+    const persistExpandState = () => {
+      if (rootPath) SessionInner._editorExpandState.set(rootPath, new Set(expandedDirs));
+    };
 
     const joinPath = (base: string, name: string) => {
       const sep = base.includes("\\") ? "\\" : "/";
@@ -2740,8 +3584,6 @@ export class SessionInner {
       }
     };
 
-    const fileIcon = (name: string): string => getFileIcon(name);
-
     const renderRecursive = async (dirPath: string, depth: number, out: string[]) => {
       const entries = await fetchDir(dirPath);
       const sorted = [...entries].sort((a, b) => {
@@ -2756,7 +3598,7 @@ export class SessionInner {
           const isExp = expandedDirs.has(fullPath);
           out.push(`<div class="si-tree-entry" data-path="${this.esc(fullPath)}" data-dir="true" style="padding-left:${indent}px">
             <span class="si-tree-chevron${isExp ? " expanded" : ""}"><i data-lucide="chevron-right" class="lucide lucide-xs"></i></span>
-            <span class="si-tree-icon"><i data-lucide="folder" class="lucide lucide-sm"></i></span>
+            <span class="si-tree-icon"><img src="${getFolderIcon(entry.name, isExp)}" class="icon" style="width:14px;height:14px"></span>
             <span class="si-tree-name">${this.esc(entry.name)}</span>
           </div>`);
           if (isExp) {
@@ -2774,32 +3616,64 @@ export class SessionInner {
 
     const renderTree = async () => {
       const ws = getState().activeWorkspace;
-      if (!ws) {
-        // No active workspace: show the empty state, but keep the poller
-        // alive so the tree appears as soon as a workspace is activated.
+      // General mode falls back to the CURRENT session's files directory
+      // (backend-resolved via config_data, keyed by session id), so the
+      // editor tree operates on the same per-session sandbox the agent
+      // writes into — and never on another session's files.
+      const root = ws || getState().sessionFilesDirs[getState().sessionId] || "";
+      if (!root) {
+        // No workspace and no files dir for this session yet: render the
+        // same subtle empty-tree view an empty directory gets — never the
+        // large empty-state placeholder. Ask the backend for a config
+        // snapshot (once per session) so the tree appears promptly.
         rootPath = "";
         lastTreeHtml = "";
-        if (!treeBody.querySelector(".si-panel-empty")) {
-          treeBody.innerHTML = `<div class="si-panel-empty si-editor-empty" style="min-height:100%;height:100%;box-sizing:border-box">
-            <i data-lucide="file-code-2" class="lucide"></i>
-            <span class="si-panel-empty-title">${t("sessionInner.editorEmpty")}</span>
-          </div>`;
+        const sid = getState().sessionId;
+        if (sid && configReqSid !== sid) {
+          configReqSid = sid;
+          configReqAt = 0;
+          configReqCount = 0;
+        }
+        if (sid) {
+          if (!configReqSid) configReqSid = sid;
+          // Bounded retry: a config snapshot can be dropped by the session
+          // filters or a WS reconnect, and a one-shot request per session
+          // used to leave the tree stuck on the empty view forever.
+          const now = Date.now();
+          if (configReqCount < 8 && now - configReqAt > 5000) {
+            configReqAt = now;
+            configReqCount++;
+            void send({ type: "get_config" });
+          }
+        }
+        if (!treeBody.querySelector(".si-empty-center")) {
+          treeBody.innerHTML = `<div class="si-empty-center"><i data-lucide="folder-open" class="lucide"></i><span class="si-empty-title">${t("sessionInner.filesEmpty")}</span></div>`;
           if (typeof (window as any).lucide !== "undefined") {
             (window as any).lucide.createIcons({ root: treeBody });
           }
         }
         return;
       }
-      if (ws !== rootPath) {
-        // Workspace changed: drop expansion state and force a full re-render.
+      if (root !== rootPath) {
+        // Root changed (workspace switch or session switch): persist this
+        // root's expansion snapshot (VSCode keeps per-explorer fold state),
+        // restore the incoming root's own, then force a full re-render.
+        if (rootPath) SessionInner._editorExpandState.set(rootPath, new Set(expandedDirs));
         expandedDirs.clear();
+        const saved = SessionInner._editorExpandState.get(root);
+        if (saved) {
+          for (const p of saved) expandedDirs.add(p);
+        }
         lastTreeHtml = "";
       }
-      rootPath = ws;
+      rootPath = root;
       dirCache.clear();
+      // Root resolved: reset the get_config retry budget for future
+      // post-switch empty-root rounds.
+      configReqCount = 0;
       const out: string[] = [];
       await renderRecursive(rootPath, 0, out);
-      const html = out.length ? out.join("") : `<div class="si-empty">${t("sessionInner.filesEmpty")}</div>`;
+      const html = out.length ? out.join("") : `<div class="si-empty-center"><i data-lucide="folder-open" class="lucide"></i><span class="si-empty-title">${t("sessionInner.filesEmpty")}</span></div>`;
       if (html === lastTreeHtml) return;
       const prevScroll = treeBody.scrollTop;
       const selEl = treeBody.querySelector(".si-tree-entry.selected") as HTMLElement | null;
@@ -2818,10 +3692,11 @@ export class SessionInner {
             await fetchDir(path);
             expandedDirs.add(path);
           }
+          persistExpandState();
           await renderTree();
         });
         (el as HTMLElement).addEventListener("contextmenu", (ev: MouseEvent) => {
-          showTreeCtx(ev, (el as HTMLElement).dataset.path!, true);
+          showTreeCtx(ev, (el as HTMLElement).dataset.path!, true, el as HTMLElement);
         });
       });
 
@@ -2833,7 +3708,7 @@ export class SessionInner {
           this.openFileInEditor(filePath);
         });
         (el as HTMLElement).addEventListener("contextmenu", (ev: MouseEvent) => {
-          showTreeCtx(ev, (el as HTMLElement).dataset.path!, false);
+          showTreeCtx(ev, (el as HTMLElement).dataset.path!, false, el as HTMLElement);
         });
       });
 
@@ -2862,11 +3737,55 @@ export class SessionInner {
     // that class and silently stall the poller.
     const panelTimer = window.setInterval(() => {
       if (!panel.isConnected) return;
-      const mainBody = document.getElementById("main-body");
-      if (mainBody && mainBody.classList.contains("sidebar-hidden")) return;
+      if (document.hidden) return;
+      // The child-window (ESD) shell never clears the #main-body
+      // "sidebar-hidden" boot state (restoreSidebarVisibility early-returns
+      // there) even while the panel is visible, so the gate below would
+      // stall the poller forever.  Only honour it in the main window.
+      if (!inChildWindow()) {
+        const mainBody = document.getElementById("main-body");
+        if (mainBody && mainBody.classList.contains("sidebar-hidden")) return;
+      }
+      // External changes must show up too: the warm dirCache would otherwise
+      // hide files created/removed outside this panel forever.  Re-list from
+      // disk every tick; tree HTML identical to lastFrame is still skipped
+      // by the renderTree diff, so steady state costs only the listing.
+      dirCache.clear();
       void renderTree();
     }, 2000);
     (panel as any)._siTreeTimer = panelTimer;
+
+    /* Toolbar (VSCode-explorer style): new file / new folder / refresh /
+       collapse-all.  All actions reuse the tree context-menu backend calls;
+       they act on the resolved tree root and are no-ops without one. */
+    panel.querySelectorAll<HTMLElement>(".si-editor-head-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        if (!rootPath) return;
+        const act = btn.dataset.act || "";
+        if (act === "new-file" || act === "new-folder") {
+          // Anchor to the selected tree entry, VSCode-style: a directory
+          // receives the new entry directly, a file's parent directory does,
+          // and with no selection at all we fall back to the tree root.
+          const sel = treeBody.querySelector(".si-tree-entry.selected") as HTMLElement | null;
+          const selPath = sel?.dataset.path || "";
+          let target = rootPath;
+          if (selPath) {
+            target = sel!.dataset.dir ? selPath : (selPath.replace(/[/\\][^/\\]+$/, "") || rootPath);
+          }
+          await treeCtxAction(act, target, true);
+        } else if (act === "refresh") {
+          // Force a full re-read: the poller keeps dirCache warm, so a manual
+          // refresh must invalidate it to pick up out-of-band disk changes.
+          dirCache.clear();
+          lastTreeHtml = "";
+          await renderTree();
+        } else if (act === "collapse-all") {
+          expandedDirs.clear();
+          persistExpandState();
+          await renderTree();
+        }
+      });
+    });
 
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: panel });
@@ -2892,7 +3811,21 @@ export class SessionInner {
     return /\0/.test(content);
   }
 
-  private async openFileInEditor(filePath: string): Promise<void> {
+  /** In-flight single-click opens, keyed by path: a double-fire click used
+   *  to race two readFile→createTab chains into duplicate code tabs. */
+  private _openFileLocks = new Set<string>();
+
+  async openFileInEditor(filePath: string): Promise<void> {
+    if (this._openFileLocks.has(filePath)) return;
+    this._openFileLocks.add(filePath);
+    try {
+      await this._openFileInEditor(filePath);
+    } finally {
+      this._openFileLocks.delete(filePath);
+    }
+  }
+
+  private async _openFileInEditor(filePath: string): Promise<void> {
     const api = (window as any).electronAPI;
     if (!api) return;
     const name = filePath.split(/[/\\]/).pop() || filePath;
@@ -2920,6 +3853,7 @@ export class SessionInner {
     const existing = this.tabs.find(t => t.type === "code" && t.filePath === filePath);
     if (existing) {
       this.activeTab = existing.id;
+      this.revealPanel();
       await this.renderTabs();
       return;
     }
@@ -3009,11 +3943,18 @@ export class SessionInner {
     const api = (window as any).electronAPI;
     if (!api) return;
 
-    container.innerHTML = `<div class="si-office-loading"><i data-lucide="loader" class="lucide spin"></i><span>${this.esc(t("sessionInner.officeLoading"))}</span></div>`;
+    container.innerHTML = "";
+    // Branded loading state while the office file is being read and parsed.
+    EALoader.mountCentered(container, "96px");
 
     api.readFileBase64(filePath).then(async (r: any) => {
+      // Any outcome below replaces the loading state outright.
+      EALoader.destroyMounted(container);
       if (!r || !r.data) {
-        container.innerHTML = `<div class="si-panel-empty"><i data-lucide="file-x-2" class="lucide"></i><span class="si-panel-empty-sub">${this.esc(t("sessionInner.binaryFileNotShown"))}</span></div>`;
+        container.innerHTML = `<div class="si-empty-center"><i data-lucide="file-x-2" class="lucide"></i><span class="si-empty-title">${this.esc(t("sessionInner.binaryFileNotShown"))}</span></div>`;
+        if (typeof (window as any).lucide !== "undefined") {
+          (window as any).lucide.createIcons({ root: container });
+        }
         return;
       }
       const bin = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0));
@@ -3026,10 +3967,10 @@ export class SessionInner {
         } else if (ext === "ppt" || ext === "pptx") {
           await this._renderOfficePptx(container, buffer);
         } else {
-          container.innerHTML = `<div class="si-panel-empty"><i data-lucide="file-x-2" class="lucide"></i><span class="si-panel-empty-sub">${this.esc(t("sessionInner.binaryFileNotShown"))}</span></div>`;
+          container.innerHTML = `<div class="si-empty-center"><i data-lucide="file-x-2" class="lucide"></i><span class="si-empty-title">${this.esc(t("sessionInner.binaryFileNotShown"))}</span></div>`;
         }
       } catch (e) {
-        container.innerHTML = `<div class="si-panel-empty"><i data-lucide="alert-triangle" class="lucide"></i><span class="si-panel-empty-sub">${this.esc(String(e))}</span></div>`;
+        container.innerHTML = `<div class="si-empty-center"><i data-lucide="alert-triangle" class="lucide"></i><span class="si-empty-title">${this.esc(String(e))}</span></div>`;
       }
       if (typeof (window as any).lucide !== "undefined") {
         (window as any).lucide.createIcons({ root: container });
@@ -3150,12 +4091,10 @@ export class SessionInner {
     (container as any)._officeCleanup = () => ro.disconnect();
   }
 
-  private setupBinaryPanel(panel: HTMLElement, filePath: string): void {
-    const name = filePath.split(/[/\\]/).pop() || filePath;
-    panel.innerHTML = `<div class="si-panel-empty">
+  private setupBinaryPanel(panel: HTMLElement): void {
+    panel.innerHTML = `<div class="si-empty-center">
       <i data-lucide="file-x-2" class="lucide"></i>
-      <span class="si-panel-empty-title">${this.esc(name)}</span>
-      <span class="si-panel-empty-sub">${t("sessionInner.binaryFileNotShown")}</span>
+      <span class="si-empty-title">${t("sessionInner.binaryFileNotShown")}</span>
     </div>`;
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: panel });
@@ -3182,31 +4121,96 @@ export class SessionInner {
     const ext = filePath.split(".").pop()?.toLowerCase() || "";
     const isDark = document.documentElement.getAttribute("data-theme") !== "light";
 
-    const editor = await getMonaco();
+    // Branded loading state for the (first-open) Monaco cold load: without
+    // it the panel is a blank rectangle for the entire ~3MB bundle fetch.
+    // When Monaco is already warm, mount+resolve+destroy happen inside one
+    // microtask run and never paint, so there is no flash.
+    EALoader.mountCentered(container, "96px");
+    let editor: typeof monaco.editor;
+    try {
+      editor = await getMonaco();
+    } catch (err) {
+      // Loader network failure / bundle timeout: never leave a blank tab.
+      EALoader.destroyMounted(container);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[monaco] code panel load failed:", msg);
+      const fail = document.createElement("div");
+      fail.style.cssText =
+        "display:flex;align-items:center;justify-content:center;height:100%;padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;user-select:text;";
+      fail.textContent = `${t("sessionInner.editorLoadFailed")}: ${msg}`;
+      container.appendChild(fail);
+      return;
+    }
+    EALoader.destroyMounted(container);
     const view = editor.create(container, {
+      ...editorViewOptions(),
       value: content,
       language: monacoLang(ext),
-      theme: isDark ? "vs-dark" : "vs",
+      theme: isDark ? "encre-dark" : "encre-light",
       readOnly: false,
-      minimap: { enabled: false },
       automaticLayout: true,
       scrollBeyondLastLine: false,
-      fontSize: 13,
-      lineNumbers: "on",
       renderLineHighlight: "line",
       contextmenu: false,
       bracketPairColorization: { enabled: true },
       padding: { top: 8 },
     });
 
+    // Selection strip for the code editor. Monaco keeps its own selection
+    // model, so there is no DOM range to read here, and `.si-code-container`
+    // is dead CSS — this anonymous div is the real host. A mouseup that ends
+    // the drag is the only trigger, which is what keeps the strip one-shot.
+    container.addEventListener("mouseup", (e: MouseEvent) => {
+      // Left button only. Monaco reports the same selection for a right-press,
+      // which used to make the strip appear together with the editor's own
+      // context menu — visibly the same copy action twice.
+      if (e.button !== 0) return;
+      const selection = view.getSelection();
+      const codeModel = view.getModel();
+      if (!selection || !codeModel || selection.isEmpty()) return;
+      const text = codeModel.getValueInRange(selection);
+      if (!text.trim()) return;
+      const host = container.getBoundingClientRect();
+      const pos = view.getScrolledVisiblePosition(selection.getEndPosition());
+      const top = pos ? host.top + pos.top : host.top;
+      const height = pos ? pos.height : 16;
+      showSelectionActionBarFor({
+        text,
+        kind: "code",
+        rect: { left: host.left, top, right: host.right, bottom: top + height },
+      });
+    });
+
     const model = view.getModel();
     if (model && typeof model.onDidChangeContent === "function") {
+      // Auto-save is a real write: the buffer goes to its own file a beat after
+      // the last keystroke.  The tab guard is what keeps a pending timer from
+      // landing on disk after the user closed the tab and chose "don't save".
+      let saveTimer = 0;
+      const scheduleAutoSave = () => {
+        if (!filePath || !_settingBool("editor_auto_save", false)) return;
+        window.clearTimeout(saveTimer);
+        saveTimer = window.setTimeout(() => {
+          if (this.panelCodeEditors.get(tabId) !== view) return;
+          const value = model.getValue();
+          if (value === content) return;
+          void window.electronAPI?.writeFile?.(filePath, value).then((ok) => {
+            if (!ok || this.panelCodeEditors.get(tabId) !== view) return;
+            content = value;
+            if (this._dirtyTabs.get(tabId)) {
+              this._dirtyTabs.set(tabId, false);
+              this._refreshTabClose(tabId);
+            }
+          });
+        }, 600);
+      };
       model.onDidChangeContent(() => {
         const dirty = model.getValue() !== content;
         if (dirty !== !!this._dirtyTabs.get(tabId)) {
           this._dirtyTabs.set(tabId, dirty);
           this._refreshTabClose(tabId);
         }
+        scheduleAutoSave();
       });
     }
 
@@ -3218,52 +4222,60 @@ export class SessionInner {
     const ctxMenu = document.createElement("div");
     ctxMenu.className = "context-menu hidden";
     ctxMenu.setAttribute("id", `code-ctx-menu-${tabId}`);
-    ctxMenu.innerHTML = `
-      <div class="context-menu-item" data-action="copy"><i data-lucide="copy" class="lucide lucide-sm"></i>${t("sessionInner.termCopy")}</div>
-      <div class="context-menu-item" data-action="paste"><i data-lucide="clipboard" class="lucide lucide-sm"></i>${t("sessionInner.termPaste")}</div>
-      <div class="context-menu-divider"></div>
-      <div class="context-menu-item" data-action="send"><i data-lucide="send" class="lucide lucide-sm"></i>${t("sessionInner.termSendToChat")}</div>`;
     document.body.appendChild(ctxMenu);
     let ctxEditorTarget: any = null;
 
     container.addEventListener("contextmenu", (ev: MouseEvent) => {
       ev.preventDefault();
       ctxEditorTarget = view;
-      showContextMenu(ctxMenu, ev.clientX, ev.clientY);
-      requestAnimationFrame(() => (window as any).lucide.createIcons({ root: ctxMenu }));
+      renderContextMenuItems(
+        [
+          {
+            action: "copy",
+            icon: "copy",
+            label: t("sessionInner.termCopy"),
+            onClick: () => {
+              const sel = ctxEditorTarget?.getSelection();
+              const model = ctxEditorTarget?.getModel();
+              const text = sel && model && !sel.isEmpty() ? model.getValueInRange(sel) : "";
+              if (text) navigator.clipboard.writeText(text).catch(() => {});
+            },
+          },
+          {
+            action: "paste",
+            icon: "clipboard",
+            label: t("sessionInner.termPaste"),
+            onClick: () => {
+              navigator.clipboard.readText().then((text) => {
+                if (!text || !ctxEditorTarget) return;
+                const sel = ctxEditorTarget.getSelection();
+                if (sel) {
+                  ctxEditorTarget.executeEdits("ctx-paste", [{ range: sel, text, forceMoveMarkers: true }]);
+                }
+                ctxEditorTarget.focus();
+              }).catch(() => {});
+            },
+          },
+          { divider: true },
+          {
+            action: "send",
+            icon: "send",
+            label: t("sessionInner.termSendToChat"),
+            onClick: () => void this._sendCodeToChat(ctxEditorTarget, filePath),
+          },
+          ...pluginMenuSpecs("code_editor", { path: filePath }),
+        ],
+        { container: ctxMenu },
+      );
+      showContextMenu(ctxMenu, ev.clientX, ev.clientY, { target: container });
     }, true);
 
     const outsideClick = (e: MouseEvent) => {
       if (!ctxMenu.contains(e.target as Node)) {
-        ctxMenu.classList.add("hidden");
+        hideAnimated(ctxMenu);
       }
     };
     document.addEventListener("click", outsideClick);
-
-    ctxMenu.querySelectorAll(".context-menu-item").forEach((item) => {
-      item.addEventListener("click", () => {
-        const action = (item as HTMLElement).dataset.action;
-        if (action === "copy" && ctxEditorTarget) {
-          const sel = ctxEditorTarget.getSelection();
-          const model = ctxEditorTarget.getModel();
-          const text = sel && model && !sel.isEmpty() ? model.getValueInRange(sel) : "";
-          if (text) navigator.clipboard.writeText(text).catch(() => {});
-        } else if (action === "paste" && ctxEditorTarget) {
-          navigator.clipboard.readText().then((text) => {
-            if (!text || !ctxEditorTarget) return;
-            const sel = ctxEditorTarget.getSelection();
-            if (sel) {
-              ctxEditorTarget.executeEdits("ctx-paste", [{ range: sel, text, forceMoveMarkers: true }]);
-            }
-            ctxEditorTarget.focus();
-          }).catch(() => {});
-        } else if (action === "send" && ctxEditorTarget) {
-          void this._sendCodeToChat(ctxEditorTarget, filePath);
-        }
-        ctxMenu.classList.add("hidden");
-        ctxEditorTarget = null;
-      });
-    });
 
     (view as any)._ctxMenuCleanup = () => {
       ctxMenu.remove();
@@ -3300,6 +4312,17 @@ export class SessionInner {
   private _reviewRequestSeq = 0;
   private _reviewDiffCache: Map<string, string> | null = null;
   private _reviewTreeCache = new Map<string, string>();
+  // Review caches are bounded: the panel re-renders on every git
+  // status/diff round, so without a cap these maps grow for the whole
+  // renderer lifetime. The oldest entry is evicted first (Map insertion
+  // order), which also keeps the hot entries (recent diffs) resident.
+  private cachePut(cache: Map<string, string>, key: string, value: string, max = 300): void {
+    if (cache.size >= max) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+    cache.set(key, value);
+  }
   // Review display toggles (set by the action menu).
   private _reviewWrap = false;        // word wrap
   private _reviewFullFile = true;     // false => truncate large diffs
@@ -3316,20 +4339,35 @@ export class SessionInner {
   // How many side buttons are currently merged into the �?overflow menu.
   private _reviewOverflow = 0;
   private _reviewDiffEl: HTMLElement | null = null;  // ref for CSS class toggling
+  // Live re-apply hook owned by the mounted review panel: it re-reads the two
+  // Settings-owned toggles and re-renders when the split flag flips (see
+  // `_applyReviewSettings`).  Null while no review panel is mounted.
+  private _reviewApply: (() => void) | null = null;
+  private _reviewSettingsSig = "";
+  // Observers created by setupReviewPanel; disconnected before the next setup
+  // so repeatedly rendering the review panel doesn't accumulate live
+  // observers on detached panels.
+  private _reviewObservers: Array<ResizeObserver | MutationObserver> = [];
 
   /** Public entry point called from App when a "View Changes" button is clicked. */
-  public showReviewTab(path: string, artifact?: ArtifactItem): void {
-    // Ensure sidebar is visible when showing review
+  /** Un-hide the panel so a tab opened from the chat is actually visible.
+   *  A hidden panel still accepts tabs -- they just land where nobody can
+   *  see them, which read as "clicking the file does nothing". */
+  public revealPanel(): void {
     const panel = document.getElementById("session-inner-sidebar");
     const mainBody = document.getElementById("main-body");
-    if (panel && mainBody && panel.classList.contains("hidden")) {
-      panel.classList.remove("hidden");
-      mainBody.classList.remove("sidebar-hidden");
-      document.getElementById("app")?.classList.add("sidebar-collapsed");
-      // Re-render info panel content since it was skipped while hidden
-      this.renderForce();
-      this.saveSidebarVisibility();
-    }
+    if (!panel || !mainBody || !panel.classList.contains("hidden")) return;
+    panel.classList.remove("hidden");
+    mainBody.classList.remove("sidebar-hidden");
+    document.getElementById("app")?.classList.add("sidebar-collapsed");
+    // Re-render info panel content since it was skipped while hidden
+    this.renderForce();
+    this.saveSidebarVisibility();
+  }
+
+  public showReviewTab(path: string, artifact?: ArtifactItem): void {
+    // Ensure sidebar is visible when showing review
+    this.revealPanel();
     if (artifact) {
       this._reviewFilter = "lastRound";
       this._reviewMode = "artifact";
@@ -3366,7 +4404,8 @@ export class SessionInner {
   /* ── Tab Events ──────────────────────────────────────────────────── */
 
   private bindTabEvents(): void {
-    // Close button (tab-close) for sidebar tabs uses data-tab from the
+    // Close affordance for sidebar tabs is the icon-slot × (mode-chip
+    // pattern); tooltips below carry data-tab from the
     // parent <button>. Also attach middle-click-to-close on the tab itself.
     const closeTab = (el: HTMLElement) => {
       const tabEl = el.closest(".tab") as HTMLElement;
@@ -3387,13 +4426,19 @@ export class SessionInner {
       el.addEventListener("mousedown", (e) => {
         if (e.button === 1) e.preventDefault();
       });
-      const xBtn = el.querySelector(".tab-close");
-      if (xBtn) {
-        xBtn.addEventListener("click", (e) => {
+      /* mode-chip pattern: the icon element carries the close click — it is
+         the transparent-but-present click target behind the × pseudo-element
+         that appears over it on hover.  Non-closable tabs keep plain icon
+         behaviour (no handler, clicks fall through to activation). */
+      const iconWrap = el.querySelector(".tab-icon-wrap");
+      if (iconWrap && el.classList.contains("closable")) {
+        iconWrap.addEventListener("click", (e) => {
           e.stopPropagation();
           closeTab(el);
         });
       }
+      const onIcon = (e: Event) =>
+        el.classList.contains("closable") && !!(e.target as HTMLElement).closest(".tab-icon-wrap");
       el.addEventListener("auxclick", (e) => {
         if ((e as MouseEvent).button === 1) {
           e.preventDefault();
@@ -3401,9 +4446,9 @@ export class SessionInner {
         }
       });
 
-      /* Activate on click (unless dragged) */
+      /* Activate on click (unless dragged; icon click on closable tabs = close) */
       el.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).closest(".tab-close")) return;
+        if (onIcon(e)) return;
         if (this.wasDragged) { this.wasDragged = false; return; }
         const id = el.dataset.tab!;
         if (id !== this.activeTab) this.activateTab(id);
@@ -3413,13 +4458,13 @@ export class SessionInner {
          plain click doesn't flash the drag visual. */
       el.addEventListener("mousedown", (e) => {
         if (e.button !== 0) return;
-        if ((e.target as HTMLElement).closest(".tab-close")) return;
+        if (onIcon(e)) return;
         this.wasDragged = false;
         this.dragEl = el;
         this.dragIdx = parseInt(el.dataset.idx ?? "-1");
         this.dragStartX = e.clientX;
-        this.dragOverIdx = this.dragIdx;
-        this.dragOverAfter = false;
+        this.dragSlot = this.dragIdx;
+        this.dragBarEl = null;
         e.preventDefault();
       });
     });
@@ -3432,27 +4477,70 @@ export class SessionInner {
         /* Only consider it a drag if moved more than 5px */
         if (!this.wasDragged && Math.abs(dx) > 5) {
           this.wasDragged = true;
+          /* Sample the untransformed geometry once, before any transform. */
+          const base = this.dragEl.getBoundingClientRect();
+          this.dragBaseLeft = base.left;
+          this.dragBaseWidth = base.width;
           this.dragEl.classList.add("dragging");
           this._showDragOverlay();
         }
         if (!this.wasDragged) return;
-        this.dragEl.style.transform = `translateX(${dx}px)`;
+        /* Clamp the slide to the strip's own extent: Edge never lets the
+           dragged tab leave the bar.  Bounds come from the geometry sampled
+           at drag start, not from the live rect — the live rect already
+           contains the clamped transform and would drift the bounds. */
+        const barRect = this.tabList.getBoundingClientRect();
+        const cdx = Math.max(
+          barRect.left - this.dragBaseLeft,
+          Math.min(dx, barRect.right - this.dragBaseLeft - this.dragBaseWidth),
+        );
+        this.dragEl.style.transform = `translateX(${cdx}px)`;
 
-        const allTabs = [...this.tabList.querySelectorAll(".tab")];
-        for (let i = 0; i < allTabs.length; i++) {
-          if (allTabs[i] === this.dragEl) continue;
-          const rect = allTabs[i].getBoundingClientRect();
-          if (e.clientX >= rect.left && e.clientX <= rect.right) {
-            const after = e.clientX > rect.left + rect.width / 2;
-            if (i !== this.dragOverIdx || after !== this.dragOverAfter) {
-              const prev = this.dragOverIdx >= 0 && this.dragOverIdx < allTabs.length ? allTabs[this.dragOverIdx] : null;
-              if (prev) prev.classList.remove("drop-target", "drop-after");
-              this.dragOverIdx = i;
-              this.dragOverAfter = after;
-              allTabs[i].classList.add("drop-target");
-              if (after) allTabs[i].classList.add("drop-after");
-            }
-            break;
+        /* Slot-based insertion geometry: the slot counts how many non-dragged
+           tabs' midpoints the pointer has passed.  Unlike per-rect half
+           splitting this has no dead zones (gutters / the dragged tab's own
+           translated body) and no edge flips inside no-op zones — the bar
+           only appears where dropping would actually change the order:
+             slot < dragIdx → bar on others[slot]           left edge
+             slot > dragIdx → bar on others[slot - 1]       right edge
+             slot == dragIdx → no bar (back to its own slot). */
+        const others = ([...this.tabList.querySelectorAll(".tab")] as HTMLElement[]).filter((t) => t !== this.dragEl);
+        const firstRect = others.length ? others[0].getBoundingClientRect() : null;
+        const lastRect = others.length ? others[others.length - 1].getBoundingClientRect() : null;
+        /* Tabs lay left-to-right in LTR and right-to-left in RTL (ar/he). */
+        const ltr = !firstRect || !lastRect || firstRect.left <= lastRect.left;
+        let slot = 0;
+        for (const t of others) {
+          const r = t.getBoundingClientRect();
+          const mid = r.left + r.width / 2;
+          if (ltr ? e.clientX > mid : e.clientX < mid) slot++;
+        }
+        /* Edge override: a pointer pinned at (or past) a strip edge means the
+           extreme slot.  Midpoints of tabs scrolled out of view are
+           unreachable, which made a drag-to-the-end land one position short —
+           the bar stuck between the last two tabs instead of after the last
+           one (and symmetrically at the left edge). */
+        if (others.length) {
+          if (ltr ? e.clientX >= barRect.right : e.clientX <= barRect.left) slot = others.length;
+          else if (ltr ? e.clientX <= barRect.left : e.clientX >= barRect.right) slot = 0;
+        }
+        let barEl: HTMLElement | null = null;
+        let after = false;
+        if (others.length > 0 && slot !== this.dragIdx) {
+          if (slot < this.dragIdx) {
+            barEl = others[slot];
+          } else {
+            barEl = others[Math.min(slot, others.length) - 1];
+            after = true;
+          }
+        }
+        if (slot !== this.dragSlot) {
+          if (this.dragBarEl) this.dragBarEl.classList.remove("drop-target", "drop-after");
+          this.dragBarEl = barEl;
+          this.dragSlot = slot;
+          if (barEl) {
+            barEl.classList.add("drop-target");
+            if (after) barEl.classList.add("drop-after");
           }
         }
       });
@@ -3464,23 +4552,19 @@ export class SessionInner {
         this._hideDragOverlay();
         this.tabList.querySelectorAll(".drop-target").forEach((t) => t.classList.remove("drop-target", "drop-after"));
 
-        if (this.wasDragged && this.dragOverIdx >= 0 && this.dragOverIdx !== this.dragIdx) {
-          /* Insert before the hovered tab, or after it when pointer was on
-             its right half — then compensate for the removal shift. */
-          let insertIdx = this.dragOverAfter ? this.dragOverIdx + 1 : this.dragOverIdx;
-          if (insertIdx > this.dragIdx) insertIdx--;
-          if (insertIdx !== this.dragIdx) {
-            const moved = this.tabs.splice(this.dragIdx, 1)[0];
-            this.tabs.splice(insertIdx, 0, moved);
-            _saveTabs(this.tabs);
-            this.renderTabs();
-          }
+        if (this.wasDragged && this.dragSlot >= 0 && this.dragSlot !== this.dragIdx) {
+          /* The slot counts non-dragged tabs; splicing the dragged tab out
+             then back in at the slot lands it exactly between them. */
+          const moved = this.tabs.splice(this.dragIdx, 1)[0];
+          this.tabs.splice(this.dragSlot, 0, moved);
+          _saveTabs(this.tabs);
+          this.renderTabs();
         }
 
         this.dragEl = null;
         this.dragIdx = -1;
-        this.dragOverIdx = -1;
-        this.dragOverAfter = false;
+        this.dragSlot = -1;
+        this.dragBarEl = null;
       });
     }
   }
@@ -3605,9 +4689,20 @@ export class SessionInner {
       if (c && typeof (c as any)._officeCleanup === "function") (c as any)._officeCleanup();
       this.panelOfficeControllers.delete(id);
     }
+    const subapp = this.panelSubapps.get(id);
+    if (subapp) {
+      subapp();
+      this.panelSubapps.delete(id);
+    }
     this.tabs.splice(idx, 1);
     _saveTabs(this.tabs);
     if (this.tabs.length === 0) {
+      // The subwindow exists for its views; with the last one closed there is
+      // nothing left to keep it open.
+      if (inChildWindow()) {
+        void window.electronAPI?.windowClose?.();
+        return;
+      }
       this.tabs = [];
       this.activeTab = "";
     } else if (this.activeTab === id) {
@@ -3694,12 +4789,35 @@ export class SessionInner {
   }
 
   saveSidebarVisibility(): void {
+    // The subwindow's tab layer is always the whole window; its visibility is
+    // not the main window's sidebar state and must not be remembered as such.
+    if (inChildWindow()) return;
     const panel = document.getElementById("session-inner-sidebar");
     if (!panel) return;
     this._sessionSidebarVisible.set(this._tabKey, !panel.classList.contains("hidden"));
   }
 
+  /** Record whether the user manually collapsed the inner sidebar. Persisted
+   *  so a browser tool call never auto-reopens the panel against the user's
+   *  will — the flag survives restarts and is only cleared by a manual
+   *  restore through the session menu button. */
+  markUserSidebarCollapsed(collapsed: boolean): void {
+    try {
+      if (collapsed) localStorage.setItem("session-sidebar-user-collapsed", "1");
+      else localStorage.removeItem("session-sidebar-user-collapsed");
+    } catch {}
+  }
+
+  isUserSidebarCollapsed(): boolean {
+    try {
+      return localStorage.getItem("session-sidebar-user-collapsed") === "1";
+    } catch {
+      return false;
+    }
+  }
+
   restoreSidebarVisibility(): void {
+    if (inChildWindow()) return;
     const panel = document.getElementById("session-inner-sidebar");
     const mainBody = document.getElementById("main-body");
     const appEl = document.getElementById("app");
@@ -3739,13 +4857,16 @@ export class SessionInner {
     const st = getState();
 
     const panels: string[] = [];
-    panels.push(this.renderIndexPanel(st));
-    panels.push(this.renderProjectRulesPanel(st));
-    panels.push(this.renderHooksPanel(st));
-    panels.push(this.renderProgressPanel(st));
-    panels.push(this.renderArtifactsPanel(st));
-    panels.push(this.renderReferencesPanel(st));
-    panels.push(this.renderCanvasPanel(st));
+    // Each panel is its own boundary: one bad artifact/reference/count must
+    // not remove the other panels from the side area.
+    const addPanel = (id: string, render: () => string) =>
+      panels.push(guardHtml("session-panel", id, render, ""));
+    addPanel("rules", () => this.renderProjectRulesPanel(st));
+    addPanel("hooks", () => this.renderHooksPanel(st));
+    addPanel("progress", () => this.renderProgressPanel(st));
+    addPanel("artifacts", () => this.renderArtifactsPanel(st));
+    addPanel("references", () => this.renderReferencesPanel(st));
+    addPanel("canvas", () => this.renderCanvasPanel(st));
 
     const html = `<div class="si-panels">${panels.join("")}</div>`;
     // State mutated but the info panel content did not change (typical during
@@ -3754,13 +4875,15 @@ export class SessionInner {
     if (this._lastInfoHtml === html) return;
     this._lastInfoHtml = html;
 
+    // Keep the reader's position: a tool boundary swaps the panel markup
+    // several times per turn, and resetting to the top reads as the sidebar
+    // jumping on its own.
+    const prevScrollTop = this.infoBody.scrollTop;
     this.infoBody.innerHTML = html;
+    this.infoBody.scrollTop = prevScrollTop;
     this.bindPanelToggles();
     this.bindReviewLink();
-    this.bindIndexManagement();
-    if (typeof (window as any).lucide !== "undefined") {
-      (window as any).lucide.createIcons({ root: this.infoBody });
-    }
+    safeCreateIcons(this.infoBody);
   }
 
   private bindPanelToggles(): void {
@@ -3792,77 +4915,6 @@ export class SessionInner {
     });
   }
 
-  private bindIndexManagement(): void {
-    const btn = document.getElementById("index-mgmt-btn");
-    if (!btn) return;
-
-    // Use a single-shot click handler (remove on first call to avoid stack-up)
-    if ((btn as any)._bound) return;
-    (btn as any)._bound = true;
-
-    const st = getState();
-    const hasIndex = st.indexStatus !== "idle" && st.indexStatus !== "no_workspace"
-      && (st.indexStatus === "ready" || st.indexStatus === "error" || (st.indexProgress || 0) > 0);
-
-    if (hasIndex) {
-      // Show dropdown with reindex / delete-index
-      let menu = document.getElementById("index-mgmt-menu") as HTMLElement | null;
-      if (!menu) {
-        menu = document.createElement("div");
-        menu.id = "index-mgmt-menu";
-        menu.className = "context-menu";
-        menu.style.cssText = "display:none;position:fixed;z-index:10000";
-        document.body.appendChild(menu);
-      }
-      menu.innerHTML = `
-        <div class="context-menu-item" data-action="reindex"><i data-lucide="refresh-cw" class="lucide lucide-sm"></i>${t("settings.reindex")}</div>
-        <div class="context-menu-item" data-action="delete-index"><i data-lucide="trash-2" class="lucide lucide-sm"></i>${t("settings.deleteIndex")}</div>`;
-
-      btn.addEventListener("click", function _onSettingsClick(e: Event) {
-        e.stopPropagation();
-        document.querySelectorAll(".context-menu").forEach(m => (m as HTMLElement).style.display = "none");
-        const shown = menu!.style.display !== "none";
-        if (shown) {
-          menu!.style.display = "none";
-        } else {
-          // Show first: a display:none menu has no measurable width, so the
-          // clamp below would be a no-op.
-          menu!.style.display = "block";
-          const rect = btn.getBoundingClientRect();
-          menu!.style.left = clampElLeft(menu!, rect.right - 160) + "px";
-          menu!.style.top = (rect.bottom + 4) + "px";
-          requestAnimationFrame(() => (window as any).lucide.createIcons({ root: menu! }));
-          setTimeout(() => {
-            document.addEventListener("click", function _closeMenu() {
-              menu!.style.display = "none";
-              document.removeEventListener("click", _closeMenu);
-            });
-          }, 0);
-        }
-      });
-
-      menu.querySelectorAll(".context-menu-item").forEach((item) => {
-        (item as HTMLElement).onclick = (e) => {
-          e.stopPropagation();
-          menu!.style.display = "none";
-          const action = (item as HTMLElement).dataset.action!;
-          send({ type: action === "reindex" ? "reindex_workspace" : "delete_index" });
-        };
-      });
-    } else {
-      // No index: clicking button directly starts indexing
-      btn.innerHTML = `<i data-lucide="play" style="width:14px;height:14px;display:block;color:var(--text-secondary)"></i>`;
-      btn.addEventListener("click", function _onStartClick(e: Event) {
-        e.stopPropagation();
-        console.log("[index] starting index...");
-        send({ type: "reindex_workspace" });
-      });
-      if (typeof (window as any).lucide !== "undefined") {
-        requestAnimationFrame(() => (window as any).lucide.createIcons());
-      }
-    }
-  }
-
   private panelHeader(id: string, label: string, icon: string, badge?: string): string {
     const collapsed = this.collapsedPanels.has(id) ? " si-panel-collapsed" : "";
     const chevron = this.collapsedPanels.has(id) ? "chevron-right" : "chevron-down";
@@ -3882,7 +4934,7 @@ export class SessionInner {
     let bodyHTML = "";
 
     if (items.length === 0) {
-      bodyHTML = `<div class="si-panel-empty">${t("sessionInner.noProgress")}</div>`;
+      bodyHTML = `<div class="si-empty-center"><i data-lucide="list-checks" class="lucide"></i><span class="si-empty-title">${t("sessionInner.noProgress")}</span></div>`;
     } else {
       bodyHTML = items.map((item) => {
         let iconClass = "si-todo-pending";
@@ -3909,7 +4961,7 @@ export class SessionInner {
     let bodyHTML = "";
 
     if (!artifacts || artifacts.length === 0) {
-      bodyHTML = `<div class="si-panel-empty">${t("sessionInner.noArtifacts")}</div>`;
+      bodyHTML = `<div class="si-empty-center"><i data-lucide="file-code-2" class="lucide"></i><span class="si-empty-title">${t("sessionInner.noArtifacts")}</span></div>`;
     } else {
       const countBadge = `${t("sessionInner.changedFiles")} ${artifacts.length}`;
       bodyHTML = `<div class="si-artifacts-header">
@@ -3946,7 +4998,7 @@ export class SessionInner {
     });
 
     if (filteredRefs.length === 0) {
-      const bodyHTML = `<div class="si-panel-empty">${t("sessionInner.noRefs")}</div>`;
+      const bodyHTML = `<div class="si-empty-center"><i data-lucide="link-2" class="lucide"></i><span class="si-empty-title">${t("sessionInner.noRefs")}</span></div>`;
       return `<div class="si-panel">
         ${this.panelHeader("references", t("sessionInner.references"), "link-2")}
         <div class="si-panel-body${this.collapsedPanels.has("references") ? " hidden" : ""}"><div class="si-panel-inner">${bodyHTML}</div></div>
@@ -3977,10 +5029,10 @@ export class SessionInner {
       .filter((g) => g.refs.length > 0)
       .map((g) => {
         const listHTML = g.refs.map((r: ReferenceItem) => {
-          const icon = r.icon || "zap";
+          const icon = r.icon || "";
           const toolLabel = r.tool.startsWith("mcp__") ? r.tool.split("__").slice(0, 2).join(":") : r.tool;
           return `<div class="si-ref-item">
-            <i data-lucide="${icon}" class="lucide si-ref-icon"></i>
+            ${icon ? `<i data-lucide="${icon}" class="lucide si-ref-icon"></i>` : ""}
             <div class="si-ref-content">
               <span class="si-ref-tool">${this.esc(toolLabel)}</span>
               <span class="si-ref-summary">${this.esc(r.summary)}</span>
@@ -4004,7 +5056,11 @@ export class SessionInner {
   private renderCanvasPanel(st: ReturnType<typeof getState>): string {
     const models = st.modelConfigs;
     const active = models[st.activeModelIndex];
-    const contextLimit = active ? (active.context_window || active.max_tokens || 0) : 0;
+    // Prefer the server-reported window: it tracks the ACTIVE model and
+    // follows every switch (manual pick or pool fallback) in real time,
+    // while modelConfigs[i] is a static snapshot that goes stale the
+    // moment the active model changes (128K ↔ 1M bug).
+    const contextLimit = st.contextWindow || (active ? (active.context_window || active.max_tokens || 0) : 0);
     const telemetry = st.telemetry;
     const tu = st.tokenUsage;
 
@@ -4085,36 +5141,11 @@ export class SessionInner {
 
     const bodyHTML = rows.length > 0
       ? `<div class="si-canvas-grid">${rows.join("")}</div>`
-      : `<div class="si-panel-empty">${t("sessionInner.noData")}</div>`;
+      : `<div class="si-empty-center"><i data-lucide="sliders" class="lucide"></i><span class="si-empty-title">${t("sessionInner.noData")}</span></div>`;
 
     return `<div class="si-panel">
       ${this.panelHeader("canvas", t("sessionInner.canvas"), "sliders")}
       <div class="si-panel-body${this.collapsedPanels.has("canvas") ? " hidden" : ""}"><div class="si-panel-inner">${bodyHTML}</div></div>
-    </div>`;
-  }
-
-  private renderIndexPanel(st: ReturnType<typeof getState>): string {
-    if (st.workspaceMode !== "iwork") return "";
-    const status = st.indexStatus;
-    const btnId = "index-mgmt-btn";
-    const pct = status === "ready" ? 100 : Math.min(st.indexProgress || 0, 100);
-
-    const html = `
-      <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
-        <div class="si-canvas-progress-wrap" style="flex:1">
-          <div class="si-canvas-progress-track">
-            <div class="si-canvas-progress-fill" style="width:${pct}%"></div>
-          </div>
-        </div>
-        <span style="font-size:11px;white-space:nowrap;min-width:32px;text-align:right;color:var(--text-secondary)">${pct}%</span>
-        <button id="${btnId}" class="si-panel-action-btn" style="flex-shrink:0;background:none;border:none;cursor:pointer;padding:2px;color:var(--text-secondary)" data-tooltip="${t("settings.indexActions")}">
-          <i data-lucide="settings-2" style="width:14px;height:14px;display:block;color:var(--text-secondary)"></i>
-        </button>
-      </div>`;
-
-    return `<div class="si-panel">
-      ${this.panelHeader("index", t("sidebar.index"), "database")}
-      <div class="si-panel-body${this.collapsedPanels.has("index") ? " hidden" : ""}"><div class="si-panel-inner">${html}</div></div>
     </div>`;
   }
 
@@ -4123,12 +5154,12 @@ export class SessionInner {
     const rules = st.projectRules || [];
     let bodyHTML: string;
     if (rules.length === 0) {
-      bodyHTML = `<div class="si-panel-empty">${t("sessionInner.noProjectRules")}</div>`;
+      bodyHTML = `<div class="si-empty-center"><i data-lucide="book-open-check" class="lucide"></i><span class="si-empty-title">${t("sessionInner.noProjectRules")}</span></div>`;
     } else {
       const rows = rules.map((r) => {
         const mod = new Date(r.modified * 1000).toLocaleString();
         return `<div class="si-rule-row">
-          <i data-lucide="file-text" class="lucide lucide-sm si-rule-icon"></i>
+          <img src="${getFileIcon(r.name)}" class="icon si-rule-icon" style="width:14px;height:14px;flex-shrink:0">
           <div class="si-rule-body">
             <div class="si-rule-name">${this.esc(r.name)}</div>
             <div class="si-rule-path">${this.esc(r.path)}</div>
@@ -4150,7 +5181,7 @@ export class SessionInner {
     const hooks = st.projectHooks || [];
     let bodyHTML: string;
     if (hooks.length === 0) {
-      bodyHTML = `<div class="si-panel-empty">${t("sessionInner.noProjectHooks")}</div>`;
+      bodyHTML = `<div class="si-empty-center"><i data-lucide="webhook" class="lucide"></i><span class="si-empty-title">${t("sessionInner.noProjectHooks")}</span></div>`;
     } else {
       const rows = hooks.map((h) => {
         const evt = this.esc(h.event_type);

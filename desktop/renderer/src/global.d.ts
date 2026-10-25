@@ -59,7 +59,8 @@ interface ElectronAPI {
   createFolder(parentDir: string, name: string): Promise<{ success: boolean; error?: string; path?: string; name?: string }>;
   deletePath(targetPath: string): Promise<{ success: boolean; error?: string }>;
   readKeyfile(): Promise<ArrayBuffer>;
-  readMachineId(): Promise<string>;
+  readKeyWrapMaterial(): Promise<{ fingerprint: string; appSecret: string }>;
+  adminFetch(urlPath: string): Promise<{ ok: boolean; status: number; body?: string; error?: string }>;
   getAppPath(): Promise<string>;
   windowMinimize(): Promise<void>;
   windowMaximize(): Promise<void>;
@@ -67,7 +68,7 @@ interface ElectronAPI {
   windowIsMaximized(): Promise<boolean>;
   onWindowMaximizeChange(cb: (maximized: boolean) => void): void;
   toggleDevTools(): Promise<void>;
-  terminalSpawn(shell?: string, shellArgs?: string[]): Promise<{ id?: number; error?: string }>;
+  terminalSpawn(shell?: string, shellArgs?: string[], cwd?: string): Promise<{ id?: number; error?: string }>;
   terminalWrite(id: number, data: string): Promise<void>;
   terminalResize(id: number, cols: number, rows: number): Promise<void>;
   terminalKill(id: number): Promise<void>;
@@ -89,7 +90,12 @@ interface ElectronAPI {
   setAutoStart(enabled: boolean): Promise<{ success: boolean; error?: string }>;
   trayLocaleUpdate(locale: string): void;
   browserLanguageUpdate(locale: string): void;
+  browserAutosaveUpdate(enabled: boolean): void;
+  browserOptionsUpdate(opts: Record<string, unknown>): void;
+  browserClearSessionData(): Promise<{ success: boolean; error?: string }>;
+  browserSaveCredential(entry: { origin: string; username: string; password: string; kind: string; url?: string; created_at?: number }): Promise<{ success: boolean; error?: string }>;
   trayThemeUpdate(themePreference: string): void;
+  traySkinUpdate(skin: string): void;
   trayPopupAction(action: string | null, sessionId: string | null): void;
   traySessionsUpdate(sessions: any[]): void;
   traySessionsBothUpdate(payload: { normal: any[]; iwork: any[]; workspaces?: any[] }): void;
@@ -104,6 +110,8 @@ interface ElectronAPI {
   }) => void): () => void;
   onSwitchSession(callback: (sessionId: string) => void): () => void;
   onSwitchWorkspace(callback: (path: string) => void): () => void;
+  onQuitRequest(callback: () => void): () => void;
+  respondQuitConfirm(allowed: boolean): void;
   browserClearData(): Promise<{ success: boolean; error?: string }>;
   getBookmarks(): Promise<any>;
   setBookmarks(data: any): Promise<{ success: boolean }>;
@@ -134,6 +142,7 @@ interface ElectronAPI {
   onChildEvent(channel: string, callback: (data: any) => void): () => void;
   openSettings(panel: string): Promise<void>;
   onNewWindow(callback: (url: string, wcId: number) => void): () => void;
+  onOpenRoutedUrl(callback: (url: string) => void): () => void;
   openLogs(): Promise<void>;
   getDiagnostics(): Promise<{
     versions: { desktop: string; agent: string };
@@ -164,9 +173,17 @@ interface ElectronAPI {
   registerCdpWebview(webContentsId: number): Promise<number>;
   unregisterCdpWebview(webContentsId: number): Promise<void>;
 
+  // Agent control overlay broadcast (shared by browser / computer tools)
+  agentControlUpdate(active: boolean): void;
+  setAgentTakeover(taken: boolean): void;
+  respondAgentControlRequest(granted: boolean): void;
+  onAgentControl(callback: (state: { active: boolean; webContentsId: number | null; takenOver?: boolean; request?: string | null }) => void): () => void;
+
   // Site info & permissions
   getSiteInfo(url: string): Promise<{ origin: string; isSecure: boolean; cookieCount: number; permissions: Array<{ name: string; granted: boolean }> }>;
   setPermission(origin: string, permission: string, granted: boolean): Promise<{ success: boolean }>;
+  /** Every origin/permission decision held in the main process this session. */
+  listPermissionGrants(): Promise<Array<{ origin: string; permission: string; granted: boolean }>>;
   getCookiesForOrigin(url: string): Promise<{ cookies: Array<{ name: string; value: string; domain: string; path: string; secure: boolean; httpOnly: boolean; sameSite: string; expirationDate?: number }> }>;
 }
 

@@ -1,0 +1,60 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-tool-chart"
+version = "0.5.0"
+description = "EA (Encre Agent) — system-default chart tool(s)."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "tool",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.entry-points."ea.plugins"]
+chart = "ea_tool_chart.plugin:create_plugin"
+
+[project.optional-dependencies]
+all = [
+    "matplotlib>=3.7",
+    "numpy",
+]
+
+[tool.ea]
+icon = "bar-chart-3"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_tool_chart*",
+]
+
+[tool.setuptools.package-data]
+ea_tool_chart = [
+    "skills/**/*.md",
+]

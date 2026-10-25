@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "generated_at": "2026-10-25T15:10:06",
+  "tasks": {
+    "text-basic": {
+      "passed": true,
+      "backend_calls": 1,
+      "text_len": 17,
+      "elapsed_ms": 1779
+    },
+    "text-unicode": {
+      "passed": true,
+      "backend_calls": 1,
+      "text_len": 15,
+      "elapsed_ms": 201
+    },
+    "text-empty-recovery": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 9,
+      "elapsed_ms": 259
+    },
+    "text-long": {
+      "passed": true,
+      "backend_calls": 1,
+      "text_len": 55003,
+      "elapsed_ms": 242
+    },
+    "text-multiline": {
+      "passed": true,
+      "backend_calls": 1,
+      "text_len": 62,
+      "elapsed_ms": 243
+    },
+    "text-no-tools": {
+      "passed": true,
+      "backend_calls": 1,
+      "text_len": 26,
+      "elapsed_ms": 241
+    },
+    "tool-single": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 12,
+      "elapsed_ms": 451
+    },
+    "tool-two-turns": {
+      "passed": true,
+      "backend_calls": 3,
+      "text_len": 11,
+      "elapsed_ms": 667
+    },
+    "tool-parallel": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 13,
+      "elapsed_ms": 456
+    },
+    "tool-unknown": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 18,
+      "elapsed_ms": 424
+    },
+    "tool-raises": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 10,
+      "elapsed_ms": 1618
+    },
+    "tool-bad-args": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 18,
+      "elapsed_ms": 1313
+    },
+    "tool-big-output": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 19,
+      "elapsed_ms": 466
+    },
+    "recovery-retryable-error": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 11,
+      "elapsed_ms": 248
+    },
+    "recovery-nonretryable-error": {
+      "passed": true,
+      "backend_calls": 2,
+      "text_len": 8,
+      "elapsed_ms": 231
+    },
+    "recovery-tool-then-empty": {
+      "passed": true,
+      "backend_calls": 3,
+      "text_len": 11,
+      "elapsed_ms": 504
+    },
+    "recovery-tool-error-then-tool": {
+      "passed": true,
+      "backend_calls": 3,
+      "text_len": 9,
+      "elapsed_ms": 1862
+    },
+    "compaction-trigger": {
+      "passed": true,
+      "backend_calls": 10,
+      "text_len": 27,
+      "elapsed_ms": 732
+    },
+    "compaction-after-tool": {
+      "passed": true,
+      "backend_calls": 7,
+      "text_len": 19,
+      "elapsed_ms": 691
+    },
+    "compaction-multi-turn": {
+      "passed": true,
+      "backend_calls": 10,
+      "text_len": 15,
+      "elapsed_ms": 1153
+    }
+  }
+}

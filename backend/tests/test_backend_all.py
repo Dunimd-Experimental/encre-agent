@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for individual backend implementations (no API keys needed)."""
+"""Tests for individual backend implementations (no API keys needed).
+
+Each provider's backend is constructed through the create_backend factory with
+dummy credentials, and the tests assert its advertised capability flags, the
+expected context-window size, and correct propagation of model overrides. A
+final section covers the retry decorator and default retry budget.
+"""
 
 import asyncio
 
@@ -101,7 +107,7 @@ class TestAnthropicBackend:
 
         The test asserts four properties: BaseBackend conformance, tool-calling support,
         context window of 1,000,000 tokens, and explicit True flags for both extended thinking
-        and prompt caching — capabilities unique to the Anthropic provider route.
+        and prompt caching, capabilities unique to the Anthropic provider route.
         """
         be = create_backend("anthropic", api_key="sk-ant-fake")
         assert isinstance(be, BaseBackend), "Factory must return a BaseBackend subclass instance."
@@ -252,7 +258,7 @@ class TestOllamaBackend:
         """Validate that create_backend returns a functional Ollama backend with correct defaults.
 
         The test asserts BaseBackend conformance, the 8,192-token context window, and that
-        supports_tool_calling returns a bool — the exact truth value depends on the connected
+        supports_tool_calling returns a bool; the exact truth value depends on the connected
         Ollama server's model roster, so only the type is checked here.
         """
         be = create_backend("ollama", base_url="http://localhost:11434")
@@ -360,7 +366,7 @@ class TestOpenAICompatibleBackend:
         """Validate that create_backend returns a functional OpenAI-compatible backend.
 
         The test asserts BaseBackend conformance, the 1,048,576-token context window, and that
-        supports_tool_calling returns a bool — compatibility servers vary in their tool-calling
+        supports_tool_calling returns a bool; compatibility servers vary in their tool-calling
         support, so the predicate is type-checked rather than hard-asserted.
         """
         be = create_backend("openai_compatible", base_url="https://api.example.com/v1", api_key="sk-fake")
@@ -408,10 +414,20 @@ class TestRetryIntegration:
         from encre.backends.retry import RetryConfig, retry_with_backoff
 
         async def _test():
+            """Drive the retry decorator against a permanently failing request in an event loop.
+
+            Runs asynchronously so that the decorator's backoff sleeps execute inside a real
+            loop, then confirms the original exception escapes once retries are exhausted.
+            """
             config = RetryConfig(max_retries=2, base_delay=0.01)
 
             @retry_with_backoff(config)
             async def flaky_request():
+                """Simulate a transient timeout that never recovers across retries.
+
+                Always raises httpx.TimeoutException so the retry decorator has no success
+                path and must terminate by re-raising after the retry budget is spent.
+                """
                 raise httpx.TimeoutException("timeout")
 
             with pytest.raises(httpx.TimeoutException):

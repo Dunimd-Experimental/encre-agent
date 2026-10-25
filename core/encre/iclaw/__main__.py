@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -24,13 +24,31 @@
 from __future__ import annotations
 
 """
-Entry point for ``python -m encre.iclaw``.
+Command-line entry point for ``python -m encre.iclaw``.
 
-Spawned by the desktop application as a headless background daemon.
-Prints ``ICLAW_READY`` to stdout when the WS server is up so the desktop
-app can parse the URL and connect.
+This module is the shell around :func:`encre.iclaw.run_iclaw`. It exists
+because the Encre Agent Desktop does not embed the daemon in its own
+process; the Electron main process spawns it as a separate OS process and
+needs a well-defined handshake to know when to attach.
 
-Args:
+The handshake is textual rather than a socket probe: once the WebSocket
+listener is bound, :func:`encre.iclaw.run_iclaw` writes ``ICLAW_READY``
+followed by the bind address to stdout. The desktop parses that single line
+to discover the port -- which matters because the port can be overridden by
+an operator and, when ``--port`` is left at its default, the caller still
+wants one authoritative value rather than re-reading config.
+
+Everything here is argument parsing plus lifecycle plumbing. The daemon
+itself -- PID file, log file, scheduler, the self-improvement add-ons --
+lives in :mod:`encre.iclaw`. Keep the flag surface in this file and the
+behaviour there, otherwise the two drift and ``--help`` lies.
+
+Position in Encre: the gateway mode (:mod:`encre.gateway`) bridges third-party
+IM platforms, while the iClaw daemon runs the same Rust agent core as a
+long-lived local WebSocket service that the desktop UI and headless drivers
+attach to. This module is the only place that mode is started by hand.
+
+CLI:
     --host                     Bind address (default: 127.0.0.1)
     --port                     WebSocket port (default: 18791)
     --max-concurrent           Max concurrent sessions (default: 20)
@@ -66,7 +84,41 @@ from encre.iclaw import _data_dir, _log_path, is_running, run_iclaw, stop_daemon
 
 
 def main() -> None:
-    """Parse CLI arguments and run (or signal) the iClaw daemon."""
+    """Parse CLI arguments and run (or signal) the iClaw daemon.
+
+    Three mutually exclusive modes are handled in order:
+
+    - ``--stop``: terminate the daemon that owns the PID file. Runs before
+      logging is configured so a control-plane invocation leaves no log
+      noise behind.
+    - ``--status``: report ``running`` or ``stopped`` and exit. The desktop
+      polls this to decide whether to spawn a fresh daemon on startup.
+    - default: boot the daemon for good.
+
+    The paired ``--flag`` / ``--no-flag`` pairs are the reason every boolean
+    here is declared twice with a shared ``dest``: argparse sets the
+    default to the enabled state and lets the ``--no-*`` form override it,
+    so an operator can disable any single self-improvement subsystem without
+    disabling the whole group.
+
+    Note:
+        ``--compact`` and ``--hooks`` are parsed and forwarded to
+        :func:`encre.iclaw.run_iclaw` but that function does not currently
+        pass them on to the profile. They exist so the flag surface is stable
+        and an operator setting them sees no argparse error.
+
+    Args:
+        None. Arguments come from ``sys.argv`` via argparse.
+
+    Returns:
+        ``None``, always. Control-plane modes return early; the daemon path
+        blocks inside :func:`asyncio.run` for the lifetime of the process.
+
+    Raises:
+        SystemExit: From argparse on ``--help``, ``--stop`` on an invalid
+            host port, or an unknown flag. Callers (the desktop spawner)
+            treat a non-zero exit as a failed daemon start.
+    """
     # Configure the argument parser with all daemon tunables.
     parser = argparse.ArgumentParser(
         description="iClaw -- Encre background daemon",
@@ -116,7 +168,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # --stop / --status bypass normal startup and act on the running daemon.
+    # --stop / --status act on an already-running daemon via the PID file, so
+    # they must short-circuit before the data dir, logging, and agent
+    # construction below -- those belong to a fresh boot, not a control-plane
+    # call.
     if args.stop:
         if is_running():
             stop_daemon()
@@ -132,8 +187,14 @@ def main() -> None:
             print("stopped", flush=True)
         return
 
+    # The data directory is created before logging is configured because the
+    # log file itself lives inside it; basicConfig with a filename target
+    # fails silently if the directory does not exist yet.
     _data_dir().mkdir(parents=True, exist_ok=True)
 
+    # Log to a file rather than stdout. stdout is reserved for the
+    # ICLAW_READY handshake that the desktop process parses line by line, so
+    # any log record written there would corrupt that protocol.
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -141,9 +202,14 @@ def main() -> None:
     )
 
     config = EncreConfig()
-    # Build the agent and launch the daemon lifecycle under asyncio.
+    # The agent is built here, before asyncio.run, so a construction error
+    # fails synchronously with a normal traceback instead of surfacing inside
+    # the event loop after the ICLAW_READY line was already emitted.
     agent = EncreAgent(config=config)
 
+    # KeyboardInterrupt is swallowed so Ctrl-C tears the daemon down through
+    # the normal shutdown path (which clears the PID file) rather than
+    # leaving a stale PID behind.
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(run_iclaw(
             agent=agent,

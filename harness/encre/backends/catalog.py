@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,24 +23,18 @@
 
 from __future__ import annotations
 
-from __future__ import annotations
+"""Authoritative provider catalog.
 
-"""Authoritative model catalog.
-
-Every entry describes one provider:
+Every entry describes one service provider:
   - ``id``       : the backend_type string accepted by ``create_backend``
   - ``label``    : human-readable provider name
-  - ``base_url`` : official documented endpoint
+  - ``base_url`` : official documented endpoint (prefill for the provider form)
   - ``docs``     : provider documentation URL (so users can verify)
-  - ``models``   : list of {id, label, context} entries -- *context* is the
-                   model's documented max INPUT context window in tokens
-  - ``allow_custom``: whether arbitrary model IDs are accepted in addition
-                      to the curated list. True for nearly every provider --
-                      most expose models that change weekly.
+  - ``auth``     : credential style ("api_key", "none", "aws_iam", ...)
 
-Curated model lists are intentionally conservative: only models the provider
-actively documents on their own pricing or API reference page. Users who
-need a cutting-edge SKU can pick "Custom" and type the ID themselves.
+No preset model lists are shipped: every model is user-defined under its
+provider (all models are custom).  Users can discover available model IDs
+through the provider's documentation or the ``fetch_models`` API probe.
 
 To extend: add to ``PROVIDERS`` below and re-export through
 ``encre/backends/__init__.py`` and ``encre/__init__.py``.
@@ -80,691 +74,413 @@ DEFAULT_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "failover": 8192,
     "router": 8192,
     "local": 4096,
+    # OpenAI-compatible gateway providers (official docs verified).
+    "302ai": 8192,
+    "atomic-chat": 8192,
+    "azure-openai": 16384,
+    "azure-cognitive": 16384,
+    "baseten": 8192,
+    "cerebras": 8192,
+    "cortecs": 8192,
+    "deep-infra": 8192,
+    "fireworks": 8192,
+    "frogbot": 8192,
+    "helicone": 8192,
+    "ionet": 8192,
+    "llamacpp": 8192,
+    "nebius": 8192,
+    "ollama-cloud": 8192,
+    "ovhcloud": 8192,
+    "scaleway": 8192,
+    "stackit": 8192,
+    "together": 8192,
+    "venice": 8192,
+    "vercel": 8192,
+    "xai": 8192,
+    "zai": 65536,
+    "zenmux": 8192,
 }
 
 
 PROVIDERS: list[dict[str, Any]] = [
-    # 鈹€鈹€ Anthropic 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "anthropic",
         "label": "Anthropic",
         "base_url": "https://api.anthropic.com",
         "docs": "https://docs.anthropic.com/en/docs/about-claude/models",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "claude-opus-5", "label": "Claude Opus 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-fable-5", "label": "Claude Fable 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-opus-4-8", "label": "Claude Opus 4.8 (legacy)", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6 (legacy)", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5 (legacy)", "context": 200000, "modalities": ["text", "image"]},
-        ],
     },
-    # 鈹€鈹€ OpenAI 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "openai",
         "label": "OpenAI",
         "base_url": "https://api.openai.com/v1",
         "docs": "https://platform.openai.com/docs/models",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "gpt-5.6", "label": "GPT-5.6 Sol", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.5", "label": "GPT-5.5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.4", "label": "GPT-5.4", "context": 400000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini", "context": 400000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.2", "label": "GPT-5.2", "context": 128000, "modalities": ["text", "image"]},
-            {"id": "gpt-4.1", "label": "GPT-4.1", "context": 1048576, "modalities": ["text", "image"]},
-            {"id": "gpt-4.1-mini", "label": "GPT-4.1 mini", "context": 1048576, "modalities": ["text", "image"]},
-            {"id": "gpt-4.1-nano", "label": "GPT-4.1 nano", "context": 1048576, "modalities": ["text", "image"]},
-            {"id": "o5", "label": "o5", "context": 400000, "modalities": ["text"]},
-            {"id": "o3", "label": "o3", "context": 200000, "modalities": ["text"]},
-            {"id": "o3-mini", "label": "o3-mini", "context": 200000, "modalities": ["text"]},
-            {"id": "o4-mini", "label": "o4-mini", "context": 200000, "modalities": ["text"]},
-            {"id": "gpt-4o", "label": "GPT-4o (legacy)", "context": 128000, "modalities": ["text", "image", "audio"]},
-            {"id": "gpt-4o-mini", "label": "GPT-4o mini (legacy)", "context": 128000, "modalities": ["text", "image", "audio"]},
-        ],
     },
-    # 鈹€鈹€ DeepSeek 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "deepseek",
         "label": "DeepSeek",
         "base_url": "https://api.deepseek.com",
         "docs": "https://api-docs.deepseek.com/quick_start/pricing",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "deepseek-v4-flash", "label": "DeepSeek-V4-Flash", "context": 1000000, "modalities": ["text"]},
-            {"id": "deepseek-v4-pro", "label": "DeepSeek-V4-Pro", "context": 1000000, "modalities": ["text"]},
-            {
-                "id": "deepseek-v4-flash-vision-exp",
-                "label": "DeepSeek-V4-Flash-Vision (multimodal)",
-                "context": 1000000,
-                "modalities": ["text", "image"],
-            },
-        ],
     },
-    # 鈹€鈹€ Google Gemini 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "google",
         "label": "Google Gemini",
         "base_url": "https://generativelanguage.googleapis.com",
         "docs": "https://ai.google.dev/gemini-api/docs/models",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "gemini-3.7-flash", "label": "Gemini 3.7 Flash", "context": 1048576, "modalities": ["text", "image", "audio", "video"]},
-            {"id": "gemini-3.6-flash", "label": "Gemini 3.6 Flash", "context": 1048576, "modalities": ["text", "image", "audio", "video"]},
-            {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "context": 1048576, "modalities": ["text", "image", "audio", "video"]},
-            {
-                "id": "gemini-3.5-flash-lite",
-                "label": "Gemini 3.5 Flash-Lite",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-            {"id": "gemini-3.1-pro", "label": "Gemini 3.1 Pro", "context": 1048576, "modalities": ["text", "image", "audio", "video"]},
-            {
-                "id": "gemini-3.1-deep-think",
-                "label": "Gemini 3.1 Deep Think (reasoning)",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-            {
-                "id": "gemini-2.5-pro",
-                "label": "Gemini 2.5 Pro (legacy)",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-            {
-                "id": "gemini-2.5-flash",
-                "label": "Gemini 2.5 Flash (legacy)",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-        ],
     },
-    # 鈹€鈹€ Groq 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "groq",
         "label": "Groq",
         "base_url": "https://api.groq.com/openai/v1",
         "docs": "https://console.groq.com/docs/models",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "llama-3.3-70b-versatile", "label": "Llama 3.3 70B Versatile", "context": 131072, "modalities": ["text"]},
-            {"id": "llama-3.1-8b-instant", "label": "Llama 3.1 8B Instant", "context": 131072, "modalities": ["text"]},
-            {"id": "openai/gpt-oss-120b", "label": "GPT-OSS 120B", "context": 131072, "modalities": ["text"]},
-            {"id": "openai/gpt-oss-20b", "label": "GPT-OSS 20B", "context": 131072, "modalities": ["text"]},
-            {"id": "groq/compound", "label": "Groq Compound", "context": 131072, "modalities": ["text"]},
-            {"id": "groq/compound-mini", "label": "Groq Compound Mini", "context": 131072, "modalities": ["text"]},
-            {
-                "id": "meta-llama/llama-4-scout-17b-16e-instruct",
-                "label": "Llama 4 Scout 17B",
-                "context": 131072,
-                "modalities": ["text", "image"],
-            },
-            {"id": "qwen/qwen3-32b", "label": "Qwen3-32B", "context": 131072, "modalities": ["text"]},
-        ],
     },
-    # 鈹€鈹€ Ollama (local) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "ollama",
         "label": "Ollama (local)",
         "base_url": "http://localhost:11434",
         "docs": "https://ollama.com/library",
-        "allow_custom": True,
         "auth": "none",
-        "models": [
-            {"id": "llama4", "label": "Llama 4", "context": 131072, "modalities": ["text", "image"]},
-            {"id": "llama3.3", "label": "Llama 3.3 70B", "context": 131072, "modalities": ["text"]},
-            {"id": "qwen3.8", "label": "Qwen 3.8", "context": 131072, "modalities": ["text", "image"]},
-            {"id": "qwen3.6", "label": "Qwen 3.6", "context": 131072, "modalities": ["text", "image"]},
-            {"id": "qwen3.5", "label": "Qwen 3.5", "context": 131072, "modalities": ["text", "image"]},
-            {"id": "qwen3", "label": "Qwen 3", "context": 131072, "modalities": ["text"]},
-            {"id": "deepseek-v3", "label": "DeepSeek V3", "context": 131072, "modalities": ["text"]},
-            {"id": "deepseek-r1", "label": "DeepSeek R1 (reasoning)", "context": 131072, "modalities": ["text"]},
-            {"id": "gemma4", "label": "Gemma 4", "context": 131072, "modalities": ["text", "image", "audio"]},
-            {"id": "gemma3", "label": "Gemma 3", "context": 131072, "modalities": ["text", "image"]},
-            {"id": "gpt-oss", "label": "GPT-OSS", "context": 131072, "modalities": ["text"]},
-            {"id": "mistral-nemo", "label": "Mistral Nemo 12B", "context": 131072, "modalities": ["text"]},
-            {"id": "phi4", "label": "Phi-4 14B", "context": 16384, "modalities": ["text"]},
-            {"id": "mixtral", "label": "Mixtral 8x7B", "context": 32768, "modalities": ["text"]},
-        ],
     },
-    # 鈹€鈹€ LM Studio (local) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "lmstudio",
         "label": "LM Studio (local)",
         "base_url": "http://localhost:1234/v1",
         "docs": "https://lmstudio.ai/docs/api",
-        "allow_custom": True,
         "auth": "none",
-        "models": [],  # always user-supplied; LM Studio exposes whatever you've loaded
     },
-    # 鈹€鈹€ Local transformers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "local",
-        "label": "Local (transformers)",
+        "label": "Local (Transformers)",
         "base_url": "",
         "docs": "https://huggingface.co/docs/transformers",
-        "allow_custom": True,
         "auth": "none",
-        "models": [],
     },
-    # 鈹€鈹€ AWS Bedrock 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "bedrock",
-        "label": "AWS Bedrock",
+        "label": "Amazon Bedrock",
         "base_url": "",
         "docs": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-        "allow_custom": True,
         "auth": "aws_iam",
-        "models": [
-            {"id": "anthropic.claude-opus-5", "label": "Claude Opus 5 (Bedrock)", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "anthropic.claude-sonnet-5", "label": "Claude Sonnet 5 (Bedrock)", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "anthropic.claude-fable-5", "label": "Claude Fable 5 (Bedrock)", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "anthropic.claude-opus-4-8", "label": "Claude Opus 4.8 (Bedrock)", "context": 1000000, "modalities": ["text", "image"]},
-            {
-                "id": "anthropic.claude-sonnet-4-6",
-                "label": "Claude Sonnet 4.6 (Bedrock)",
-                "context": 1000000,
-                "modalities": ["text", "image"],
-            },
-            {
-                "id": "anthropic.claude-haiku-4-5-20251001-v1:0",
-                "label": "Claude Haiku 4.5 (Bedrock)",
-                "context": 200000,
-                "modalities": ["text", "image"],
-            },
-            {
-                "id": "us.meta.llama4-scout-17b-16e-instruct-v1:0",
-                "label": "Llama 4 Scout 17B Instruct",
-                "context": 1048576,
-                "modalities": ["text", "image"],
-            },
-            {"id": "us.meta.llama3-3-70b-instruct-v1:0", "label": "Llama 3.3 70B Instruct", "context": 128000, "modalities": ["text"]},
-            {"id": "amazon.nova-premier-v1:0", "label": "Amazon Nova Premier", "context": 300000, "modalities": ["text", "image"]},
-            {"id": "amazon.nova-pro-v1:0", "label": "Amazon Nova Pro", "context": 300000, "modalities": ["text", "image", "video"]},
-            {"id": "amazon.nova-lite-v1:0", "label": "Amazon Nova Lite", "context": 300000, "modalities": ["text", "image", "video"]},
-            {"id": "amazon.nova-micro-v1:0", "label": "Amazon Nova Micro", "context": 128000, "modalities": ["text"]},
-        ],
     },
-    # 鈹€鈹€ Generic OpenAI-compatible 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "openai_compatible",
         "label": "OpenAI-Compatible (custom)",
         "base_url": "",
         "docs": "",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [],
     },
-    # 鈹€鈹€ Aggregators 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "openrouter",
         "label": "OpenRouter",
         "base_url": "https://openrouter.ai/api/v1",
         "docs": "https://openrouter.ai/models",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "openrouter/auto", "label": "Auto (router)", "context": 2000000, "modalities": ["text", "image", "audio", "video"]},
-            {"id": "anthropic/claude-opus-5", "label": "Claude Opus 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "anthropic/claude-fable-5", "label": "Claude Fable 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "anthropic/claude-sonnet-5", "label": "Claude Sonnet 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.6-sol", "label": "GPT-5.6 Sol", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.6-luna", "label": "GPT-5.6 Luna", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.6-terra", "label": "GPT-5.6 Terra", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.5", "label": "GPT-5.5", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-4.1", "label": "GPT-4.1", "context": 1047576, "modalities": ["text", "image"]},
-            {
-                "id": "google/gemini-3.7-flash",
-                "label": "Gemini 3.7 Flash",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-            {
-                "id": "google/gemini-3.5-flash",
-                "label": "Gemini 3.5 Flash",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-            {
-                "id": "google/gemini-3.1-pro-preview",
-                "label": "Gemini 3.1 Pro Preview",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-            {"id": "deepseek/deepseek-v4-flash", "label": "DeepSeek V4 Flash", "context": 1048576, "modalities": ["text"]},
-            {"id": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro", "context": 1048576, "modalities": ["text"]},
-            {
-                "id": "deepseek/deepseek-v4-flash-vision-exp",
-                "label": "DeepSeek V4 Flash Vision",
-                "context": 1048576,
-                "modalities": ["text", "image"],
-            },
-            {"id": "meta-llama/llama-4-scout", "label": "Llama 4 Scout", "context": 1310720, "modalities": ["text", "image"]},
-            {"id": "x-ai/grok-4.6", "label": "Grok 4.6", "context": 500000, "modalities": ["text", "image"]},
-            {"id": "qwen/qwen3.8-max", "label": "Qwen3.8 Max", "context": 1000000, "modalities": ["text", "image"]},
-        ],
     },
     {
         "id": "novita",
         "label": "Novita AI",
-        "base_url": "https://api.novita.ai/v3/openai",
+        "base_url": "https://api.novita.ai/openai/v1",
         "docs": "https://novita.ai/docs/api-reference/llms-llm-api",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro", "context": 1000000, "modalities": ["text"]},
-            {"id": "moonshotai/kimi-k3", "label": "Kimi K3", "context": 1000000, "modalities": ["text"]},
-            {"id": "zai-org/glm-5.3-flash", "label": "GLM 5.3 Flash", "context": 1000000, "modalities": ["text"]},
-            {"id": "zai-org/glm-5.3", "label": "GLM 5.3", "context": 1000000, "modalities": ["text"]},
-            {"id": "minimax/minimax-m3", "label": "MiniMax M3", "context": 977000, "modalities": ["text"]},
-            {"id": "qwen/qwen3.8-max", "label": "Qwen3.8 Max", "context": 977000, "modalities": ["text"]},
-            {"id": "deepseek/deepseek-v4-flash", "label": "DeepSeek V4 Flash", "context": 1000000, "modalities": ["text"]},
-            {"id": "zai-org/glm-5.2", "label": "GLM 5.2", "context": 1000000, "modalities": ["text"]},
-            {"id": "moonshotai/kimi-k2.7-code", "label": "Kimi K2.7 Code", "context": 262000, "modalities": ["text"]},
-            {"id": "qwen/qwen3.5-397b-a17b", "label": "Qwen3.5 397B-A17B", "context": 262000, "modalities": ["text"]},
-            {"id": "XiaomiMiMo/MiMo-V2.5-Pro", "label": "MiMo V2.5 Pro", "context": 1000000, "modalities": ["text"]},
-            {"id": "deepseek/deepseek-v3.2", "label": "DeepSeek V3.2", "context": 160000, "modalities": ["text"]},
-        ],
     },
     {
         "id": "aigateway",
         "label": "Cloudflare AI Gateway",
         "base_url": "https://gateway.ai.cloudflare.com/v1",
         "docs": "https://developers.cloudflare.com/ai-gateway/",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [],
     },
     {
         "id": "huggingface",
-        "label": "Hugging Face Inference",
-        "base_url": "https://api-inference.huggingface.co/v1",
-        "docs": "https://huggingface.co/docs/api-inference",
-        "allow_custom": True,
+        "label": "Hugging Face Inference Providers",
+        "base_url": "https://router.huggingface.co/v1",
+        "docs": "https://huggingface.co/docs/inference-providers",
         "auth": "api_key",
-        "models": [
-            {
-                "id": "meta-llama/Llama-4-Maverick-17B-Instruct",
-                "label": "Llama 4 Maverick 17B Instruct",
-                "context": 1048576,
-                "modalities": ["text", "image"],
-            },
-            {
-                "id": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-                "label": "Llama 4 Scout 17B 16E Instruct",
-                "context": 1310720,
-                "modalities": ["text", "image"],
-            },
-            {"id": "Qwen/Qwen3.8-27B", "label": "Qwen3.8 27B", "context": 262144, "modalities": ["text"]},
-            {"id": "deepseek-ai/DeepSeek-V4-Flash", "label": "DeepSeek V4 Flash", "context": 1048576, "modalities": ["text"]},
-            {"id": "zai-org/GLM-5.3-Flash", "label": "GLM-5.3-Flash", "context": 1000000, "modalities": ["text"]},
-            {
-                "id": "meta-llama/Llama-3.3-70B-Instruct",
-                "label": "Llama 3.3 70B Instruct (legacy)",
-                "context": 131072,
-                "modalities": ["text"],
-            },
-        ],
     },
     {
         "id": "github-copilot",
         "label": "GitHub Copilot",
         "base_url": "https://api.githubcopilot.com",
         "docs": "https://docs.github.com/en/copilot",
-        "allow_custom": True,
         "auth": "github_oauth",
-        "models": [
-            {"id": "gpt-5.6", "label": "GPT-5.6 Sol", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-4o", "label": "GPT-4o (deprecated)", "context": 128000, "modalities": ["text", "image", "audio"]},
-            {"id": "gpt-4o-mini", "label": "GPT-4o mini (deprecated)", "context": 128000, "modalities": ["text", "image", "audio"]},
-            {"id": "o3-mini", "label": "o3-mini", "context": 200000, "modalities": ["text"]},
-            {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-3.5-sonnet", "label": "Claude 3.5 Sonnet", "context": 200000, "modalities": ["text", "image"]},
-            {
-                "id": "gemini-2.0-flash-001",
-                "label": "Gemini 2.0 Flash",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-        ],
     },
-    # 鈹€鈹€ Chinese Domestic Providers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "glm",
-        "label": "Zhipu GLM (BigModel)",
+        "label": "BigModel (GLM)",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "docs": "https://docs.bigmodel.cn/cn/guide/models/text",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "glm-5.3", "label": "GLM-5.3 (flagship)", "context": 1000000, "modalities": ["text"]},
-            {"id": "glm-5.3-flash", "label": "GLM-5.3-Flash (multimodal)", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "glm-5.2", "label": "GLM-5.2", "context": 1000000, "modalities": ["text"]},
-            {"id": "glm-5.1", "label": "GLM-5.1", "context": 200000, "modalities": ["text"]},
-            {"id": "glm-5", "label": "GLM-5", "context": 200000, "modalities": ["text"]},
-            {"id": "glm-5-turbo", "label": "GLM-5-Turbo", "context": 200000, "modalities": ["text"]},
-            {"id": "glm-4.7", "label": "GLM-4.7", "context": 200000, "modalities": ["text"]},
-            {"id": "glm-4.6", "label": "GLM-4.6", "context": 200000, "modalities": ["text"]},
-            {"id": "glm-4.7-flash", "label": "GLM-4.7-Flash (free)", "context": 200000, "modalities": ["text"]},
-            {"id": "glm-4-long", "label": "GLM-4-Long", "context": 1000000, "modalities": ["text"]},
-            {"id": "glm-5v-turbo", "label": "GLM-5V-Turbo (vision)", "context": 200000, "modalities": ["text", "image"]},
-        ],
     },
     {
         "id": "kimi",
-        "label": "Kimi (Moonshot)",
+        "label": "Moonshot AI (Kimi)",
         "base_url": "https://api.moonshot.cn/v1",
         "docs": "https://platform.moonshot.cn/docs/models",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "kimi-k3", "label": "Kimi K3", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "kimi-k2.7-code", "label": "Kimi K2.7 Code", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "kimi-k2.7-code-highspeed", "label": "Kimi K2.7 Code HighSpeed", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "kimi-k2.6", "label": "Kimi K2.6", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "kimi-k2.5", "label": "Kimi K2.5 (legacy)", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "moonshot-v1-128k", "label": "Moonshot v1-128k (legacy)", "context": 131072, "modalities": ["text"]},
-        ],
     },
     {
         "id": "minimax",
         "label": "MiniMax",
-        "base_url": "https://api.minimax.chat/v1",
+        "base_url": "https://api.minimax.io/v1",
         "docs": "https://platform.minimax.io/docs/llms.txt",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "MiniMax-M3", "label": "MiniMax-M3", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "MiniMax-M2.7", "label": "MiniMax-M2.7", "context": 204800, "modalities": ["text"]},
-            {"id": "MiniMax-M2.7-highspeed", "label": "MiniMax-M2.7-HighSpeed", "context": 204800, "modalities": ["text"]},
-            {"id": "MiniMax-M2.5", "label": "MiniMax-M2.5 (legacy)", "context": 204800, "modalities": ["text"]},
-            {"id": "MiniMax-M2.1", "label": "MiniMax-M2.1 (legacy)", "context": 204800, "modalities": ["text"]},
-        ],
     },
     {
         "id": "alibaba",
-        "label": "Tongyi Qianwen (Qwen)",
+        "label": "Alibaba Cloud Model Studio (Qwen)",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "docs": "https://help.aliyun.com/zh/model-studio/text-generation-model/",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "qwen3.8-max", "label": "Qwen3.8-Max", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.7-plus", "label": "Qwen3.7-Plus", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.7-flash", "label": "Qwen3.7-Flash", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.7-max", "label": "Qwen3.7-Max", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.6-max-preview", "label": "Qwen3.6-Max-Preview", "context": 256000, "modalities": ["text"]},
-            {"id": "qwen3.6-plus", "label": "Qwen3.6-Plus", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwen3.6-flash", "label": "Qwen3.6-Flash", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwen3.5-plus", "label": "Qwen3.5-Plus", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwen3.5-flash", "label": "Qwen3.5-Flash", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwen3-max", "label": "Qwen3-Max", "context": 256000, "modalities": ["text"]},
-            {"id": "qwen3-coder-plus", "label": "Qwen3-Coder-Plus", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwen3-coder-flash", "label": "Qwen3-Coder-Flash", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwq-plus", "label": "QwQ-Plus (reasoning)", "context": 128000, "modalities": ["text"]},
-            {"id": "qwen-long", "label": "Qwen-Long", "context": 10000000, "modalities": ["text"]},
-            {"id": "qwen-plus", "label": "Qwen-Plus (legacy)", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwen-turbo", "label": "Qwen-Turbo (legacy)", "context": 128000, "modalities": ["text"]},
-            {"id": "qwen-flash", "label": "Qwen-Flash (legacy)", "context": 1000000, "modalities": ["text"]},
-            {"id": "qwen-max", "label": "Qwen-Max (legacy)", "context": 32768, "modalities": ["text"]},
-        ],
     },
     {
         "id": "tencent",
         "label": "Tencent Hunyuan",
-        "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
-        "docs": "https://cloud.tencent.com/document/product/1729/104753",
-        "allow_custom": True,
+        "base_url": "https://tokenhub.tencentmaas.com/v1",
+        "docs": "https://cloud.tencent.com/document/product/1823/132252",
         "auth": "api_key",
-        "models": [
-            {"id": "hy4-preview", "label": "Hy4 (preview)", "context": 1024000, "modalities": ["text"]},
-            {"id": "hunyuan-a13b", "label": "Hunyuan-A13B (mixed-reasoning)", "context": 224000, "modalities": ["text"]},
-            {"id": "hy3", "label": "Hy3 (preview)", "context": 262144, "modalities": ["text"]},
-            {"id": "hunyuan-turbos-latest", "label": "Hunyuan-TurboS-Latest", "context": 28000, "modalities": ["text"]},
-            {
-                "id": "hunyuan-vision-1.5-instruct",
-                "label": "Hunyuan-Vision 1.5 Instruct",
-                "context": 24000,
-                "modalities": ["text", "image"],
-            },
-            {"id": "hunyuan-t1-vision-20250916", "label": "Hunyuan-T1-Vision", "context": 28000, "modalities": ["text", "image"]},
-            {
-                "id": "hunyuan-turbos-vision-video",
-                "label": "Hunyuan-TurboS-Vision-Video",
-                "context": 24000,
-                "modalities": ["text", "image"],
-            },
-            {"id": "hunyuan-role-latest", "label": "Hunyuan-Role (roleplay)", "context": 28000, "modalities": ["text"]},
-            {"id": "hunyuan-lite", "label": "Hunyuan-Lite (free, legacy)", "context": 262144, "modalities": ["text"]},
-        ],
     },
     {
         "id": "xiaomi",
         "label": "Xiaomi MiMo",
         "base_url": "https://api.xiaomimimo.com/v1",
         "docs": "https://huggingface.co/XiaomiMiMo",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "mimo-v2.5-pro", "label": "MiMo V2.5 Pro", "context": 1000000, "modalities": ["text"]},
-            {"id": "mimo-v2.5-0424", "label": "MiMo V2.5", "context": 1000000, "modalities": ["text"]},
-            {"id": "mimo-v2-omni", "label": "MiMo V2 Omni", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "mimo-v2-flash", "label": "MiMo V2 Flash", "context": 262144, "modalities": ["text"]},
-            {"id": "mimo-7b-rl", "label": "MiMo 7B RL (legacy)", "context": 32768, "modalities": ["text"]},
-            {"id": "mimo-7b-base", "label": "MiMo 7B Base (legacy)", "context": 32768, "modalities": ["text"]},
-        ],
     },
-    # 鈹€鈹€ Volcengine Ark 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    # Ark accepts BOTH universal model IDs (doubao-*) and account-specific
-    # deployed endpoint IDs (ep-xxxxxx) as the "model" field.  The universal
-    # Doubao / Seed model IDs below work directly via the OpenAI-compatible
-    # endpoint; allow_custom lets users type their own endpoint ID instead.
+    # Volcengine Ark accepts BOTH universal model IDs (doubao-*) and
+    # account-specific deployed endpoint IDs (ep-xxxxxx) as the model field.
     {
         "id": "volcengine-ark",
         "label": "Volcengine Ark",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
         "docs": "https://www.volcengine.com/docs/82379/1330310",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "doubao-seed-2.0", "label": "Doubao Seed 2.0 (thinking)", "context": 256000, "modalities": ["text"]},
-            {"id": "doubao-seed-1.6", "label": "Doubao Seed 1.6 (thinking)", "context": 256000, "modalities": ["text"]},
-            {"id": "doubao-1.6-pro", "label": "Doubao 1.6 Pro", "context": 256000, "modalities": ["text"]},
-            {"id": "doubao-1.6-lite", "label": "Doubao 1.6 Lite", "context": 32000, "modalities": ["text"]},
-            {"id": "doubao-1.5-pro", "label": "Doubao 1.5 Pro", "context": 256000, "modalities": ["text"]},
-            {"id": "doubao-1.5-vision-pro", "label": "Doubao 1.5 Vision Pro", "context": 32768, "modalities": ["text", "image"]},
-            {"id": "doubao-pro-128k", "label": "Doubao Pro 128K (legacy)", "context": 131072, "modalities": ["text"]},
-            {"id": "doubao-pro-32k", "label": "Doubao Pro 32K (legacy)", "context": 32768, "modalities": ["text"]},
-            {"id": "doubao-lite-128k", "label": "Doubao Lite 128K (legacy)", "context": 131072, "modalities": ["text"]},
-            {"id": "doubao-lite-32k", "label": "Doubao Lite 32K (legacy)", "context": 32768, "modalities": ["text"]},
-        ],
     },
-    # 鈹€鈹€ Coding / agent specialists 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "arcee",
         "label": "Arcee AI",
         "base_url": "https://api.arcee.ai/v2",
         "docs": "https://docs.arcee.ai/",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "trinity-large-thinking", "label": "Trinity Large Thinking (400B)", "context": 131072, "modalities": ["text"]},
-            {"id": "trinity-large-preview", "label": "Trinity Large Preview", "context": 131072, "modalities": ["text"]},
-            {"id": "trinity-mini", "label": "Trinity Mini (26B)", "context": 131072, "modalities": ["text"]},
-            {"id": "trinity-nano", "label": "Trinity Nano (6B)", "context": 131072, "modalities": ["text"]},
-        ],
     },
     {
         "id": "gmi",
         "label": "GMI Cloud",
         "base_url": "https://api.gmi-serving.com/v1",
         "docs": "https://docs.gmicloud.ai/model-quickstarts/text/overview.md",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "deepseek-ai/DeepSeek-V4-Pro", "label": "DeepSeek V4 Pro", "context": 1000000, "modalities": ["text"]},
-            {"id": "deepseek-ai/DeepSeek-V4-Flash", "label": "DeepSeek V4 Flash", "context": 1000000, "modalities": ["text"]},
-            {"id": "moonshotai/kimi-k2.6", "label": "Kimi K2.6", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "minimaxai/minimax-m2.7", "label": "MiniMax M2.7", "context": 204800, "modalities": ["text"]},
-            {"id": "zai-org/glm-5.1", "label": "GLM 5.1", "context": 200000, "modalities": ["text"]},
-            {"id": "qwen/qwen3.7-max", "label": "Qwen3.7 Max", "context": 1000000, "modalities": ["text", "image"]},
-            {
-                "id": "meta-llama/llama-4-maverick-17b-128e-instruct-fp8",
-                "label": "Llama 4 Maverick 17B",
-                "context": 1000000,
-                "modalities": ["text"],
-            },
-            {"id": "google/gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview", "context": 1000000, "modalities": ["text"]},
-        ],
     },
     {
         "id": "kilocode",
         "label": "Kilo Code",
         "base_url": "https://kilocode.ai/api/openrouter",
         "docs": "https://kilocode.ai/docs/",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "anthropic/claude-opus-5", "label": "Claude Opus 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "anthropic/claude-fable-5", "label": "Claude Fable 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "anthropic/claude-sonnet-5", "label": "Claude Sonnet 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.6-sol", "label": "GPT-5.6 Sol", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.6-terra", "label": "GPT-5.6 Terra", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.6-luna", "label": "GPT-5.6 Luna", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "openai/gpt-5.5", "label": "GPT-5.5", "context": 1050000, "modalities": ["text", "image"]},
-            {
-                "id": "google/gemini-3.7-flash",
-                "label": "Gemini 3.7 Flash",
-                "context": 1048576,
-                "modalities": ["text", "image", "audio", "video"],
-            },
-            {"id": "google/gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview", "context": 1048576, "modalities": ["text", "image"]},
-            {"id": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro", "context": 1048576, "modalities": ["text"]},
-            {"id": "qwen/qwen3.8-max", "label": "Qwen3.8 Max", "context": 1000000, "modalities": ["text", "image"]},
-        ],
     },
     {
         "id": "opencode-zen",
         "label": "OpenCode Zen",
         "base_url": "https://opencode.ai/zen/v1",
         "docs": "https://opencode.ai/docs/zen/",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.5", "label": "GPT-5.5", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "claude-fable-5", "label": "Claude Fable 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-opus-5", "label": "Claude Opus 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "gemini-3.7-flash", "label": "Gemini 3.7 Flash", "context": 1048576, "modalities": ["text", "image", "audio", "video"]},
-            {"id": "gemini-3.1-pro", "label": "Gemini 3.1 Pro", "context": 1048576, "modalities": ["text", "image"]},
-            {"id": "grok-4.6", "label": "Grok 4.6", "context": 500000, "modalities": ["text", "image"]},
-            {"id": "qwen3.7-max", "label": "Qwen3.7 Max", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "context": 1048576, "modalities": ["text"]},
-            {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash", "context": 1048576, "modalities": ["text"]},
-            {"id": "minimax-m3", "label": "MiniMax M3", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "glm-5.2", "label": "GLM 5.2", "context": 1000000, "modalities": ["text"]},
-            {"id": "kimi-k3", "label": "Kimi K3", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "kimi-k2.7-code", "label": "Kimi K2.7 Code", "context": 262144, "modalities": ["text", "image"]},
-        ],
     },
     {
         "id": "opencode-go",
         "label": "OpenCode Go",
         "base_url": "https://opencode.ai/zen/go/v1",
         "docs": "https://opencode.ai/docs/go/",
-        "allow_custom": True,
         "auth": "api_key",
-        "models": [
-            {"id": "grok-4.6", "label": "Grok 4.6", "context": 500000, "modalities": ["text", "image"]},
-            {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "context": 1050000, "modalities": ["text", "image"]},
-            {"id": "glm-5.3-flash", "label": "GLM-5.3-Flash", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "glm-5.3", "label": "GLM-5.3", "context": 1000000, "modalities": ["text"]},
-            {"id": "glm-5.2", "label": "GLM-5.2", "context": 1000000, "modalities": ["text"]},
-            {"id": "glm-5.1", "label": "GLM-5.1", "context": 200000, "modalities": ["text"]},
-            {"id": "kimi-k3", "label": "Kimi K3", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "kimi-k2.7-code", "label": "Kimi K2.7 Code", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "kimi-k2.6", "label": "Kimi K2.6", "context": 262144, "modalities": ["text", "image"]},
-            {"id": "longcat-2.0", "label": "LongCat 2.0", "context": 1000000, "modalities": ["text"]},
-            {"id": "mimo-v2.5-pro", "label": "MiMo-V2.5-Pro", "context": 1000000, "modalities": ["text"]},
-            {"id": "mimo-v2.5", "label": "MiMo-V2.5", "context": 1000000, "modalities": ["text"]},
-            {"id": "minimax-m3", "label": "MiniMax M3", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "minimax-m2.7", "label": "MiniMax M2.7", "context": 204800, "modalities": ["text"]},
-            {"id": "minimax-m2.5", "label": "MiniMax M2.5", "context": 204800, "modalities": ["text"]},
-            {"id": "muse-spark-1.2-contributor", "label": "Muse Spark 1.2 Contributor", "context": 200000, "modalities": ["text"]},
-            {"id": "qwen3.8-max", "label": "Qwen3.8 Max", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.8-flash", "label": "Qwen3.8 Flash", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.7-max", "label": "Qwen3.7 Max", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.7-plus", "label": "Qwen3.7 Plus", "context": 1000000, "modalities": ["text", "image"]},
-            {"id": "qwen3.6-plus", "label": "Qwen3.6 Plus", "context": 1000000, "modalities": ["text"]},
-            {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "context": 1048576, "modalities": ["text"]},
-            {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash", "context": 1048576, "modalities": ["text"]},
-            {
-                "id": "deepseek-v4-flash-vision-exp",
-                "label": "DeepSeek V4 Flash Vision Exp",
-                "context": 1048576,
-                "modalities": ["text", "image"],
-            },
-            {"id": "hy4-preview", "label": "Hy4 (preview)", "context": 1024000, "modalities": ["text"]},
-            {"id": "hy3", "label": "Hy3", "context": 262144, "modalities": ["text"]},
-        ],
     },
-    # 鈹€鈹€ Meta backends (failover / router) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     {
         "id": "failover",
         "label": "Failover (composite)",
         "base_url": "",
         "docs": "",
-        "allow_custom": True,
         "auth": "none",
-        "models": [],
     },
     {
         "id": "router",
         "label": "Router (composite)",
         "base_url": "",
         "docs": "",
-        "allow_custom": True,
         "auth": "none",
-        "models": [],
+    },
+    # OpenAI-compatible gateway providers -- every base URL below was
+    # verified against the provider's OWN documentation (never aggregator
+    # sites).  See gateway_providers.py for the source table.
+    {
+        "id": "302ai",
+        "label": "302.AI",
+        "base_url": "https://api.302.ai/v1",
+        "docs": "https://doc.302.ai/",
+        "auth": "api_key",
+    },
+    {
+        "id": "azure-openai",
+        "label": "Azure OpenAI",
+        "base_url": "",
+        "docs": "https://learn.microsoft.com/azure/foundry/openai/",
+        "auth": "api_key",
+    },
+    {
+        "id": "azure-cognitive",
+        "label": "Azure Cognitive Services",
+        "base_url": "",
+        "docs": "https://learn.microsoft.com/azure/ai-services/openai/",
+        "auth": "api_key",
+    },
+    {
+        "id": "baseten",
+        "label": "Baseten",
+        "base_url": "https://inference.baseten.co/v1",
+        "docs": "https://docs.baseten.co/quickstart",
+        "auth": "api_key",
+    },
+    {
+        "id": "cerebras",
+        "label": "Cerebras",
+        "base_url": "https://api.cerebras.ai/v1",
+        "docs": "https://inference-docs.cerebras.ai/",
+        "auth": "api_key",
+    },
+    {
+        "id": "cortecs",
+        "label": "Cortecs",
+        "base_url": "https://api.cortecs.ai/v1",
+        "docs": "https://docs.cortecs.ai/",
+        "auth": "api_key",
+    },
+    {
+        "id": "deep-infra",
+        "label": "Deep Infra",
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "docs": "https://docs.deepinfra.com/",
+        "auth": "api_key",
+    },
+    {
+        "id": "fireworks",
+        "label": "Fireworks AI",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "docs": "https://fireworks.ai/docs/tools-sdks/openai-compatibility",
+        "auth": "api_key",
+    },
+    {
+        "id": "helicone",
+        "label": "Helicone AI Gateway",
+        "base_url": "https://ai-gateway.helicone.ai",
+        "docs": "https://docs.helicone.ai/getting-started/quick-start",
+        "auth": "api_key",
+    },
+    {
+        "id": "ionet",
+        "label": "IO Intelligence (io.net)",
+        "base_url": "https://api.intelligence.io.solutions/api/v1",
+        "docs": "https://io.net/docs/reference/ai-models/get-started-with-io-intelligence-api",
+        "auth": "api_key",
+    },
+    {
+        "id": "nebius",
+        "label": "Nebius Token Factory",
+        "base_url": "https://api.tokenfactory.nebius.com/v1",
+        "docs": "https://docs.tokenfactory.nebius.com/quickstart",
+        "auth": "api_key",
+    },
+    {
+        "id": "ollama-cloud",
+        "label": "Ollama Cloud",
+        "base_url": "https://ollama.com/v1",
+        "docs": "https://docs.ollama.com/api/openai-compatibility",
+        "auth": "api_key",
+    },
+    {
+        "id": "ovhcloud",
+        "label": "OVHcloud AI Endpoints",
+        "base_url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        "docs": "https://docs.ovhcloud.com/",
+        "auth": "api_key",
+    },
+    {
+        "id": "scaleway",
+        "label": "Scaleway Generative APIs",
+        "base_url": "https://api.scaleway.ai/v1",
+        "docs": "https://www.scaleway.com/en/docs/generative-apis/reference-content/openai-compatibility/",
+        "auth": "api_key",
+    },
+    {
+        "id": "stackit",
+        "label": "STACKIT AI Model Serving",
+        "base_url": "https://api.openai-compat.model-serving.eu01.onstackit.cloud/v1",
+        "docs": "https://docs.stackit.cloud/",
+        "auth": "api_key",
+    },
+    {
+        "id": "together",
+        "label": "Together AI",
+        "base_url": "https://api.together.ai/v1",
+        "docs": "https://docs.together.ai/docs/inference/openai-compatibility",
+        "auth": "api_key",
+    },
+    {
+        "id": "venice",
+        "label": "Venice AI",
+        "base_url": "https://api.venice.ai/api/v1",
+        "docs": "https://docs.venice.ai/api-reference/endpoint/chat/completions",
+        "auth": "api_key",
+    },
+    {
+        "id": "vercel",
+        "label": "Vercel AI Gateway",
+        "base_url": "https://ai-gateway.vercel.sh/v1",
+        "docs": "https://vercel.com/docs/ai-gateway/openai-compat",
+        "auth": "api_key",
+    },
+    {
+        "id": "xai",
+        "label": "xAI (Grok)",
+        "base_url": "https://api.x.ai/v1",
+        "docs": "https://docs.x.ai/docs/api-reference",
+        "auth": "api_key",
+    },
+    {
+        "id": "zai",
+        "label": "Z.AI",
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "docs": "https://docs.z.ai/",
+        "auth": "api_key",
+    },
+    {
+        "id": "zenmux",
+        "label": "ZenMux",
+        "base_url": "https://zenmux.ai/api/v1",
+        "docs": "https://zenmux.ai/docs/zh/guide/quickstart.html",
+        "auth": "api_key",
+    },
+    # Local / self-hosted gateways (endpoint fixed by the tool itself).
+    {
+        "id": "atomic-chat",
+        "label": "Atomic Chat (local)",
+        "base_url": "http://127.0.0.1:1337/v1",
+        "docs": "",
+        "auth": "none",
+    },
+    {
+        "id": "llamacpp",
+        "label": "llama.cpp (local)",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "docs": "https://github.com/ggml-org/llama.cpp",
+        "auth": "none",
+    },
+    {
+        "id": "frogbot",
+        "label": "FrogBot Gateway (self-hosted)",
+        "base_url": "http://localhost:3939/v1",
+        "docs": "https://docs.frogbot.ai/",
+        "auth": "api_key",
     },
 ]
-
-
-# Helper: lookup by id 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-
-def get_provider(provider_id: str) -> dict[str, Any] | None:
-    """Return the catalog entry for ``provider_id`` or None if unknown."""
-    # Linear scan over the (small) provider list for a matching id.
-    for p in PROVIDERS:
-        if p["id"] == provider_id:
-            return p
-    return None
-
-
-def get_model(provider_id: str, model_id: str) -> dict[str, Any] | None:
-    """Return the model entry, or None if the model isn't in the catalog."""
-    # First resolve the provider, then search its curated model list.
-    provider = get_provider(provider_id)
-    if not provider:
-        return None
-    for m in provider.get("models", []):
-        if m["id"] == model_id:
-            return m
-    return None
 
 
 def default_output_tokens(provider_id: str) -> int:
@@ -773,8 +489,87 @@ def default_output_tokens(provider_id: str) -> int:
     return DEFAULT_MAX_OUTPUT_TOKENS.get(provider_id, 8192)
 
 
+# ---------------------------------------------------------------------------
+# Model context windows -- single source of truth
+# ---------------------------------------------------------------------------
+# One lookup path for per-model context windows.  ``registry.resolve_model_info``
+# consults :func:`get_context_window` before applying provider-level defaults,
+# and the OpenAI / Anthropic / Kimi backends consult it before their own
+# family heuristics.  Values mirror the documented 2026 limits that the
+# per-backend reference tables used to duplicate.
+
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    # OpenAI
+    "gpt-4.1": 1048576,
+    "gpt-4.1-mini": 1048576,
+    "gpt-4.1-nano": 1048576,
+    "gpt-4o": 128000,
+    "gpt-5.1": 128000,
+    "gpt-5.2": 128000,
+    "gpt-5.3": 128000,
+    "gpt-5.4": 400000,
+    "gpt-5.5": 1048576,
+    "gpt-5.6": 1050000,
+    "gpt-6": 1048576,
+    "o3": 200000,
+    "o4-mini": 200000,
+    "o5": 400000,
+    # Anthropic (API-style hyphenated model names)
+    "claude-opus-5": 1000000,
+    "claude-fable-5": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-opus-4-8": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    # Kimi / Moonshot
+    "kimi-k3": 1000000,
+    "moonshot-v1-128k": 131072,
+    "moonshot-v1-32k": 32768,
+    "moonshot-v1-8k": 8192,
+}
+
+
+def _is_version_suffix(suffix: str) -> bool:
+    """Return True when *suffix* looks like a version/date/build tag.
+
+    Used by :func:`get_context_window` so that e.g. ``gpt-4.1-2026-05``
+    fuzzy-matches the ``gpt-4.1`` entry while a fabricated name such as
+    ``claude-opus-5-imaginary`` does not.
+    """
+    if not suffix:
+        return True
+    parts = [p for p in suffix.replace("_", "-").replace(".", "-").split("-") if p]
+    if not parts:
+        return True
+    return all(part[0].isdigit() or part[0] in {"v", "V"} for part in parts)
+
+
+def get_context_window(model_name: str) -> int | None:
+    """Return the context window (tokens) for *model_name*, or ``None``.
+
+    Matching strategy:
+      1. Exact (case-insensitive) table hit.
+      2. Fuzzy: the name starts with a table entry and the remainder is a
+         version/date-like suffix (e.g. ``gpt-4.1-2026-05`` matches the
+         ``gpt-4.1`` entry).
+
+    ``None`` means "no catalog entry" -- callers fall back to their own
+    provider default or family heuristic.
+    """
+    name = (model_name or "").strip().lower()
+    if not name:
+        return None
+    window = MODEL_CONTEXT_WINDOWS.get(name)
+    if window is not None:
+        return window
+    for entry, entry_window in MODEL_CONTEXT_WINDOWS.items():
+        if name.startswith(entry) and _is_version_suffix(name[len(entry):]):
+            return entry_window
+    return None
+
+
 def catalog_payload() -> dict[str, Any]:
-    """Serializable snapshot used by the frontend model form."""
+    """Serializable snapshot used by the frontend provider form."""
     return {
         "providers": PROVIDERS,
         "default_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
@@ -783,9 +578,9 @@ def catalog_payload() -> dict[str, Any]:
 
 __all__ = [
     "DEFAULT_MAX_OUTPUT_TOKENS",
+    "MODEL_CONTEXT_WINDOWS",
     "PROVIDERS",
     "catalog_payload",
     "default_output_tokens",
-    "get_model",
-    "get_provider",
+    "get_context_window",
 ]

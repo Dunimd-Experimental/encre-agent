@@ -31,13 +31,26 @@
  * snapshots and notify listeners on a microtask.
  */
 
-import { AppState, createEmptyState, createEmptySessionSnapshot, Message, ToolCallState, TelemetryData, UsageStatsData, TokenUsage, PlanItem, PlanProposal, NotificationItem, AttachmentMeta, TimelineSegment, BranchMeta, SessionSnapshot, SearchFilter, defaultSearchFilter, SessionState } from "./types.js";
+import { AppState, createEmptyState, createEmptySessionSnapshot, Message, ToolCallState, TelemetryData, UsageStatsData, TokenUsage, PlanItem, PlanProposal, NotificationItem, AttachmentMeta, TimelineSegment, BranchMeta, SessionSnapshot, SearchFilter, defaultSearchFilter, SessionState, QueuedPrompt } from "./types.js";
 import { t } from "../features/i18n.js";
-import { findSlashCommand } from "../features/slash_commands.js";
+import { findSlashCommand } from "../ui/slash-commands.js";
+import { wireChipClose, removeChipWithSeparator } from "../ui/chip.js";
 import { buildTraySessionData, dedupeSessions } from "../chat/session-projection.js";
-import { Dialog } from "../ui/dialog.js";
+import { reportUiFault } from "./ui_boundary.js";
+import {
+  evictScope,
+  setSurfaceSession,
+  swapSession as swapSurfaceSession,
+} from "./scope.js";
 
-type Listener = () => void;
+type Key = keyof AppState;
+type Listener = (changed: ReadonlySet<Key>) => void;
+type KeyList = "*" | ReadonlyArray<Key>;
+
+interface Subscription {
+  fn: Listener;
+  keys: Set<Key> | null;
+}
 
 function loadSearchFilter(): SearchFilter {
   try {
@@ -54,8 +67,19 @@ function loadSearchFilter(): SearchFilter {
 
 let state = createEmptyState();
 state.searchFilter = loadSearchFilter();
-const listeners = new Set<Listener>();
-let pendingRollbackEdit: { serverId?: string; userIdx: number; content: string } | null = null;
+const listeners = new Set<Subscription>();
+let pendingRollbackEdit: { sid: string; serverId?: string; userIdx: number; content: string; at: number } | null = null;
+
+/** Pending rollback edits are only meaningful for the operation that started
+ *  them. Beyond this age the confirming event has not arrived, so applying
+ *  the marker would cut whichever user message merely happens to sit at the
+ *  remembered ordinal (typically the user's own re-sent message). */
+const ROLLBACK_EDIT_TTL_MS = 30_000;
+
+/** Sessions/turns already warned about for a collapsed duplicate user turn.
+ *  ``loadSessionMessages`` re-runs on every open/resume, so the warning must
+ *  be throttled per dropped turn instead of re-toasting each restore. */
+const _duplicateTurnWarned = new Set<string>();
 
 function getSessionKey(sessionId?: string): string {
   return sessionId ?? state.sessionId ?? "";
@@ -85,12 +109,16 @@ function syncActiveSessionState(): void {
   state.references = snapshot.references;
 state.compactEvents = snapshot.compactEvents;
   state.compactStartingEvents = snapshot.compactStartingEvents || [];
+  state.retryNotice = snapshot.retryNotice ?? null;
   state.systemMessages = snapshot.systemMessages || [];
   state.branches = snapshot.branches;
   state.activeBranchId = snapshot.activeBranchId;
   state.running = snapshot.running;
   state.agentState = snapshot.agentState ?? null;
   state.planReview = snapshot.planReview;
+  // The spec card reads `state.spec` from the timeline; mirroring only
+  // planReview left the previous conversation's spec floating over a new one.
+  state.spec = snapshot.spec;
 }
 
 function syncSessionState(sessionId?: string): void {
@@ -104,28 +132,95 @@ export function getState(): Readonly<AppState> {
   return state;
 }
 
-/** Subscribes a listener to state changes; returns an unsubscribe function. */
-export function subscribe(fn: Listener): () => void {
-  listeners.add(fn);
-  return () => listeners.delete(fn);
+/** Subscribes a listener to state changes; returns an unsubscribe function.
+ *  When `keys` is omitted or `"*"`, the listener fires on every change.
+ *  When `keys` is an array of top-level AppState fields, the listener fires
+ *  only when at least one of those fields was mutated. */
+export function subscribe(fn: Listener, keys?: KeyList): () => void {
+  const sub: Subscription = { fn, keys: !keys || keys === "*" ? null : new Set(keys) };
+  listeners.add(sub);
+  return () => listeners.delete(sub);
 }
 
 let _emitPending = false;
+const _pendingChanged: Set<Key> = new Set();
+let _allChanged = false;
 
-function emit(): void {
-  if (_emitPending) return;
+function _scheduleFlush(): void {
   _emitPending = true;
   queueMicrotask(() => {
     _emitPending = false;
-    for (const fn of listeners) {
-      fn();
+    const all = _allChanged;
+    _allChanged = false;
+    const snapshot = new Set(_pendingChanged);
+    _pendingChanged.clear();
+    if (!all && snapshot.size === 0) return;
+    const started = performance.now();
+    for (const sub of listeners) {
+      if (all || sub.keys === null) {
+        try { sub.fn(snapshot); } catch (e) { reportUiFault("subscriber", "state", e); }
+      } else {
+        let hit = false;
+        for (const k of sub.keys) {
+          if (snapshot.has(k)) { hit = true; break; }
+        }
+        if (hit) {
+          try { sub.fn(snapshot); } catch (e) { reportUiFault("subscriber", "state", e); }
+        }
+      }
+    }
+    // Attribution for boot/plane long tasks: which state keys woke which
+    // subscribers for how long. Synchronous subscriber work is the one part
+    // of the pipeline the render scheduler cannot split.
+    const elapsed = performance.now() - started;
+    if (elapsed >= 30) {
+      console.warn(
+        `[perf] state flush ${Math.round(elapsed)}ms keys=${all ? "*" : Array.from(snapshot).join(",")}`,
+      );
     }
   });
 }
 
+let _batchDepth = 0;
+let _batchChanged: Set<Key> | null = null;
+
+/** Batches multiple state mutations so subscribers fire exactly once at the
+ *  end instead of once per `update()` call. Must wrap synchronous mutation
+ *  sequences — any `await` inside defers the flush. */
+export function batch<T>(fn: () => T): T {
+  _batchDepth++;
+  try {
+    return fn();
+  } finally {
+    _batchDepth--;
+    if (_batchDepth === 0 && _batchChanged && _batchChanged.size > 0) {
+      const changed = _batchChanged;
+      _batchChanged = null;
+      for (const k of changed) _pendingChanged.add(k);
+      if (!_emitPending) _scheduleFlush();
+    }
+  }
+}
+
+function emit(...changedKeys: Key[]): void {
+  if (_batchDepth > 0) {
+    if (!_batchChanged) _batchChanged = new Set();
+    if (changedKeys.length === 0) _allChanged = true;
+    else for (const k of changedKeys) _batchChanged.add(k);
+    return;
+  }
+  if (changedKeys.length === 0) {
+    _allChanged = true;
+  } else {
+    for (const k of changedKeys) _pendingChanged.add(k);
+  }
+  if (!_emitPending) _scheduleFlush();
+}
+
 function update(partial: Partial<AppState>): void {
   state = { ...state, ...partial };
-  emit();
+  const keys = Object.keys(partial) as Key[];
+  emit(...keys);
 }
 
 /** Sets the WebSocket connected flag. */
@@ -133,21 +228,108 @@ export function setConnected(v: boolean): void {
   update({ connected: v });
 }
 
+/** True while the backend still owes session `sid` an answer — a floating
+ *  surface of that session may only be resurrected while it is live. */
+function isSessionLive(sid: string): boolean {
+  const snapshot = state.sessionStore[sid];
+  if (!snapshot) return false;
+  return snapshot.running || snapshot.sessionState === "awaiting_approval";
+}
+
 /** Switches the active session id, resetting scoped fields and syncing its snapshot. */
 export function setSessionId(id: string): void {
   if (id !== state.sessionId) {
-    Dialog.swapSession(state.sessionId, id);
+    const oldSid = state.sessionId;
+    setSurfaceSession(id);
+    // Hand the floating surfaces over: the outgoing conversation's own popups
+    // and confirmations close, and anything the backend is still waiting on is
+    // shelved — it returns only while that session is still live. Global
+    // surfaces are left exactly where they are.
+    swapSurfaceSession(oldSid, id, isSessionLive);
   }
   state.sessionId = id;
   getOrCreateSessionSnapshot(id);
+  setSurfaceSession(id);
   // Reset session-scoped global fields so the sidebar canvas does not
   // display stale data from a previously active session. The fields are
   // repopulated by the next context_usage events. Per-session fields
   // (telemetry, tokenUsage, ...) are restored by syncActiveSessionState().
   state.contextTokens = 0;
   state.contextWindow = 0;
+  state.contextUsageBreakdown = null;
+  // Show the model this conversation used last time while the resume reply
+  // is in flight. The backend remains authoritative — `session_ready` lands
+  // moments later and overwrites this — but without the local restore the
+  // picker briefly shows the PREVIOUS conversation's model.
+  const cachedModel = getSessionSnapshot(id).activeModelIndex;
+  if (typeof cachedModel === "number") state.activeModelIndex = cachedModel;
   syncActiveSessionState();
+  // Per-session model isolation is backend-driven: the `session_ready` reply
+  // carries the target session's own `active_model_index`, and stream.ts
+  // applies it via setActiveModelIndex(). `modelIndexSessionId` still points
+  // at the outgoing session until that reply lands, which keeps the
+  // selector's auto-fallback from pushing a guessed model into the session
+  // that is being opened.
   emit();
+}
+
+/** Applies the backend-authoritative active model for the CURRENT session and
+ *  pins it into that session's snapshot.  Called from stream.ts when a
+ *  `session_ready` frame arrives — the backend is the single source of truth
+ *  for which model a conversation runs on. */
+export function setActiveModelIndex(idx: number): void {
+  if (idx !== state.activeModelIndex || state.modelIndexSessionId !== state.sessionId) {
+    update({ activeModelIndex: idx, modelIndexSessionId: state.sessionId });
+  }
+  recordSessionModel(idx);
+}
+
+/** Marks the current model index as belonging to *sessionId*.
+ *
+ *  Called whenever a backend frame settles the active model (`session_ready`,
+ *  `models_updated`, a config snapshot).  A frame for another session is
+ *  ignored: only the conversation being viewed may unlock the picker's
+ *  auto-fallback. */
+export function markModelIndexSynced(sessionId?: string): void {
+  const sid = sessionId || state.sessionId;
+  if (!sid || sid !== state.sessionId) return;
+  if (state.modelIndexSessionId !== sid) {
+    update({ modelIndexSessionId: sid });
+  }
+}
+
+/** Records which model the CURRENT session uses.  Called wherever the global
+ *  active model settles (backend `models_updated` / `config_patch` apply), so
+ *  the snapshot always mirrors what this conversation actually ran on —
+ *  regardless of whether the change came from the picker, a settings edit or
+ *  an auto-fallback. */
+export function recordSessionModel(idx: number): void {
+  const snapshot = getOrCreateSessionSnapshot(state.sessionId);
+  snapshot.activeModelIndex = idx;
+}
+
+/**
+ * Notice modes ride along as user-role messages but are NOT real user
+ * turns: backend compaction boundaries (``compact_marker``) and the
+ * persisted UI notices (``compact_notice`` / ``model_switch``).  Every
+ * user-message count, duplicate guard and per-turn storage index must
+ * exclude them so numbering stays aligned with the backend's own
+ * user-message count.
+ */
+export function isNoticeMode(mode: string | undefined): boolean {
+  return mode === "compact_marker" || mode === "compact_notice" || mode === "model_switch";
+}
+
+/**
+ * Real user turns only. Mirrors exactly how ``chat/timeline.ts`` numbers the
+ * timeline: ``data-user-idx`` is assigned only to genuine user bubbles, after
+ * the three notice modes are skipped. Any consumer that resolves an ordinal
+ * (rollback, delete, retry, truncate) must therefore filter the same way — a
+ * bare ``role === "user"`` filter counts the notice records too and drifts by
+ * one per notice, which is what made rollback hit the wrong turn.
+ */
+export function realUserMessages(messages: readonly Message[]): Message[] {
+  return messages.filter(m => m.role === "user" && !isNoticeMode(m.mode));
 }
 
 /** Appends a message to the (active) session snapshot. */
@@ -156,6 +338,18 @@ export function addMessage(msg: Message, sessionId = state.sessionId): void {
   // than the one currently active.
   if (sessionId && state.sessionId && sessionId !== state.sessionId) return;
   const snapshot = getOrCreateSessionSnapshot(sessionId);
+  // Duplicate guard for optimistic user turns: rollback / delete
+  // reconciliation or double event delivery can append the same user
+  // message twice -- identical text, adjacent in the timeline, regardless
+  // of whether the previous copy already carries a server id. Legitimate
+  // repeated sends are separated by an assistant turn.
+  if (msg.role === "user" && !isNoticeMode(msg.mode) && !msg.serverId) {
+    const prev = snapshot.messages[snapshot.messages.length - 1];
+    if (prev && prev.role === "user" && !isNoticeMode(prev.mode)
+      && prev.content === msg.content) {
+      return;
+    }
+  }
   snapshot.messages.push(msg);
   syncSessionState(sessionId);
   emit();
@@ -270,12 +464,31 @@ function restoreToolCalls(rawToolCalls: any[] | undefined): ToolCallState[] {
   return restoredToolCalls;
 }
 
+/**
+ * Whether a restored tool result is a failure.
+ *
+ * The backend persists the authoritative flag (`is_error`), so it wins; the
+ * text heuristics only cover sessions written before that flag existed.  The
+ * prefix list must also cover the recovery engine's terminal markers
+ * (`[Exhausted]`, `[Aborted]`, ...), otherwise a plugin fault silently loses
+ * its card the moment the session is reloaded.
+ */
+function restoredToolError(raw: { is_error?: unknown }, text: string): boolean {
+  if (typeof raw.is_error === "boolean") return raw.is_error;
+  return /^\s*(error|blocked|permission denied|tool execution|\[exhausted\]|\[aborted\]|\[error)/i.test(text || "");
+}
+
 function indexToolCalls(toolCallsById: Map<string, ToolCallState>, toolCalls: ToolCallState[]): void {
   for (const toolCall of toolCalls) {
     toolCallsById.set(toolCall.id, toolCall);
     if (toolCall.backendId) toolCallsById.set(toolCall.backendId, toolCall);
   }
 }
+
+/** Warn once per unique orphaned tool result id -- a list reload re-runs
+ *  restore for every message, so a damaged (historically truncated) session
+ *  would otherwise spam the console with the same warning dozens of times. */
+const orphanedToolResultWarned = new Set<string>();
 
 function findRestoredToolCall(
   raw: { tool_call_id?: string; _client_id?: string },
@@ -288,17 +501,22 @@ function findRestoredToolCall(
     || (toolCallId ? toolCallsById.get(toolCallId) : undefined);
 
   if (target) return target;
-  if (clientId || toolCallId) {
-    console.warn("[state] Unable to restore tool result", {
+
+  // Fall back to position-based pairing when IDs don't match
+  // (e.g. stale or mismatched backend ids after compaction).
+  const fallback = fallbackAssistant?.toolCalls[fallbackAssistant.toolCalls.length - 1];
+  if (fallback) return fallback;
+
+  const warnKey = clientId || toolCallId || "";
+  if (warnKey && !orphanedToolResultWarned.has(warnKey)) {
+    orphanedToolResultWarned.add(warnKey);
+    console.warn("[state] Unable to restore tool result (orphaned -- its assistant tool_call is not in this list)", {
       clientId,
       toolCallId,
-      knownToolCallIds: [...toolCallsById.keys()],
     });
-    return undefined;
   }
 
-  // Legacy history without a tool-call id can only be paired by position.
-  return fallbackAssistant?.toolCalls[fallbackAssistant.toolCalls.length - 1];
+  return undefined;
 }
 
 /** Reconciles a raw message list into `Message` objects (used on resume). */
@@ -308,6 +526,11 @@ export function restoreMessages(rawMessages: Array<{ role: string; content: stri
   let latestAssistantWithToolCalls: Message | undefined;
   for (const raw of rawMessages || []) {
     if (raw.role === "system") continue;
+    // Backend-injected retry nudges (empty response, anti-stub,
+    // anti-deliberation, grace, ...) arrive as role "user" with
+    // is_synthetic=true.  They are loop plumbing, not user input --
+    // never render them as chat bubbles.
+    if (raw.role === "user" && (raw as any).is_synthetic) continue;
     if (raw.role === "compact_marker") {
       // Backend compaction boundary: renders as an inline "history
       // compacted" divider, never as a user bubble.
@@ -323,12 +546,46 @@ export function restoreMessages(rawMessages: Array<{ role: string; content: stri
       });
       continue;
     }
+    if (raw.role === "compact_notice" || raw.role === "model_switch") {
+      // Persisted UI notice spliced into the renderer stream by the
+      // backend (recorded like a tool call; survives reload).
+      messages.push({
+        id: (raw as any).id ? `m:${(raw as any).id}` : crypto.randomUUID(),
+        role: "user",
+        content: "",
+        isStreaming: false,
+        toolCalls: [],
+        segments: [],
+        timestamp: (raw as any).created_at || Date.now(),
+        mode: raw.role,
+        serverId: (raw as any).id,
+        ...(raw.role === "compact_notice"
+          ? {
+              compactStats: {
+                oldTokens: Number((raw as any).old_tokens) || 0,
+                newTokens: Number((raw as any).new_tokens) || 0,
+                oldCount: Number((raw as any).old_count) || 0,
+                newCount: Number((raw as any).new_count) || 0,
+              },
+            }
+          : {
+              switchInfo: {
+                fromModel: String((raw as any).from_model || ""),
+                toModel: String((raw as any).to_model || ""),
+                reason: String((raw as any).reason || ""),
+                source: String((raw as any).source || "manual"),
+              },
+            }),
+      });
+      continue;
+    }
     if (raw.role === "tool") {
       const target = findRestoredToolCall(raw as any, toolCallsById, latestAssistantWithToolCalls);
       if (target) {
         const toolText = extractMessageText(raw.content);
         target.result = toolText;
-        target.isError = /^error:/i.test(toolText) || /^permission denied/i.test(toolText);
+        target.isError = restoredToolError(raw as any, toolText);
+        if (target.isError && !target.errorAt) target.errorAt = (raw as any).created_at || Date.now();
         target.status = "done";
         const subAgentMessages = (raw as any).sub_agent_messages;
         if (Array.isArray(subAgentMessages)) {
@@ -365,7 +622,12 @@ export function restoreMessages(rawMessages: Array<{ role: string; content: stri
           ...toolCalls.map((tc) => ({ kind: "tool" as const, toolId: tc.id })),
         ];
     const message: Message = {
-      id: crypto.randomUUID(),
+      // Deterministic id from the server message id (same rule as
+      // loadSessionMessages): sub-agent transcripts are re-restored on every
+      // progress tick, and a churning random id would change every timeline
+      // key -- forcing a full innerHTML rebuild of the WHOLE transcript
+      // ~12x/second and resetting expand/collapse state each time.
+      id: (raw as any).id ? `m:${(raw as any).id}` : crypto.randomUUID(),
       role: raw.role === "assistant" ? "assistant" : "user",
       content: extractMessageText(raw.content),
       isStreaming: false,
@@ -397,15 +659,29 @@ export function restoreMessages(rawMessages: Array<{ role: string; content: stri
 }
 
 /** Loads a session's raw messages into the active session snapshot. */
-export function loadSessionMessages(rawMessages: Array<{ role: string; content: string | Array<{ type: string; text: string }>; tool_calls?: any[]; reasoning_content?: string }>, sessionId = state.sessionId): void {
+export function loadSessionMessages(
+  rawMessages: Array<{ role: string; content: string | Array<{ type: string; text: string }>; tool_calls?: any[]; reasoning_content?: string }>,
+  sessionId = state.sessionId,
+  opts?: { userIndexOffset?: number },
+): void {
+  // Tail-first open: the tail chunk resumes the absolute user-message
+  // ordinal where the (incoming) pre-tail backfill chunk will leave off, so
+  // per-user-message storage keys (fr:<sid>:<idx>) keep full-list numbering.
+  const userIndexOffset = opts?.userIndexOffset ?? 0;
   const messages: Message[] = [];
   const toolCallsById = new Map<string, ToolCallState>();
+  const seenUserServerIds = new Set<string>();
   let latestAssistantWithToolCalls: Message | undefined;
   let totalInput = 0;
   let totalOutput = 0;
 
   for (const raw of rawMessages) {
     if (raw.role === "system") continue;
+
+    // Backend-injected loop plumbing (context updates, retry nudges,
+    // grace prompts) arrives as role "user" with is_synthetic=true --
+    // never render it as a chat bubble.  Mirrors restoreMessages().
+    if (raw.role === "user" && (raw as any).is_synthetic) continue;
 
     if (raw.role === "compact_marker") {
       // Backend compaction boundary: renders as an inline "history
@@ -422,13 +698,47 @@ export function loadSessionMessages(rawMessages: Array<{ role: string; content: 
       });
       continue;
     }
+    if (raw.role === "compact_notice" || raw.role === "model_switch") {
+      // Persisted UI notice spliced into the renderer stream by the
+      // backend (recorded like a tool call; survives reload).
+      messages.push({
+        id: (raw as any).id ? `m:${(raw as any).id}` : crypto.randomUUID(),
+        role: "user",
+        content: "",
+        isStreaming: false,
+        toolCalls: [],
+        segments: [],
+        timestamp: (raw as any).created_at || Date.now(),
+        mode: raw.role,
+        serverId: (raw as any).id,
+        ...(raw.role === "compact_notice"
+          ? {
+              compactStats: {
+                oldTokens: Number((raw as any).old_tokens) || 0,
+                newTokens: Number((raw as any).new_tokens) || 0,
+                oldCount: Number((raw as any).old_count) || 0,
+                newCount: Number((raw as any).new_count) || 0,
+              },
+            }
+          : {
+              switchInfo: {
+                fromModel: String((raw as any).from_model || ""),
+                toModel: String((raw as any).to_model || ""),
+                reason: String((raw as any).reason || ""),
+                source: String((raw as any).source || "manual"),
+              },
+            }),
+      });
+      continue;
+    }
 
     if (raw.role === "tool") {
       const target = findRestoredToolCall(raw as any, toolCallsById, latestAssistantWithToolCalls);
       if (target) {
         const toolText = extractMessageText(raw.content);
         target.result = toolText;
-        target.isError = /^error:/i.test(toolText) || /^permission denied/i.test(toolText);
+        target.isError = restoredToolError(raw as any, toolText);
+        if (target.isError && !target.errorAt) target.errorAt = (raw as any).created_at || Date.now();
         target.status = "done";
         const subAgentMessages = (raw as any).sub_agent_messages;
         if (Array.isArray(subAgentMessages)) {
@@ -482,15 +792,16 @@ export function loadSessionMessages(rawMessages: Array<{ role: string; content: 
     if (!rawFileRefs) {
       const atts = (raw as any).attachments as any[] | undefined;
       if (atts) {
-        rawFileRefs = atts.map(a => ({ name: a.name, size: a.size, icon: a.mime_type === "text/x-terminal" ? "terminal" : a.mime_type === "text/x-directory" ? "folder" : "paperclip", path: a.path, mime_type: a.mime_type }));
+        rawFileRefs = atts.map(a => ({ name: a.name, size: a.size, icon: "paperclip", path: a.path, mime_type: a.mime_type }));
       }
     }
     if (!rawFileRefs) {
       const sid = sessionId;
-      // Compact markers ride along as user-role messages but are not real
+      // Notice entries ride along as user-role messages but are not real
       // user turns -- exclude them so the per-user-message storage index
       // stays aligned with the backend's own user-message count.
-      const idx = messages.filter(m => m.role === "user" && m.mode !== "compact_marker").length;
+      const idx = userIndexOffset
+        + messages.filter(m => m.role === "user" && !isNoticeMode(m.mode)).length;
       try {
         const stored = localStorage.getItem(`fr:${sid}:${idx}`);
         if (stored) rawFileRefs = JSON.parse(stored);
@@ -527,6 +838,38 @@ export function loadSessionMessages(rawMessages: Array<{ role: string; content: 
       hasError: !!(raw as any).hasError,
       errorCategory: (raw as any).errorCategory,
     };
+    // Duplicate guard: reconciliation after rollback / delete can deliver
+    // the same user turn twice -- with an identical server id, as adjacent
+    // uncommitted copies, or as the resurrected pre-rollback message next
+    // to its re-sent replacement (adjacent, identical text, different ids).
+    // Collapse ALL adjacent identical user turns to the last one. Legitimate
+    // repeated sends are separated by an assistant turn and are unaffected.
+    if (message.role === "user" && !isNoticeMode(message.mode)) {
+      const dupById = !!message.serverId && seenUserServerIds.has(message.serverId);
+      const prev = messages[messages.length - 1];
+      const dupAdjacent = !!prev && prev.role === "user" && !isNoticeMode(prev.mode)
+        && prev.content === message.content;
+      if (dupById || dupAdjacent) {
+        console.warn("[loadSessionMessages] collapsed duplicate user turn", {
+          droppedId: message.serverId || message.id,
+          keptId: prev?.serverId || prev?.id,
+          content: message.content.slice(0, 60),
+        });
+        // A dropped duplicate normally means the backend never actually
+        // removed the rolled-back turn -- the pre-rollback message came back
+        // next to its replacement. Silent de-duplication would make a failed
+        // rollback look like a success, so surface it. Throttled per dropped
+        // turn: this path also runs on plain reloads.
+        const dupKey = `${getSessionKey(sessionId)}|${message.serverId || message.id}`;
+        if (!_duplicateTurnWarned.has(dupKey)) {
+          _duplicateTurnWarned.add(dupKey);
+          if (_duplicateTurnWarned.size > 256) _duplicateTurnWarned.clear();
+          showToast(t("chat.duplicateTurnCollapsed"), message.content.slice(0, 60), "warning", "Chat");
+        }
+        continue;
+      }
+      if (message.serverId) seenUserServerIds.add(message.serverId);
+    }
     messages.push(message);
     if (message.role === "assistant" && toolCalls.length > 0) {
       indexToolCalls(toolCallsById, toolCalls);
@@ -680,6 +1023,7 @@ export function loadSessionMessages(rawMessages: Array<{ role: string; content: 
   snapshot.artifacts = [];
   snapshot.compactEvents = [];
   snapshot.compactStartingEvents = [];
+  snapshot.retryNotice = null;
   if (totalInput > 0 || totalOutput > 0) {
     snapshot.tokenUsage = { input_tokens: totalInput, output_tokens: totalOutput, total_tokens: totalInput + totalOutput };
     state.contextTokens = totalInput + totalOutput;
@@ -698,31 +1042,149 @@ export function loadSessionMessages(rawMessages: Array<{ role: string; content: 
   emit();
 }
 
+/**
+ * Prepends the pre-tail history chunk onto an already-opened session.
+ *
+ * Tail-first opens render the most recent turns immediately; this lands the
+ * older range in front of them moments later. The chunk is transformed by the
+ * same loader (its tool calls/results are self-contained — the backend never
+ * cuts between a call and its result) and spliced in front of the live tail,
+ * keeping every streaming/sub-agent state the tail already restored.
+ */
+export function prependSessionMessages(
+  rawMessages: Array<{ role: string; content: string | Array<{ type: string; text: string }>; tool_calls?: any[]; reasoning_content?: string }>,
+  sessionId = state.sessionId,
+): void {
+  const snapshot = getOrCreateSessionSnapshot(sessionId);
+  // Belt & braces: drop anything the tail already delivered so a duplicated
+  // backfill can never render twice.
+  const existingIds = new Set<string>();
+  for (const m of snapshot.messages) if (m.serverId) existingIds.add(m.serverId);
+  const fresh = rawMessages.filter(r => {
+    const id = (r as any).id;
+    return !id || !existingIds.has(String(id));
+  });
+  if (fresh.length === 0) return;
+
+  // Transform the chunk in isolation. Stashing the live state keeps the
+  // loader's running-session merge paths (sub-agent restore, streaming
+  // re-attach, token usage overwrite) away from the live tail — the chunk is
+  // pure history. The chunk's own user-message ordinal starts at 0, which is
+  // exactly right: these are the FIRST user messages of the conversation.
+  const savedMessages = snapshot.messages;
+  const savedRunning = snapshot.running;
+  const savedUsage = snapshot.tokenUsage;
+  snapshot.messages = [];
+  snapshot.running = false;
+  try {
+    loadSessionMessages(fresh, sessionId);
+  } finally {
+    const backfill = snapshot.messages;
+    const backfillUsage = snapshot.tokenUsage;
+    snapshot.messages = [...backfill, ...savedMessages];
+    snapshot.running = savedRunning;
+    // Combine token totals: the loader reported the chunk alone.
+    if (savedUsage && backfillUsage) {
+      const input = savedUsage.input_tokens + backfillUsage.input_tokens;
+      const output = savedUsage.output_tokens + backfillUsage.output_tokens;
+      snapshot.tokenUsage = { input_tokens: input, output_tokens: output, total_tokens: input + output };
+      state.contextTokens = input + output;
+    } else if (savedUsage) {
+      snapshot.tokenUsage = savedUsage;
+      state.contextTokens = savedUsage.total_tokens;
+    }
+  }
+
+  // Viewport anchor: prepending grows the list ABOVE the visible range, and
+  // a naive re-render would jump the user's view. Compensate the scrollTop
+  // by the height delta after the flush has re-rendered (the flush itself is
+  // a queueMicrotask, so one more microtask runs after it).
+  const el = document.getElementById("chat-container");
+  const prevHeight = el?.scrollHeight ?? 0;
+  const prevTop = el?.scrollTop ?? 0;
+  syncSessionState(sessionId);
+  emit();
+  queueMicrotask(() => {
+    const el2 = document.getElementById("chat-container");
+    if (el2 && prevHeight > 0) el2.scrollTop = prevTop + (el2.scrollHeight - prevHeight);
+  });
+}
+
 /** Remembers which user message should receive a pending rollback edit. */
 export function rememberRollbackEditTarget(message: Message, userIdx: number): void {
   pendingRollbackEdit = {
+    sid: state.sessionId,
     serverId: message.serverId,
     userIdx,
     content: message.content,
+    // The marker is only valid for the rollback the user just started. The
+    // re-sent message lands at the SAME ordinal with the SAME text, so a
+    // marker that outlives its operation cuts the user's own new message.
+    at: Date.now(),
   };
 }
 
+/** Drops any pending rollback edit. Call it from paths that invalidate it:
+ *  a refused request, a fresh session, or a branch switch that is not the
+ *  rollback's own reply. */
+export function clearPendingRollbackEdit(): void {
+  pendingRollbackEdit = null;
+}
+
+/** True while a rollback edit awaits server confirmation. Belongs to the
+ *  conversation it was started in, so a snapshot for any other session is
+ *  never treated as the confirming one. */
+export function hasPendingRollbackEdit(sessionId?: string): boolean {
+  if (!pendingRollbackEdit) return false;
+  const target = sessionId || state.sessionId;
+  return pendingRollbackEdit.sid === target;
+}
+
 /** Applies the pending rollback edit onto a raw message list, if any. */
-export function applyPendingRollbackEdit<T extends { role?: string; content?: string | Array<{ type: string; text: string }>; id?: string }>(rawMessages: T[]): T[] {
+export function applyPendingRollbackEdit<T extends { role?: string; content?: string | Array<{ type: string; text: string }>; id?: string }>(rawMessages: T[], sessionId?: string): T[] {
   if (!pendingRollbackEdit) return rawMessages;
+  // The edit belongs to the conversation it was started in. Loading another
+  // session's list must not consume it — the old code cut the wrong session's
+  // messages at whichever ordinal/content happened to match.
+  const targetSid = sessionId || state.sessionId;
+  if (!pendingRollbackEdit.sid || pendingRollbackEdit.sid !== targetSid) return rawMessages;
+  // A marker whose operation has not been confirmed within the TTL is stale:
+  // applying it would cut whichever message merely sits at the remembered
+  // ordinal -- normally the user's own re-sent copy of the same text.
+  if (Date.now() - pendingRollbackEdit.at > ROLLBACK_EDIT_TTL_MS) {
+    pendingRollbackEdit = null;
+    return rawMessages;
+  }
 
   let userOrdinal = -1;
   let cutIdx = -1;
   for (let i = 0; i < rawMessages.length; i++) {
     const raw = rawMessages[i];
-    if (raw.role !== "user") continue;
+    // Align with buildTimeline's data-user-idx counting: only real user
+    // turns consume an ordinal. compact_marker / compact_notice /
+    // model_switch arrive as their own roles in a raw backend list, or as
+    // mode-tagged user-role messages in a normalised one, and are skipped
+    // either way; synthetic loop plumbing is skipped here too. The old rule
+    // counted compact_marker IN and compact_notice/model_switch OUT, so the
+    // ordinal base drifted from the stored userIdx after compaction.
+    const isSynthetic = raw.role === "user" && (raw as any).is_synthetic;
+    if (raw.role !== "user" || isSynthetic
+        || isNoticeMode(raw.role)
+        || isNoticeMode((raw as any).mode)) continue;
     userOrdinal++;
 
     const rawId = raw.id || "";
     const idMatches = pendingRollbackEdit.serverId
       ? rawId === pendingRollbackEdit.serverId || rawId.endsWith(`:M:${pendingRollbackEdit.serverId}`)
       : false;
-    const contentMatches = userOrdinal === pendingRollbackEdit.userIdx
+    // Content matching is a fallback for targets without a server id only.
+    // A re-sent rollback edit lands at the SAME ordinal with the SAME text,
+    // so a content match would cut the NEW message out of the list. Guard it
+    // with the marker timestamp: a message created after the rollback click
+    // is the re-send, not the target.
+    const contentMatches = !pendingRollbackEdit.serverId
+      && userOrdinal === pendingRollbackEdit.userIdx
+      && Number((raw as any).created_at || 0) <= pendingRollbackEdit.at
       && extractMessageText(raw.content || "") === pendingRollbackEdit.content;
 
     if (idMatches || contentMatches) {
@@ -731,8 +1193,12 @@ export function applyPendingRollbackEdit<T extends { role?: string; content?: st
     }
   }
 
-  if (cutIdx < 0) return rawMessages;
+  // Resolve the pending edit on the first list arrival after the rollback
+  // operation: either the target is still present (git checkout path -- cut
+  // it) or the server already removed it (branch path -- nothing to cut).
+  // Letting it linger would content-match the re-sent message later.
   pendingRollbackEdit = null;
+  if (cutIdx < 0) return rawMessages;
   return rawMessages.slice(0, cutIdx);
 }
 
@@ -747,6 +1213,7 @@ export function clearMessages(sessionId = state.sessionId): void {
   snapshot.references = [];
   snapshot.compactEvents = [];
   snapshot.compactStartingEvents = [];
+  snapshot.retryNotice = null;
   snapshot.branches = [];
   snapshot.activeBranchId = "";
   snapshot.running = false;
@@ -783,6 +1250,9 @@ export function finishThinking(): void {
   }
 }
 
+/** Max per-session file-ref cache entries kept in localStorage. */
+const FR_CACHE_MAX = 200;
+
 /** Adds a user message (optionally with file references) and returns it. */
 export function addUserMessage(content: string, mode?: string, fileRefs?: { name: string; size: number; icon: string; path?: string; mime_type?: string }[]): Message {
   const msg: Message = {
@@ -800,8 +1270,26 @@ export function addUserMessage(content: string, mode?: string, fileRefs?: { name
   addMessage(msg, sid);
   if (sid && fileRefs && fileRefs.length > 0) {
     const snapshot = getOrCreateSessionSnapshot(sid);
-    const idx = snapshot.messages.filter(m => m.role === "user").length - 1;
-    try { localStorage.setItem(`fr:${sid}:${idx}`, JSON.stringify(fileRefs)); } catch {}
+    // Same base as buildTimeline's data-user-idx, which is also what
+    // loadSessionMessages uses to read these keys back: the notice records
+    // consume no ordinal, so counting them misaligned the fr:<sid>:<idx>
+    // storage slot with the restored one.
+    const idx = realUserMessages(snapshot.messages).length - 1;
+    try {
+      localStorage.setItem(`fr:${sid}:${idx}`, JSON.stringify(fileRefs));
+      // localStorage has a hard quota; keep a per-session index list so the
+      // oldest entries are evicted instead of accumulating for life.
+      const listKey = `fr-idx:${sid}`;
+      let list: number[] = [];
+      const rawList = localStorage.getItem(listKey);
+      if (rawList) { try { const parsed = JSON.parse(rawList); if (Array.isArray(parsed)) list = parsed; } catch {} }
+      list.push(idx);
+      while (list.length > FR_CACHE_MAX) {
+        const drop = list.shift();
+        if (drop !== undefined) localStorage.removeItem(`fr:${sid}:${drop}`);
+      }
+      localStorage.setItem(listKey, JSON.stringify(list));
+    } catch {}
   }
   return msg;
 }
@@ -844,13 +1332,23 @@ export function recordSegment(kind: TimelineSegment["kind"], toolId?: string, se
   emit();
 }
 
-/** Returns the last assistant message in the (active) session, if any. */
+/**
+ * Returns the assistant message of the CURRENT turn (the one after the last
+ * user message), if any.
+ *
+ * The scan stops at the last user message: tool-call / text-delta events must
+ * never attach to an assistant message from a PREVIOUS turn.  The old
+ * "scan back for any assistant" behavior let a stale streaming assistant (e.g.
+ * one left open by a suspended question tool or a missed finish event) swallow
+ * the next turn's tool calls, which rendered new question cards up inside the
+ * old turn instead of at the bottom.
+ */
 export function getLastAssistantMessage(sessionId = state.sessionId): Message | undefined {
   const snapshot = getOrCreateSessionSnapshot(sessionId);
   for (let i = snapshot.messages.length - 1; i >= 0; i--) {
-    if (snapshot.messages[i].role === "assistant") {
-      return snapshot.messages[i];
-    }
+    const msg = snapshot.messages[i];
+    if (msg.role === "user") return undefined;
+    if (msg.role === "assistant") return msg;
   }
   return undefined;
 }
@@ -965,6 +1463,23 @@ export function addToolCall(tc: ToolCallState, sessionId = state.sessionId): voi
   }
 }
 
+/** Resolves one tool call by id, preferring an exact renderer-id match over a
+ *  backend-protocol-id match.  Several backends mint request-local protocol ids
+ *  ("call_0", "call_1", "call_2") that repeat on every request, so a restored
+ *  card's ``backendId`` can equal a later event's id; the exact pass keeps live
+ *  events on their own card instead of rewriting the earliest match. */
+function resolveToolCall(id: string, sessionId: string): ToolCallState | null {
+  if (!id) return null;
+  const snapshot = getOrCreateSessionSnapshot(sessionId);
+  for (const msg of snapshot.messages) {
+    for (const tc of msg.toolCalls) if (tc.id === id) return tc;
+  }
+  for (const msg of snapshot.messages) {
+    for (const tc of msg.toolCalls) if (tc.backendId === id) return tc;
+  }
+  return null;
+}
+
 /** Updates an existing tool call by id (status/result/params). */
 export function updateToolCall(
   id: string,
@@ -972,15 +1487,11 @@ export function updateToolCall(
   sessionId = state.sessionId
 ): void {
   if (sessionId && state.sessionId && sessionId !== state.sessionId) return;
-  const snapshot = getOrCreateSessionSnapshot(sessionId);
-  for (const msg of snapshot.messages) {
-    const tc = msg.toolCalls.find((t) => toolCallMatchesId(t, id));
-    if (tc) {
-      Object.assign(tc, patch);
-      syncSessionState(sessionId);
-      emit();
-      return;
-    }
+  const tc = resolveToolCall(id, sessionId);
+  if (tc) {
+    Object.assign(tc, patch);
+    syncSessionState(sessionId);
+    emit();
   }
 }
 
@@ -1098,6 +1609,47 @@ export function setPermissionPolicies(policies: import("./types.js").PermissionP
   update({ permissionPolicies: policies });
 }
 
+/**
+ * Single funnel for opening any URL from the renderer UI.
+ *
+ * Every non-`file:` URL must go through here so the user's
+ * `default_link_behavior` setting (Encre Agent Desktop Subwindow / ESD sub-app vs. system browser) is always
+ * honored — regardless of which panel or view the link lives in. `file:` URLs
+ * are deliberately ignored: they belong to dedicated internal flows (info
+ * pages, markdown previews) and must never be re-routed. Non-web schemes
+ * (e.g. `mailto:`) can only be handled by the OS, so they always go to the
+ * system handler.
+ */
+export function openRoutedLink(rawUrl: string, label?: string): void {
+  if (!rawUrl) return;
+  let url = rawUrl.trim();
+  if (!url || /^file:/i.test(url)) return;
+  if (/^www\./i.test(url)) url = "https://" + url;
+  let protocol = "";
+  try {
+    protocol = new URL(url).protocol;
+  } catch {
+    return; // Not a parseable URL — nothing sensible to open.
+  }
+  const api = (window as any).electronAPI;
+  if (!api) {
+    window.open(url, "_blank");
+    return;
+  }
+  if (protocol !== "http:" && protocol !== "https:") {
+    void api.openExternal?.(url);
+    return;
+  }
+  const behavior = (state.settings.default_link_behavior as string) || "system";
+  if (behavior === "in_app" && api.openChildWindow) {
+    void api.openChildWindow(url, label || url);
+  } else if (api.openExternal) {
+    void api.openExternal(url);
+  } else {
+    window.open(url, "_blank");
+  }
+}
+
 /** Sets the concrete resolved theme (`dark`/`light`). */
 export function setTheme(theme: "dark" | "light"): void {
   update({ theme });
@@ -1109,6 +1661,22 @@ export function setThemePreference(pref: "system" | "dark" | "light"): void {
   update({ themePreference: pref });
 }
 
+/** Colour skins shipped with the app — the keys of themes/<skin>.css. */
+export const THEME_SKINS = [
+  "ink", "spring", "autumn", "winter", "honey", "grass", "sky", "sunset",
+] as const;
+
+/**
+ * Sets the active colour skin and mirrors it onto `<html data-skin>`.
+ * The palettes themselves live in themes/<skin>.css; the light/dark mode
+ * keeps riding on [data-theme], so every existing mode-level override
+ * keeps working unchanged.
+ */
+export function setThemeSkin(skin: string): void {
+  update({ themeSkin: skin });
+  document.documentElement.setAttribute("data-skin", skin);
+}
+
 /** Generates a random unique id. */
 export function generateId(): string {
   return crypto.randomUUID();
@@ -1116,13 +1684,7 @@ export function generateId(): string {
 
 /** Finds a tool call by id in the (active) session. */
 export function findToolCall(id: string, sessionId = state.sessionId): ToolCallState | null {
-  const snapshot = getOrCreateSessionSnapshot(sessionId);
-  for (const msg of snapshot.messages) {
-    for (const tc of msg.toolCalls) {
-      if (toolCallMatchesId(tc, id)) return tc;
-    }
-  }
-  return null;
+  return resolveToolCall(id, sessionId);
 }
 
 /** Sets the telemetry summary data for the (active) session. */
@@ -1158,9 +1720,17 @@ export function setTokenUsage(data: TokenUsage, sessionId = state.sessionId): vo
 
 // ── Attachments ──────────────────────────────────────────────────────────
 
-/** Adds attachment records to the composer state. */
+/** Adds attachment records to the composer state.
+ *
+ *  Duplicate paths are skipped: the rollback paths can fire twice for the
+ *  same message (local edit restore + the async ``rollback_checkout``
+ *  broadcast), and blindly pushing would stack identical chips and make
+ *  the next send carry the attachment more than once. */
 export function addAttachments(items: AttachmentMeta[]): void {
-  state.attachments.push(...items);
+  for (const item of items) {
+    if (item.path && state.attachments.some((a) => a.path === item.path)) continue;
+    state.attachments.push(item);
+  }
   emit();
 }
 
@@ -1259,18 +1829,181 @@ export function appendReferences(newRefs: import("./types.js").ReferenceItem[], 
 }
 
 /** Records a context-compaction-starting event for the (active) session. */
-export function addCompactStartingEvent(sessionId = state.sessionId): void {
+export function addCompactStartingEvent(
+  noticeId: string,
+  anchorId: string,
+  sessionId = state.sessionId,
+): void {
   const snapshot = getOrCreateSessionSnapshot(sessionId);
-  snapshot.compactStartingEvents = [...snapshot.compactStartingEvents, { timestamp: Date.now() }];
+  snapshot.compactStartingEvents = [
+    ...snapshot.compactStartingEvents,
+    { timestamp: Date.now(), noticeId, anchorId },
+  ];
   syncSessionState(sessionId);
   emit();
 }
 
-/** Clears all compact-starting events. */
-export function clearCompactStartingEvents(): void {
-  const snapshot = getOrCreateSessionSnapshot();
-  snapshot.compactStartingEvents = [];
-  syncSessionState();
+/** Clears compact-starting events.
+ *
+ *  With a *noticeId* only that one indicator is dismissed (the compaction
+ *  it describes finished or failed); without one every indicator goes --
+ *  the session was reset or the turn ended.  Ids the session never saw are
+ *  a no-op, so a late ``compact_failed`` cannot wipe a live indicator. */
+export function clearCompactStartingEvents(noticeId = "", sessionId = state.sessionId): void {
+  const snapshot = getOrCreateSessionSnapshot(sessionId);
+  if (!noticeId) {
+    if (snapshot.compactStartingEvents.length === 0) return;
+    snapshot.compactStartingEvents = [];
+  } else {
+    const before = snapshot.compactStartingEvents.length;
+    snapshot.compactStartingEvents = snapshot.compactStartingEvents.filter(
+      (e) => e.noticeId !== noticeId,
+    );
+    if (snapshot.compactStartingEvents.length === before) return;
+  }
+  syncSessionState(sessionId);
+  emit();
+}
+
+/** Appends a persisted-style UI notice message to the (active) session.
+ *
+ *  Used for LIVE events (model switch) whose persisted twin the backend has
+ *  already recorded: the message rides in ``st.messages`` exactly like the
+ *  ``compact_marker`` entries restored from history, so the timeline renders
+ *  it inline and a later full-history reload replaces it in place.
+ *
+ *  Model-switch COALESCING: the backend merges a burst of switches (no new
+ *  round in between) into ONE persisted notice and re-emits it under the
+ *  ORIGINAL id with the net change.  An event whose id is already on screen
+ *  therefore UPDATES that line in place instead of stacking a duplicate;
+ *  a net no-op (from == to, switched away and back) removes the line. */
+export function appendNoticeMessage(
+  kind: "compact_notice" | "model_switch",
+  payload: Record<string, unknown>,
+  sessionId = state.sessionId,
+): string {
+  const snapshot = getOrCreateSessionSnapshot(sessionId);
+  const id = String(payload.id || `${kind}-${Date.now()}`);
+  const ts = Number(payload.timestamp) || Date.now();
+  if (kind === "model_switch") {
+    const fromModel = String(payload.from_model || "");
+    const toModel = String(payload.to_model || "");
+    const existingIdx = snapshot.messages.findIndex((m) => m.serverId === id);
+    if (existingIdx >= 0) {
+      const existing = snapshot.messages[existingIdx];
+      if (fromModel && fromModel === toModel) {
+        // Switched away and back within the same round: net no change,
+        // so the notice disappears entirely.
+        snapshot.messages = snapshot.messages.filter((_, i) => i !== existingIdx);
+      } else {
+        const updated: import("./types.js").Message = {
+          ...existing,
+          timestamp: ts,
+          switchInfo: {
+            fromModel: fromModel || existing.switchInfo?.fromModel || "",
+            toModel: toModel || existing.switchInfo?.toModel || "",
+            reason: String(payload.reason || ""),
+            source: String(payload.source || existing.switchInfo?.source || "manual"),
+          },
+        };
+        snapshot.messages = snapshot.messages.map((m, i) => (i === existingIdx ? updated : m));
+      }
+      syncSessionState(sessionId);
+      emit();
+      return id;
+    }
+    // Net no-op with nothing on screen yet: nothing to show.
+    if (fromModel && fromModel === toModel) return id;
+  }
+  // A model-switch line only makes sense inside a conversation. An empty
+  // timeline (new chat, history still loading, cleared transcript) must not
+  // show a lone divider floating on a blank page.
+  if (kind === "model_switch") {
+    const hasVisibleTurn = snapshot.messages.some(
+      (m) =>
+        m.role === "assistant" ||
+        (m.role === "user" &&
+          m.mode !== "model_switch" &&
+          m.mode !== "compact_notice" &&
+          m.mode !== "compact_marker"),
+    );
+    if (!hasVisibleTurn) return id;
+  }
+  // Dedupe: a reload that already carries the notice must not stack a
+  // second copy on top of the live one.
+  if (snapshot.messages.some((m) => m.serverId === id)) return id;
+  const msg: import("./types.js").Message = {
+    id: `m:${id}`,
+    role: "user",
+    content: "",
+    isStreaming: false,
+    toolCalls: [],
+    segments: [],
+    timestamp: ts,
+    mode: kind,
+    serverId: id,
+    ...(kind === "compact_notice"
+      ? {
+          compactStats: {
+            oldTokens: Number(payload.old_tokens) || 0,
+            newTokens: Number(payload.new_tokens) || 0,
+            oldCount: Number(payload.old_count) || 0,
+            newCount: Number(payload.new_count) || 0,
+          },
+        }
+      : {
+          switchInfo: {
+            fromModel: String(payload.from_model || ""),
+            toModel: String(payload.to_model || ""),
+            reason: String(payload.reason || ""),
+            source: String(payload.source || "manual"),
+          },
+        }),
+  };
+  // Position: right after the message this notice belongs to — NEVER at the
+  // very end while an in-flight streaming assistant bubble is sitting there
+  // (that is what dragged every notice below the reply).  The backend's
+  // anchor id wins when it resolves; otherwise the notice goes after the
+  // last COMMITTED message (the one the switch/compaction followed).
+  const anchorId = String(payload.anchor_id || "");
+  let insertAfter = -1;
+  if (anchorId) {
+    insertAfter = snapshot.messages.findIndex((m) => m.serverId === anchorId);
+  }
+  if (insertAfter < 0) {
+    for (let i = snapshot.messages.length - 1; i >= 0; i--) {
+      if (!snapshot.messages[i].isStreaming) {
+        insertAfter = i;
+        break;
+      }
+    }
+  }
+  snapshot.messages = [
+    ...snapshot.messages.slice(0, insertAfter + 1),
+    msg,
+    ...snapshot.messages.slice(insertAfter + 1),
+  ];
+  syncSessionState(sessionId);
+  emit();
+  return id;
+}
+
+/** Records the in-flight retry notice for the (active) session. */
+export function setRetryNotice(info: import("./types.js").RetryNoticeInfo, sessionId = state.sessionId): void {
+  const snapshot = getOrCreateSessionSnapshot(sessionId);
+  snapshot.retryNotice = info;
+  syncSessionState(sessionId);
+  emit();
+}
+
+/** Drops the in-flight retry notice once the retried attempt produces output
+ *  (or the turn ends).  No-op when there is nothing to clear, so the
+ *  per-token clear calls in the streaming handlers stay cheap. */
+export function clearRetryNotice(sessionId = state.sessionId): void {
+  const snapshot = getOrCreateSessionSnapshot(sessionId);
+  if (!snapshot.retryNotice) return;
+  snapshot.retryNotice = null;
+  syncSessionState(sessionId);
   emit();
 }
 
@@ -1369,7 +2102,7 @@ export function showToast(
     type,
     title: displayMessage,
     message,
-    source: source || t("general.sourceYim"),
+    source: source || t("general.sourceEncre"),
     timestamp: Date.now(),
     read: false,
     media,
@@ -1492,22 +2225,27 @@ export function restoreInputModeChip(mode: string): void {
   const input = document.getElementById("prompt-input") as HTMLElement | null;
   if (!input) return;
 
-  const old = input.querySelector(".mode-chip");
-  if (old) old.remove();
+  const old = input.querySelector(".mode-chip[data-mode]");
+  if (old) removeChipWithSeparator(old);
 
   const cmd = findSlashCommand(mode);
   const label = cmd ? cmd.title : mode;
-  const icon = cmd ? cmd.icon : "list-checks";
+  // A plugin command with no declared icon gets no glyph; "list-checks" is
+  // only this app's own marker for a mode the command table does not know.
+  const icon = cmd ? (cmd.icon || "") : "list-checks";
 
   const chip = document.createElement("span");
   chip.contentEditable = "false";
   chip.className = "mode-chip";
   chip.setAttribute("data-mode", mode);
-  chip.innerHTML = `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i><span>${label}</span>`;
+  chip.innerHTML = `${icon ? `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i>` : ""}<span>${label}</span>`;
+  // Draft-level close (removeInlineModeChip) — the restored chip is an
+  // editable draft; ending the persistent mode globally is the toolbar ×.
+  wireChipClose(chip, () => (window as any).__app?.removeInlineModeChip?.());
   input.insertBefore(chip, input.firstChild);
 
   if ((window as any).lucide) {
-    (window as any).lucide.createIcons();
+    (window as any).lucide.createIcons({ root: chip });
   }
 
   // Sync toolbar mode chip and input area styling
@@ -1522,7 +2260,7 @@ export function restoreInputModeChip(mode: string): void {
     if (tbIcon) tbIcon.setAttribute("data-lucide", icon);
     if (tbLabel) tbLabel.textContent = label;
     if ((window as any).lucide) {
-      (window as any).lucide.createIcons();
+      (window as any).lucide.createIcons({ root: tbChip });
     }
   }
 }
@@ -1538,22 +2276,25 @@ export function restoreInputCommandChip(name: string): void {
   const input = document.getElementById("prompt-input") as HTMLElement | null;
   if (!input) return;
 
-  const old = input.querySelector(".command-chip");
-  if (old) old.remove();
+  const old = input.querySelector(".command-chip[data-command]");
+  if (old) removeChipWithSeparator(old);
 
   const cmd = findSlashCommand(name);
   const label = cmd ? cmd.title : name;
-  const icon = cmd ? cmd.icon : "wand-2";
+  const icon = cmd ? (cmd.icon || "") : "wand-2";
 
   const chip = document.createElement("span");
   chip.contentEditable = "false";
   chip.className = "command-chip";
   chip.setAttribute("data-command", name);
-  chip.innerHTML = `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i><span>${label}</span>`;
+  chip.innerHTML = `${icon ? `<i data-lucide="${icon}" class="chip-icon" style="width:12px;height:12px;"></i>` : ""}<span>${label}</span>`;
+  // Shared delegation — see ui/chip.ts for why the icon element cannot carry
+  // the listener (lucide swaps it for an <svg>).
+  wireChipClose(chip, () => (window as any).__app?.deactivateCommandChip?.());
   input.insertBefore(chip, input.firstChild);
 
   if ((window as any).lucide) {
-    (window as any).lucide.createIcons();
+    (window as any).lucide.createIcons({ root: chip });
   }
 
   // Mirror into the App instance (same shape as command_changed handling).
@@ -1570,6 +2311,38 @@ export function restoreInputCommandChip(name: string): void {
  *  `mode` "merge" (default) unions with the existing cache (mode-scoped
  *  updates must not drop sessions from other modes); "replace" overwrites
  *  with an authoritative full listing (e.g. the tray `sessions_all` event). */
+/** 32-bit FNV-1a over one string (no intermediate list allocation). */
+function _hash32(text: string, seed: number): number {
+  let h = seed >>> 0;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Stable identity of a session list for change detection.
+ *
+ * Two independent 32-bit hashes (64 bits total) replace the previous
+ * ~500KB concatenated string, which was rebuilt and compared on every
+ * sessions push (boot, streaming, tray sync). Collision odds are negligible.
+ */
+function _sessionsSignature(list: import("./types.js").SessionEntryData[]): string {
+  let h1 = 2166136261;
+  let h2 = 0x811c9dc5 ^ 0x9e3779b9;
+  for (const s of list) {
+    const md = (s.metadata || {}) as Record<string, unknown>;
+    const line = `${s.session_id}|${s.name || ""}|${(s.preview || "").slice(0, 80)}|${s.state || ""}|${s.last_active || 0}|${s.message_count || 0}|${s.channel || ""}|${s.source?.platform || ""}|${md.workspace_path || md.workspace || ""}`;
+    h1 = _hash32(line, h1);
+    h2 = _hash32(line, h2);
+  }
+  return `${list.length}:${h1}:${h2}`;
+}
+
+let _sessionsListSig = "";
+let _allSessionsSig = "";
+
 export function setAllSessions(
   sessions: import("./types.js").SessionEntryData[],
   mode: "merge" | "replace" = "merge",
@@ -1582,6 +2355,9 @@ export function setAllSessions(
       !isTempChatSession(s.session_id),
   );
   if (mode === "replace") {
+    const sig = _sessionsSignature(filtered);
+    if (sig === _allSessionsSig) return;
+    _allSessionsSig = sig;
     update({ allSessions: filtered });
     return;
   }
@@ -1592,6 +2368,9 @@ export function setAllSessions(
     seen.add(s.session_id);
     return true;
   });
+  const sig = _sessionsSignature(merged);
+  if (sig === _allSessionsSig) return;
+  _allSessionsSig = sig;
   update({ allSessions: merged });
 }
 
@@ -1606,10 +2385,20 @@ export function setSessionsList(sessions: import("./types.js").SessionEntryData[
     if (isExternalChannelSession(session.session_id)) return false;
     const ch = (session as { channel?: string }).channel || "normal";
     if (ch !== "normal" && ch !== "iwork") return false;
+    // A session only becomes "history" once it has at least one message:
+    // brand-new empty sessions must not appear in "All tasks".
     return (session.message_count || 0) > 0;
   });
-  update({ sessionsList: visible });
-  // Keep the global search cache in sync (never cleared by mode switches).
+  // The backend broadcasts the same list on several edges (connect snapshot,
+  // no-op refreshes). Re-storing an identical list would wake the sidebar,
+  // the tray and the search cache for nothing.
+  const sig = _sessionsSignature(visible);
+  if (sig !== _sessionsListSig) {
+    _sessionsListSig = sig;
+    update({ sessionsList: visible });
+  }
+  // Keep the global search cache in sync (never cleared by mode switches);
+  // it dedupes its own signature.
   setAllSessions(sessions);
   // Note: do NOT update traySessionsCache here — it only has one mode's
   // data and would corrupt the dual-mode cache.  The tray cache is
@@ -1660,12 +2449,22 @@ export function getTraySessions(): { normal: any[]; iwork: any[] } {
   return traySessionsCache;
 }
 
+let _lastTraySig = "";
+
 function publishTraySessions(): void {
   const projected = buildTraySessionData(
     traySessionsCache.normal,
     traySessionsCache.iwork,
     state.workspaces,
   );
+  const sig =
+    projected.normal.map((s) => `${s.session_id}:${s.state}:${s.name}:${s.last_active}`).join("|") +
+    "#" +
+    projected.iwork.map((s) => `${s.session_id}:${s.state}:${s.name}:${s.last_active}`).join("|") +
+    "#" +
+    projected.workspaces.map((w) => `${w.path}:${w.icon_data || ""}`).join("|");
+  if (sig === _lastTraySig) return;
+  _lastTraySig = sig;
   window.electronAPI?.traySessionsBothUpdate?.(projected as any);
 }
 
@@ -1673,6 +2472,11 @@ function publishTraySessions(): void {
 export function removeSessionById(sessionId: string): void {
   const sessions = state.sessionsList.filter((s) => s.session_id !== sessionId);
   const history = state.automationHistory.filter((h: any) => h.session_id !== sessionId);
+  // A deleted conversation takes its floating surfaces with it: an unanswered
+  // shelved prompt must never resurface, nor may a rollback intent cut a list
+  // for an id that no longer exists.
+  evictScope("session", sessionId);
+  if (pendingRollbackEdit && pendingRollbackEdit.sid === sessionId) pendingRollbackEdit = null;
   update({ sessionsList: sessions, automationHistory: history });
 }
 
@@ -1714,6 +2518,29 @@ export function setModelConfigs(models: import("./types.js").ModelConfigMeta[], 
   update({ modelConfigs: models, activeModelIndex: activeIndex });
 }
 
+export function setProviders(providers: import("./types.js").ProviderConfigMeta[]): void {
+  update({ providers });
+}
+
+/**
+ * Maps a flat `modelConfigs` index onto its owning provider.
+ *
+ * The backend flattens providers in declaration order, so the flat list
+ * indexes models provider-by-provider.  Returns null when the index is
+ * out of range or the provider snapshot is out of sync.
+ */
+export function locateModelInProviders(flatIdx: number): { providerIdx: number; modelIdx: number } | null {
+  const providers = (getState() as any).providers as import("./types.js").ProviderConfigMeta[] | undefined;
+  if (!providers) return null;
+  let n = 0;
+  for (let p = 0; p < providers.length; p++) {
+    const count = providers[p]?.models?.length || 0;
+    if (flatIdx < n + count) return { providerIdx: p, modelIdx: flatIdx - n };
+    n += count;
+  }
+  return null;
+}
+
 export function setSkillsList(skills: import("./types.js").SkillInfo[]): void {
   update({ skillsList: skills });
 }
@@ -1730,44 +2557,20 @@ export function setCustomCommands(commands: import("./types.js").CustomCommand[]
   update({ customCommands: commands });
 }
 
-export function setPendingQueueCount(n: number): void {
-  update({ pendingQueueCount: n });
+/** Replaces the local queue mirror with the backend's authoritative snapshot.
+ *
+ * The submit queue lives server-side (persisted across restarts), so the
+ * renderer never mutates it locally: panel edits go out as ``queue_move`` /
+ * ``queue_remove`` / ``queue_pop`` messages and the refreshed snapshot
+ * arrives back as a ``queued_submits`` broadcast, which lands here.
+ */
+export function setQueuedPrompts(items: QueuedPrompt[]): void {
+  update({ queuedPrompts: items, pendingQueueCount: items.length });
 }
 
-export function clearPendingQueueCount(): void {
-  update({ pendingQueueCount: 0, queuedPrompts: [] });
-}
-
-export function pushQueuedPrompt(text: string, mode?: string): void {
-  state.queuedPrompts.push({ text, mode });
-  state.pendingQueueCount = state.queuedPrompts.length;
-  emit();
-}
-
-/** Shifts the next queued prompt off the queue and returns it. */
-export function shiftQueuedPrompt(): void {
-  state.queuedPrompts.shift();
-  emit();
-}
-
-/** Clears all queued prompts. */
+/** Clears the local queue mirror (session switch; the backend re-syncs). */
 export function clearQueuedPrompts(): void {
-  state.queuedPrompts = [];
-  emit();
-}
-
-/** Removes a queued prompt at the given index. */
-export function removeQueuedPromptAt(index: number): void {
-  state.queuedPrompts.splice(index, 1);
-  emit();
-}
-
-/** Moves a queued prompt from one index to another (for reordering). */
-export function moveQueuedPrompt(fromIndex: number, toIndex: number): void {
-  if (fromIndex === toIndex) return;
-  const [moved] = state.queuedPrompts.splice(fromIndex, 1);
-  state.queuedPrompts.splice(toIndex, 0, moved);
-  emit();
+  update({ queuedPrompts: [], pendingQueueCount: 0 });
 }
 
 /** Removes the last (assistant) message from the (active) session. */
@@ -1786,13 +2589,17 @@ export function truncateToUserMessage(userIdx: number): boolean {
   let ui = 0;
   let cutIdx = -1;
   for (let i = 0; i < snapshot.messages.length; i++) {
-    if (snapshot.messages[i].role === "user") {
-      if (ui === userIdx) {
-        cutIdx = i;
-        break;
-      }
-      ui++;
+    const msg = snapshot.messages[i];
+    // Count exactly like buildTimeline assigns data-user-idx: the notice
+    // records (compact_marker / compact_notice / model_switch) ride along as
+    // user-role messages but never consume an ordinal, so they must not here
+    // either. Counting them made rollback cut one turn earlier than clicked.
+    if (msg.role !== "user" || isNoticeMode(msg.mode)) continue;
+    if (ui === userIdx) {
+      cutIdx = i;
+      break;
     }
+    ui++;
   }
   if (cutIdx >= 0) {
     snapshot.messages = snapshot.messages.slice(0, cutIdx);
@@ -1840,6 +2647,13 @@ export function setActiveWorkspace(path: string): void {
   update({ activeWorkspace: path });
 }
 
+/** Records a session's backend-resolved files directory, keyed by session id
+ *  so each session's editor tree root stays isolated from the others. */
+export function setSessionFilesDir(sessionId: string, dir: string): void {
+  if (!sessionId) return;
+  update({ sessionFilesDirs: { ...state.sessionFilesDirs, [sessionId]: dir } });
+}
+
 /** Sets the cached config for a workspace (keyed by its path). */
 export function setWorkspaceConfig(path: string, config: import("./types.js").WorkspaceConfig): void {
   update({ workspaceConfigs: { ...state.workspaceConfigs, [path]: config } });
@@ -1853,42 +2667,20 @@ export function setWorkspaceMode(mode: "iwork" | "normal"): void {
   update({ workspaceMode: mode });
 }
 
-/** Sets the document index status. */
-export function setIndexStatus(status: "idle" | "ready" | "indexing" | "error" | "no_workspace"): void {
-  update({ indexStatus: status });
-}
-
-/** Sets the indexed file count. */
-export function setIndexFiles(files: number): void {
-  update({ indexFiles: files });
-}
-
-/** Sets the index progress (0-100). */
-export function setIndexProgress(progress: number): void {
-  update({ indexProgress: progress });
-}
-
 /** Updates context-token usage for the (active) session. */
-export function updateContextUsage(tokens: number, window: number, sessionId = state.sessionId): void {
+export function updateContextUsage(
+  tokens: number,
+  window: number,
+  sessionId = state.sessionId,
+  breakdown?: import("./types.js").ContextUsageBreakdown | null,
+): void {
   if (!sessionId) return;
   // Ignore events from non-active sessions so background sessions cannot
   // overwrite the canvas panel currently shown in the sidebar.
   if (sessionId !== state.sessionId) return;
   state.contextTokens = tokens;
   state.contextWindow = window;
-  emit();
-}
-
-/** Updates a workspace's index status/files/progress. */
-export function updateWorkspaceIndex(wsId: string, status: string, files: number, progress?: number): void {
-  if (!wsId) return;
-  state.workspaces = state.workspaces.map(w =>
-    w.id === wsId ? { ...w, index_status: status, index_files: files, index_progress: progress ?? w.index_progress } : w
-  );
-  // Also update global for session-inner panel
-  state.indexStatus = status as any;
-  state.indexFiles = files;
-  if (progress !== undefined) state.indexProgress = progress;
+  state.contextUsageBreakdown = breakdown ?? null;
   emit();
 }
 
@@ -1897,9 +2689,14 @@ export function setGitignoreContent(content: string): void {
   update({ gitignoreContent: content });
 }
 
-/** Sets the document list (indexed docs). */
-export function setDocsList(docs: import("./types.js").DocumentEntry[]): void {
-  update({ docsList: docs });
+/** Sets the knowledge-library tree (all nodes, flat). */
+export function setLibraryTree(nodes: import("./types.js").LibraryNode[]): void {
+  update({ libraryTree: nodes });
+}
+
+/** Sets the last library content read (or clears it with null). */
+export function setLibraryContent(content: { id: string; content: string } | null): void {
+  update({ libraryContent: content });
 }
 
 /** Sets the gateway (MCP gateway) status. */
@@ -1930,6 +2727,11 @@ export function setMemoryList(entries: import("./types.js").MemoryEntry[]): void
 /** Sets the memory detail being viewed. */
 export function setMemoryDetail(detail: { path: string; content: string; error?: string } | null): void {
   update({ memoryDetail: detail });
+}
+
+/** Sets the memory relationship graph (nodes + typed edges). */
+export function setMemoryGraph(graph: { nodes: import("./types.js").MemoryGraphNode[]; edges: import("./types.js").MemoryGraphEdge[] } | null): void {
+  update({ memoryGraph: graph });
 }
 
 /** Sets the global rules list. */
@@ -2054,10 +2856,17 @@ export function setBranches(branches: BranchMeta[], activeBranchId: string, sess
   emit();
 }
 
-/** Removes the given message ids from a branch. */
+/** Removes the given message ids from a branch.
+ *
+ *  Ids arrive in two forms: renderer ids are `m:<backend id>` (assigned in
+ *  loadSessionMessages) while `branch_rolled_back` reports raw backend ids.
+ *  Match both, otherwise a raw-id removal compares against `m:`-prefixed
+ *  ids and silently removes nothing. */
 export function removeBranchMessages(removedIds: Set<string>, sessionId = state.sessionId): void {
   const snapshot = getOrCreateSessionSnapshot(sessionId);
-  snapshot.messages = snapshot.messages.filter(m => !removedIds.has(m.id));
+  snapshot.messages = snapshot.messages.filter(
+    m => !removedIds.has(m.id) && !removedIds.has(m.id.replace(/^m:/, ""))
+  );
   syncSessionState(sessionId);
   emit();
 }

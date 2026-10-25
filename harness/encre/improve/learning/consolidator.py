@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,11 +21,13 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Periodic memory consolidation for the learning subsystem.
 
 The learning subsystem accumulates experiences in the agent's memory during a
 run. Left unchecked, those short-term memories grow without bound and become
-expensive to search. This module provides :class:`MemoryConsolidator`, a thin
+expensive to search. This module provides :class:`LearningConsolidator`, a thin
 background driver that periodically asks the agent's memory system to merge,
 deduplicate, and summarise its stored memories (a process the code refers to as
 "consolidation").
@@ -56,7 +58,7 @@ from encre.agent import EncreAgent
 logger = logging.getLogger("encre.learning.consolidator")
 
 
-class MemoryConsolidator:
+class LearningConsolidator:
     """Drives periodic, best-effort memory consolidation on a background timer.
 
     The consolidator is a self-contained async driver. It holds a reference to

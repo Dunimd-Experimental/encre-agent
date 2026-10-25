@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Prompt template base classes.
 
@@ -63,12 +65,12 @@ class EncreBasePrompt(ABC):
         skill_summary: str = "",
         active_command: dict[str, Any] | None = None,
         model: str = "",
-    ) -> str:
-        ...
+        model_profile: Any = None,
+        include_specialty: bool = True,
+    ) -> str: ...
 
     @abstractmethod
-    def build_tool_instructions(self, tool_names: list[str]) -> str:
-        ...
+    def build_tool_instructions(self, tool_names: list[str]) -> str: ...
 
     @abstractmethod
     def build_with_restrictions(
@@ -88,8 +90,9 @@ class EncreBasePrompt(ABC):
         skill_summary: str = "",
         active_command: dict[str, Any] | None = None,
         model: str = "",
-    ) -> tuple[str, dict[str, Any]]:
-        ...
+        model_profile: Any = None,
+        include_specialty: bool = True,
+    ) -> tuple[str, dict[str, Any]]: ...
 
 
 class EncrePromptTemplate(EncreBasePrompt):
@@ -124,6 +127,8 @@ class EncrePromptTemplate(EncreBasePrompt):
         skill_summary: str = "",
         active_command: dict[str, Any] | None = None,
         model: str = "",
+        model_profile: Any = None,
+        include_specialty: bool = True,
     ) -> str:
         """Build the system prompt from session context.
 
@@ -148,6 +153,8 @@ class EncrePromptTemplate(EncreBasePrompt):
             skill_summary=skill_summary,
             active_command=active_command,
             model=model,
+            model_profile=model_profile,
+            include_specialty=include_specialty,
         )
 
     def build_tool_instructions(self, tool_names: list[str]) -> str:
@@ -170,6 +177,16 @@ class EncrePromptTemplate(EncreBasePrompt):
         """The underlying prompt builder instance."""
         return self._builder
 
+    @property
+    def specialty(self) -> str:
+        """The specialty label this template forces into the builder.
+
+        Public because the loop supplies the domain-specialty section as a
+        per-turn context block (``include_specialty=False``) and must select the
+        same section the template would have.
+        """
+        return self._specialty
+
     def build_with_restrictions(
         self,
         mode: PermissionMode,
@@ -187,6 +204,8 @@ class EncrePromptTemplate(EncreBasePrompt):
         skill_summary: str = "",
         active_command: dict[str, Any] | None = None,
         model: str = "",
+        model_profile: Any = None,
+        include_specialty: bool = True,
     ) -> tuple[str, dict[str, Any]]:
         """Build the system prompt with active restrictions metadata.
 
@@ -211,4 +230,6 @@ class EncrePromptTemplate(EncreBasePrompt):
             skill_summary=skill_summary,
             active_command=active_command,
             model=model,
+            model_profile=model_profile,
+            include_specialty=include_specialty,
         )

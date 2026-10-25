@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,12 +21,23 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
 from encre.logging_config import get_logger
+from encre.modes.goal import (
+    ActiveGoal,
+    GoalItem,
+    build_complete_message,
+    build_continue_message,
+    build_incomplete_message,
+    extract_items,
+)
 from encre.utils.loop_helpers import _WRITE_TOOL_NAMES
 from encre.utils.types import (
     AgentEvent,
@@ -38,6 +49,106 @@ from encre.utils.types import (
 )
 
 logger = get_logger(__name__)
+
+# ── Read-only shell exploration exemption (plan mode) ──────────────────
+#
+# Plan mode must not gate the tool calls that BUILD the plan: listing
+# directories, searching files and inspecting state are how the agent
+# gathers context before proposing anything.  Only commands whose every
+# pipeline segment is a known read-only verb skip the proposal gate;
+# anything with a redirect, substitution, or a mutating verb still gets
+# proposed.  This is a deliberately narrow allowlist -- unknown commands
+# stay intercepted (fail closed).
+
+_RE_SEGMENT_SPLIT = re.compile(r"\s*(?:\|\||&&|[|\n;&])\s*")
+# Stderr redirects are read-safe noise; strip before the redirect scan.
+_RE_STDERR_REDIRECT = re.compile(r"(?:2>\s*(?:&1|/dev/null|>\s*&1|\$null|NUL))", re.IGNORECASE)
+_RE_SUBSTITUTION = re.compile(r"\$\(|`|<\(")
+
+_READ_ONLY_HEADS: frozenset[str] = frozenset({
+    # POSIX / shells
+    "ls", "ll", "cat", "head", "tail", "wc", "stat", "file", "find", "fd",
+    "grep", "rg", "ag", "tree", "du", "df", "pwd", "which", "where",
+    "whereis", "whoami", "id", "uname", "hostname", "date", "uptime",
+    "env", "printenv", "echo", "printf", "sort", "uniq", "cut", "tr",
+    "diff", "cmp", "less", "more", "type", "basename", "dirname", "realpath",
+    "readlink", "strings", "md5sum", "sha1sum", "sha256sum", "cksum",
+    "columns", "nl", "od", "hexdump", "xxd", "jq", "yq",
+    # Windows cmd built-ins (note: bare ``set`` is PowerShell's Set-Variable
+    # alias -- mutating -- so it is deliberately absent)
+    "dir", "findstr", "path", "ver", "vol", "free",
+    # Common CLIs, subcommand-gated below
+    "git", "docker", "kubectl", "pip", "pip3", "npm", "pnpm", "yarn",
+})
+
+# Subcommand allowlists for multi-verb tools; a bare entry means every
+# invocation of that head is read-only.
+_READ_ONLY_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "git": frozenset({"status", "log", "diff", "show", "blame", "ls-files",
+                      "ls-tree", "rev-parse", "describe", "shortlog", "cat-file"}),
+    "docker": frozenset({"ps", "images", "inspect", "logs", "version", "top", "stats"}),
+    "kubectl": frozenset({"get", "describe", "logs", "version", "top"}),
+    "pip": frozenset({"list", "show", "freeze", "check"}),
+    "pip3": frozenset({"list", "show", "freeze", "check"}),
+    "npm": frozenset({"ls", "list", "view", "outdated", "whoami"}),
+    "pnpm": frozenset({"ls", "list", "view", "outdated"}),
+    "yarn": frozenset({"list", "info", "why"}),
+}
+
+# PowerShell approved-verb prefixes that only retrieve/format pipeline data.
+_READ_ONLY_PS_VERBS: tuple[str, ...] = ("get-", "select-", "format-", "measure-",
+                                        "group-", "sort-", "compare-", "test-", "resolve-")
+
+# Tokens that disqualify an otherwise read-only head (in-place / exec flags).
+_READ_ONLY_TOXIC_FLAGS: tuple[str, ...] = ("-exec", "-execdir", "-delete", "-ok",
+                                           "-fprint", "-fprintf", "-fls", "--in-place")
+
+
+def _is_readonly_command(command: str) -> bool:
+    """True when every segment of *command* is a known read-only operation.
+
+    Conservative by design: empty input, unknown executables, redirects to
+    files, command substitution, and mutating flags all return ``False`` so
+    the plan-mode proposal gate keeps them.
+    """
+    text = (command or "").strip()
+    if not text:
+        return False
+    stripped = _RE_STDERR_REDIRECT.sub(" ", text)
+    if ">" in stripped or "<" in stripped or _RE_SUBSTITUTION.search(stripped):
+        return False
+    segments = [s.strip() for s in _RE_SEGMENT_SPLIT.split(stripped) if s.strip()]
+    if not segments:
+        return False
+    for seg in segments:
+        lowered = seg.lower()
+        if any(flag in lowered.split() for flag in _READ_ONLY_TOXIC_FLAGS):
+            return False
+        tokens = seg.split()
+        idx = 0
+        # Skip env assignments (FOO=bar cmd ...) and a leading timeout wrapper.
+        while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith("-"):
+            idx += 1
+        if idx < len(tokens) and tokens[idx].lower() == "timeout":
+            idx += 1
+            while idx < len(tokens) and tokens[idx][0].isdigit():
+                idx += 1
+        if idx >= len(tokens):
+            return False
+        head = tokens[idx].lower().rstrip(";")
+        if head.startswith("./") or head.startswith("/") or head.endswith(".ps1") or head.endswith(".sh"):
+            return False  # explicit script paths can do anything
+        if head in _READ_ONLY_HEADS:
+            subs = _READ_ONLY_SUBCOMMANDS.get(head)
+            if subs is not None:
+                rest = [t.lower() for t in tokens[idx + 1:] if not t.startswith("-")]
+                if not rest or rest[0] not in subs:
+                    return False
+            continue
+        if "-" in head and head.startswith(_READ_ONLY_PS_VERBS):
+            continue
+        return False
+    return True
 
 
 class PlanModeManager:
@@ -62,22 +173,27 @@ class PlanModeManager:
         self._safety = safety
         self._cancel_event = cancel_event
 
-        # 鈹€鈹€ Permission state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # ── Permission state ───────────────────────────────────────
         self._permission_event: asyncio.Event | None = None
         self._permission_decision: bool = False
         self._pending_tool_name: str = ""
 
-        # 鈹€鈹€ Question state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # ── Question state ─────────────────────────────────────────
         self._question_event: asyncio.Event | None = None
-        self._question_answers: str = ""
+        self._question_answers: str | list[str] = ""
 
-        # 鈹€鈹€ Plan mode state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # ── Plan mode state ────────────────────────────────────────
         self._plan_event: asyncio.Event | None = None
         self._plan_decision: bool = False
         self._plan_proposals: dict[str, dict[str, Any]] = {}
         self._plan_decision_timed_out: bool = False
 
-    # 鈹€鈹€ Permission API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # ── Standing goal state ────────────────────────────────────
+        # Run-scoped flag: the goal was satisfied during this run, so the
+        # protocol layer has to tell the UI that the mode went off.
+        self._goal_completed: bool = False
+
+    # ── Permission API ────────────────────────────────────────────────
 
     async def request_permission(self, tool_name: str) -> bool:
         """Encapsulated setup + wait + teardown for a permission request.
@@ -113,10 +229,9 @@ class PlanModeManager:
                 try:
                     await task
                 except asyncio.CancelledError:
-                    pass
+                    logger.debug("exception suppressed", exc_info=True)
                 except Exception:
-                    pass
-
+                    logger.debug("exception suppressed", exc_info=True)
         try:
             done, pending = await asyncio.wait(
                 [permission_waiter, cancel_waiter],
@@ -151,24 +266,46 @@ class PlanModeManager:
         if self._permission_event is not None:
             self._permission_event.set()
 
-    def resolve_question(self, answers: str) -> None:
-        """Called when the user answers a pending question."""
+    def resolve_question(self, answers: str | list[str]) -> None:
+        """Called when the user answers a pending question.
+
+        ``answers`` is a single string for a one-question ask, or a list with
+        one entry per question (in ask order) for a batched ask.
+        """
         self._question_answers = answers
         if self._question_event is not None:
             self._question_event.set()
 
-    # 鈹€鈹€ Plan mode API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Plan mode API ────────────────────────────────────────────────
 
     @property
     def plan_mode_active(self) -> bool:
         return getattr(self._config, "slash_command_mode", "") == "plan"
 
+    @property
+    def permission_pending(self) -> bool:
+        """True while a permission request blocks the turn awaiting a decision."""
+        return self._permission_event is not None
+
     def set_mode(self, mode: str) -> None:
         mode = mode if mode in self._VALID_MODES else ""
         prev = getattr(self._config, "slash_command_mode", "")
+        if mode != prev:
+            goal = self.active_goal
+            # Leaving a mode by hand ends its objective, and switching between
+            # the two modes ends the previous one.  Restoring the same mode
+            # (session reopen) never reaches this branch, so a persisted goal
+            # survives a reload instead of being dropped by its own restore.
+            if goal is not None and (mode == "" or goal.kind != mode):
+                self.abandon_goal(reason=f"mode -> {mode or 'normal'}")
         self._config.slash_command_mode = mode
         self._state_mgr.slash_command_mode = mode
         self._state_mgr.plan_mode_active = (mode == "plan")
+        # Every mode transition re-arms the per-write gate.  What opens it
+        # again is the approval: the run start derives it from the standing
+        # goal, so an approved plan keeps writing without per-write proposals
+        # across runs until the goal closes.
+        self._state_mgr.plan_gate_released = False
         if prev == "plan" and mode != "plan" and self._plan_event is not None:
             self._plan_event.set()
 
@@ -203,7 +340,149 @@ class PlanModeManager:
     def get_pending_proposals(self) -> list[dict[str, Any]]:
         return [dict(v) for v in self._plan_proposals.values()]
 
-    # 鈹€鈹€ Proposal building 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Standing goal API ───────────────────────────────────────────
+    #
+    # An approved plan/spec is the session's objective, not a one-shot
+    # approval.  The goal below is what the stop path reads to keep the run
+    # driving towards the items that are still outstanding; it is dropped
+    # only when every item is done, or when the user leaves the mode.
+
+    @property
+    def active_goal(self) -> ActiveGoal | None:
+        """The typed standing goal, or ``None`` when nothing is approved."""
+        return ActiveGoal.from_dict(getattr(self._state_mgr, "active_goal", None))
+
+    def _store_goal(self, goal: ActiveGoal | None) -> None:
+        self._state_mgr.active_goal = goal.to_dict() if goal is not None else None
+
+    @property
+    def goal_implementing(self) -> bool:
+        """True while an approved goal still has work outstanding."""
+        goal = self.active_goal
+        return bool(goal is not None and goal.drives)
+
+    @property
+    def goal_completed(self) -> bool:
+        """Set for the run in which the goal was satisfied (UI notification)."""
+        return bool(self._goal_completed)
+
+    @goal_completed.setter
+    def goal_completed(self, value: bool) -> None:
+        self._goal_completed = bool(value)
+
+    def activate_goal(
+        self,
+        kind: str,
+        title: str = "",
+        files: Any = None,
+        plan_items: Any = None,
+        spec_sections: Any = None,
+    ) -> ActiveGoal:
+        """Install the approved artifacts as the session's standing goal.
+
+        The checklist comes from the live todo list when the model keeps one,
+        otherwise from the artifacts themselves (checkbox list, spec sections,
+        headings).  A goal with no items is stored but never drives -- there is
+        nothing to gate on.
+        """
+        files = [str(f) for f in (files or [])]
+        items = extract_items(files=files, plan_items=plan_items, spec_sections=spec_sections)
+        goal = ActiveGoal(
+            kind=kind,
+            title=str(title or "")[:200],
+            items=items,
+            files=files,
+        )
+        self._store_goal(goal)
+        logger.info(
+            "[goal] activated kind=%s items=%d files=%d",
+            kind, len(items), len(files),
+        )
+        return goal
+
+    def abandon_goal(self, reason: str = "") -> None:
+        """Drop the standing goal without completing it (user exit / switch)."""
+        goal = self.active_goal
+        if goal is None:
+            return
+        self._store_goal(None)
+        logger.info(
+            "[goal] abandoned (%s) kind=%s items=%d",
+            reason or "-", goal.kind, goal.total,
+        )
+
+    def complete_goal(self) -> None:
+        """Close the goal and mark this run as the one that satisfied it."""
+        goal = self.active_goal
+        if goal is None:
+            return
+        self._store_goal(None)
+        self._goal_completed = True
+        logger.info("[goal] completed kind=%s items=%d", goal.kind, goal.total)
+
+    def sync_goal_plan_items(self, plan_items: Any) -> bool:
+        """Merge the live todo list into the goal (statuses follow the tool)."""
+        goal = self.active_goal
+        if goal is None or not goal.drives:
+            return False
+        if goal.sync_items(plan_items):
+            self._store_goal(goal)
+            return True
+        return False
+
+    def pending_goal_items(self) -> list[GoalItem]:
+        """Checklist entries that are not done yet (empty when no goal)."""
+        goal = self.active_goal
+        return goal.pending_items() if goal is not None else []
+
+    def note_goal_push(self) -> bool:
+        """Record one push; ``False`` once the drive has stalled (no progress)."""
+        goal = self.active_goal
+        if goal is None:
+            return False
+        within_budget = goal.note_push()
+        self._store_goal(goal)
+        return within_budget
+
+    def goal_continue_message(self) -> str:
+        goal = self.active_goal
+        return build_continue_message(goal) if goal is not None else ""
+
+    def goal_complete_message(self) -> str:
+        goal = self.active_goal
+        return build_complete_message(goal) if goal is not None else ""
+
+    def goal_incomplete_message(self) -> str:
+        goal = self.active_goal
+        return build_incomplete_message(goal) if goal is not None else ""
+
+    def verify_ladder_allowed(self, slash_mode: str) -> bool:
+        """Whether the verify-on-stop ladder applies to this turn.
+
+        Plan/spec mode suspends the ladder while the artifacts are still being
+        drafted -- there is nothing to verify yet, and the deliverable is a
+        document.  The implementation pass that follows an approval is exactly
+        where the ladder matters most, so an approved goal re-enables it.
+        """
+        if slash_mode not in ("plan", "spec"):
+            return True
+        return self.goal_implementing
+
+    def spec_write_allowed(self, spec_engine: Any) -> bool:
+        """Whether write tools may run in spec mode.
+
+        The spec engine's status is in-memory and is lost on reload, so an
+        approved spec goal counts as approval too -- otherwise a resumed
+        objective would be blocked by its own gate.
+        """
+        goal = self.active_goal
+        if goal is not None and goal.kind == "spec" and goal.drives:
+            return True
+        current = getattr(spec_engine, "current_spec", None) if spec_engine is not None else None
+        status = getattr(current, "status", None)
+        return str(getattr(status, "value", "") or "") == "approved"
+
+    # ── Proposal building ───────────────────────────────────────────
 
     def build_plan_proposal(
         self,
@@ -317,7 +596,7 @@ class PlanModeManager:
             risk=risk,
         )
 
-    # 鈹€鈹€ Plan decision waiting 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Plan decision waiting ───────────────────────────────────────
 
     async def await_plan_decision(
         self,
@@ -349,7 +628,7 @@ class PlanModeManager:
         self._plan_proposals.pop(proposal.proposal_id, None)
         return decision
 
-    # 鈹€鈹€ Plan mode interception (async generator) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Plan mode interception (async generator) ───────────────────
 
     async def intercept_plan_mode(
         self,
@@ -359,7 +638,26 @@ class PlanModeManager:
         _client_id: str,
     ) -> AsyncGenerator[AgentEvent, None]:
         interceptable = tool_name in _WRITE_TOOL_NAMES or tool_name == "bash"
+        # Markdown artifacts are the plan phase's deliverable: writing them
+        # is not "execution" and bypasses the per-write proposal gate
+        # (submit_review is what presents them for review).
+        if interceptable and tool_name in ("file_write", "write_file", "writeFile", "file_edit"):
+            if str(tool_args.get("file_path", "") or "").lower().endswith(".md"):
+                interceptable = False
+        # Read-only shell exploration is how the plan gathers its context --
+        # listing, searching and inspecting never mutate state, so gating
+        # them behind a proposal would stall the very turn that has to
+        # produce the plan.  Anything that is not provably read-only stays
+        # intercepted.
+        if interceptable and tool_name == "bash":
+            if _is_readonly_command(str(tool_args.get("command", "") or "")):
+                interceptable = False
         if not self.plan_mode_active or not interceptable:
+            return
+        # The user approved a plan: implementation writes go through without a
+        # per-write proposal for as long as the standing goal drives.  The mode
+        # is left when the goal closes or the user exits it, not with the run.
+        if getattr(self._state_mgr, "plan_gate_released", False):
             return
         proposal_id = f"plan-{uuid.uuid4().hex[:12]}"
         proposal = self.build_plan_proposal(

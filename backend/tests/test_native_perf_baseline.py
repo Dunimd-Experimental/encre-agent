@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,40 +23,46 @@
 
 from __future__ import annotations
 
-"""native 热路径性能基线（Task 10.4）。
+"""Performance baseline for the native hot path (Task 10.4).
 
-本模块为 ``harness/encre/native.py`` 导出的热路径函数建立**真实测量**的性能基线：
-在**相同输入**下，用 ``time.perf_counter`` 分别测量 native 与纯 Python 回退的耗时
-（多轮取最小值以降低调度噪声），并断言 native 不慢于回退（宽容容差）。native
-不可用时（``_HAS_NATIVE`` 为假）用 ``skipif`` 跳过对比，但回退侧的功能正确性断言
-仍会运行。
+This module establishes a **measured** performance baseline for the hot-path
+functions exported by ``harness/encre/native.py``: for **identical inputs**,
+``time.perf_counter`` measures the native implementation against a pure-Python
+fallback (the minimum over several rounds is taken to suppress scheduling
+noise), and the native path is asserted not to be slower than the fallback
+beyond a generous tolerance. When native is unavailable (``_HAS_NATIVE`` is
+false) the comparison is skipped via ``skipif``, but the functional
+correctness assertions on the fallback side still run.
 
-**热路径 -> 纯 Python 回退对照表**
+**Hot path -> pure-Python fallback cross-reference**
 
 ============================  ==========================  ==================================================
-native 函数                    用途                        纯 Python 回退位置
+native function               purpose                       pure-Python fallback location
 ============================  ==========================  ==================================================
-``count_tokens``             估算文本 token 数            ``harness/encre/utils/tokens.py::estimate_tokens``
-                                                          （native -> tiktoken -> ``len//4`` 三级回退）
-``compute_diff``             生成行级 diff                无 in-tree 回退（Rust-only）；测试内用 ``difflib``
-``apply_diff``               应用行级 diff                无 in-tree 回退；测试内实现同格式应用器
-``grep``                     正则搜索文件                 无 in-tree 回退（Rust-only）；测试内用 ``re``
-``text_similarity``          空白分词 Jaccard             无 in-tree 回退；测试内用 set 交/并集
-``cosine_similarity``        向量余弦相似度               无 in-tree 回退；测试内用 dot/norm
-``simd_find_all``            子串全部出现位置             无 in-tree 回退；测试内用 ``str.find`` 循环
-``simd_contains``            子串存在性                   无 in-tree 回退；测试内用 ``in``
-``simd_memmem``              字节级 memmem                 无 in-tree 回退；测试内用 ``bytes.find``
-``read_file``                读文件（支持 offset/limit）   无 in-tree 回退；测试内用 ``Path.read_text``
-``write_file``               原子写（temp+fsync+rename）   无 in-tree 回退；测试内用 Python 原子写
+``count_tokens``              estimate text token count     ``harness/encre/utils/tokens.py::estimate_tokens``
+                                                          (native -> tiktoken -> ``len//4`` three-level fallback)
+``compute_diff``              produce a line-level diff     no in-tree fallback (Rust only); ``difflib`` used in the test
+``apply_diff``                apply a line-level diff       no in-tree fallback; a same-format applier lives in the test
+``grep``                      regex-search a file           no in-tree fallback (Rust only); ``re`` used in the test
+``text_similarity``           whitespace-token Jaccard      no in-tree fallback; set intersection/union in the test
+``cosine_similarity``         vector cosine similarity      no in-tree fallback; dot/norm in the test
+``simd_find_all``             all substring occurrences     no in-tree fallback; a ``str.find`` loop in the test
+``simd_contains``             substring presence            no in-tree fallback; ``in`` in the test
+``simd_memmem``               byte-level memmem             no in-tree fallback; ``bytes.find`` in the test
+``read_file``                 read a file (offset/limit)    no in-tree fallback; ``Path.read_text`` in the test
+``write_file``                atomic write (temp+fsync+rename) no in-tree fallback; a Python atomic write in the test
 ============================  ==========================  ==================================================
 
-说明：``memdir/semantic.py::_cosine_similarity`` 作用于词频 dict，与 native 的
-向量 ``cosine_similarity`` 不是同一函数，故不作为其回退。
+Note: ``memdir/semantic.py::_cosine_similarity`` operates on a word-frequency
+dict and is not the same function as the native vector ``cosine_similarity``,
+so it is not treated as a fallback for it.
 
-**诚实界定**：本模块只给出本机（GNU 工具链编译的 release 产物）在确定性负载下的
-真实耗时数字，**不**声称任何真实 LLM 任务收益。若某函数 native 反而更慢，本模块
-**不掩盖**：要么如实断言其真实劣化（见 :class:`TestObservedNativeRegressions`），
-要么在报告中给出真实数字。
+**Honest scope**: this module only reports real wall-clock numbers for the
+local machine (release build from the GNU toolchain) under deterministic loads,
+and makes **no** claim about real-world LLM task gains. If a function turns out
+to be slower in native, this module does **not** hide it: either it asserts the
+real regression honestly (see :class:`TestObservedNativeRegressions`), or it
+reports the real numbers.
 """
 
 import math
@@ -70,28 +76,34 @@ import pytest
 from encre import native
 from encre.utils.tokens import estimate_tokens
 
-#: native 是否真正加载（本机已编译，通常为 True）。
+#: Whether native is actually loaded (compiled on this machine, usually True).
 _HAS_NATIVE: bool = bool(getattr(native, "_HAS_NATIVE", False))
 
-#: 性能断言默认容差：允许 native 在极端情况下略慢（本机 release 产物 + 计时噪声）。
+#: Default tolerance for performance assertions: allows native to be slightly
+#: slower in extreme cases (local release build plus timing noise).
 _DEFAULT_TOLERANCE = 8.0
 
-#: 默认测量轮数（取最小值以削弱调度/GC 噪声）。
+#: Default measurement rounds (the minimum is taken to reduce scheduling/GC noise).
 _DEFAULT_REPEATS = 7
 
-#: 性能测试统一跳过条件：native 不可用时无法做 native/回退对比。
+#: Shared skip condition for performance tests: the native/fallback comparison
+#: is impossible when native is unavailable.
 _requires_native = pytest.mark.skipif(
     not _HAS_NATIVE, reason="encre._native 未编译，跳过 native/回退性能对比",
 )
 
 
 # ---------------------------------------------------------------------------
-# 计时与断言工具
+# Timing and assertion utilities
 # ---------------------------------------------------------------------------
 
 
 def _best_of(fn, *, repeats: int = _DEFAULT_REPEATS) -> float:
-    """返回 ``fn`` 多次调用的**最小**单次耗时（秒），降低噪声。"""
+    """Return the **minimum** single-call duration (seconds) of ``fn`` over many calls.
+
+    Taking the best of several runs suppresses scheduler and GC noise so the
+    reported figure approximates the steady-state cost of the operation.
+    """
     best = float("inf")
     for _ in range(repeats):
         start = time.perf_counter()
@@ -101,7 +113,12 @@ def _best_of(fn, *, repeats: int = _DEFAULT_REPEATS) -> float:
 
 
 def _compare(label: str, native_fn, py_fn, *, tolerance: float, repeats: int) -> tuple[float, float]:
-    """测量并打印 native vs 回退耗时；断言 native 不慢于回退超过 ``tolerance`` 倍。"""
+    """Measure and print native vs fallback duration; assert native is not slower than ``tolerance``x.
+
+    Both sides are measured over the same number of rounds and with the same
+    inputs. The elapsed figures are printed for the report and the assertion
+    only guards against native exceeding the generous tolerance.
+    """
     native_t = _best_of(native_fn, repeats=repeats)
     py_t = _best_of(py_fn, repeats=repeats)
     ratio = native_t / max(py_t, 1e-9)
@@ -117,12 +134,16 @@ def _compare(label: str, native_fn, py_fn, *, tolerance: float, repeats: int) ->
 
 
 # ---------------------------------------------------------------------------
-# 纯 Python 回退（等价语义的 stdlib 参考实现，供对比使用）
+# Pure-Python fallbacks (equivalent-semantics stdlib reference implementations)
 # ---------------------------------------------------------------------------
 
 
 def _py_apply_diff(content: str, diff: str) -> str:
-    """应用 native 行级 diff 格式（``' '``/``'-'``/``'+'`` 前缀，行含换行）。"""
+    """Apply the native line-level diff format (``' '``/``'-'``/``'+'`` prefixes).
+
+    Each line carries its own trailing newline, matching the format produced by
+    the native ``compute_diff`` function.
+    """
     out: list[str] = []
     for raw in diff.splitlines(keepends=True):
         if not raw:
@@ -132,12 +153,12 @@ def _py_apply_diff(content: str, diff: str) -> str:
             out.append(text)
         elif tag == " ":
             out.append(text)
-        # "-" 表示删除该行，不输出。
+        # "-" marks a deleted line and contributes nothing to the output.
     return "".join(out)
 
 
 def _py_grep(pattern: str, path: str) -> list[int]:
-    """逐行正则搜索，返回命中行号（1-indexed）。"""
+    """Regex-search a file line by line and return hit line numbers (1-indexed)."""
     rx = re.compile(pattern)
     hits: list[int] = []
     with open(path, encoding="utf-8") as handle:
@@ -148,7 +169,7 @@ def _py_grep(pattern: str, path: str) -> list[int]:
 
 
 def _py_text_similarity(a: str, b: str) -> float:
-    """空白分词 Jaccard 相似度。"""
+    """Whitespace-token Jaccard similarity between two texts."""
     left, right = set(a.split()), set(b.split())
     if not left and not right:
         return 1.0
@@ -157,7 +178,7 @@ def _py_text_similarity(a: str, b: str) -> float:
 
 
 def _py_cosine_similarity(a: list[float], b: list[float]) -> float:
-    """向量余弦相似度（纯 Python dot/norm）。"""
+    """Vector cosine similarity computed with pure Python dot/norm."""
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
@@ -167,7 +188,7 @@ def _py_cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def _py_find_all(haystack: str, needle: str) -> list[int]:
-    """``str.find`` 循环找出全部出现位置。"""
+    """Find every occurrence position of ``needle`` using a ``str.find`` loop."""
     out: list[int] = []
     index = haystack.find(needle)
     while index != -1:
@@ -177,7 +198,7 @@ def _py_find_all(haystack: str, needle: str) -> list[int]:
 
 
 def _py_atomic_write(path: str, content: str) -> None:
-    """Python 原子写：temp -> flush + fsync -> os.replace（与 native 语义对齐）。"""
+    """Python atomic write: temp -> flush + fsync -> os.replace (native-equivalent)."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         handle.write(content)
@@ -187,63 +208,71 @@ def _py_atomic_write(path: str, content: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 回退侧功能正确性（native 不可用时也必须运行）
+# Fallback-side functional correctness (must run even without native)
 # ---------------------------------------------------------------------------
 
 
 class TestFallbackCorrectness:
-    """回退路径的功能正确性断言（不依赖 native，任何环境都运行）。"""
+    """Functional correctness assertions for the fallback path (native-free).
+
+    These tests do not depend on the compiled extension and therefore run in
+    every environment, guaranteeing that the reference implementations remain
+    trustworthy even when native is absent.
+    """
 
     def test_production_python_token_fallback_runs(self):
-        """生产 Python 回退 ``estimate_tokens`` 始终可用且行为合理。"""
+        """The production Python fallback ``estimate_tokens`` is always available and sane."""
         assert estimate_tokens("") == 0
         assert estimate_tokens("hello world this is a token estimate") > 0
         assert estimate_tokens("a" * 400) >= 1
 
     def test_reference_implementations_are_correct(self, tmp_path):
-        """测试内 Python 参考实现在手工可验证的输入上结果正确。"""
-        # apply_diff：' a\n-b\n+c\n' 把 a/b 变为 a/c。
+        """The in-test Python reference implementations are correct on hand-verifiable inputs."""
+        # apply_diff: " a\\n-b\\n+c\\n" turns "a\\nb" into "a\\nc".
         assert _py_apply_diff("a\nb\n", " a\n-b\n+c\n") == "a\nc\n"
         assert _py_apply_diff("", "+x\n+y\n") == "x\ny\n"
 
-        # grep：命中行号。
+        # grep: returns the matching line numbers.
         path = tmp_path / "sample.txt"
         path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
         assert _py_grep("a", str(path)) == [1, 2, 3]
 
-        # Jaccard：{a,b,c} 与 {a,b} -> 2/3。
+        # Jaccard: {a,b,c} vs {a,b} -> 2/3.
         assert abs(_py_text_similarity("a b c", "a b") - 2.0 / 3.0) < 1e-12
 
-        # 余弦：同向 1.0，正交 0.0。
+        # Cosine: aligned vectors give 1.0, orthogonal vectors give 0.0.
         assert abs(_py_cosine_similarity([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-12
         assert abs(_py_cosine_similarity([1.0, 0.0], [0.0, 1.0])) < 1e-12
 
-        # find_all / contains / memmem。
+        # find_all / contains / memmem.
         assert _py_find_all("abab", "ab") == [0, 2]
         assert "ell" in "hello"
         assert b"abab".find(b"ab") == 0
 
     def test_native_shim_flag_is_bool(self):
-        """``_HAS_NATIVE`` 始终是可读的布尔标志。"""
+        """``_HAS_NATIVE`` is always a readable boolean flag."""
         assert isinstance(_HAS_NATIVE, bool)
 
 
 # ---------------------------------------------------------------------------
-# native 与回退在相同输入下结果一致
+# Native and fallback agree on identical inputs
 # ---------------------------------------------------------------------------
 
 
 @_requires_native
 class TestNativeEquivalence:
-    """native 与纯 Python 回退在相同输入下结果一致（功能正确性）。"""
+    """Native and the pure-Python fallback produce identical results on equal inputs."""
 
     def test_count_tokens_is_positive_and_scales(self):
+        """Native token counting is positive and grows with input length."""
         text = "The quick brown fox jumps over the lazy dog. " * 2000
         assert native.count_tokens(text) > 0
         assert native.count_tokens(text) > native.count_tokens("short text")
 
     def test_diff_round_trip_matches_reference(self):
-        # native diff 是"行含换行"格式，输入以换行结尾才能无损往返。
+        """Native compute_diff/apply_diff round-trips and matches the Python reference."""
+        # The native diff uses a "line includes newline" format, so inputs must
+        # end with a newline for a lossless round trip.
         old = "\n".join(f"line {i} content here" for i in range(500)) + "\n"
         new = "\n".join(
             (f"line {i} changed" if i % 20 == 0 else f"line {i} content here")
@@ -254,6 +283,7 @@ class TestNativeEquivalence:
         assert _py_apply_diff(old, diff) == new
 
     def test_grep_matches_reference_line_numbers(self, tmp_path):
+        """Native grep reports the same matching line numbers as the Python reference."""
         path = tmp_path / "code.py"
         path.write_text(
             "\n".join(
@@ -266,21 +296,25 @@ class TestNativeEquivalence:
         assert native_hits
 
     def test_text_similarity_matches_reference(self):
+        """Native text similarity agrees with the Python Jaccard reference."""
         a = " ".join(f"tok{i}" for i in range(400))
         b = " ".join(f"tok{i}" for i in range(200, 600))
-        # native 以 f32 计算，故用 f32 精度量级的容差。
+        # Native computes in f32, so the tolerance is at f32 precision scale.
         assert abs(native.text_similarity(a, b) - _py_text_similarity(a, b)) < 1e-6
 
     def test_cosine_similarity_matches_reference(self):
+        """Native cosine similarity agrees with the Python reference."""
         a = [float(i % 7) for i in range(256)]
         b = [float((i + 1) % 5) for i in range(256)]
         assert abs(native.cosine_similarity(a, b) - _py_cosine_similarity(a, b)) < 1e-6
 
     def test_simd_find_all_matches_reference(self):
+        """Native SIMD substring search returns the same offsets as str.find."""
         haystack = "abab" * 200
         assert native.simd_find_all(haystack, "ab") == _py_find_all(haystack, "ab")
 
     def test_simd_contains_and_memmem_match_reference(self):
+        """Native SIMD contains and memmem agree with ``in`` and ``bytes.find``."""
         haystack = ("abcdefghij" * 1000) + "NEEDLE"
         assert native.simd_contains(haystack, "NEEDLE") is True
         assert native.simd_contains(haystack, "ABSENT") is False
@@ -288,6 +322,7 @@ class TestNativeEquivalence:
         assert native.simd_memmem(haystack.encode(), b"ABSENT") is None
 
     def test_read_write_file_round_trip_matches_reference(self, tmp_path):
+        """Native file I/O round-trips content identical to what pathlib writes."""
         path = str(tmp_path / "round_trip.txt")
         content = "x" * 10000 + "\nline two\n"
         assert native.write_file(path, content) is True
@@ -296,16 +331,20 @@ class TestNativeEquivalence:
 
 
 # ---------------------------------------------------------------------------
-# 热路径性能基线（native vs 纯 Python 回退）
+# Hot-path performance baseline (native vs pure-Python fallback)
 # ---------------------------------------------------------------------------
 
 
 @_requires_native
 class TestHotPathPerformance:
-    """真实耗时对比：断言 native 不慢于回退超过宽容容差，并打印真实数字。"""
+    """Real wall-clock comparison: assert native is not slower beyond tolerance.
+
+    Every figure is printed for the report so the numbers stay auditable
+    instead of being swallowed by a boolean assertion.
+    """
 
     def test_count_tokens_vs_tiktoken(self):
-        """token 计数：native vs tiktoken（等价的分词器回退）。"""
+        """Token counting: native vs tiktoken (the equivalent tokenizer fallback)."""
         tiktoken = pytest.importorskip("tiktoken")
         encoding = tiktoken.get_encoding("o200k_base")
         text = "The quick brown fox jumps over the lazy dog. " * 2000
@@ -318,7 +357,7 @@ class TestHotPathPerformance:
         )
 
     def test_compute_diff_vs_difflib(self):
-        """diff 生成：native vs difflib.unified_diff。"""
+        """Diff generation: native vs difflib.unified_diff."""
         import difflib
 
         old = "\n".join(f"line {i} content here" for i in range(2000))
@@ -337,7 +376,7 @@ class TestHotPathPerformance:
         )
 
     def test_apply_diff_vs_python(self):
-        """diff 应用：native vs 纯 Python 应用器。"""
+        """Diff application: native vs a pure-Python applier."""
         old = "\n".join(f"line {i} content here" for i in range(2000))
         new = "\n".join(
             (f"line {i} changed" if i % 20 == 0 else f"line {i} content here")
@@ -353,7 +392,7 @@ class TestHotPathPerformance:
         )
 
     def test_grep_vs_python_re(self, tmp_path):
-        """文件正则搜索：native vs Python ``re`` 逐行扫描。"""
+        """File regex search: native vs line-by-line Python ``re`` scanning."""
         path = tmp_path / "big.txt"
         path.write_text(
             "\n".join(
@@ -370,7 +409,7 @@ class TestHotPathPerformance:
         )
 
     def test_text_similarity_vs_python(self):
-        """文本 Jaccard：native vs 纯 Python set 交/并集。"""
+        """Text Jaccard: native vs pure-Python set intersection/union."""
         a = " ".join(f"tok{i}" for i in range(5000))
         b = " ".join(f"tok{i}" for i in range(2500, 7500))
         _compare(
@@ -382,7 +421,7 @@ class TestHotPathPerformance:
         )
 
     def test_cosine_similarity_vs_python(self):
-        """向量余弦：native vs 纯 Python dot/norm。"""
+        """Vector cosine: native vs pure-Python dot/norm."""
         a = [float(i % 7) for i in range(4096)]
         b = [float((i + 1) % 5) for i in range(4096)]
         _compare(
@@ -394,7 +433,7 @@ class TestHotPathPerformance:
         )
 
     def test_simd_find_all_vs_python(self):
-        """子串全部位置：native vs ``str.find`` 循环。"""
+        """All substring positions: native vs a ``str.find`` loop."""
         haystack = "abab" * 50000
         _compare(
             "simd_find_all(200KB, 100k hits)",
@@ -405,7 +444,7 @@ class TestHotPathPerformance:
         )
 
     def test_read_file_vs_pathlib(self, tmp_path):
-        """读文件：native vs ``Path.read_text``。"""
+        """File read: native vs ``Path.read_text``."""
         path = tmp_path / "read.txt"
         path.write_text("x" * 500000, encoding="utf-8")
         _compare(
@@ -417,10 +456,11 @@ class TestHotPathPerformance:
         )
 
     def test_write_file_vs_python_atomic_write(self, tmp_path):
-        """原子写：native（temp+fsync+rename）vs 等价 Python 原子写。
+        """Atomic write: native (temp+fsync+rename) vs an equivalent Python atomic write.
 
-        对照必须是**等价语义**（含 fsync 持久化）：与无 fsync 的普通写相比 native
-        会显得更慢，但那不是同类比较。
+        The comparison must be **semantically equivalent** (including fsync
+        persistence): against a plain write without fsync the native path would
+        look slower, but that is not a like-for-like comparison.
         """
         path = str(tmp_path / "write.txt")
         content = "x" * 500000
@@ -434,21 +474,23 @@ class TestHotPathPerformance:
 
 
 # ---------------------------------------------------------------------------
-# 观测到的 native 劣化（如实断言，不掩盖）
+# Observed native regressions (asserted honestly, never hidden)
 # ---------------------------------------------------------------------------
 
 
 @_requires_native
 class TestObservedNativeRegressions:
-    """如实记录 native 反而慢于 stdlib 的函数。
+    """Record faithfully the functions where native is slower than stdlib.
 
-    这两个 ``simd_*`` 函数在整个仓库中**没有任何 Python 调用方**（只有
-    ``native.py`` 的导出），因此不构成生产热路径；但作为基线必须如实记录其真实
-    倍率。此处只断言"未出现灾难性劣化"的上界，并在报告中给出精确数字。
+    These two ``simd_*`` functions have **no Python caller anywhere in the
+    repository** (only the ``native.py`` export), so they do not form a
+    production hot path; as a baseline their real ratio must still be recorded
+    honestly. Here we only assert an upper bound against catastrophic
+    regression, and the report carries the precise numbers.
     """
 
     def test_simd_contains_is_slower_than_stdlib(self):
-        """``simd_contains`` 慢于 CPython ``in``（后者用优化的 memchr/two-way）。"""
+        """``simd_contains`` is slower than CPython ``in`` (optimized memchr/two-way)."""
         haystack = ("abcdefghij" * 100000) + "NEEDLE"
         native_t = _best_of(lambda: native.simd_contains(haystack, "NEEDLE"))
         py_t = _best_of(lambda: "NEEDLE" in haystack)
@@ -457,11 +499,12 @@ class TestObservedNativeRegressions:
             f"python={py_t * 1e6:.1f}us ratio={native_t / max(py_t, 1e-9):.2f}x"
         )
         assert native.simd_contains(haystack, "NEEDLE") is True
-        # 上界只用于防止灾难性劣化；真实倍率由报告给出（本机约 5x 慢）。
+        # The upper bound only guards against catastrophic regression; the real
+        # ratio is reported (about 5x slower on this machine).
         assert native_t <= py_t * 20.0
 
     def test_simd_memmem_is_slower_than_stdlib(self):
-        """``simd_memmem`` 慢于 CPython ``bytes.find``（本机约 28x）。"""
+        """``simd_memmem`` is slower than CPython ``bytes.find`` (about 28x locally)."""
         haystack = (b"abcdefghij" * 100000) + b"NEEDLE"
         native_t = _best_of(lambda: native.simd_memmem(haystack, b"NEEDLE"))
         py_t = _best_of(lambda: haystack.find(b"NEEDLE"))
@@ -470,5 +513,6 @@ class TestObservedNativeRegressions:
             f"python={py_t * 1e6:.1f}us ratio={native_t / max(py_t, 1e-9):.2f}x"
         )
         assert native.simd_memmem(haystack, b"NEEDLE") == haystack.find(b"NEEDLE")
-        # 上界只用于防止灾难性劣化；真实倍率由报告给出（本机约 28x 慢）。
+        # The upper bound only guards against catastrophic regression; the real
+        # ratio is reported (about 28x slower on this machine).
         assert native_t <= py_t * 100.0

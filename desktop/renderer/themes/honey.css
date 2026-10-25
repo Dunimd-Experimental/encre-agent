@@ -1,0 +1,88 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Theme skin "honey" (琥珀) — generated from the theme-demo v5.2
+ * palette (自然材质色阶). One file per skin; the mode ("light" / "dark")
+ * stays on [data-theme], the skin on [data-skin]. Only colours live here;
+ * surfaces (content paper, chassis, form-control background) and the
+ * neutral hover/selection plates are NOT defined here — styles.css and
+ * themes/tokens.css own them and keep them identical across every skin. Text/semantic values meet WCAG 4.5 (body) / 4.0 (tertiary)
+ * / 3.4 (muted) against the mode paper. */
+
+/* ═══ 琥珀 · 浅 ═══ */
+html[data-skin="honey"] {
+  --text-primary: hsl(38 20% 20%);
+  --text-secondary: hsl(40 11% 42%);
+  --text-tertiary: hsl(42 8% 47%);
+  --text-muted: hsl(42 8% 51.5%);
+  --tool-text: hsl(40 11% 36%);
+  --accent: hsl(40 44% 36.5%);
+  --accent-hover: hsl(40 46% 31.5%);
+  --accent-light: hsl(40 44% 46% / .11);
+  --accent-contrast: hsl(40 30% 98%);
+  --success: hsl(150 20% 40%);
+  --error: hsl(6 38% 48%);
+  --warning: hsl(38 42% 38%);
+  --border: hsl(42 10% 85%);
+  --border-light: hsl(42 10% 87%);
+  --card-border: hsl(42 16% 83%);
+  --card-fill: hsl(42 10% 91%);
+  --border-control: hsl(42 10% 78%);
+  --checkbox-border: hsl(42 15% 73%);
+  --selection-bg: hsl(42 40% 56% / .26);
+  --seg-bg: hsl(42 11% 93.5%);
+  --seg-active-bg: #fffdf6;
+  --seg-text: hsl(40 11% 42%);
+  --seg-text-hover: hsl(38 20% 20%);
+  --seg-active-text: hsl(38 20% 20%);
+  --page:linear-gradient(170deg, #f6ecd0 0%, #f6ecd2 46%, #f3e8c8 100%);
+  --blob1:radial-gradient(920px 540px at 84% -12%, hsl(42 70% 76% / .44), transparent 68%);
+  --blob2:radial-gradient(780px 500px at -14% 44%, hsl(26 60% 78% / .32), transparent 66%);
+}
+
+/* ═══ 琥珀 · 深 ═══ */
+html[data-skin="honey"][data-theme="dark"] {
+  --text-primary: hsl(38 10% 88%);
+  --text-secondary: hsl(38 7% 64%);
+  --text-tertiary: hsl(38 5% 47%);
+  --text-muted: hsl(38 5% 40%);
+  --tool-text: hsl(38 10% 88%);
+  --accent: hsl(40 40% 58%);
+  --accent-hover: hsl(40 38% 64%);
+  --accent-light: hsl(40 40% 58% / .13);
+  --accent-contrast: hsl(38 30% 11%);
+  --success: hsl(150 20% 55%);
+  --error: hsl(6 30% 58%);
+  --warning: hsl(42 32% 58%);
+  --border: hsl(38 8% 24%);
+  --border-light: hsl(38 8% 26%);
+  --card-border: hsl(38 8% 26%);
+  --card-fill: hsl(38 9% 15%);
+  --border-control: hsl(38 8% 30%);
+  --checkbox-border: hsl(38 9% 34%);
+  --selection-bg: hsl(42 32% 56% / .28);
+  --seg-bg: hsl(38 8% 19%);
+  --seg-active-bg: hsl(38 8% 23%);
+  --seg-text: hsl(38 7% 64%);
+  --seg-text-hover: hsl(38 10% 88%);
+  --seg-active-text: hsl(38 10% 88%);
+  --page:linear-gradient(172deg, hsl(40 14% 16%) 0%, hsl(38 12% 13%) 55%, hsl(34 11% 12%) 100%);
+  --blob1:radial-gradient(900px 520px at 82% -12%, hsl(42 55% 56% / .14), transparent 68%);
+  --blob2:radial-gradient(760px 480px at -12% 42%, hsl(26 50% 52% / .09), transparent 66%);
+}

@@ -1,0 +1,102 @@
+{
+  "updated_at": "2026-03-12",
+  "date_range": {
+    "start": "2026-03-01",
+    "end": "2026-03-12"
+  },
+  "stats": {
+    "evolution_events": 9,
+    "total_signals": 66,
+    "unprocessed": 6
+  },
+  "gate": {
+    "should_evolve": true,
+    "message": "6 条未处理反馈（含 1 条高优先级），建议运行 /evolve"
+  },
+  "timeline": [
+    {
+      "date": "2026-03-12",
+      "description": "Agent 进化：6 信号 → 2 mutation（AGENTS.md + SOUL.md）"
+    },
+    {
+      "date": "2026-03-09",
+      "description": "Agent 进化：10 个 mutation，覆盖 6 session"
+    },
+    {
+      "date": "2026-03-08",
+      "description": "GitHub Trend Observer v0.1.0 → v0.2.0"
+    },
+    {
+      "date": "2026-03-05",
+      "description": "Agent 进化：3 项 Judgment 进化"
+    },
+    {
+      "date": "2026-03-04",
+      "description": "Agent 进化：6 项进化"
+    },
+    {
+      "date": "2026-03-01",
+      "description": "xhs v0.1→v0.2 + Evolution Coach v0.2.0"
+    }
+  ],
+  "verification": {
+    "needs_attention": [
+      {
+        "name": "先建任务再执行",
+        "layer": "protocol",
+        "status": "regression",
+        "note": "03-05 通过 → 03-06/07 再次违反"
+      },
+      {
+        "name": "信号收集 Hook v2",
+        "layer": "capability",
+        "status": "partial",
+        "note": "手动运作；Hook 未部署"
+      }
+    ],
+    "pending": [
+      {"name": "先调研再提问", "status": "pending", "date": "03-12"},
+      {"name": "记忆访问边界", "status": "pending", "date": "03-12"},
+      {"name": "反 AI 味检查单", "status": "pending", "date": "03-09"},
+      {"name": "验证标准升级", "status": "pending", "date": "03-09"},
+      {"name": "Session 开场任务检查", "status": "pending", "date": "03-09"}
+    ],
+    "verified_observed": [
+      {"name": "Definition of Done", "status": "observed"},
+      {"name": "流程遵从规则", "status": "observed"},
+      {"name": "方案 trade-off 透明化", "status": "observed"},
+      {"name": "Session 结束检查单", "status": "observed"}
+    ]
+  },
+  "signals": {
+    "sparkline": [
+      {"date": "03-01", "count": 8},
+      {"date": "03-02", "count": 15},
+      {"date": "03-03", "count": 8},
+      {"date": "03-04", "count": 19},
+      {"date": "03-05", "count": 9},
+      {"date": "03-06", "count": 6},
+      {"date": "03-07", "count": 3},
+      {"date": "03-09", "count": 6},
+      {"date": "03-12", "count": 6}
+    ],
+    "recent": [
+      {"date": "03-12", "count": 6, "source": "evolution skill 测试"},
+      {"date": "03-09", "count": 6, "source": "multi-agent 系统设计"},
+      {"date": "03-04", "count": 19, "source": "2 sessions"}
+    ],
+    "older_summary": "03-01: 8 · 03-02: ~15 · 03-03: ~8 · 03-05: 9 · 03-06: 6 · 03-07: 3"
+  },
+  "capabilities": {
+    "soul_principles": ["先对齐再执行", "不经确认不改动", "行动范围匹配", "Session 结束检查单"],
+    "strengths": ["搜索分析", "从零搭建基础设施"],
+    "weaknesses": ["多系统联调", "中文 prose 写作"],
+    "moderate": ["流程遵从", "基础设施诊断"]
+  },
+  "report_archive": [
+    {"date": "2026-03-12", "summary": "2 mutation · 6 信号"},
+    {"date": "2026-03-09", "summary": "10 mutation · 15 信号 · 6 sessions"},
+    {"date": "2026-03-05", "summary": "3 mutation · 9 信号"}
+  ],
+  "cost_total": "~$39"
+}

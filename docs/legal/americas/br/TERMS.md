@@ -30,7 +30,7 @@
 | Serviço | Descrição | Disponibilidade |
 |---|---|---|
 | **Encre Agent Desktop** | Aplicativo desktop para agentes de IA locais | Windows, macOS, Linux |
-| **Encre Agent Framework** | Framework Python + núcleo nativo Rust | Open source, github.com/mf2023/Encre |
+| **Encre Agent** | Gateway Python + núcleo nativo Rust | Open source, github.com/mf2023/Encre |
 | **Integrações de chat** | Conectores para 18 plataformas de mensageria | Conforme disponibilidade |
 | **PiscesLx** | Inferência de LLM hospedada (opcional) | Assinatura |
 | **StadionOS** | Projeto de sistema operacional | Licenciamento próprio |

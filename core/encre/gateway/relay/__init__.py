@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -25,25 +25,56 @@ from __future__ import annotations
 
 """Relay subsystem: connector-backed platform fronting (EXPERIMENTAL).
 
-The relay is an **indirect** platform path: instead of a direct platform adapter
-(:mod:`encre.gateway.platforms.*`), the gateway dials out to a connector over a
-WebSocket and lets the connector front the real platform.  This lets a hosted
-gateway (no public inbound IP) still serve platform traffic.
+The relay is an indirect platform path.  Instead of speaking a concrete vendor
+protocol from inside the gateway process the way
+:mod:`encre.gateway.platforms` does, the gateway dials **out** to a connector
+host over a WebSocket and lets the connector own the real platform sockets.
+That makes hosted gateways viable: a gateway with no public inbound IP can
+still serve platform traffic because the vendor never has to call back into
+the gateway.
 
-Activation is **config-driven, not a feature flag**: when
-``GATEWAY_RELAY_URL`` (env) or ``gateway.relay_url`` (settings) is set, the
-relay platform is registered; otherwise the gateway is a normal direct-connect
-single-tenant gateway and this module is inert.  This means adding the relay
-subsystem is non-breaking -- existing deployments that do not configure a
-relay URL are unaffected.
+This is deliberately distinct from :mod:`encre.gateway.ws_bridge`, which
+bridges a whole *adapter process* -- a remote Encre adapter that owns the real
+platform socket and attaches to a local gateway.  The relay inverts that
+direction: the local gateway owns the agent and reaches out to a connector that
+owns the platform.
 
-Public surface:
+Activation is config-driven, not a feature flag.  When ``GATEWAY_RELAY_URL``
+(environment) or ``gateway.relay_url`` (settings) is present,
+:class:`encre.gateway.run.GatewayRunner` registers the relay platform at async
+startup; otherwise this module is inert and the gateway runs as an ordinary
+direct-connect single-tenant gateway.  The subsystem is therefore non-breaking
+to add: :func:`register_relay_adapter` imports the adapter and transport lazily,
+so an unconfigured deployment pays only for the config lookups below.
 
-- :func:`relay_url` / :func:`relay_gateway_id` / :func:`relay_upgrade_secret`
-  / :func:`relay_wake_url` -- read the relay config.
+Message flow once registered::
+
+    platform vendor  <--vendor protocol-->  connector
+                                               |  inbound: normalized event
+                                               v
+                              RelayAdapter.handle_message -> runner
+                                               |  agent turn (Encre Agent Core)
+                                               v
+                              stream consumer / delivery router
+                                               |  adapter.send()
+                                               v
+                              outbound frame -> connector -> platform vendor
+
+The connector is the trust boundary.  It enforces platform authorization (hence
+:attr:`RelayAdapter.authorization_is_upstream`), strips provider signatures and
+tenant credentials, and holds the vendor tokens -- this package never sees one.
+Authentication of the connector channel itself is handled by
+:mod:`encre.gateway.relay.auth`.
+
+Public API:
+
+- :func:`relay_is_configured` -- the gate :class:`GatewayRunner` checks.
+- :func:`relay_url`, :func:`relay_gateway_id`, :func:`relay_upgrade_secret`,
+  :func:`relay_wake_url`, :func:`relay_platform_identities` -- read the relay
+  configuration from environment or settings.
 - :func:`register_relay_adapter` -- build a :class:`RelayAdapter` from config
   and register it as the ``relay`` platform in a :class:`GatewayRunner`.
-- :func:`relay_relevance_policy` / :func:`send_relay_policy` -- declare the
+- :func:`relay_relevance_policy`, :func:`send_relay_policy` -- declare the
   gateway's message-relevance policy to the connector at boot.
 - :func:`self_provision_relay` -- (stub) self-provision with the connector.
 """
@@ -54,10 +85,28 @@ from typing import Any
 
 logger = logging.getLogger("encre.gateway.relay")
 
-# 鈹€鈹€ config accessors 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---------------------------------------------------------------------------
+# Configuration accessors
+#
+# Every accessor reads the environment first and falls back to the settings
+# mapping, so a hosted deployment can override a committed config.yaml without
+# editing the file.  Each one returns None for "absent", which the callers treat
+# as "relay not configured" rather than as an error.
+# ---------------------------------------------------------------------------
 
 
 def _settings() -> dict[str, Any]:
+    """Return the loaded settings mapping, or an empty dict on any failure.
+
+    All accessors in this module route through here so a missing, unreadable, or
+    malformed ``config.yaml`` degrades the relay to "not configured" instead of
+    raising during gateway startup.  The settings are re-read on every call
+    rather than cached, so a config edit is picked up at the next gateway start
+    without restarting the interpreter.
+
+    Returns:
+        The loaded settings dict, or ``{}`` when ``load_settings`` raises.
+    """
     try:
         from encre.settings_manager import load_settings
         return load_settings() or {}
@@ -66,10 +115,16 @@ def _settings() -> dict[str, Any]:
 
 
 def relay_url() -> str | None:
-    """The connector URL to dial (``https://``/``http://``/``ws://``/``wss://``).
+    """Return the connector endpoint the gateway dials out to.
 
-    Reads ``GATEWAY_RELAY_URL`` (env, takes precedence) or
-    ``gateway.relay_url`` (settings).  None when relay is not configured.
+    Environment wins over settings.  The settings key is historically
+    ``gateway_relay_url``; the bare ``relay_url`` alias is still honoured for
+    older deployments.
+
+    Returns:
+        A stripped, non-empty URL string, or None when relay is not configured.
+        Whitespace-only and empty values are treated as absent, so a stray empty
+        environment variable cannot register a platform that can never connect.
     """
     env = os.environ.get("GATEWAY_RELAY_URL", "").strip()
     if env:
@@ -79,7 +134,16 @@ def relay_url() -> str | None:
 
 
 def relay_gateway_id() -> str | None:
-    """This gateway's identifier (for the upgrade-token payload)."""
+    """Return this gateway's identifier for the relay auth payload.
+
+    The identifier is the payload half of the upgrade token minted by
+    :func:`encre.gateway.relay.auth.make_upgrade_token`; the connector peeks at
+    it to index its per-gateway secret table before verifying the signature, so
+    it is transmitted in clear text inside a bearer token.
+
+    Returns:
+        A stripped gateway id, or None when unset (an unauthenticated dial).
+    """
     env = os.environ.get("GATEWAY_RELAY_GATEWAY_ID", "").strip()
     if env:
         return env
@@ -88,7 +152,14 @@ def relay_gateway_id() -> str | None:
 
 
 def relay_upgrade_secret() -> str | None:
-    """The per-gateway HMAC secret authenticating the WS upgrade."""
+    """Return the per-gateway HMAC secret used to authenticate the WS upgrade.
+
+    Returns:
+        A stripped secret, or None when unset.  A gateway without both an id and
+        a secret still dials the connector; the connector may accept or reject
+        that depending on its own policy, and a rejection before the handshake
+        is retryable rather than terminal.
+    """
     env = os.environ.get("GATEWAY_RELAY_SECRET", "").strip()
     if env:
         return env
@@ -97,8 +168,15 @@ def relay_upgrade_secret() -> str | None:
 
 
 def relay_wake_url() -> str | None:
-    """An out-of-band wake URL the connector can GET to wake a scaled-to-zero
-    gateway.  None when scale-to-zero is not used.
+    """Return the out-of-band wake URL for scale-to-zero gateways.
+
+    A gateway that suspends itself via
+    :meth:`RelayAdapter.go_dormant` may be unreachable afterwards, so the
+    connector can GET this URL to pull it back up before replaying buffered
+    platform traffic.
+
+    Returns:
+        A stripped wake URL, or None when scale-to-zero is not used.
     """
     env = os.environ.get("GATEWAY_RELAY_WAKE_URL", "").strip()
     if env:
@@ -108,8 +186,19 @@ def relay_wake_url() -> str | None:
 
 
 def relay_platform_identities() -> list[dict[str, Any]]:
-    """The platform identities this gateway fronts via the connector
-    (e.g. ``[{platform: "discord", bot_id: "..."}]``)."""
+    """Return the platform identities this gateway fronts through the connector.
+
+    Each entry names one vendored identity, e.g.
+    ``{"platform": "discord", "bot_id": "..."}``.  A single WebSocket can front
+    N of these, but the ``hello`` frame must advertise at least one, so callers
+    always fall back to a synthetic ``relay`` identity for an empty list.
+
+    Returns:
+        The parsed identity list from ``GATEWAY_RELAY_IDENTITIES`` (a JSON
+        string) or the ``gateway_relay_identities`` setting (a list, or a JSON
+        string).  An empty list on any malformed input, so bad JSON degrades to
+        "no identities advertised" instead of aborting startup.
+    """
     import json
     env = os.environ.get("GATEWAY_RELAY_IDENTITIES", "").strip()
     if env:
@@ -128,24 +217,48 @@ def relay_platform_identities() -> list[dict[str, Any]]:
     return []
 
 
-# 鈹€鈹€ registration 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
 
 
 def relay_is_configured() -> bool:
-    """True when a relay URL is set (the relay platform should register)."""
+    """Return True when the relay platform should be registered.
+
+    :class:`encre.gateway.run.GatewayRunner` checks this at async startup and
+    calls :func:`register_relay_adapter` only when it is True.  The check is a
+    pure URL presence test, deliberately not a connectivity probe, so a
+    temporarily unreachable connector never blocks gateway startup.
+    """
     return bool(relay_url())
 
 
 async def register_relay_adapter(manager: Any) -> bool:
-    """Build a :class:`RelayAdapter` from config and register it with ``manager``.
+    """Build a :class:`RelayAdapter` from config and register it with *manager*.
 
-    Called by :class:`~encre.gateway.run.GatewayRunner` at async startup
-    when :func:`relay_is_configured` is True.  Returns True on success; False
-    (and a logged warning) when the relay is not configured or registration
-    fails -- never raises, so a misconfigured relay never aborts gateway startup.
+    Called by :class:`encre.gateway.run.GatewayRunner` at async startup when
+    :func:`relay_is_configured` is True.  The relay platform is not present in
+    :mod:`encre.gateway.platform_registry`, so the runner cannot construct it
+    through its normal ``start_adapter`` path; instead the adapter is inserted
+    directly into the runner's ``_instances`` map, where the rest of the runner
+    -- delivery routing, the adapter panel, ``stop_all`` -- treats it exactly
+    like any in-process adapter.
 
-    The adapter + its transport are constructed lazily here (not at module
-    import) so an unconfigured gateway pays no import cost for the relay stack.
+    The adapter and its transport are constructed here, at registration time,
+    rather than at module import so an unconfigured gateway incurs no relay
+    import cost.
+
+    Args:
+        manager: The :class:`GatewayRunner` instance.  Only ``_instances`` and
+            ``_handle_message`` are used, so a dict-like stand-in works in tests.
+
+    Returns:
+        True when the platform is registered and connected, False otherwise.
+        A failure logs a warning and never raises, so a misconfigured relay can
+        never abort gateway startup.
+
+    Raises:
+        Nothing -- every failure path is logged and swallowed.
     """
     url = relay_url()
     if not url:
@@ -155,9 +268,9 @@ async def register_relay_adapter(manager: Any) -> bool:
         from encre.gateway.relay.ws_transport import WebSocketRelayTransport
 
         identities = relay_platform_identities()
-        # Use the first identity's platform/bot_id as the transport's primary
-        # identity (a single WS fronts N platforms, but the hello frame
-        # advertises at least one).
+        # One WebSocket fronts N platforms, but the hello frame must advertise
+        # at least one identity; use the first for the transport's primary
+        # platform/bot_id and let the connector fan out the rest.
         platform = identities[0].get("platform", "relay") if identities else "relay"
         bot_id = identities[0].get("bot_id") if identities else None
 
@@ -171,10 +284,12 @@ async def register_relay_adapter(manager: Any) -> bool:
         )
         adapter = RelayAdapter(transport=transport)
 
-        # Register into the runner's instance map directly (the relay platform
-        # is not in the platform_registry, so start_adapter cannot construct it).
+        # Insert straight into the instance map: the registry has no "relay"
+        # entry, so the normal start_adapter lookup would not find it.
         manager._instances["relay"] = adapter
-        # Wire up the message handler so inbound messages route through the runner.
+        # Wire the inbound path.  BasePlatformAdapter.handle_message invokes the
+        # handler as handler(adapter, event), which matches GatewayRunner's
+        # _handle_message signature.
         adapter.set_message_handler(getattr(manager, "_handle_message", None))
         ok = await adapter.connect()
         if ok:
@@ -187,7 +302,8 @@ async def register_relay_adapter(manager: Any) -> bool:
         return ok
     except Exception as e:
         logger.warning("[relay] registration failed: %s %s", type(e).__name__, e)
-        # Clean up a half-registered instance.
+        # Remove a half-registered instance so the runner never advertises a
+        # platform that is neither connected nor stopped cleanly.
         if isinstance(manager, dict):
             pass
         try:
@@ -197,15 +313,30 @@ async def register_relay_adapter(manager: Any) -> bool:
         return False
 
 
-# 鈹€鈹€ relevance policy (Phase 7 of the relay contract) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---------------------------------------------------------------------------
+# Message-relevance policy
+#
+# Relevance is the connector-side decision of which inbound messages are worth
+# handing to the gateway at all (mentions vs. free channels vs. other bots).
+# It is layered on top of the connector's own authorization gate and is purely
+# an optimization, so pushing it never blocks boot.
+# ---------------------------------------------------------------------------
 
 
 def relay_relevance_policy() -> dict[str, Any] | None:
-    """Project the gateway's relevance knobs into a platform-agnostic policy.
+    """Return the gateway's relevance settings as a platform-agnostic policy.
 
-    Returns None when the policy is all-default (the connector's absent-row
-    default already matches, so the gateway sends nothing).  Mirrors Encre's
-    ``relay_relevance_policy()``.
+    The policy mirrors three gateway settings in a vendor-neutral shape:
+    ``gateway_require_mention`` -> ``requireAddress``,
+    ``gateway_free_response_channels`` (a list or a comma-separated string) ->
+    ``freeResponseScopes``, and ``gateway_allow_bots`` (``all`` or ``mentions``)
+    -> ``allowOtherBots``.
+
+    Returns:
+        The policy dict, or None when every setting is at its default.  The
+        connector's absent-row default already matches the gateway default, so
+        sending nothing in the default case keeps the connector's table empty
+        and avoids a needless write.
     """
     require_address = bool(_settings().get("gateway_require_mention"))
     free_scopes = _settings().get("gateway_free_response_channels")
@@ -225,32 +356,43 @@ def relay_relevance_policy() -> dict[str, Any] | None:
 
 
 async def send_relay_policy() -> bool:
-    """POST the relevance policy to the connector at boot (fail-soft).
+    """Send the relevance policy to the connector at boot (fail-soft).
 
-    A failure logs and boot proceeds -- relevance is an optimization layered on
-    the authorization gate, never a boot dependency.  Returns True on success.
+    Relevance is an optimization layered on the connector's authorization gate,
+    never a boot dependency, so a failure logs and boot continues.
+
+    Returns:
+        True when nothing had to be sent (all-default settings) or when the
+        policy was handed off; False only if a future implementation fails to
+        deliver it.  Never raises.
     """
     policy = relay_relevance_policy()
     if policy is None:
         # All-default: the connector's absent-row default already matches.
         return True
-    # The actual POST lives in the connector's /relay/policy route; this stub
-    # logs the intent.  A full implementation would use the upgrade token +
-    # the relay host.  Fail-soft: never raise.
+    # The actual POST lives on the connector's /relay/policy route; this stub
+    # only records intent, and a full implementation would reuse the upgrade
+    # token plus the relay host to authenticate the call.
     logger.info("[relay] would POST relevance policy: %s", policy)
     return True
 
 
-# 鈹€鈹€ self-provisioning (stub) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---------------------------------------------------------------------------
+# Self-provisioning (stub)
+# ---------------------------------------------------------------------------
 
 
 def self_provision_relay() -> bool:
-    """Self-provision with the connector (``/relay/provision``).
+    """Attempt self-provisioning with the connector via ``/relay/provision``.
 
-    Stub -- a full implementation would POST to the connector's provision
-    route with the wake URL + gateway id and store the returned per-gateway
-    secret.  Returns False when not yet implemented so callers fall back to
-    an externally-provisioned secret.
+    A full implementation would POST the wake URL and gateway id to the
+    connector's provision route, then persist the returned per-gateway secret
+    that :func:`relay_upgrade_secret` later reads.
+
+    Returns:
+        False today (unimplemented, or no relay URL configured) so callers fall
+        back to an externally-provisioned secret.  A False return is not an
+        error -- it is the expected signal that manual provisioning is required.
     """
     if not relay_url():
         return False

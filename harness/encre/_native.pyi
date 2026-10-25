@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,100 +23,12 @@
 
 from __future__ import annotations
 
+from __future__ import annotations
+
 from typing import Any
 
 
 def search_codebase(query: str, path: str | None = None) -> list[dict[str, Any]]:
-    ...
-
-
-def build_code_index(workspace: str) -> str:
-    ...
-
-
-def count_code_index_candidates(workspace: str) -> int:
-    ...
-
-
-def load_code_index(workspace: str) -> str:
-    ...
-
-
-def update_code_index(workspace: str) -> str:
-    ...
-
-
-def search_code_index(workspace: str, query: str, limit: int | None = None) -> str:
-    ...
-
-
-def build_code_context(workspace: str, file_path: str) -> str:
-    ...
-
-
-def ast_available() -> bool:
-    ...
-
-
-def ast_backend_name() -> str:
-    ...
-
-
-def build_ast_index(workspace: str) -> str:
-    ...
-
-
-def load_ast_index(workspace: str) -> str:
-    ...
-
-
-def update_ast_index(workspace: str) -> str:
-    ...
-
-
-def ast_get_symbol(workspace: str, name: str) -> str:
-    ...
-
-
-def ast_get_outline(workspace: str, file: str) -> str:
-    ...
-
-
-def ast_list_files(workspace: str) -> str:
-    ...
-
-
-def ast_find_relevant(workspace: str, name: str, limit: int = 10) -> str:
-    ...
-
-
-def ast_find_references(workspace: str, name: str) -> str:
-    ...
-
-
-def ast_goto_definition(workspace: str, file: str, line: int, col: int) -> str:
-    ...
-
-
-def build_embedding_slices(workspace: str, max_chars: int = 4000) -> str:
-    ...
-
-
-def load_embedding_index(workspace: str) -> str:
-    ...
-
-
-def save_embedding_index(
-    workspace: str,
-    slices_json: str,
-    vectors_json: str,
-    file_mtimes_json: str,
-    embedding_dim: int,
-) -> None:
-    ...
-
-
-def search_embedding_index(workspace: str, query_vector_json: str, k: int) -> str:
     ...
 
 
@@ -271,37 +183,3 @@ def build_lsp_request(id: int, method: str, params: str) -> str:
 def build_content_length_header(content: str) -> str:
     """Build an LSP Content-Length header for the given body."""
     ...
-
-
-# ---------------------------------------------------------------------------
-# BM25 indexer
-# ---------------------------------------------------------------------------
-
-class Bm25Index:
-    """BM25-powered code search index.
-
-    Usage::
-
-        idx = Bm25Index()
-        idx.build([("path.py", "def foo(): pass")])
-        results = idx.search("foo", 10)
-    """
-
-    def __init__(self) -> None: ...
-    def build(self, files: list[tuple[str, str]]) -> None:
-        """Build or rebuild the index from (path, content) pairs."""
-        ...
-    def search(self, query: str, limit: int = 10) -> list[tuple[str, float]]:
-        """Search with BM25 ranking. Returns list of (path, score)."""
-        ...
-    def add_document(self, path: str, content: str) -> None:
-        """Add or update a single document."""
-        ...
-    def remove_document(self, path: str) -> None:
-        """Remove a document by path."""
-        ...
-    def clear(self) -> None:
-        """Clear the entire index."""
-        ...
-    def __len__(self) -> int: ...
-    def __bool__(self) -> bool: ...

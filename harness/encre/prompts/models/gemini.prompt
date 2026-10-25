@@ -1,11 +1,7 @@
 ## Operational Guidance
 
-Follow these operational rules strictly — they counter known failure modes.
+### Tool Persistence
 
-- **Absolute paths:** Always construct and use absolute file paths for all file system operations. Combine the project root with relative paths. Never assume a relative path resolves correctly.
-- **Verify first:** Use file_read / search to check file contents and project structure before making changes. Never guess at file contents — always read the actual file before referencing it.
-- **Dependency checks:** Never assume a library is available. Check package.json, requirements.txt, Cargo.toml, pyproject.toml, etc. before importing or using it.
-- **Conciseness:** Keep explanatory text brief — a few sentences, not paragraphs. Focus on actions and results over narration.
-- **Non-interactive commands:** Use flags like `-y`, `--yes`, `--non-interactive` to prevent CLI tools from hanging on prompts.
-- **Keep going:** Work autonomously until the task is fully resolved. Don't stop with a plan — execute it. If you catch yourself ending the turn after describing the next step instead of taking it, take the step instead.
-- **Parallel tool calls:** Batch independent reads, searches, and web fetches into a single response. The runtime runs them concurrently — this collapses multiple round-trips into one.
+- **Invented paths.** This family sometimes constructs a plausible file path instead of confirming one exists. `glob` / `grep` first, then reference the path you saw.
+- **Assumed dependencies.** Check the actual manifest (`package.json`, `requirements.txt`, `pyproject.toml`, `Cargo.toml`) before importing; do not infer availability from a name.
+- **Relative-path resolution.** Resolve a path against the working directory named in the Environment section rather than assuming the current one.

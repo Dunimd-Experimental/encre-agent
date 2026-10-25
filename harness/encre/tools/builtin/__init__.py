@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -23,12 +22,29 @@
 
 """Hardcoded builtin tools of the harness.
 
-These six tools (file-read / file-write / file-edit / terminal / web-search /
-web-fetch) are the mandatory core toolset every Encre agent has, regardless
-of which plugins are installed.  They were previously shipped as separate
-``ea-tool-*`` EA packages; inlining them removes the circular dependency
-(EA packages depending on ``encre-harness``) and makes a bare
-``pip install encre-harness`` a working agent with the standard primitives.
+These tools are the mandatory core toolset every Encre agent has, regardless
+of which plugins are installed:
+
+- file-read / file-write / file-edit / terminal (bash) / web-search -- the
+  primitives.  Previously shipped as separate ``ea-tool-*`` EA packages;
+  inlining them removes the circular dependency (EA packages depending on
+  ``encre-harness``) and makes a bare ``pip install encre-harness`` a working
+  agent with the standard primitives.
+- bash_output / bash_kill / bash_list -- background shell session
+  management beside the bash tool that spawns the sessions.  Previously the
+  ``ea-tool-bash-io`` EA plugin (deleted).
+- process_list / process_kill -- system-wide process enumeration and
+  graceful-then-forced termination (psutil based).
+- manage -- the runtime plugin manager (tool discovery, dynamic installs,
+  full plugin lifecycle).  Previously the ``ea-tool-manage`` EA plugin.
+- memory_create / memory_read / memory_update / memory_search / memory_link /
+  memory_status / memory_profile -- the memory-graph surface the memory
+  system prompt mandates direct calls to every turn.  Previously the
+  ``ea-tool-memory`` EA plugin.
+
+``web_fetch`` is NOT a builtin: it ships as the ``ea-tool-web-fetch``
+system-default EA plugin.  Information helpers (``info``) also ship as an
+uninstallable, reinstallable system-default EA plugin under ``ea_tools/``.
 """
 
 from __future__ import annotations
@@ -37,7 +53,7 @@ from typing import Any
 
 
 def register_builtin_tools(tool_registry: Any) -> list[str]:
-    """Register all six builtin tools into *tool_registry*.
+    """Register all builtin tools into *tool_registry*.
 
     Idempotent: tools already present (same name) are skipped.  Returns
     the list of tool names registered by this call.
@@ -45,8 +61,25 @@ def register_builtin_tools(tool_registry: Any) -> list[str]:
     from encre.tools.builtin.file_edit import file_edit_tool
     from encre.tools.builtin.file_read import file_read_tool
     from encre.tools.builtin.file_write import file_write_tool
-    from encre.tools.builtin.terminal import terminal_tool
-    from encre.tools.builtin.web_fetch import web_fetch_tool
+    from encre.tools.builtin.manage import manage_tool
+    from encre.tools.builtin.submit_review import submit_review_tool
+    from encre.tools.builtin.memory import (
+        memory_create_tool,
+        memory_link_tool,
+        memory_profile_tool,
+        memory_read_tool,
+        memory_search_tool,
+        memory_status_tool,
+        memory_update_tool,
+    )
+    from encre.tools.builtin.terminal import (
+        bash_kill_tool,
+        bash_list_tool,
+        bash_output_tool,
+        process_kill_tool,
+        process_list_tool,
+        terminal_tool,
+    )
     from encre.tools.builtin.web_search import web_search_tool
 
     registered: list[str] = []
@@ -57,7 +90,13 @@ def register_builtin_tools(tool_registry: Any) -> list[str]:
     )
     for tool in (
         file_read_tool, file_write_tool, file_edit_tool,
-        terminal_tool, web_search_tool, web_fetch_tool,
+        terminal_tool, web_search_tool,
+        manage_tool, submit_review_tool,
+        memory_create_tool, memory_read_tool, memory_update_tool,
+        memory_search_tool, memory_link_tool, memory_status_tool,
+        memory_profile_tool,
+        bash_output_tool, bash_kill_tool, bash_list_tool,
+        process_list_tool, process_kill_tool,
     ):
         name = getattr(tool, "name", "")
         if name and name in existing:

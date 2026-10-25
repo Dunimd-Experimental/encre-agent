@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 OpenAI-compatible backend -- generic adapter for any OpenAI-compatible API.
@@ -46,6 +48,11 @@ import re
 from typing import Any
 
 from encre.backends.openai_sse import OpenAISSEBackend
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 # Known 1M-context model families (prefix or regex patterns) for auto-detection
 _LARGE_CONTEXT_PATTERNS: list[str] = [
@@ -139,17 +146,27 @@ class OpenAICompatibleBackend(OpenAISSEBackend):
             return {"reasoning_effort": self.reasoning_effort}
         return None
 
-    # 鈹€鈹€ Context window 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Context window ──────────────────────────────────────────────────
 
     def context_window_size(self) -> int:
         """Return the context window size for this model.
 
-        Explicitly configured value takes priority.  Otherwise, heuristics
-        based on known model families are used.  Defaults to 128 000 tokens
-        as a safe fallback for unknown models.
+        Resolution order: (1) explicitly configured value, (2) the
+        data-driven model registry / provider defaults, (3) model-name
+        heuristics, (4) the 256 000 fallback.  The registry is consulted
+        BEFORE the heuristics so switching models always takes effect
+        immediately for the compaction math instead of being shadowed by
+        stale name-pattern guesses.
         """
         if self._context_window > 0:
             return self._context_window
+        try:
+            from encre.backends.registry import resolve_model_info
+            info = resolve_model_info(self.model)
+            if info is not None and getattr(info, "context_window", 0) and info.context_window > 0:
+                return int(info.context_window)
+        except Exception:
+            logger.debug("exception suppressed", exc_info=True)
         return _detect_context_window(self.model)
 
 

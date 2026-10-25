@@ -1,0 +1,61 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-connector-matrix"
+version = "0.5.0"
+description = "EA (Encre Agent) — system-default Matrix connector plugin."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "connector",
+    "matrix",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+    "encre-core>=0.5.0",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.entry-points."ea.plugins"]
+matrix = "ea_connector_matrix.plugin:create_plugin"
+
+[project.optional-dependencies]
+all = [
+    "mautrix[encryption]>=0.20",
+    "aiohttp>=3.9",
+    "aiohttp-socks>=0.8",
+    "markdown>=3.4",
+    "asyncpg>=0.27",
+    "aiosqlite>=0.19",
+]
+
+[tool.ea]
+icon = "message-square"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_connector_matrix*",
+]

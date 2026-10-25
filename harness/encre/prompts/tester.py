@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -120,12 +119,16 @@ class PromptTestSuite:
         self._cases: list[PromptTestCase] = []
 
     def register(
-        self, name: str, description: str = "",
+        self,
+        name: str,
+        description: str = "",
     ) -> Callable[[Callable[[PromptLoader], bool]], Callable[[PromptLoader], bool]]:
         """Decorator to register a test case."""
+
         def decorator(fn: Callable[[PromptLoader], bool]) -> Callable[[PromptLoader], bool]:
             self._cases.append(PromptTestCase(name=name, fn=fn, description=description))
             return fn
+
         return decorator
 
     def register_case(self, case: PromptTestCase) -> None:
@@ -147,17 +150,17 @@ class PromptTestSuite:
                     logger.warning("[prompt-test] FAIL: %s", case.name)
             except AssertionError as e:
                 results.failed.append((case.name, str(e) or "assertion failed"))
-                logger.warning("[prompt-test] FAIL: %s 鈥?%s", case.name, e)
+                logger.warning("[prompt-test] FAIL: %s — %s", case.name, e)
             except Exception as e:
                 results.errors.append((case.name, f"{type(e).__name__}: {e}"))
-                logger.error("[prompt-test] ERROR: %s 鈥?%s", case.name, e)
+                logger.error("[prompt-test] ERROR: %s — %s", case.name, e)
         return results
 
     def list_cases(self) -> list[PromptTestCase]:
         return list(self._cases)
 
 
-# 鈹€鈹€ Built-in validation tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Built-in validation tests ──────────────────────────────────────
 
 _suite = PromptTestSuite()
 
@@ -254,7 +257,7 @@ def _test_coding_comments(loader: PromptLoader) -> bool:
     return True
 
 
-# 鈹€鈹€ Contract tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Contract tests ──────────────────────────────────────────────────
 
 # Valid intent names recognized by the classifier and prompt builder.
 _VALID_INTENTS = frozenset({"general", "coding", "research", "data", "conversation"})
@@ -267,14 +270,13 @@ _KNOWN_VARIABLE_PROVIDERS: dict[str, tuple[str, str]] = {
     "channel": ("channels/base.py:250", "Platform channel name"),
     "command_body": ("prompts/system.py:288", "Active command body text"),
     "command_name": ("prompts/system.py:288", "Active command name"),
-    "cwd": ("prompts/system.py:397", "Current working directory"),
+    "environment_lines": ("prompts/system.py:_environment_block", "Workspace / launch-directory / git-repo lines, composed per mode"),
     "date": ("prompts/system.py:415", "Current date string"),
     "details": ("prompts/system.py:397", "OS version details"),
     "device_context": ("loop_context.py:409", "Device context catalog"),
     "execution_context": ("loop/phases/prompt.py:378", "Headless vs interactive rules scope annotation"),
     "files_root": ("prompts/system.py:370", "Session files directory"),
     "guidance": ("permission/<mode>.prompt content", "Permission-mode guidance body"),
-    "is_git": ("prompts/system.py:397", "Git repo detection flag"),
     "os_name": ("prompts/system.py:397", "Operating system name"),
     "project_snapshot": ("prompts/system.py:255", "Project summary snapshot"),
     "rules_content": ("loop.py:1941", "User-defined rules content"),
@@ -327,16 +329,23 @@ _MODEL_NAMES: dict[str, list[str]] = {
 }
 
 # Expected priority ordering invariants for critical blocks.
-# Format: (block_name, expected_priority) 鈥?exact match.
+# Format: (block_name, expected_priority) — exact match.
 # NOTE: memory_discipline sits deliberately at 0.6 -- right after identity (0)
 # but before task_completion (1) -- so the recall/precedence frame is
 # established before any delivery-focused guidance is read.
+# NOTE: the register layer (0.2 vocabulary, 0.3 live register) sits between
+# memory governance and the delivery standard, so the model learns WHICH kind
+# of turn this is before it reads what that kind of turn owes.
 _CRITICAL_BLOCK_PRIORITIES: dict[str, float] = {
     "identity": 0,
+    "register_policy": 0.2,
+    "register_chat": 0.3,
+    "register_answer": 0.31,
+    "register_work": 0.32,
     "mandatory_constraints": 0.5,
     "task_completion": 1,
-    "tool_execution": 3,
-    "post_execution_validation": 4,
+    "tool_execution": 4,
+    "post_execution_validation": 4.5,
     "environment": 8,
     "current_datetime": 9,
     "task_management": 15,
@@ -356,6 +365,7 @@ _CRITICAL_BLOCK_PRIORITIES: dict[str, float] = {
 @_suite.register("all_prompt_files_loadable", "every .prompt file must load without error")
 def _test_all_files_loadable(loader: PromptLoader) -> bool:
     import os
+
     root = loader.root
     errors: list[str] = []
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -377,6 +387,7 @@ def _test_all_files_loadable(loader: PromptLoader) -> bool:
 def _test_template_variables(loader: PromptLoader) -> bool:
     import os
     import re
+
     root = loader.root
     var_pattern = re.compile(r"\{\{(\w+)\}\}")
     unregistered: list[str] = []
@@ -390,13 +401,14 @@ def _test_template_variables(loader: PromptLoader) -> bool:
             var = m.group(1)
             if var not in _KNOWN_VARIABLE_PROVIDERS:
                 unregistered.append(f"blocks/{fn}: {{{{${var}}}}}")
-    assert not unregistered, f"Unregistered template variables:\n" + "\n".join(unregistered)
+    assert not unregistered, "Unregistered template variables:\n" + "\n".join(unregistered)
     return True
 
 
 @_suite.register("model_family_blocks_hide_model_names", "model family prompts must not name their own model")
 def _test_model_family_no_names(loader: PromptLoader) -> bool:
     import os
+
     root = loader.root
     models_dir = os.path.join(root, "models")
     violations: list[str] = []
@@ -414,7 +426,7 @@ def _test_model_family_no_names(loader: PromptLoader) -> bool:
             if word.lower() in content:
                 violations.append(f"models/{fn} contains model name: {word!r}")
                 break
-    assert not violations, f"Model name leaks:\n" + "\n".join(violations)
+    assert not violations, "Model name leaks:\n" + "\n".join(violations)
     return True
 
 
@@ -426,16 +438,28 @@ def _test_cache_boundary(loader: PromptLoader) -> bool:
 
 
 @_suite.register("priority_invariants_maintained", "critical blocks must have expected priority values")
-def _test_priority_invariants(loader: PromptLoader) -> bool:
+def _test_priority_invariants(_loader: PromptLoader) -> bool:
     from encre.prompts.system import (
-        _identity_block, _task_completion_block, _tool_execution_block,
-        _environment_block, _current_datetime_block, _task_management_block,
-        _memory_discipline_block, _output_format_block, _safety_block,
-        _tool_usage_block, _post_execution_validation_block,
+        _current_datetime_block,
+        _environment_block,
+        _identity_block,
+        _memory_discipline_block,
+        _output_format_block,
+        _post_execution_validation_block,
+        _register_blocks,
+        _register_policy_block,
+        _safety_block,
+        _task_completion_block,
+        _task_management_block,
+        _tool_execution_block,
+        _tool_usage_block,
     )
+
     # Build a dict of actual blocks and check their priorities
     blocks = {
         "identity": _identity_block(),
+        "register_policy": _register_policy_block(),
+        **{block.name: block for block in _register_blocks()},
         "task_completion": _task_completion_block(),
         "tool_execution": _tool_execution_block(),
         "post_execution_validation": _post_execution_validation_block(),
@@ -453,31 +477,47 @@ def _test_priority_invariants(loader: PromptLoader) -> bool:
             actual = blocks[name].priority
             if actual != expected:
                 violations.append(f"{name}: expected priority {expected}, got {actual}")
-    # Verify ordering: identity < task_completion < tool_execution
-    ordered = sorted(blocks.values(), key=lambda b: b.priority)
-    expected_order = [b.name for b in ordered]
-    assert not violations, f"Priority mismatches:\n" + "\n".join(violations)
+    assert not violations, "Priority mismatches:\n" + "\n".join(violations)
     return True
 
 
 @_suite.register("conditions_use_valid_intents", "every block condition must reference valid intent names")
-def _test_conditions_valid(loader: PromptLoader) -> bool:
+def _test_conditions_valid(_loader: PromptLoader) -> bool:
     from encre.prompts.system import (
-        _identity_block, _task_completion_block, _tool_execution_block,
-        _safety_block, _current_datetime_block, _environment_block,
-        _tool_usage_block, _task_management_block, _memory_discipline_block,
-        _output_format_block, _model_family_block,
-        _specialty_coding_block, _specialty_research_block,
-        _specialty_data_block, _specialty_general_block,
+        _current_datetime_block,
+        _environment_block,
+        _identity_block,
+        _memory_discipline_block,
+        _model_family_block,
+        _output_format_block,
         _post_execution_validation_block,
+        _safety_block,
+        _specialty_coding_block,
+        _specialty_data_block,
+        _specialty_general_block,
+        _specialty_research_block,
+        _task_completion_block,
+        _task_management_block,
+        _tool_execution_block,
+        _tool_usage_block,
     )
+
     blocks = [
-        _identity_block(), _task_completion_block(), _tool_execution_block(),
-        _safety_block(), _current_datetime_block(), _environment_block(),
-        _tool_usage_block(), _task_management_block(), _memory_discipline_block(),
-        _output_format_block(), _model_family_block(),
-        _specialty_coding_block(), _specialty_research_block(),
-        _specialty_data_block(), _specialty_general_block(),
+        _identity_block(),
+        _task_completion_block(),
+        _tool_execution_block(),
+        _safety_block(),
+        _current_datetime_block(),
+        _environment_block(),
+        _tool_usage_block(),
+        _task_management_block(),
+        _memory_discipline_block(),
+        _output_format_block(),
+        _model_family_block(),
+        _specialty_coding_block(),
+        _specialty_research_block(),
+        _specialty_data_block(),
+        _specialty_general_block(),
         _post_execution_validation_block(),
     ]
     invalid: list[str] = []
@@ -486,37 +526,85 @@ def _test_conditions_valid(loader: PromptLoader) -> bool:
             for intent in b.condition:
                 if intent not in _VALID_INTENTS:
                     invalid.append(f"{b.name}: unknown intent {intent!r}")
-    assert not invalid, f"Invalid intent references:\n" + "\n".join(invalid)
+    assert not invalid, "Invalid intent references:\n" + "\n".join(invalid)
     return True
 
 
-@_suite.register("specialty_conditions_cover_all_domains", "output_format must cover all domains including research")
-def _test_specialty_conditions(loader: PromptLoader) -> bool:
-    from encre.prompts.system import _output_format_block
-    block = _output_format_block()
-    assert block.condition is not None, "output_format must have a condition"
-    assert "research" in block.condition, (
-        f"output_format condition {block.condition} must include 'research'"
-    )
-    assert "coding" in block.condition, (
-        f"output_format condition {block.condition} must include 'coding'"
-    )
-    assert "data" in block.condition, (
-        f"output_format condition {block.condition} must include 'data'"
-    )
-    # Verify task_management excludes research (intentional)
-    from encre.prompts.system import _task_management_block
-    tm = _task_management_block()
-    assert tm.condition is not None
-    assert "research" not in tm.condition, (
-        f"task_management condition {tm.condition} should exclude 'research'"
-    )
+@_suite.register("domain_gate_lives_only_in_the_specialty_layer", "conditioned blocks must be the specialty sections only")
+def _test_domain_gate_placement(_loader: PromptLoader) -> bool:
+    """One axis per mechanism: ``condition`` is the DOMAIN gate, and the domain
+    is expressed only by the specialty sections.
+
+    Any other block carrying a ``condition`` would make the frozen prefix
+    depend on the detected intents, which is the first-message lock-in this
+    architecture removed: the loop builds the prefix with
+    ``include_specialty=False`` and supplies the specialty per turn, so the
+    prefix must be intent-independent.
+    """
+    import os
+
+    root = _loader.root
+    blocks_dir = os.path.join(root, "blocks")
+    offenders: list[str] = []
+    for filename in sorted(os.listdir(blocks_dir)):
+        if not filename.endswith(".prompt"):
+            continue
+        meta, _body = _loader.load_full(filename[: -len(".prompt")], category="blocks")
+        condition = meta.get("condition")
+        if condition is None:
+            continue
+        if not filename.startswith("specialty_"):
+            offenders.append(f"{filename}: condition {condition}")
+    assert not offenders, "non-specialty blocks carry a domain condition:\n" + "\n".join(offenders)
+
+    # And the specialty sections really are domain-scoped.
+    from encre.prompts.system import _specialty_coding_block, _specialty_general_block
+
+    assert _specialty_coding_block().condition == ["coding"]
+    assert _specialty_general_block().condition is None
+    return True
+
+
+@_suite.register("register_activation_is_coherent", "register metadata must partition sections and keep the prefix cache-stable")
+def _test_register_activation(_loader: PromptLoader) -> bool:
+    """Two guarantees the register axis has to hold.
+
+    1. *Partition*: every labelled section names real registers, and the
+       work-shaped ones are never in force during conversation -- otherwise a
+       greeting inherits an implementation request's delivery standard.
+    2. *Cache stability*: the assembled system prompt carries all three
+       register sections at once and accepts no register argument, so the
+       session prefix is byte-identical however the turns alternate.
+    """
+    import inspect
+
+    from encre.prompts.system import REGISTER_ORDER, EncrePromptBuilder, register_activation_map
+
+    activation = register_activation_map()
+    assert activation, "no section carries register metadata"
+    for title, registers in activation.items():
+        assert set(registers) <= set(REGISTER_ORDER), f"{title} labels unknown registers {registers}"
+        assert len(registers) == len(set(registers)), f"{title} repeats a register"
+
+    assert activation["Chat Register"] == ["chat"], activation["Chat Register"]
+    assert activation["Answer Register"] == ["answer"], activation["Answer Register"]
+    assert activation["Task Completion"] == ["work"], activation["Task Completion"]
+    assert activation["Post-Execution Validation"] == ["work"], activation["Post-Execution Validation"]
+    assert activation["MANDATORY Constraints"] == ["answer", "work"], activation["MANDATORY Constraints"]
+    assert "chat" not in activation["Tool Execution Discipline"], "conversation must not carry execution pressure"
+
+    # Unlabelled sections are in force in every register by construction.
+    prompt = EncrePromptBuilder().build()
+    assert "register" not in inspect.signature(EncrePromptBuilder.build).parameters
+    for title in ("Chat Register", "Answer Register", "Work Register"):
+        assert title in prompt, f"{title} missing from the always-on prefix"
     return True
 
 
 @_suite.register("skills_have_output_format", "every skill agent template must define an output format")
 def _test_skills_output(loader: PromptLoader) -> bool:
     import os
+
     root = loader.root
     skills_dir = os.path.join(root, "skills")
     missing: list[str] = []
@@ -539,9 +627,7 @@ def _test_skills_output(loader: PromptLoader) -> bool:
             content = f.read()
         if "STATUS:" not in content and "STATUS" not in content:
             missing_status.append(fn)
-    assert not missing_status, (
-        f"Skills without STATUS markers: {missing_status}"
-    )
+    assert not missing_status, f"Skills without STATUS markers: {missing_status}"
     return True
 
 
@@ -549,6 +635,7 @@ def _test_skills_output(loader: PromptLoader) -> bool:
 def _test_frontmatter_version(loader: PromptLoader) -> bool:
     import os
     import re
+
     root = loader.root
     missing: list[str] = []
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -572,21 +659,33 @@ def run_builtin_tests() -> TestResults:
     return _suite.run_all()
 
 
-# 鈹€鈹€ Model Compliance Matrix 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Model Compliance Matrix ────────────────────────────────────────────────
 # Structural tests that validate every model family prompt file has the
 # guidance sections appropriate to its category (open-weight, compact, etc.).
 
-_OPEN_WEIGHT_MODELS = frozenset({
-    "llama", "mistral", "phi", "arcee", "minimax", "mimo", "nova",
-    "doubao", "qwen", "glm", "hunyuan", "kimi",
-})
+_OPEN_WEIGHT_MODELS = frozenset(
+    {
+        "llama",
+        "mistral",
+        "phi",
+        "arcee",
+        "minimax",
+        "mimo",
+        "nova",
+        "doubao",
+        "qwen",
+        "glm",
+        "hunyuan",
+        "kimi",
+    }
+)
 _COMPACT_MODELS = frozenset({"mimo", "phi"})
 
 
-@_suite.register("model_family_compliance",
-                  "all model .prompt files must have ## Operational Guidance header")
+@_suite.register("model_family_compliance", "all model .prompt files must have ## Operational Guidance header")
 def _test_model_family_compliance(loader: PromptLoader) -> bool:
     import os
+
     root = loader.root
     models_dir = os.path.join(root, "models")
     missing: list[str] = []
@@ -602,10 +701,10 @@ def _test_model_family_compliance(loader: PromptLoader) -> bool:
     return True
 
 
-@_suite.register("open_weight_models_have_tool_discipline",
-                  "open-weight models must reinforce tool-use discipline")
+@_suite.register("open_weight_models_have_tool_discipline", "open-weight models must reinforce tool-use discipline")
 def _test_open_weight_tool_discipline(loader: PromptLoader) -> bool:
     import os
+
     root = loader.root
     models_dir = os.path.join(root, "models")
     missing: list[str] = []
@@ -621,16 +720,14 @@ def _test_open_weight_tool_discipline(loader: PromptLoader) -> bool:
             content = f.read()
         if not any(kw in content for kw in discipline_keywords):
             missing.append(fn)
-    assert not missing, (
-        f"Open-weight models without tool discipline section: {missing}"
-    )
+    assert not missing, f"Open-weight models without tool discipline section: {missing}"
     return True
 
 
-@_suite.register("compact_models_have_sequential_guidance",
-                  "compact models (mimo, phi) must have step-by-step guidance")
+@_suite.register("compact_models_have_sequential_guidance", "compact models (mimo, phi) must have step-by-step guidance")
 def _test_compact_sequential_guidance(loader: PromptLoader) -> bool:
     import os
+
     root = loader.root
     models_dir = os.path.join(root, "models")
     missing: list[str] = []
@@ -646,9 +743,7 @@ def _test_compact_sequential_guidance(loader: PromptLoader) -> bool:
             content = f.read()
         if not any(kw in content for kw in sequential_keywords):
             missing.append(fn)
-    assert not missing, (
-        f"Compact models without sequential guidance: {missing}"
-    )
+    assert not missing, f"Compact models without sequential guidance: {missing}"
     return True
 
 
@@ -682,4 +777,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())

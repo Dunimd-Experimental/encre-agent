@@ -1,0 +1,88 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Theme skin "grass" (苔原) — generated from the theme-demo v5.2
+ * palette (自然材质色阶). One file per skin; the mode ("light" / "dark")
+ * stays on [data-theme], the skin on [data-skin]. Only colours live here;
+ * surfaces (content paper, chassis, form-control background) and the
+ * neutral hover/selection plates are NOT defined here — styles.css and
+ * themes/tokens.css own them and keep them identical across every skin. Text/semantic values meet WCAG 4.5 (body) / 4.0 (tertiary)
+ * / 3.4 (muted) against the mode paper. */
+
+/* ═══ 苔原 · 浅 ═══ */
+html[data-skin="grass"] {
+  --text-primary: hsl(94 16% 19%);
+  --text-secondary: hsl(94 9% 42%);
+  --text-tertiary: hsl(94 6% 47%);
+  --text-muted: hsl(94 6% 51.5%);
+  --tool-text: hsl(94 9% 36%);
+  --accent: hsl(94 22% 37.5%);
+  --accent-hover: hsl(94 24% 32.5%);
+  --accent-light: hsl(94 22% 40% / .10);
+  --accent-contrast: hsl(92 14% 97%);
+  --success: hsl(140 22% 38%);
+  --error: hsl(6 38% 48%);
+  --warning: hsl(40 40% 38%);
+  --border: hsl(92 9% 85%);
+  --border-light: hsl(92 9% 87%);
+  --card-border: hsl(92 13% 83%);
+  --card-fill: hsl(92 9% 91%);
+  --border-control: hsl(92 9% 78%);
+  --checkbox-border: hsl(92 14% 73%);
+  --selection-bg: hsl(94 20% 54% / .24);
+  --seg-bg: hsl(92 10% 93.5%);
+  --seg-active-bg: #fcfff8;
+  --seg-text: hsl(94 9% 42%);
+  --seg-text-hover: hsl(94 16% 19%);
+  --seg-active-text: hsl(94 16% 19%);
+  --page:linear-gradient(170deg, #e9f2d8 0%, #edf3df 46%, #e9f0d3 100%);
+  --blob1:radial-gradient(920px 540px at 84% -12%, hsl(82 65% 74% / .40), transparent 68%);
+  --blob2:radial-gradient(780px 500px at -14% 44%, hsl(150 45% 78% / .28), transparent 66%);
+}
+
+/* ═══ 苔原 · 深 ═══ */
+html[data-skin="grass"][data-theme="dark"] {
+  --text-primary: hsl(96 9% 88%);
+  --text-secondary: hsl(96 6% 64%);
+  --text-tertiary: hsl(96 5% 47%);
+  --text-muted: hsl(96 5% 40%);
+  --tool-text: hsl(96 9% 88%);
+  --accent: hsl(96 20% 54%);
+  --accent-hover: hsl(96 19% 60%);
+  --accent-light: hsl(96 20% 54% / .12);
+  --accent-contrast: hsl(96 20% 11%);
+  --success: hsl(140 22% 55%);
+  --error: hsl(6 30% 58%);
+  --warning: hsl(42 30% 58%);
+  --border: hsl(96 7% 24%);
+  --border-light: hsl(96 7% 26%);
+  --card-border: hsl(96 7% 26%);
+  --card-fill: hsl(96 8% 15%);
+  --border-control: hsl(96 7% 30%);
+  --checkbox-border: hsl(96 8% 34%);
+  --selection-bg: hsl(96 16% 52% / .28);
+  --seg-bg: hsl(96 7% 19%);
+  --seg-active-bg: hsl(96 7% 23%);
+  --seg-text: hsl(96 6% 64%);
+  --seg-text-hover: hsl(96 9% 88%);
+  --seg-active-text: hsl(96 9% 88%);
+  --page:linear-gradient(172deg, hsl(100 12% 16%) 0%, hsl(96 10% 13%) 55%, hsl(92 9% 12%) 100%);
+  --blob1:radial-gradient(900px 520px at 82% -12%, hsl(85 60% 52% / .13), transparent 68%);
+  --blob2:radial-gradient(760px 480px at -12% 42%, hsl(150 45% 48% / .09), transparent 66%);
+}

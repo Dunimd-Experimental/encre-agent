@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,12 +21,14 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """
 Layered retry engine for LLM API calls.
 
 Provides a configurable retry decorator that handles transient HTTP errors
 (429 rate limits, 502/503/504 server errors, 529 overloaded), connection
-timeouts, auth failures, and context-overflow adjustments 鈥?mirroring the
+timeouts, auth failures, and context-overflow adjustments — mirroring the
 sophistication of production-grade agents like Claude Code.
 
 Design decisions
@@ -73,6 +75,7 @@ import logging
 import random
 import re
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
@@ -305,6 +308,19 @@ class RetryConfig:
 # Default configuration suitable for most LLM API providers.
 DEFAULT_RETRY_CONFIG = RetryConfig()
 
+#: Ambient retry-notice sink for the turn currently being run.
+#:
+#: The retry engine knows nothing about transports, and a backend instance is
+#: shared and long-lived, so a caller cannot hand it a per-turn callback
+#: without rebuilding the backend.  This context variable carries that callback
+#: through the task context instead: the loop installs one before driving
+#: ``backend.chat()``, and the engine invokes whatever it finds here (an
+#: explicit ``RetryConfig.on_retry`` still wins).  A model call issued outside a
+#: turn -- compaction, a background probe -- finds ``None`` and stays quiet.
+RETRY_NOTICE_SINK: ContextVar[Callable[[RetryEvent], Any] | None] = ContextVar(
+    "encre_retry_notice_sink", default=None
+)
+
 # Static 529 close-code that some providers return.
 _529_STATUS = 529
 
@@ -347,13 +363,13 @@ def _is_retryable_status(status: int, body: str | None, error_class: ErrorClass,
 
     Source-aware: background queries skip 529/overloaded retries.
     """
-    # Non-HTTP status (connection errors) 鈥?retryable by exception catch below.
+    # Non-HTTP status (connection errors) — retryable by exception catch below.
     if status == 0:
         return True
 
     base_retryable = status in config.retryable_status_codes
 
-    # 529 is not in the default retryable set 鈥?check explicitly.
+    # 529 is not in the default retryable set — check explicitly.
     if status == _529_STATUS or (body and _is_overloaded_error(body)):
         # Background sources bail immediately on 529.
         if config.query_source == "background":
@@ -385,19 +401,19 @@ def _compute_delay(
     """Compute sleep delay with optional server-directed waits.
 
     Priority:
-    1. ``retry-after`` header (server directive, bypasses exponential cap)
-    2. Rate-limit reset header (``x-ratelimit-reset``)
+    1. ``retry-after`` header (server directive, capped at ``max_delay``)
+    2. Rate-limit reset header (``x-ratelimit-reset``, capped at ``max_delay``)
     3. Exponential backoff with equal jitter (cap/2 + random(0, cap/2))
     """
-    if retry_after is not None and retry_after > 0:
-        return retry_after
-    if rate_limit_reset is not None and rate_limit_reset > 0:
-        return rate_limit_reset
-
     max_delay = config.persistent_max_delay if config.persistent_retry else config.max_delay
+    if retry_after is not None and retry_after > 0:
+        return min(retry_after, max_delay)
+    if rate_limit_reset is not None and rate_limit_reset > 0:
+        return min(rate_limit_reset, max_delay)
+
     cap = min(config.base_delay * (2**attempt), max_delay)
 
-    # Equal jitter 鈥?smoother retry distribution than full jitter.
+    # Equal jitter — smoother retry distribution than full jitter.
     half = cap / 2.0
     return half + random.uniform(0, half)
 
@@ -456,7 +472,7 @@ class _RetryState:
             rate_limit_reset = _get_rate_limit_reset(self.last_error.response)
 
         return _compute_delay(
-            attempt=self.persistent_attempt if self.config.persistent_retry else 0,
+            attempt=self.persistent_attempt,
             config=self.config,
             retry_after=retry_after,
             rate_limit_reset=rate_limit_reset,
@@ -477,10 +493,14 @@ class _RetryState:
             return None  # not enough room even after reduction
         return max(_CONTEXT_OVERFLOW_FLOOR_TOKENS, available)
 
-    def make_retry_event(self, delay_ms: int) -> RetryEvent:
+    def make_retry_event(self, delay_ms: int, attempt: int | None = None) -> RetryEvent:
+        # ``attempt`` is the caller's loop index (0-based); report it 1-based so
+        # the first retry reads "attempt 1". Without it the field was left at 0
+        # for every non-persistent retry.
+        reported = (attempt + 1) if attempt is not None else self.persistent_attempt
         return RetryEvent(
-            attempt=self.persistent_attempt if self.config.persistent_retry else 0,
-            max_retries=self.config.max_retries,
+            attempt=reported,
+            max_retries=0 if self.config.persistent_retry else self.config.max_retries,
             delay_ms=delay_ms,
             error_class=self.last_error_class,
             status_code=self.last_status_code,
@@ -494,15 +514,23 @@ class _RetryState:
 
 
 async def _notify_on_retry(config: RetryConfig, event: RetryEvent) -> None:
-    """Invoke the ``on_retry`` callback if one is registered."""
-    if config.on_retry is None:
+    """Announce an imminent retry to whoever is observing.
+
+    An explicit ``RetryConfig.on_retry`` wins; otherwise the ambient
+    :data:`RETRY_NOTICE_SINK` is used, which is how a turn observes retries
+    without every backend having to be rebuilt with a callback. Best-effort by
+    construction: a broken observer must never turn a retryable error into a
+    hard failure.
+    """
+    sink = config.on_retry if config.on_retry is not None else RETRY_NOTICE_SINK.get()
+    if sink is None:
         return
     try:
-        result = config.on_retry(event)
+        result = sink(event)
         if result is not None:
             await result
     except Exception:
-        logger.exception("on_retry callback failed")
+        logger.exception("retry notice observer failed")
 
 
 async def _notify_fallback(config: RetryConfig, original: str, fallback: str) -> None:
@@ -601,9 +629,8 @@ def retry_with_backoff(
                             "Context overflow: reducing max_tokens to %d (attempt %d)",
                             overflow_max_tokens, attempt + 1,
                         )
-                        kwargs["_retry_max_tokens_override"] = overflow_max_tokens
                         delay = state.compute_delay()
-                        event = state.make_retry_event(int(delay * 1000))
+                        event = state.make_retry_event(int(delay * 1000), attempt)
                         await _notify_on_retry(config, event)
                         await asyncio.sleep(delay)
                         attempt += 1
@@ -642,7 +669,7 @@ def retry_with_backoff(
                     # --- Sleep & notify ---
                     delay = state.compute_delay()
                     delay_ms = int(delay * 1000)
-                    event = state.make_retry_event(delay_ms)
+                    event = state.make_retry_event(delay_ms, attempt)
                     await _notify_on_retry(config, event)
 
                     if config.persistent_retry:
@@ -664,9 +691,10 @@ def retry_with_backoff(
 def _wrap_async_gen(func, config: RetryConfig):
     """Wrap an async generator with layered retry logic.
 
-    On transient failures the generator is re-invoked from scratch; partial
-    events from the failed attempt are discarded so the caller sees a clean
-    stream.
+    Only failures that occur BEFORE the first yielded event are retried.
+    Once an event has been delivered to the caller it cannot be retracted,
+    so a mid-stream failure propagates instead of re-invoking the generator
+    (which would duplicate text and tool calls).
     """
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -678,11 +706,17 @@ def _wrap_async_gen(func, config: RetryConfig):
         while max_attempts is None or attempt < max_attempts:
             state.persistent_attempt = attempt
 
+            yielded_any = False
             try:
                 async for item in func(*args, **kwargs):
                     yield item
+                    yielded_any = True
                 return  # Stream completed successfully.
             except Exception as exc:
+                # Mid-stream failure: deltas already yielded cannot be
+                # retracted, so retrying would duplicate them.  Propagate.
+                if yielded_any:
+                    raise
                 state.record_error(exc)
 
                 # --- Context overflow ---
@@ -696,9 +730,8 @@ def _wrap_async_gen(func, config: RetryConfig):
                         "Context overflow: reducing max_tokens to %d (attempt %d)",
                         overflow_max_tokens, attempt + 1,
                     )
-                    kwargs["_retry_max_tokens_override"] = overflow_max_tokens
                     delay = state.compute_delay()
-                    event = state.make_retry_event(int(delay * 1000))
+                    event = state.make_retry_event(int(delay * 1000), attempt)
                     await _notify_on_retry(config, event)
                     await asyncio.sleep(delay)
                     attempt += 1
@@ -732,7 +765,7 @@ def _wrap_async_gen(func, config: RetryConfig):
                 # --- Sleep & notify ---
                 delay = state.compute_delay()
                 delay_ms = int(delay * 1000)
-                event = state.make_retry_event(delay_ms)
+                event = state.make_retry_event(delay_ms, attempt)
                 await _notify_on_retry(config, event)
 
                 if config.persistent_retry:

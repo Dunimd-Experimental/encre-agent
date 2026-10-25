@@ -1,8 +1,9 @@
 ---
 name: skills
-version: 1
+version: 2
 priority: 47
 condition: ~
+registers: ['answer', 'work']
 ---
 
 ## Skills (auto-discovered)

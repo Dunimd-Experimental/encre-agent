@@ -46,8 +46,8 @@ Encre Agent 的设计借鉴了以下相邻项目的思想 —— 通过阅读它
 ### 语言与区域致谢
 
 - **中文开源社区** — 提供了模型 API、聊天平台适配器（飞书、钉钉、企业微信、微信、QQ Bot、腾讯元宝）以及文档审阅
-- **Hugging Face** — 提供了 `transformers`、`tokenizers`、`candle` 生态，使我们的本地模式与 embedding 后端得以实现
-- **Rust 社区** — 提供了 `serde`、`pyo3`、`tree-sitter` 等关键库，使单个 Rust crate 能够作为可行的跨语言加速层
+- **Hugging Face** — 提供了 `transformers` 生态，使我们的本地模式后端得以实现
+- **Rust 社区** — 提供了 `serde`、`pyo3` 等关键库，使单个 Rust crate 能够作为可行的跨语言加速层
 
 ---
 
@@ -112,7 +112,6 @@ Encre Agent 的设计借鉴了以下相邻项目的思想 —— 通过阅读它
 | [PyYAML](https://pyyaml.org/) | MIT | `>=6.0` | YAML 配置解析 |
 | [cryptography](https://cryptography.io) | Apache 2.0 / BSD | `>=41.0` | 加密原语（AES-GCM、Fernet） |
 | [zero-api-key-web-search](https://pypi.org/project/zero-api-key-web-search/) | Apache 2.0 | `>=23.0` | 默认 `web_search` 后端 |
-| [pathspec](https://github.com/cpburnz/python-path-specification) | BSD 3-Clause | `>=0.12` | 代码库索引器的 `.gitignore` 风格路径匹配 |
 | [websockets](https://websockets.readthedocs.io) | BSD 3-Clause | `>=12.0,<14` | WebSocket 客户端/服务器 |
 | [Pillow](https://python-pillow.org) | HPND | `>=10.0` | `image` 工具的图像处理 |
 | [tiktoken](https://github.com/openai/tiktoken) | MIT | `>=0.5` | Token 计数 |
@@ -127,8 +126,6 @@ Encre Agent 的设计借鉴了以下相邻项目的思想 —— 通过阅读它
 | [pytesseract](https://github.com/madmaze/pytesseract) | Apache 2.0 | `>=0.3` | 基于 Tesseract 的 OCR |
 | [uiautomation](https://github.com/pywinauto/uiautomation) | MIT | `>=2.0` | Windows UI 自动化 |
 | [watchfiles](https://github.com/samuelcolvin/watchfiles) | MIT | `>=0.21` | 文件系统监听 |
-| [tree-sitter](https://tree-sitter.github.io) | MIT | `>=0.21` | 代码库索引器与 LSP 助手使用的增量解析器 |
-| [tree-sitter-language-pack](https://github.com/Goldziher/tree-sitter-language-pack) | MIT | `>=0.6` | 预构建的 tree-sitter 语言语法包 |
 
 ### 可选依赖
 
@@ -175,27 +172,8 @@ Encre Agent 的设计借鉴了以下相邻项目的思想 —— 通过阅读它
 | [serde_json](https://docs.rs/serde_json) | MIT / Apache 2.0 | JSON 序列化 |
 | [regex](https://docs.rs/regex) | MIT / Apache 2.0 | 正则表达式（用于 `search.rs`） |
 | [walkdir](https://docs.rs/walkdir) | MIT / Apache 2.0 | 递归目录遍历 |
-| [ignore](https://docs.rs/ignore) | MIT / Apache 2.0 | 感知 `.gitignore` 的目录遍历 |
 | [similar](https://docs.rs/similar) | Apache 2.0 | 文本 diff（用于 `diff.rs`） |
 | [glob](https://docs.rs/glob) | MIT / Apache 2.0 | Glob 模式匹配 |
-| [tempfile](https://docs.rs/tempfile) | MIT / Apache 2.0 | 临时文件管理 |
-| [tree-sitter](https://tree-sitter.github.io) | MIT | 增量解析框架 |
-| [tree-sitter-python](https://github.com/tree-sitter/tree-sitter-python) | MIT | Python 语法 |
-| [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript) | MIT | JavaScript 语法 |
-| [tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript) | MIT | TypeScript 语法 |
-| [tree-sitter-rust](https://github.com/tree-sitter/tree-sitter-rust) | MIT | Rust 语法 |
-| [tree-sitter-go](https://github.com/tree-sitter/tree-sitter-go) | MIT | Go 语法 |
-| [tree-sitter-java](https://github.com/tree-sitter/tree-sitter-java) | MIT | Java 语法 |
-| [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) | MIT | C 语法 |
-| [tree-sitter-cpp](https://github.com/tree-sitter/tree-sitter-cpp) | MIT | C++ 语法 |
-| [tree-sitter-c-sharp](https://github.com/tree-sitter/tree-sitter-c-sharp) | MIT | C# 语法 |
-| [tree-sitter-php](https://github.com/tree-sitter/tree-sitter-php) | MIT | PHP 语法 |
-| [tree-sitter-ruby](https://github.com/tree-sitter/tree-sitter-ruby) | MIT | Ruby 语法 |
-| [tree-sitter-swift](https://github.com/alex-pinkus/tree-sitter-swift) | MIT | Swift 语法 |
-| [tree-sitter-kotlin-ng](https://github.com/sergey-tokarev/tree-sitter-kotlin-ng) | MIT | Kotlin 语法 |
-| [tree-sitter-scala](https://github.com/tree-sitter/tree-sitter-scala) | MIT | Scala 语法 |
-| [candle-core](https://github.com/huggingface/candle) | MIT / Apache 2.0 | ML 推理 — **可选**，由 `embedding` feature 启用 |
-| [tokenizers](https://github.com/huggingface/tokenizers) | Apache 2.0 | 分词 — **可选**，由 `embedding` feature 启用 |
 | [wide](https://github.com/starkat99/wide-rs) | MIT / Apache 2.0 | SIMD 内置函数 — **可选**，由 `simd` feature 启用 |
 | [windows-sys](https://github.com/microsoft/windows-rs) | MIT / Apache 2.0 | Windows API 绑定（仅 Windows 目标） |
 | [libc](https://github.com/rust-lang/libc) | MIT / Apache 2.0 | libc 绑定（非 Windows 目标） |
@@ -326,7 +304,7 @@ Node.js 使用类 MIT 的自定义许可证。完整文本见 <https://github.co
 
 ### 验证脚本
 
-本文件与发布 **0.4.3** 的清单一致。编辑后可这样重新核对：
+本文件与发布 **0.5.0** 的清单一致。编辑后可这样重新核对：
 
 ```bash
 # 比较 Python 核心依赖与 pyproject.toml
@@ -376,6 +354,6 @@ PY
 
 ## 致谢
 
-本文件已于 **2026-08-23** 针对 **0.4.3** 发布与项目清单完成最后一次核对。上面的依赖列表与该 commit 的 `pyproject.toml`、`desktop/package.json`、`native/crates/*/Cargo.toml` 一致。
+本文件已于 **2026-08-23** 针对 **0.5.0** 发布与项目清单完成最后一次核对。上面的依赖列表与该 commit 的 `pyproject.toml`、`desktop/package.json`、`native/crates/*/Cargo.toml` 一致。
 
 如发现差异，请提交 PR —— 参见 [CONTRIBUTING.md → Development Setup](CONTRIBUTING.md#development-setup)。

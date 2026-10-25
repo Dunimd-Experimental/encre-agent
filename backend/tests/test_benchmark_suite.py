@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -25,9 +25,9 @@ from __future__ import annotations
 
 """Tests for the benchmark evaluation suite: scoring, diagnosis, and summarization.
 
-These tests validate how raw benchmark task results are scored against required
-tokens, classified into failure buckets, and aggregated into summaries/analyses.
-"""
+These tests validate how raw benchmark task results are scored against
+required tokens, classified into failure buckets, and aggregated into
+summaries and analyses."""
 
 from encre.improve.eval.benchmark_suite import (
     analyze_benchmark_results,
@@ -41,20 +41,21 @@ from encre.improve.eval.benchmark_suite import (
 class TestBenchmarkScoring:
     """Validate the scoring engine for benchmark task outputs.
 
-    This class exercises the end-to-end scoring pipeline: token matching
-    against ``must_include``/``any_of``/``must_exclude`` constraints, coverage
-    calculation, and forbidden-text detection. It ensures the scorer rejects
-    partial matches and correctly attributes failures to missing or forbidden
+    Exercises the end-to-end scoring pipeline: token matching against
+    ``must_include``/``any_of``/``must_exclude`` constraints, coverage
+    calculation, and forbidden-text detection. The scorer must reject
+    partial matches and attribute failures to missing or forbidden
     content so downstream diagnosis can surface the right gap.
     """
 
     def test_score_task_output_supports_any_of_and_excludes(self):
         """Validate that scoring accepts a response when must_include, any_of, and must_exclude constraints are all satisfied.
 
-        The test constructs a task requiring both "python" and "release",
-        accepting either "october" or "2024", and forbidding "hallucinated".
-        A response containing all required tokens, one any_of token, and no
-        forbidden text should pass with full coverage and an empty forbidden list.
+        The task requires both "python" and "release", accepts either
+        "october" or "2024", and forbids "hallucinated". A response
+        containing all required tokens, one any_of token, and no
+        forbidden text must pass with full coverage and an empty
+        forbidden list.
         """
         task = normalize_task({
             "id": "research-1",
@@ -63,8 +64,8 @@ class TestBenchmarkScoring:
             "must_exclude": ["hallucinated"],
         })
         result = score_task_output(task, "Python 3.13 release landed in October 2024.")
-        # Full coverage expected because every required token matched and no
-        # forbidden token was present in the response.
+        # Full coverage is expected because every required token matched
+        # and no forbidden token was present in the response.
         assert result["passed"] is True
         assert result["coverage"] == 1.0
         assert result["forbidden_found"] == []
@@ -72,18 +73,19 @@ class TestBenchmarkScoring:
     def test_score_task_output_marks_missing_tokens(self):
         """Validate that scoring reports missing tokens and marks the task failed when must_include constraints are not met.
 
-        The test supplies a task requiring "loop", "retry", and "test" but
-        provides a response that only contains "loop". The scorer must report
-        the two absent tokens in ``missing`` and set ``passed`` to False so
-        downstream tools can identify which constraints were unfulfilled.
+        The task requires "loop", "retry", and "test" but the response
+        only contains "loop". The scorer must list the two absent tokens
+        in ``missing`` and set ``passed`` to False so downstream tools
+        can identify which constraints went unfulfilled.
         """
         task = normalize_task({
             "id": "coding-1",
             "must_include": ["loop", "retry", "test"],
         })
         result = score_task_output(task, "Loop behavior is described, but verification is absent.")
-        # Both "retry" and "test" are absent from the response, so they must
-        # appear in the missing list and the overall pass flag must be False.
+        # Both "retry" and "test" are absent from the response, so they
+        # must appear in the missing list and the overall pass flag must
+        # be False.
         assert result["passed"] is False
         assert "retry" in result["missing"]
         assert "test" in result["missing"]
@@ -92,21 +94,21 @@ class TestBenchmarkScoring:
 class TestBenchmarkDiagnosis:
     """Validate the failure-bucket diagnosis engine for benchmark results.
 
-    This class ensures that raw run metrics (tool-call counts, turn counts,
-    coverage, finish reasons) are mapped to semantically meaningful diagnosis
-    buckets. Correct bucket assignment lets engineers prioritize fix areas —
-    e.g. tool_selection_gap versus long_horizon_drift — without inspecting
-    individual traces.
+    Ensures raw run metrics (tool-call counts, turn counts, coverage,
+    finish reasons) are mapped to semantically meaningful diagnosis
+    buckets. Correct bucket assignment lets engineers prioritize fix
+    areas -- e.g. tool_selection_gap versus long_horizon_drift --
+    without inspecting individual traces.
     """
 
     def test_classify_benchmark_result_detects_tool_selection_gap(self):
         """Validate that a task with preferred tools but zero invocations is diagnosed as a tool_selection_gap.
 
-        The test simulates a failing task where the agent never called any
-        tools despite the task declaring preferred tools. Zero tool calls in
-        this scenario indicate the agent failed to reach the execution stage
-        or did not recognize the need for tool use, which the diagnosis
-        engine should flag as a tool-selection deficiency.
+        Simulates a failing task where the agent never called any tools
+        despite the task declaring preferred tools. Zero tool calls in
+        this scenario indicate the agent failed to reach the execution
+        stage or did not recognize the need for tool use, which the
+        diagnosis engine should flag as a tool-selection deficiency.
         """
         task = normalize_task({
             "id": "coding-2",
@@ -127,18 +129,19 @@ class TestBenchmarkDiagnosis:
             "task_stage_history": ["discover"],
         }
         diagnosis = classify_benchmark_result(task, result)
-        # Zero tool calls when preferred tools are declared means the agent
-        # did not attempt tool selection, which maps to tool_selection_gap.
+        # Zero tool calls when preferred tools are declared means the
+        # agent did not attempt tool selection, which maps to
+        # tool_selection_gap.
         assert diagnosis["bucket"] == "tool_selection_gap"
 
     def test_classify_benchmark_result_detects_long_horizon_drift(self):
         """Validate that exceeding max turns with low coverage is diagnosed as long_horizon_drift.
 
-        The test constructs a result where the agent ran 11 turns against a
-        max of 8, accumulated a stuck event, and achieved only 50% coverage.
-        This pattern — many turns without reaching the target — indicates the
-        agent drifted through the horizon without converging on a complete
-        answer, which the diagnosis engine should bucket as long_horizon_drift.
+        The result shows 11 turns against a max of 8, one stuck event,
+        and only 50% coverage. This pattern -- many turns without
+        reaching the target -- indicates the agent drifted through the
+        horizon without converging on a complete answer, which the
+        diagnosis engine should bucket as long_horizon_drift.
         """
         task = normalize_task({
             "id": "long-1",
@@ -159,29 +162,32 @@ class TestBenchmarkDiagnosis:
             "task_stage_history": ["discover", "plan", "execute"],
         }
         diagnosis = classify_benchmark_result(task, result)
-        # Surpassing the turn limit with incomplete coverage signals that the
-        # agent lost focus over a long horizon rather than failing fast.
+        # Surpassing the turn limit with incomplete coverage signals
+        # the agent lost focus over a long horizon rather than failing
+        # fast.
         assert diagnosis["bucket"] == "long_horizon_drift"
 
 
 class TestBenchmarkSummary:
     """Validate the aggregation and analysis pipeline for benchmark result sets.
 
-    This class ensures that raw per-task results are correctly grouped by
-    track, category, and difficulty; that pass rates and latency metrics are
-    computed accurately; and that the top-level analysis surfaces the slowest
-    tasks and prioritized fix buckets in the expected order. Accurate
-    aggregation is essential for reporting dashboards and regression alerts.
+    Ensures raw per-task results are grouped correctly by track,
+    category, and difficulty; that pass rates and latency metrics are
+    computed accurately; and that the top-level analysis surfaces the
+    slowest tasks and prioritized fix buckets in the expected order.
+    Accurate aggregation is essential for reporting dashboards and
+    regression alerts.
     """
 
     def test_summarize_benchmark_results_groups_tracks_and_buckets(self):
         """Validate that summary aggregation correctly groups by track, category, difficulty, and failure bucket.
 
-        The test feeds two heterogeneous results — one passing on claude_code
-        and one failing on manus with a tool_selection_gap — and asserts that
-        the summary reports the correct task count, failure bucket count,
-        per-track pass rate, per-category failure count, per-difficulty
-        failure count, and per-track first-token-latency average.
+        Feeds two heterogeneous results -- one passing on claude_code
+        and one failing on manus with a tool_selection_gap -- and
+        asserts the summary reports the correct task count, failure
+        bucket count, per-track pass rate, per-category failure count,
+        per-difficulty failure count, and per-track first-token-latency
+        average.
         """
         results = [
             {
@@ -228,7 +234,7 @@ class TestBenchmarkSummary:
         assert summary["task_count"] == 2
         # Exactly one task fell into the tool_selection_gap bucket.
         assert summary["failure_buckets"]["tool_selection_gap"] == 1
-        # claude_code task passed, so its pass rate must be 1.0.
+        # The claude_code task passed, so its pass rate must be 1.0.
         assert summary["by_track"]["claude_code"]["pass_rate"] == 1.0
         # research_synthesis has one failing task.
         assert summary["by_category"]["research_synthesis"]["failed"] == 1
@@ -240,11 +246,11 @@ class TestBenchmarkSummary:
     def test_analyze_benchmark_results_surfaces_priorities(self):
         """Validate that analysis ranks slowest tasks first and surfaces prioritized fix buckets.
 
-        The test supplies two failing tasks — one slow runtime-or-budget
-        failure and one tool-selection gap — and asserts that the slowest-task
-        list and first-token-latency list both place the slower task ("slow-1")
-        at index 0, and that the first prioritized fix corresponds to one of
-        the two known failure buckets.
+        Supplies two failing tasks -- one slow runtime-or-budget failure
+        and one tool-selection gap -- and asserts that the slowest-task
+        list and first-token-latency list both place the slower task
+        ("slow-1") at index 0, and that the first prioritized fix
+        corresponds to one of the two known failure buckets.
         """
         results = [
             {
@@ -283,8 +289,8 @@ class TestBenchmarkSummary:
             },
         ]
         analysis = analyze_benchmark_results(results, top_n=2)
-        # "slow-1" has the highest duration and first-token latency so it must
-        # appear first in both ranked lists.
+        # "slow-1" has the highest duration and first-token latency, so
+        # it must appear first in both ranked lists.
         assert analysis["top_slowest_tasks"][0]["id"] == "slow-1"
         assert analysis["top_first_token_latency_tasks"][0]["id"] == "slow-1"
         # The highest-priority fix must be one of the two failure buckets present.

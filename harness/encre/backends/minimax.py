@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -38,10 +36,10 @@ Models:
 - MiniMax-M2.7: Latest flagship model
 
 Two endpoints:
-- Global: https://api.minimax.chat/v1  (MINIMAX_API_KEY)
-- China:  https://api.minimax.chat/v1  (MINIMAX_CN_API_KEY, alias minimax-cn)
+- Global: https://api.minimax.io/v1  (MINIMAX_API_KEY)
+- China:  https://api.minimax.cn/v1  (MINIMAX_CN_API_KEY, alias minimax-cn)
 
-Base URL: https://api.minimax.chat/v1
+Base URL: https://api.minimax.io/v1
 Authentication: MINIMAX_API_KEY environment variable or explicit api_key.
 """
 
@@ -56,7 +54,7 @@ class MiniMaxBackend(OpenAISSEBackend):
     Supports MiniMax-M2.1, M2.5, and M2.7 via MiniMax's OpenAI-compatible API.
     """
 
-    DEFAULT_BASE_URL = "https://api.minimax.chat/v1"
+    DEFAULT_BASE_URL = "https://api.minimax.io/v1"
 
     def __init__(
         self,

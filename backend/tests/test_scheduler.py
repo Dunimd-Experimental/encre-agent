@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -25,6 +25,12 @@ from __future__ import annotations
 
 """Tests for the cron scheduler: :class:`CronSchedule`, :class:`ScheduledJob`,
 :class:`EncreScheduler`, :class:`ScheduleType`, and :class:`JobState`.
+
+The suite covers cron expression parsing and field matching, next-fire
+computation including leap-year boundaries, JSON round-trip serialization of
+jobs, durable save/load with corruption recovery, skipping of recurring
+occurrences that were missed before a restart, job lifecycle callbacks with
+execution history, and the enum shapes used across the codebase.
 """
 
 import json
@@ -49,6 +55,7 @@ from encre.scheduler import (
 def isolate_default_scheduler_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep default scheduler instances independent across tests."""
     monkeypatch.setattr("encre.config.get_data_dir", lambda: tmp_path)
+
 
 # ===========================================================================
 # CronSchedule.parse()
@@ -206,7 +213,7 @@ class TestMatchField:
     """
 
     def test_verify_star_matches_all_values(self):
-        """Validate that ``*`` matches every integer in the 0鈥?9 range.
+        """Validate that ``*`` matches every integer in the 0-59 range.
 
         The test exercises a wildcard field against 60 integer values and
         asserts every call returns ``True`` because a star field represents
@@ -240,7 +247,7 @@ class TestMatchField:
         assert cs._match_field(7, "*/5") is False
 
     def test_verify_step_with_base_matches_correctly(self):
-        """Validate that ``10/5`` matches 10, 15, 20 鈥?and rejects 9.
+        """Validate that ``10/5`` matches 10, 15, 20 and so on while rejecting 9.
 
         The test exercises values 10, 15, and 9 against ``"10/5"`` and asserts
         10 and 15 return ``True`` while 9 returns ``False`` because step-with-base
@@ -410,7 +417,7 @@ class TestWeekdayCron:
         cron day-of-week numbering where Sunday is 0.
         """
         wday = CronSchedule._weekday_cron(2024, 1, 1)
-        assert wday == 1  # Monday = 1 in cron
+        assert wday == 1  # Monday is numbered 1 in cron
 
     def test_verify_known_sunday_date(self):
         """Validate that 2024-01-07 (Sunday) maps to cron weekday 0.
@@ -419,7 +426,7 @@ class TestWeekdayCron:
         Sunday is the zero-indexed anchor in cron's weekday numbering.
         """
         wday = CronSchedule._weekday_cron(2024, 1, 7)
-        assert wday == 0  # Sunday = 0 in cron
+        assert wday == 0  # Sunday is numbered 0 in cron
 
     def test_verify_known_friday_date(self):
         """Validate that 2026-05-15 (Friday) maps to cron weekday 5.
@@ -428,7 +435,7 @@ class TestWeekdayCron:
         Friday is the sixth day in cron's week starting from Sunday=0.
         """
         wday = CronSchedule._weekday_cron(2026, 5, 15)
-        assert wday == 5  # Friday = 5 in cron
+        assert wday == 5  # Friday is numbered 5 in cron
 
 
 # ===========================================================================
@@ -495,7 +502,7 @@ class TestNextFire:
         """Validate that ``0 9 * * 1-5`` lands on a weekday at 9:00 AM.
 
         The test exercises a weekday-only schedule and asserts the result is
-        a weekday (Python ``tm_wday`` 0鈥?) at hour 9 because the ``1-5``
+        a weekday (Python ``tm_wday`` 0-4) at hour 9 because the ``1-5``
         day-of-week filter must exclude Saturday and Sunday from firing.
         """
         cs = CronSchedule.parse("0 9 * * 1-5")
@@ -503,7 +510,7 @@ class TestNextFire:
         nf = cs.next_fire(now)
         assert nf is not None
         t = time.localtime(nf)
-        assert 0 <= t.tm_wday <= 4  # Python: 0=Mon, 4=Fri
+        assert 0 <= t.tm_wday <= 4  # Python indexes Monday as 0 and Friday as 4
         assert t.tm_hour == 9
 
     def test_verify_next_fire_on_monday(self):
@@ -518,7 +525,7 @@ class TestNextFire:
         nf = cs.next_fire(now)
         assert nf is not None
         t = time.localtime(nf)
-        assert t.tm_wday == 0  # Python: Monday=0
+        assert t.tm_wday == 0  # Python indexes Monday as 0
         assert t.tm_hour == 12
 
     def test_verify_next_fire_always_returns_future(self):
@@ -1038,7 +1045,7 @@ class TestEncreSchedulerDurability:
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "partial.json")
-            data = [{"id": "x"}]  # Missing required keys
+            data = [{"id": "x"}]  # Entry deliberately missing required fields
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f)
             sched = EncreScheduler(durable_path=path)
@@ -1074,6 +1081,7 @@ class TestRecurringMissedOccurrences:
         monkeypatch.setattr(sched, "_spawn_job", lambda j: spawned.append(j))
 
         async def _stop(seconds: float) -> None:
+            """Replace ``asyncio.sleep`` so a single poll iteration exits instead of blocking."""
             sched._running = False
 
         monkeypatch.setattr("asyncio.sleep", _stop)
@@ -1241,10 +1249,14 @@ class TestJobCallbacks:
         job start through message snapshot delivery.
         """
         class FakeLoop:
+            """Stand-in agent loop that records the injected session ID and streams a fixed message pair."""
+
             def __init__(self):
+                """Initialize with an empty recorded session ID."""
                 self.received_session_id = ""
 
             async def _run_sub_agent(self, **kwargs):
+                """Capture the passed session ID, emit a two-message snapshot, and return it."""
                 self.received_session_id = kwargs["session_id"]
                 await kwargs["progress_callback"]([
                     {"role": "user", "content": "Run report"},
@@ -1266,6 +1278,7 @@ class TestJobCallbacks:
         events: list[tuple[str, dict[str, object]]] = []
 
         async def capture(_job, event_type, event_data):
+            """Record each progress event as a (type, data) pair for later assertion."""
             events.append((event_type, event_data))
 
         scheduler.on_job_progress(capture)

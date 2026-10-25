@@ -41,10 +41,14 @@ import MiniSearch from "minisearch";
 import { getState, subscribe, setSearchResults, addAttachments, getAppliedSearchSeq } from "../core/state.js";
 import { send } from "../core/ws.js";
 import { setRequestedSessionId } from "../core/stream.js";
-import type { SearchResultEntry, SearchFilter, SearchFilterKey } from "../core/types.js";
+import { guardRender } from "../core/ui_boundary.js";
+import { scheduleRender } from "../core/render_scheduler.js";
+import type { SearchResultEntry, SearchFilter, SearchFilterKey, PluginUiResult } from "../core/types.js";
 import { t, onLocaleChange } from "./i18n.js";
-import { matchingSlashCommands, SLASH_COMMANDS } from "./slash_commands.js";
+import { pluginSearchModes, sendPluginUiAction, onPluginUiResult, CONTRIBUTIONS_CHANGED } from "./plugin_contributions.js";
+import { matchingSlashCommands, SLASH_COMMANDS } from "../ui/slash-commands.js";
 import { getFileIcon } from "./files.js";
+import { hideAnimated, showAnimated } from "../ui/animate.js";
 
 /**
  * Registry of app-action callbacks invokable from search results.
@@ -160,7 +164,7 @@ const SECTION_DEFS: Record<string, SectionTemplate> = {
   },
   tool: {
     getLabel: () => t("search.sectionTools"),
-    icon: `<i data-lucide="wrench" class="lucide lucide-sm"></i>`,
+    icon: `<i data-lucide="layout-grid" class="lucide lucide-sm"></i>`,
     kindLabel: () => t("search.resultTool"),
   },
   automation: {
@@ -184,21 +188,21 @@ const SECTION_DEFS: Record<string, SectionTemplate> = {
 
 /** Every settings panel the app can navigate to (must match `PanelId`). */
 export const SETTINGS_NAV_ITEMS: { panel: string; nameEn: string; nameZh: string }[] = [
-  { panel: "general", nameEn: "General", nameZh: "基本设置" },
+  { panel: "general", nameEn: "General", nameZh: "常规" },
   { panel: "model", nameEn: "Model", nameZh: "模型管理" },
   { panel: "mcp", nameEn: "MCP", nameZh: "MCP 服务器" },
-  { panel: "skills", nameEn: "Skills", nameZh: "技能管理" },
-  { panel: "agent", nameEn: "Agent", nameZh: "子代理管理" },
-  { panel: "index", nameEn: "Index", nameZh: "资料库" },
-  { panel: "rules", nameEn: "Rules", nameZh: "规则管理" },
+  { panel: "skills", nameEn: "Skills & Commands", nameZh: "技能与命令" },
+  { panel: "flow", nameEn: "Flow", nameZh: "对话流" },
+  { panel: "plugins", nameEn: "Plugins", nameZh: "插件" },
+  { panel: "agent", nameEn: "Sub-Agents", nameZh: "子智能体管理" },
+  { panel: "library", nameEn: "Library", nameZh: "资料库" },
   { panel: "memory", nameEn: "Memory", nameZh: "记忆" },
   { panel: "usage", nameEn: "Usage", nameZh: "使用统计" },
   { panel: "about", nameEn: "About", nameZh: "关于" },
   { panel: "shortcuts", nameEn: "Shortcuts", nameZh: "快捷键" },
   { panel: "storage", nameEn: "Storage", nameZh: "存储" },
-  { panel: "browser", nameEn: "Browser", nameZh: "浏览器" },
-  { panel: "gateway", nameEn: "Gateway", nameZh: "网关" },
-  { panel: "permissions", nameEn: "Permissions", nameZh: "权限" },
+  { panel: "assist", nameEn: "Assist Panels", nameZh: "辅助面板" },
+  { panel: "gateway", nameEn: "Connector", nameZh: "连接器" },
   { panel: "developer", nameEn: "Developer", nameZh: "开发者" },
 ];
 
@@ -212,9 +216,9 @@ interface AppActionLabel {
 const APP_ACTION_LABELS: Record<string, AppActionLabel> = {
   "settings": { en: "Settings", zh: "设置", alias: ["打开设置", "进入设置", "偏好设置"] },
   "model-management": { en: "Model Management", zh: "模型管理", alias: ["配置模型", "模型设置"] },
-  "skills-management": { en: "Skills Management", zh: "技能管理", alias: ["配置技能", "技能设置"] },
+  "skills-management": { en: "Skills & Commands", zh: "技能与命令", alias: ["配置技能", "技能设置", "规则"] },
   "mcp-servers": { en: "MCP Servers", zh: "MCP 服务器", alias: ["MCP 配置", "配置 MCP"] },
-  "agent-config": { en: "Agent Config", zh: "子代理配置", alias: ["配置子代理", "子代理"] },
+  "agent-config": { en: "Sub-Agent Config", zh: "子智能体配置", alias: ["配置子智能体", "子智能体", "子代理"] },
   "about": { en: "About", zh: "关于", alias: ["关于应用", "版本信息"] },
   "theme-dark": { en: "Dark Theme", zh: "深色主题", alias: ["暗色主题", "夜间模式"] },
   "theme-light": { en: "Light Theme", zh: "浅色主题", alias: ["亮色主题", "日间模式"] },
@@ -230,8 +234,11 @@ const APP_ACTION_LABELS: Record<string, AppActionLabel> = {
   "language-pt": { en: "Português", zh: "Português", alias: ["葡萄牙语", "Portuguese"] },
   "language-ar": { en: "العربية", zh: "العربية", alias: ["阿拉伯语", "Arabic"] },
   "language-he": { en: "עברית", zh: "עברית", alias: ["希伯来语", "Hebrew"] },
-  "new-session": { en: "New Session", zh: "新建对话", alias: ["新建会话", "新会话", "新对话", "开始新对话"] },
   "keyboard-shortcuts": { en: "Keyboard Shortcuts", zh: "键盘快捷键", alias: ["快捷键", "快捷键设置", "按键"] },
+  "terminal-settings": { en: "Terminal Panel", zh: "终端面板", alias: ["终端", "命令行", "shell", "terminal"] },
+  "editor-settings": { en: "Editor Panel", zh: "编辑器面板", alias: ["编辑器", "编辑设置", "editor"] },
+  "review-settings": { en: "Review Panel", zh: "审查面板", alias: ["审查", "代码审查", "diff", "review"] },
+  "browser-settings": { en: "Browser Panel", zh: "浏览器面板", alias: ["浏览器", "内置浏览器", "browser"] },
 };
 
 /** Action ids exposed as dedicated search categories (not under "Actions"). */
@@ -285,7 +292,7 @@ function dataSourceSignature(st: AppStateT): string {
     st.modelConfigs.length,
     st.mcpServers.length,
     st.subAgents.length,
-    st.docsList.length,
+    st.libraryTree.length,
     st.notifications.length,
     st.customCommands.length,
     st.memoryList.length,
@@ -412,6 +419,10 @@ const ACTION_TO_NAV_PANEL: Record<string, string> = {
   "agent-config": "agent",
   about: "about",
   "keyboard-shortcuts": "shortcuts",
+  "terminal-settings": "assist",
+  "editor-settings": "assist",
+  "review-settings": "assist",
+  "browser-settings": "assist",
 };
 
 /** Resolves the search-filter key for a result kind (defaults to the kind). */
@@ -543,7 +554,10 @@ export function runLocalSearch(q: string, filter: SearchFilter): SearchResultEnt
   for (const mc of st.modelConfigs) items.push({ kind: "model", name: mc.name, snippet: mc.name, preview: mc.model_id });
   for (const sv of st.mcpServers) items.push({ kind: "mcp_server", name: sv.name, snippet: sv.name });
   for (const sa of st.subAgents) items.push({ kind: "sub_agent", name: sa.name, snippet: sa.name, preview: sa.description });
-  for (const doc of st.docsList) items.push({ kind: "document", name: doc.name, snippet: doc.name });
+  for (const node of st.libraryTree) {
+    if (node.type === "space" || node.type === "folder") continue;
+    items.push({ kind: "document", name: node.name, snippet: node.name });
+  }
   for (const n of st.notifications) items.push({ kind: "notification", name: n.title, snippet: n.title, preview: n.message });
   for (const cc of st.customCommands) items.push({ kind: "custom_command", name: cc.name, snippet: cc.title, preview: cc.description });
   for (const m of st.memoryList) items.push({ kind: "memory", name: m.name, snippet: m.path, preview: m.preview, path: m.path });
@@ -680,6 +694,13 @@ export class Search {
   private searching = false;
   /** Sequence of the newest backend results already applied to state. */
   private lastAppliedSeq = -1;
+  /** Plugin-contributed search modes (declarative contributions). */
+  private pluginModes: ReturnType<typeof pluginSearchModes> = [];
+  /** Currently active plugin mode (empty = the default first-party search). */
+  private activePlugin = "";
+  private activeModeId = "";
+  /** Results returned by the active plugin mode through `plugin_ui_result`. */
+  private pluginResults: SearchResultEntry[] = [];
 
   /**
    * Constructor: resolves DOM elements, wires input/keys, and kicks off the
@@ -691,23 +712,105 @@ export class Search {
 
     this.input.addEventListener("input", () => this.onInput());
     this.input.addEventListener("keydown", (e) => this.onKey(e));
-    subscribe(() => this.onStateChange());
+    subscribe(() => this.onStateChange(), ["workspaces"]);
     onLocaleChange(() => this.renderResults());
 
+    this.pluginModes = pluginSearchModes();
+    // Contribution set changed (plugin reload): refresh the mode chips and
+    // drop an active mode that no longer exists.
+    window.addEventListener(CONTRIBUTIONS_CHANGED, () => {
+      this.pluginModes = pluginSearchModes();
+      if (this.activeModeId && !this.pluginModes.some((m) => m.plugin === this.activePlugin && m.id === this.activeModeId)) {
+        this.activePlugin = "";
+        this.activeModeId = "";
+        this.pluginResults = [];
+      }
+      this.renderResults();
+    });
+    // Chip clicks activate/deactivate a plugin search mode.
+    this.resultsEl.addEventListener("click", (e) => {
+      const chip = (e.target as HTMLElement).closest?.(".search-plugin-mode-chip") as HTMLElement | null;
+      if (!chip) return;
+      this.togglePluginMode(chip.dataset.plugin || "", chip.dataset.mode || "");
+    });
+    // Plugin modes answer through the unified `plugin_ui_result` event.
+    onPluginUiResult((res) => this.onPluginResult(res));
+
     this.refreshWorkspaceFiles();
+  }
+
+  /** Activates (or deactivates) a plugin search mode chip. */
+  private togglePluginMode(plugin: string, id: string): void {
+    if (this.activePlugin === plugin && this.activeModeId === id) {
+      this.activePlugin = "";
+      this.activeModeId = "";
+    } else {
+      this.activePlugin = plugin;
+      this.activeModeId = id;
+    }
+    this.pluginResults = [];
+    this.searching = false;
+    this.selectedIdx = -1;
+    this.renderResults();
+    const q = this.input.value.trim();
+    if (q && this.activeModeId) this.dispatchPluginSearch(q);
+  }
+
+  /** Runs the active plugin mode for `q` through the unified plugin channel. */
+  private dispatchPluginSearch(q: string): void {
+    this.searching = true;
+    this.pluginResults = [];
+    this.renderResults();
+    sendPluginUiAction("search_mode", this.activePlugin, this.activeModeId, { query: q });
+  }
+
+  /** Applies a `plugin_ui_result` carrying the active mode's search results. */
+  private onPluginResult(res: PluginUiResult): void {
+    if (res.kind !== "search_mode" || !res.ok) return;
+    if (res.plugin !== this.activePlugin || res.action !== this.activeModeId) return;
+    const data = (res.data && typeof res.data === "object" ? res.data : {}) as Record<string, unknown>;
+    // A mode may echo the query it answered; drop stale echoes.
+    if (typeof data.query === "string" && data.query !== this.input.value.trim()) return;
+    const list = Array.isArray(data.results) ? data.results : [];
+    const entries: SearchResultEntry[] = [];
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object") continue;
+      const o = raw as Record<string, unknown>;
+      const name = typeof o.name === "string" ? o.name : "";
+      const snippet = typeof o.snippet === "string" ? o.snippet : "";
+      if (!name && !snippet) continue;
+      entries.push({
+        kind: "plugin_search",
+        name,
+        snippet: name || snippet,
+        preview: snippet && snippet !== name ? snippet : typeof o.preview === "string" ? o.preview : undefined,
+        path: typeof o.path === "string" ? o.path : undefined,
+        icon: typeof o.icon === "string" ? o.icon : undefined,
+        plugin: res.plugin,
+      } as SearchResultEntry);
+    }
+    this.pluginResults = entries;
+    this.searching = false;
+    this.selectedIdx = -1;
+    this.renderResults();
   }
 
   /** Opens the search overlay and clears previous state/results. */
   open(): void {
     const overlay = document.getElementById("search-overlay")!;
-    overlay.classList.remove("hidden");
+    showAnimated(overlay);
     this.input.value = "";
     this.selectedIdx = -1;
     this.currentResults = [];
     this.searching = false;
     this.lastAppliedSeq = searchSeqCounter;
+    // The palette always opens in the default first-party mode.
+    this.activePlugin = "";
+    this.activeModeId = "";
+    this.pluginResults = [];
+    this.pluginModes = pluginSearchModes();
     setSearchResults([]);
-    this.resultsEl.innerHTML = "";
+    this.resultsEl.innerHTML = this.pluginModesHtml();
     // Rebuild the registered-workspace file index so it's current.
     this.refreshWorkspaceFiles();
     setTimeout(() => this.input.focus(), 10);
@@ -715,7 +818,7 @@ export class Search {
 
   /** Closes the search overlay and clears state/results. */
   close(): void {
-    document.getElementById("search-overlay")?.classList.add("hidden");
+    hideAnimated(document.getElementById("search-overlay"));
     this.input.value = "";
     this.selectedIdx = -1;
     this.currentResults = [];
@@ -730,8 +833,9 @@ export class Search {
     if (!q) {
       this.searching = false;
       this.lastAppliedSeq = searchSeqCounter;
+      this.pluginResults = [];
       setSearchResults([]);
-      this.resultsEl.innerHTML = "";
+      this.resultsEl.innerHTML = this.pluginModesHtml();
       return;
     }
     // Treat a request as in flight as soon as the user types: stale backend
@@ -742,7 +846,13 @@ export class Search {
     this.lastAppliedSeq = searchSeqCounter;
     this.renderResults();
     this.timer = window.setTimeout(() => {
-      send({ type: "search", query: q, seq: nextSearchSeq() });
+      // In a plugin mode the query rides the unified plugin channel instead
+      // of the first-party backend search.
+      if (this.activeModeId) {
+        this.dispatchPluginSearch(q);
+      } else {
+        send({ type: "search", query: q, seq: nextSearchSeq() });
+      }
     }, 150);
   }
 
@@ -829,7 +939,7 @@ export class Search {
         this.openSettingsPanel("agent");
         break;
       case "document":
-        this.openSettingsPanel("index");
+        this.openSettingsPanel("library");
         break;
       case "settings_nav": {
         const panel = r.preview || "general";
@@ -851,6 +961,15 @@ export class Search {
       }
       case "slash_command": {
         this.insertPromptText(r.name ?? "");
+        break;
+      }
+      case "plugin_search": {
+        // Hand the activated entry back to the contributing plugin through
+        // the unified plugin channel; the plugin decides what "open" means.
+        const owner = (r as SearchResultEntry & { plugin?: string }).plugin || this.activePlugin;
+        sendPluginUiAction("search_mode", owner, "open", {
+          entry: { name: r.name, snippet: r.snippet, preview: r.preview, path: r.path, icon: r.icon },
+        });
         break;
       }
       default:
@@ -927,10 +1046,30 @@ export class Search {
     this.insertPromptText(t("search.readFile", { path: fullPath }));
   }
 
+  /** Renders the plugin-mode chip row (empty string when no modes exist). */
+  private pluginModesHtml(): string {
+    if (this.pluginModes.length === 0) return "";
+    const chips = this.pluginModes.map((m) => {
+      const active = m.plugin === this.activePlugin && m.id === this.activeModeId;
+      return `<button type="button" class="search-plugin-mode-chip${active ? " active" : ""}" data-plugin="${this.esc(m.plugin)}" data-mode="${this.esc(m.id)}" title="${this.esc(m.description || m.label)}">${this.esc(m.label)}</button>`;
+    }).join("");
+    return `<div class="search-plugin-modes">${chips}</div>`;
+  }
+
   /** Renders the merged backend + local results grouped into sections. */
   private renderResults(): void {
+    // Keyed scheduler + shared boundary: several pushes in one frame coalesce,
+    // and a failure leaves the previous result list in place.
+    scheduleRender("search", () => {
+      guardRender("search", "results", () => this._renderResultsImpl());
+    }, 60);
+  }
+
+  private _renderResultsImpl(): void {
     const q = this.input.value.trim();
     const filter = getState().searchFilter;
+    const modeActive = !!this.activeModeId;
+    const chipsHtml = this.pluginModesHtml();
     // A newer backend result sequence landing ends the in-flight state.
     const appliedSeq = getAppliedSearchSeq();
     if (appliedSeq > this.lastAppliedSeq) {
@@ -939,15 +1078,15 @@ export class Search {
     }
     // While a request is in flight, ignore stale backend results so they
     // never mismatch the current query.
-    const backendResults = this.searching
+    const backendResults = modeActive || this.searching
       ? []
       : getState().searchResults.filter((r) => {
           if (r.kind === "conversation") return filter.session;
           if (r.kind === "file") return filter.workspace_file;
           return true;
         });
-    const localResults = runLocalSearch(q, filter);
-    const results = this.mergeResults(backendResults, localResults);
+    const localResults = modeActive ? [] : runLocalSearch(q, filter);
+    const results = modeActive ? this.pluginResults : this.mergeResults(backendResults, localResults);
     this.currentResults = results;
 
     if (results.length === 0) {
@@ -955,20 +1094,34 @@ export class Search {
       // or the no-results empty state. Never mix text + spinner, and once a
       // single result exists the spinner is gone entirely.
       if (q && this.searching) {
-        this.resultsEl.innerHTML = `<div class="search-loading-spinner"><i data-lucide="loader-circle" class="lucide search-loading-spinner-icon"></i></div>`;
+        this.resultsEl.innerHTML = `${chipsHtml}<div class="search-loading-spinner"><i data-lucide="loader-circle" class="lucide search-loading-spinner-icon"></i></div>`;
         if (typeof (window as any).lucide !== "undefined") (window as any).lucide.createIcons({ root: this.resultsEl });
         return;
       }
       this.resultsEl.innerHTML = q
-        ? `<div class="si-empty-center" style="min-height:0;padding:32px 16px"><i data-lucide="search-x" class="lucide"></i><span class="si-empty-title">${t("search.noResultsFor", { query: this.esc(q) })}</span></div>`
-        : "";
+        ? `${chipsHtml}<div class="si-empty-center" style="min-height:0;padding:32px 16px"><i data-lucide="search-x" class="lucide"></i><span class="si-empty-title">${t("search.noResultsFor", { query: this.esc(q) })}</span></div>`
+        : chipsHtml;
       if (q && typeof (window as any).lucide !== "undefined") (window as any).lucide.createIcons({ root: this.resultsEl });
       return;
     }
 
-    const sections = this.buildSections(results);
+    // In a plugin mode the results render as one section owned by the mode;
+    // otherwise the standard kind-based sections apply.
+    const mode = modeActive
+      ? this.pluginModes.find((m) => m.plugin === this.activePlugin && m.id === this.activeModeId)
+      : undefined;
+    const sections = modeActive && mode
+      ? [{
+          getLabel: () => mode.label,
+          icon: mode.icon && isKnownLucideIcon(mode.icon)
+            ? `<i data-lucide="${this.esc(mode.icon)}" class="lucide lucide-sm"></i>`
+            : `<i data-lucide="layout-grid" class="lucide lucide-sm"></i>`,
+          kindLabel: () => mode.label,
+          items: results,
+        }]
+      : this.buildSections(results);
 
-    let html = `<div class="search-result-count">${t("search.resultCount", { count: results.length })}</div>`;
+    let html = `${chipsHtml}<div class="search-result-count">${t("search.resultCount", { count: results.length })}</div>`;
     for (const sec of sections) {
       if (sec.items.length === 0) continue;
       html += `<div class="search-result-section-title">${sec.getLabel()}</div>`;

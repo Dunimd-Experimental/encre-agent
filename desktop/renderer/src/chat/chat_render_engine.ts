@@ -33,34 +33,157 @@
 // `XImpl.call(this, ...)` so the instance context is preserved.
 
 import type { Chat } from "./chat.js";
-import type { Message } from "../core/types.js";
-import type { TimelineItem } from "./timeline.js";
+import type { Message, ToolCallState } from "../core/types.js";
+import type { TimelineItem, BranchSwitcherGroup } from "./timeline.js";
+import { scheduleRender, cancelScheduledRender, runScheduledRenderNow, RENDER_PRIORITY } from "../core/render_scheduler.js";
+import { guardHtml, guardRender, reportUiFault } from "../core/ui_boundary.js";
 import { getState, setSubAgentView, isEnabled, toolCallMatchesId } from "../core/state.js";
-import { t } from "../features/i18n.js";
+import { t, getLocale } from "../features/i18n.js";
 import { EALoader } from "../features/ealoader.js";
 import { renderMarkdown, escapeHtml } from "./chat_markdown.js";
 import { getToolSummary, getToolInlineSummary, getToolBodyText, _toolStatusHtml, createLucideIcons, saveVideoPlayback, restoreVideoPlayback } from "./chat_tool_display.js";
+import { metaFor } from "./tool_meta.js";
 import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTaskMessages } from "./timeline.js";
 
-  export function requestRenderImpl(this: Chat): void {
-    if (this.rafPending) return;
-    this.rafPending = true;
-    requestAnimationFrame(() => {
-      this.rafPending = false;
-      this.render();
+  /**
+   * Replays the unified content-enter motion on an element that is already
+   * visible.  A session switch swaps `#message-list`'s innerHTML in place —
+   * the node never passes through `display:none`, so the `:not(.hidden)` CSS
+   * rule never fires and the tape would snap straight to the new transcript.
+   * Dropping the class, forcing a reflow, then re-adding it restarts the
+   * keyframes.  (In the reverse direction — history arriving after the
+   * welcome screen — the element really does unhide, so CSS handles it and
+   * no JS call is needed.)
+   */
+  function playEnterAnim(el: HTMLElement | null | undefined): void {
+    if (!el) return;
+    el.classList.remove("session-enter");
+    void el.offsetWidth;
+    el.classList.add("session-enter");
+  }
+
+  // === Tail-following card bodies ==========================================
+  //
+  // Every expandable card body that clips its content (thinking, tool result,
+  // terminal output) shows its NEWEST lines, not its first ones: the scrolling
+  // window sits on the bottom and content growing below it pushes the window
+  // down with it. The marker class lives on the body so the behaviour is
+  // scoped to the cards the user asked for and cannot leak onto a review or
+  // spec document, which is read from the top. A diff nests its own scroller,
+  // so the inner `.diff-body` is tracked alongside the body that wraps it.
+  const TAIL_BODY_SELECTOR = ".tail-follow, .tail-follow .diff-body";
+  const TAIL_SLACK = 4;
+
+  /**
+   * Bodies the user scrolled away from their bottom. They are left where the
+   * user put them until scrolled back down. Keyed by element identity: a
+   * re-render builds fresh nodes, so a body re-arms for tailing on its own.
+   */
+  const _detachedBodies = new WeakSet<HTMLElement>();
+
+  function isBodyAtBottom(el: HTMLElement): boolean {
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= TAIL_SLACK;
+  }
+
+  /** Tracks a transcript scroll event's target; wired to the capture phase
+   *  because scroll events do not bubble out of the body that fired them. */
+  export function noteBodyScroll(target: EventTarget | null): void {
+    const el = target as HTMLElement | null;
+    if (!el || !el.classList || !el.matches?.(TAIL_BODY_SELECTOR)) return;
+    if (isBodyAtBottom(el)) _detachedBodies.delete(el);
+    else _detachedBodies.add(el);
+  }
+
+  /** Pins one body to its newest line unless the user scrolled it away. A
+   *  body that does not overflow is left alone (nothing to scroll). */
+  export function pinBodyTail(el: HTMLElement | null): void {
+    if (!el || _detachedBodies.has(el)) return;
+    if (el.scrollHeight > el.clientHeight) el.scrollTop = el.scrollHeight;
+  }
+
+  /** Pins every tail-following body under `root` — the full-render pass.
+   *  Measured first, moved second: interleaving `scrollTop` writes with
+   *  `scrollHeight` reads would force a layout per card (layout thrashing). */
+  export function pinBodyTails(root: ParentNode): void {
+    const pending: Array<{ el: HTMLElement; top: number }> = [];
+    root.querySelectorAll<HTMLElement>(TAIL_BODY_SELECTOR).forEach((el) => {
+      if (_detachedBodies.has(el)) return;
+      if (el.scrollHeight > el.clientHeight) pending.push({ el, top: el.scrollHeight });
     });
+    for (const { el, top } of pending) el.scrollTop = top;
+  }
+
+  /**
+   * Live countdown for the transient retry line ("3s 后重试" -> 2 -> 1).
+   *
+   * The remaining seconds deliberately are NOT part of the render key: a value
+   * that changes every second would force a full transcript re-render every
+   * second.  Instead the number is ticked in place.  The line carries
+   * `data-retry-deadline` (epoch ms), re-read from the DOM on every tick, so a
+   * re-render that replaces the node is picked up automatically.  The tick
+   * stops itself the moment the countdown is over or the line is gone, so a
+   * stale interval can never outlive its notice.
+   */
+  let _retryCountdownTimer: number | null = null;
+
+  function _stopRetryCountdown(): void {
+    if (_retryCountdownTimer !== null) {
+      window.clearInterval(_retryCountdownTimer);
+      _retryCountdownTimer = null;
+    }
+  }
+
+  function _paintRetryCountdown(ml: HTMLElement | null): void {
+    const span = ml?.querySelector("[data-retry-deadline] .turn-line__countdown") as HTMLElement | null;
+    if (!span) {
+      _stopRetryCountdown();
+      return;
+    }
+    const line = span.closest("[data-retry-deadline]") as HTMLElement | null;
+    const deadline = Number(line?.getAttribute("data-retry-deadline")) || 0;
+    const remaining = Math.ceil((deadline - Date.now()) / 1000);
+    if (remaining <= 0) {
+      // The wait is over and the retried request is in flight; a frozen "0"
+      // would be a lie, so drop the countdown clause entirely.
+      if (span.textContent) span.textContent = "";
+      _stopRetryCountdown();
+      return;
+    }
+    const text = t("chat.retryCountdown", { seconds: remaining });
+    if (span.textContent !== text) span.textContent = text;
+  }
+
+  function syncRetryCountdown(ml: HTMLElement | null): void {
+    _paintRetryCountdown(ml);
+    if (
+      _retryCountdownTimer === null &&
+      ml?.querySelector("[data-retry-deadline] .turn-line__countdown")
+    ) {
+      _retryCountdownTimer = window.setInterval(() => _paintRetryCountdown(ml), 1000);
+    }
+  }
+
+  export function requestRenderImpl(this: Chat): void {
+    // Keyed scheduler: any number of state writes in one tick produce a
+    // single chat paint, ordered before the sidebar and side panels.
+    scheduleRender("chat", () => this.render(), RENDER_PRIORITY.chat);
   }
 
   export function renderForceImpl(this: Chat): void {
+    // A forced paint renders current state now through the scheduler's
+    // immediate mode; a queued paint would be a duplicate of the same state.
+    cancelScheduledRender("chat");
     this.renderedKey = "";
     this._inRenderForce = true;
+    const paintNow = () =>
+      runScheduledRenderNow("chat", () => this.render(), RENDER_PRIORITY.chat);
     try {
       const st = getState();
       const subTc = st.subAgentView;
       const isSubAgentStreaming = !!subTc &&
         (subTc.status === "running" || subTc.status === "pending");
       if (!isSubAgentStreaming) {
-        this.render();
+        paintNow();
         return;
       }
       // Throttle sub-agent streaming renders (single AND parallel) so the
@@ -69,12 +192,12 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
       // transcript re-render, which freezes the UI while a sub-agent runs.
       this._pendingParallelRender = true;
       if (this._parallelRenderTimer === null) {
-        this.render();
+        paintNow();
         this._parallelRenderTimer = window.setTimeout(() => {
           this._parallelRenderTimer = null;
           if (this._pendingParallelRender) {
             this._pendingParallelRender = false;
-            this.render();
+            paintNow();
           }
         }, 100);
       }
@@ -142,17 +265,34 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
         : (subTc.status === "running" || subTc.status === "pending");
       this.renderedKey = "__subagent__";
       if (hasInlineData) {
-        // Sub-agent snapshot arrived: render the real user + assistant
-        // bubbles together.  The loader was already torn down at the
-        // top of render(), so the message area is clean by now.
-        const timeline = buildSubAgentTimeline(selectedMsgs, isStreaming);
-        this.fullRender(timeline, selectedMsgs);
+        // Combined parallel run (no specific task picked, >= 2 task
+        // dividers): tile every task into its own pane via
+        // fullRenderParallel. Routing it through the flat fullRender below
+        // interleaves the two transcripts into one column.
+        const combinedParallel =
+          subTc.taskIndex === undefined &&
+          subMsgs.filter((m) => m.mode === "task_divider").length >= 2;
+        if (combinedParallel) {
+          this.fullRenderParallel(subMsgs, isStreaming);
+        } else {
+          // Sub-agent snapshot arrived: render the real user + assistant
+          // bubbles together.  The loader was already torn down at the
+          // top of render(), so the message area is clean by now.
+          const timeline = buildSubAgentTimeline(selectedMsgs, isStreaming);
+          this.fullRender(timeline, selectedMsgs);
+        }
       } else if (isStreaming) {
-        // Still waiting for the first snapshot: hide every message bubble
-        // (no user box, no assistant box) and show only the centered EA
-        // loader.  Both bubbles will appear together once data lands.
-        this.ml.innerHTML = "";
-        this.liveLoader = new EALoader(this.ml, { maxWidth: "50px" });
+        // Still waiting for the first snapshot: show the delegated task
+        // prompt as a plain user bubble right away (same bubble as the main
+        // chat) instead of a bare centered loader. Only fall back to the
+        // loader when no prompt text is available yet.
+        const promptBubble = this.buildDelegatedPromptBubble(subTc);
+        if (promptBubble) {
+          this.ml.innerHTML = promptBubble;
+        } else {
+          this.ml.innerHTML = "";
+          this.liveLoader = new EALoader(this.ml, { maxWidth: "96px" });
+        }
       } else if (subTc.isError) {
         // Map the raw tool result into something the user can act on:
         // bare sandbox exit codes (-1 timeout / -2 Docker missing) get a
@@ -167,10 +307,10 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
         } else if (rawResult.startsWith("Error:") && rawResult.length > 6) {
           errorCode = rawResult.length > 500 ? rawResult.slice(0, 500) + "…" : rawResult;
         }
-        this.ml.innerHTML = `<div class="si-panel-empty" style="flex:1;gap:14px;">
+        this.ml.innerHTML = `<div class="si-empty-center" style="flex:1;gap:14px;">
           <i data-lucide="ban" class="lucide"></i>
-          <div class="si-panel-empty-title">${t("automation.executionFailed") || "Automation execution error"}</div>
-          <div class="si-panel-empty-sub" style="word-break:break-word;">${escapeHtml(errorCode)}</div>
+          <div class="si-empty-title">${t("automation.executionFailed") || "Automation execution error"}</div>
+          <div class="si-empty-sub" style="word-break:break-word;">${escapeHtml(errorCode)}</div>
         </div>`;
       } else {
         // No inline transcript survived (e.g. reopened after switching
@@ -185,19 +325,26 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
           this.ml.innerHTML = `<div class="si-empty-center"><i data-lucide="bot" class="lucide"></i><span class="si-empty-title">${t("chat.noSubAgentOutput")}</span></div>`;
         }
       }
-      createLucideIcons();
+      createLucideIcons(this.ml);
       this._updateStatusBar(false);
       this.autoScroll();
       return;
     }
-    this.toggleWelcome(state.messages.length === 0);
-    const msgs = state.messages;
-    if (msgs.length === 0) {
-      this.ml.innerHTML = "";
-      this.renderedKey = "";
-      this.syncScrollButton();
-      return;
-    }
+     this.toggleWelcome(state.messages.length === 0);
+     const msgs = state.messages;
+     if (msgs.length === 0) {
+       if (this.ml.children.length > 0) {
+         // Keep the previous session's content visible until the new
+         // session's content arrives via fullRender — avoids a
+         // welcome-screen flash between sessions.
+         this.syncScrollButton();
+         return;
+       }
+       this.ml.innerHTML = "";
+       this.renderedKey = "";
+       this.syncScrollButton();
+       return;
+     }
     const timeline = buildTimeline(msgs);
     const key = buildRenderKey(timeline);
     const wasRunning = this._lastRunning;
@@ -206,12 +353,28 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
     // logic in fullRender is applied correctly (the render key may not
     // change when running transitions from true to false).
     if (key !== this.renderedKey || (wasRunning && !state.running)) {
-      console.log("[chat.render] fullRender", { msgCount: msgs.length, roles: msgs.map(m => m.role), serverIds: msgs.map(m => m.serverId?.slice(-12)) });
-      this.fullRender(timeline, msgs);
+      // Streaming fast path: when the key only grew by whole tail segments
+      // (a new tool card / text block appended mid-run), patch just the tail
+      // in place. A full innerHTML swap here is what made streaming feel
+      // like the whole page refreshing and restarted every CSS animation.
+      const tailOk = wasRunning && state.running
+        && this.renderedKey !== ""
+        && key.startsWith(this.renderedKey)
+        && this.appendTimelineTail(timeline, this.renderedItemCount);
+      if (tailOk) {
+        this.autoScroll();
+      } else {
+        this.fullRender(timeline, msgs);
+      }
       this.renderedKey = key;
+      this.renderedItemCount = timeline.length;
     } else {
       this.incrementalTextUpdate(timeline);
     }
+    // Keep the retry line's seconds ticking (or tear the ticker down once the
+    // notice is gone).  Runs after the DOM update above so it sees the node
+    // the current frame actually produced.
+    syncRetryCountdown(this.ml);
     this._updateStatusBar(state.running);
     // Auto-open HTML info cards only when the model just finished
     if (wasRunning && !state.running) {
@@ -231,6 +394,25 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
    * Used by the automation panel to render execution results inside
    * #automation-detail-content without switching to chat mode.
    */
+  /**
+   * Builds the delegated task prompt as a plain user bubble, identical to
+   * the main chat's user bubble. Reads the prompt from the agent tool call
+   * params (`prompt` / `description`). Used from the sub-agent view before
+   * the first transcript snapshot lands so the prompt is visible
+   * immediately instead of a bare centered loader.
+   */
+  export function buildDelegatedPromptBubbleImpl(this: Chat, tc: ToolCallState): string {
+    const prompt =
+      (typeof tc.params.prompt === "string" && tc.params.prompt.trim()) ||
+      (typeof tc.params.task === "string" && tc.params.task.trim()) ||
+      (typeof tc.params.description === "string" && tc.params.description.trim()) ||
+      "";
+    if (!prompt) return "";
+    return `<div class="user-item" data-user-idx="0">
+      <div class="user-bubble">${escapeHtml(prompt as string)}</div>
+    </div>`;
+  }
+
   export function renderSubAgentIntoImpl(this: Chat, container: HTMLElement, messages: Message[], isRunning: boolean): void {
     const timeline = buildSubAgentTimeline(messages, isRunning);
     const st = getState();
@@ -250,9 +432,12 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
     const _vs = saveVideoPlayback(container);
     window.__stopAllMedia?.();
     container.innerHTML = html;
-    createLucideIcons();
+    createLucideIcons(container);
     window.__initMediaCards?.(container);
     restoreVideoPlayback(_vs, container);
+    // Fresh nodes start with scrollTop 0; an expanded card must still open on
+    // its newest lines, so the tail pin runs after the rebuild.
+    pinBodyTails(container);
     if (!container.dataset.subAgentClickBound) {
       container.addEventListener("click", (e) => this.handleDelegateClick(e));
       container.dataset.subAgentClickBound = "true";
@@ -338,7 +523,71 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
     let turnActions = false;
     let turnRetry = false;
     let turnBranchSwitcher = false;
+    let turnBranchSwitcherGroup: BranchSwitcherGroup | undefined;
     const _this = this;
+    // The newest few answers are what the reader is looking at. Render those
+    // as markdown on the first pass and defer only older history, so the
+    // visible text never reformats (raw → markdown) a moment after paint.
+    const tailAssistantIds = new Set<string>();
+    for (let i = timeline.length - 1; i >= 0 && tailAssistantIds.size < 6; i--) {
+      if (timeline[i].kind === "assistant_text") tailAssistantIds.add(timeline[i].id);
+    }
+
+    // Isolation boundary for the timeline loop: one broken item renderer is
+    // logged and skipped, it never aborts the whole transcript render. Arrow
+    // form on purpose - it is called bare below, so a plain `function` would
+    // see `this === undefined` and lose the Chat instance.
+    const renderItemSafe = (item: TimelineItem): string => guardHtml(
+      "chat-item",
+      (item as { id?: string }).id || (item as { kind?: string }).kind || "item",
+      () => {
+        if (item.kind === "assistant_text") {
+          // Markdown + syntax highlighting is the expensive part of a full
+          // render. Reuse the previous HTML when the block's inputs are
+          // unchanged; only the streaming block fails this check and is
+          // re-parsed. Each item is independent, so one changing block never
+          // forces its neighbours back through markdown-it.
+          //
+          // While boot deferral is active, historical blocks render as escaped
+          // text (nearly free) and are upgraded to markdown in idle slices.
+          // An already-upgraded block stays markdown even if deferral is on.
+          const cache = _this.assistantHtmlCache;
+          const locale = getLocale();
+          const deferred =
+            _this.deferMarkdown &&
+            !treatAsSubAgent &&
+            !item.isStreaming &&
+            !tailAssistantIds.has(item.id);
+          const cached = cache.get(item.id);
+          if (
+            cached &&
+            cached.content === item.content &&
+            cached.isStreaming === item.isStreaming &&
+            cached.hasError === item.hasError &&
+            cached.messageId === item.messageId &&
+            cached.locale === locale &&
+            (!cached.deferred || deferred)
+          ) {
+            return cached.html;
+          }
+          const html = deferred
+            ? _this.renderAssistantTextRaw(item)
+            : _this.renderItemHTML(item);
+          _this.cacheAssistantHtml(item.id, {
+            content: item.content,
+            isStreaming: item.isStreaming,
+            hasError: item.hasError,
+            messageId: item.messageId,
+            locale,
+            html,
+            deferred,
+          });
+          return html;
+        }
+        return _this.renderItemHTML(item);
+      },
+      "",
+    );
 
     function closeTurn() {
       if (!turnMid) return;
@@ -346,21 +595,19 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
       if (turnActions) {
         html += `<div class="assistant-actions turn-actions">`;
         html += `<button class="btn-icon btn-icon--msg assistant-copy-btn" data-tooltip="${t("chat.copy")}">
-          <span class="icon-wrap">
-            <i data-lucide="copy" class="semantic"></i>
-            <i data-lucide="chevron-down" class="arrow"></i>
-          </span>
+          <i data-lucide="copy" class="lucide"></i>
         </button>`;
         if (turnRetry) {
           html += `<button class="btn-icon btn-icon--msg assistant-retry-btn" data-tooltip="${t("chat.retry")}">
-            <span class="icon-wrap">
-              <i data-lucide="refresh-cw" class="semantic"></i>
-              <i data-lucide="chevron-down" class="arrow"></i>
-            </span>
+            <i data-lucide="refresh-cw" class="lucide"></i>
           </button>`;
         }
         if (turnBranchSwitcher) {
-          html += _this.renderBranchSwitcher();
+          try {
+            html += _this.renderBranchSwitcher(turnBranchSwitcherGroup);
+          } catch (e) {
+            reportUiFault("chat-turn", "branch-switcher", e);
+          }
         }
         html += `</div>`;
       }
@@ -369,21 +616,26 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
       turnActions = false;
       turnRetry = false;
       turnBranchSwitcher = false;
+      turnBranchSwitcherGroup = undefined;
     }
 
     const inSubAgent = treatAsSubAgent || !!getState().subAgentView || !!(window as any).__parentSessionId;
     for (let i = 0; i < timeline.length; i++) {
       const item = timeline[i];
 
-      if (item.kind === "compact" || item.kind === "workflow" || (item.kind === "user" && !inSubAgent)) {
+      if (item.kind === "compact" || item.kind === "workflow" || (item.kind === "user" && !inSubAgent)
+        || item.kind === "compact_notice" || item.kind === "model_switch" || item.kind === "compact_starting") {
         closeTurn.call(_this);
-        html += this.renderItemHTML(item);
+        html += renderItemSafe(item);
       } else if (item.kind === "ai_header") {
         closeTurn.call(_this);
-        turnMid += this.renderItemHTML(item);
+        turnMid += renderItemSafe(item);
       } else {
         // thinking / assistant_text / tool / status cards all belong to the current turn
-        if ((item as any).showBranchSwitcher) turnBranchSwitcher = true;
+        if ((item as any).showBranchSwitcher) {
+          turnBranchSwitcher = true;
+          turnBranchSwitcherGroup = (item as any).branchSwitcher;
+        }
         if ((item as any).showActions) {
           // Every completed turn gets a copy button
           turnActions = true;
@@ -402,7 +654,7 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
             }
           }
         }
-        turnMid += this.renderItemHTML(item);
+        turnMid += renderItemSafe(item);
       }
     }
     closeTurn.call(_this);
@@ -465,6 +717,10 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
         bodyHtml = g.body.length > 0
           ? this.buildTimelineHTML(bodyTimeline, g.body, true)
           : `<div class="parallel-task-pending">${t("chat.taskWaiting") || "Waiting for output…"}</div>`;
+      } catch (e) {
+        // One failed task pane must not blank every sibling pane.
+        reportUiFault("chat-turn", `parallel-task:${g.divider.taskIndex ?? ""}`, e);
+        bodyHtml = `<div class="parallel-task-pending">${escapeHtml(g.divider.taskName || "")}</div>`;
       } finally {
         this._subAgentRender = false;
       }
@@ -513,11 +769,171 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
       this.ml.innerHTML = html;
       window.__initMediaCards?.(this.ml);
       restoreVideoPlayback(_vs, this.ml);
-      
+
+    }
+    // The innerHTML rebuild dropped the status bar node — put it back so the
+    // running turn's status line stays pinned under the latest output.
+    this.mountStatusBar();
+    pinBodyTails(this.ml);
+  }
+
+  /**
+   * Re-render one tool card in place. A finished tool result only changes
+   * that card's own markup (body, error state, info-card source); replacing
+   * it avoids rebuilding every earlier turn's markdown and DOM. Returns
+   * false when the card or its timeline item cannot be found, so the caller
+   * can fall back to a full render.
+   */
+  /** Replace one tool card's DOM with fresh markup. No scroll handling. */
+  function _replaceToolCard(this: Chat, item: Extract<TimelineItem, { kind: "tool" }>): boolean {
+    // A multi-task agent card renders one sibling strip per task, all sharing
+    // the same data-id. Anchor on the first and drop the rest, or replacing
+    // one would leave duplicated siblings behind.
+    const existing = Array.from(
+      this.ml.querySelectorAll(`[data-id="tc-${item.tc.id}"]`)
+    ) as HTMLElement[];
+    const el = existing[0];
+    if (!el) return false;
+    let html = "";
+    try {
+      html = this.renderItemHTML(item).trim();
+    } catch (e) {
+      console.warn("[chat] tool item patch failed:", e);
+      return false;
+    }
+    if (!html) return false;
+    const tmp = document.createElement("template");
+    tmp.innerHTML = html;
+    const nodes = Array.from(tmp.content.children) as HTMLElement[];
+    if (nodes.length === 0) return false;
+    el.replaceWith(...nodes);
+    for (const extra of existing.slice(1)) extra.remove();
+    for (const node of nodes) {
+      createLucideIcons(node);
+      guardRender("media", "tool-patch", () => window.__initMediaCards?.(node));
+      guardRender("scroll", "tool-patch-pin", () => pinBodyTails(node));
+    }
+    return true;
+  }
+
+  export function patchToolItemImpl(this: Chat, tcId: string): boolean {
+    const timeline = buildTimeline(getState().messages);
+    let item: Extract<TimelineItem, { kind: "tool" }> | undefined;
+    for (const candidate of timeline) {
+      if (candidate.kind === "tool" && candidate.tc.id === tcId) {
+        item = candidate;
+        break;
+      }
+    }
+    if (!item) return false;
+    // Replacing the card changes its height; keep the reader's anchor stable
+    // instead of letting the viewport drift under them.
+    const container = this.container;
+    const prevTop = container.scrollTop;
+    const prevHeight = container.scrollHeight;
+    if (!_replaceToolCard.call(this, item)) return false;
+    if (this.userScrolledUp) {
+      const delta = container.scrollHeight - prevHeight;
+      if (delta) container.scrollTop = prevTop + delta;
+    } else {
+      this.autoScroll();
+    }
+    return true;
+  }
+
+  /**
+   * Re-render every tool card in place. Used when the tool-UI catalog
+   * changes (plugin metadata arriving after boot): cards derive their shape,
+   * icon and labels from it, while assistant text does not. This replaces
+   * only the cards instead of rebuilding the whole transcript, so the answer
+   * text never visually refreshes.
+   */
+  export function refreshToolCardsImpl(this: Chat): void {
+    const timeline = buildTimeline(getState().messages);
+    const container = this.container;
+    const prevTop = container.scrollTop;
+    const prevHeight = container.scrollHeight;
+    let changed = false;
+    for (const item of timeline) {
+      if (item.kind !== "tool") continue;
+      if (_replaceToolCard.call(this, item)) changed = true;
+    }
+    if (!changed) return;
+    if (this.userScrolledUp) {
+      const delta = container.scrollHeight - prevHeight;
+      if (delta) container.scrollTop = prevTop + delta;
+    } else {
+      this.autoScroll();
     }
   }
 
+  /**
+   * Streaming fast path: the render key only GREW by whole segments — the
+   * existing transcript prefix is byte-identical, so only the newly arrived
+   * timeline items need DOM nodes. Appending them in place avoids the full
+   * innerHTML swap that re-created every icon and replayed every CSS
+   * animation on the page each time a tool card or text block appeared.
+   * Returns false when the change is structural (unknown/new kind of item,
+   * no viable insertion point) and the caller must fullRender instead.
+   */
+  export function appendTimelineTailImpl(this: Chat, timeline: TimelineItem[], prevCount: number): boolean {
+    // Only content items that stream mid-turn may be appended; turn
+    // boundaries (user bubble, ai header) and session-level cards rebuild.
+    const appendable = new Set(["thinking", "tool", "assistant_text", "error_card", "warning_card", "inline_success", "inline_cancelled"]);
+    for (let i = prevCount; i < timeline.length; i++) {
+      if (!appendable.has(timeline[i].kind)) return false;
+    }
+    const appended: HTMLElement[] = [];
+    for (let i = prevCount; i < timeline.length; i++) {
+      const item = timeline[i];
+      let html = "";
+      try {
+        html = this.renderItemHTML(item).trim();
+      } catch (e) {
+        console.warn(`[chat] tail append aborted kind=${item.kind}:`, e);
+        return false;
+      }
+      if (!html) continue;
+      const tmp = document.createElement("template");
+      tmp.innerHTML = html;
+      // A multi-task agent card renders one sibling strip per task. Insert
+      // every top-level node, not just the first, or the remaining task cards
+      // silently vanish from the tape.
+      const nodes = Array.from(tmp.content.children) as HTMLElement[];
+      if (nodes.length === 0) continue;
+      // Streaming items always belong to the LAST turn in the DOM. The
+      // action bar (copy / retry) sits at the very end of a closed turn, so
+      // new items must slot in before it.
+      const turn = this.ml.querySelector(".turn:last-of-type") as HTMLElement | null;
+      if (turn) {
+        const actions = turn.querySelector(":scope > .assistant-actions");
+        for (const node of nodes) {
+          if (actions) turn.insertBefore(node, actions);
+          else turn.appendChild(node);
+          appended.push(node);
+        }
+      } else {
+        for (const node of nodes) {
+          this.ml.appendChild(node);
+          appended.push(node);
+        }
+      }
+    }
+    // Hydrate only the nodes that were just appended. A document/tape-wide
+    // lucide pass replaces every existing icon node, which is O(history) per
+    // appended card and can swap an icon out from under a click.
+    for (const node of appended) {
+      createLucideIcons(node);
+      guardRender("media", "chat-append", () => window.__initMediaCards?.(node));
+      guardRender("scroll", "chat-append-pin", () => pinBodyTails(node));
+    }
+    return true;
+  }
+
+  let _fullRenderCount = 0;
+
   export function fullRenderImpl(this: Chat, timeline: TimelineItem[], allMsgs?: Message[]): void {
+    const _renderStarted = performance.now();
     this.ml.classList.remove("parallel-active");
     const st = getState();
     const autoExpand = isEnabled(st.settings.auto_expand);
@@ -540,16 +956,39 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
     // chat feel like it is "always rendering", preventing them from
     // scrolling up to inspect earlier turns.
     const container = this.container;
-    const wasScrolledUp = this.userScrolledUp;
+    // A session switch is a fresh navigation: the stale userScrolledUp flag
+    // from the previous session (or from scroll events fired while the old
+    // DOM was being swapped) must not preserve the old scroll offset — the
+    // user expects to land on the last turn of the newly opened session.
+    // The same applies to rollback / branch switches (one-shot flag): the
+    // conversation just got truncated, so preserving the pre-rollback
+    // scroll offset would leave the view stranded above the new bottom.
+    const sessionChanged = this._lastRenderedSessionId !== st.sessionId;
+    this._lastRenderedSessionId = st.sessionId;
+    const forcePin = sessionChanged || this._forcePinNextRender;
+    this._forcePinNextRender = false;
+    const wasScrolledUp = this.userScrolledUp && !forcePin;
+    if (forcePin) this.userScrolledUp = false;
     const prevScrollTop = container.scrollTop;
     const prevScrollHeight = container.scrollHeight;
     const _vs = saveVideoPlayback(this.ml);
     window.__stopAllMedia?.();
     this.ml.innerHTML = html;
-    createLucideIcons();
-    window.__initMediaCards?.(this.ml);
-    restoreVideoPlayback(_vs, this.ml);
-    
+    // The rebuild produced fresh nodes and classes; force the next incremental
+    // pass to re-check every item once instead of trusting stale signatures.
+    this.incrementalSigs.clear();
+    // Post-swap decoration is individually bounded: one broken image/video/
+    // icon must not leave the transcript without scroll restoration.
+    createLucideIcons(this.ml);
+    guardRender("media", "chat-full", () => window.__initMediaCards?.(this.ml));
+    guardRender("media", "chat-video", () => restoreVideoPlayback(_vs, this.ml));
+    // The innerHTML rebuild dropped the status bar node — put it back so the
+    // running turn's status line stays pinned under the latest output.
+    this.mountStatusBar();
+    // Rebuilt bodies come back at scrollTop 0; re-pin each one to its newest
+    // line so an expanded card never flashes its first lines before tailing.
+    guardRender("scroll", "chat-pin", () => pinBodyTails(this.ml));
+
     if (wasScrolledUp) {
       // Preserve the user's visual position: when new content is appended
       // below, the previous bottom offset should still point at the same
@@ -565,12 +1004,55 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
       // New render: always pin to the bottom so the latest message is
       // visible. This covers both streaming and static sessions -- when
       // the user opens a session, we want to land on the last turn,
-      // not the middle of the history.
-      this.scrollToBottomAfterMedia();
+      // not the middle of the history. Session switches and rollbacks
+      // force the pin so the stale flag cannot block it.
+      this.scrollToBottomAfterMedia(forcePin);
     }
-    const userMsgs = getState().messages.filter(m => m.role === "user");
-    this.scrollIndicator.update(userMsgs.length, userMsgs.map(m => m.content));
+    updateScrollIndicatorImpl.call(this);
     this.syncScrollButton();
+    // The scroll anchor above must measure layout before anything transforms
+    // the tape, so the enter motion is replayed last: switching sessions
+    // fades and settles onto the new transcript instead of snapping to it.
+    const _renderMs = performance.now() - _renderStarted;
+    if (_renderMs >= 60 || _fullRenderCount < 3) {
+      _fullRenderCount++;
+      console.log(
+        `[perf] fullRender ${Math.round(_renderMs)}ms items=${timeline.length} deferred=${!!this.deferMarkdown}`,
+      );
+    }
+    if (sessionChanged) playEnterAnim(this.ml);
+  }
+
+  /** Keeps the scroll indicator in sync with the current user-turn set.
+   *
+   *  The signature is allocation-free (turn count + total user text
+   *  length), so it is safe to compute every render frame. The tick texts
+   *  themselves are only materialised when the signature actually changes,
+   *  which was not the case before: a full `filter` + `map` + `join` of
+   *  every user message's content ran per frame, copying the whole
+   *  conversation's prompt text into one string just to detect a change.
+   */
+  export function updateScrollIndicatorImpl(this: Chat): void {
+    const msgs = getState().messages;
+    let turns = 0;
+    let total = 0;
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].role === "user") {
+        turns++;
+        total += msgs[i].content.length;
+      }
+    }
+    const sig = `${turns}:${total}`;
+    if (sig === this._scrollSig) {
+      this.scrollIndicator.update();
+      return;
+    }
+    this._scrollSig = sig;
+    const texts: string[] = [];
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].role === "user") texts.push(msgs[i].content);
+    }
+    this.scrollIndicator.update(turns, texts);
   }
 
   export function incrementalTextUpdateImpl(this: Chat, timeline: TimelineItem[]): void {
@@ -606,11 +1088,19 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
     for (let i = 0; i < timeline.length; i++) {
       const item = timeline[i];
       if (item.kind === "thinking") {
+        // Unchanged reasoning blocks must not cost a DOM query per frame.
+        const sig = `${item.id}|${item.text.length}|${item.id === activeThinkingId ? 1 : 0}|${this.expandedItems.has(item.id) ? 1 : 0}`;
+        if (this.incrementalSigs.get(item.id) === sig) continue;
+        this.incrementalSigs.set(item.id, sig);
         const el = this.ml.querySelector(`[data-id="${item.id}"]`) as HTMLElement | null;
         if (el) {
           const bodyEl = el.querySelector(".thought-body") as HTMLElement | null;
           if (bodyEl && bodyEl.textContent !== item.text) {
             bodyEl.textContent = item.text;
+            // The thought grows past its window one token at a time; keep the
+            // visible slice on the newest line instead of leaving it parked at
+            // the top of the very first tokens.
+            pinBodyTail(bodyEl);
           }
           // Auto-expand thinking: while the model is ACTIVELY thinking (this is
           // the last content it has produced) always expand unless the user
@@ -638,6 +1128,17 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
     for (let i = 0; i < timeline.length; i++) {
       const toolItem = timeline[i];
       if (toolItem.kind !== "tool") continue;
+      // Cheap signature covering everything this pass writes: status, result
+      // growth, error state, expansion, streamed arguments and sub-agent
+      // progress. Unchanged cards skip the DOM sweep entirely.
+      const tcState = toolItem.tc;
+      const subs = tcState.subAgentMessages;
+      const subSig = subs && subs.length
+        ? `${subs.length}:${subs[subs.length - 1]?.content?.length ?? 0}`
+        : "0";
+      const sig = `${toolItem.id}|${tcState.status}|${(tcState.result || "").length}|${tcState.isError ? 1 : 0}|${this.expandedItems.has(toolItem.id) ? 1 : 0}|${subSig}|${String(tcState.params?.arguments || "").length}`;
+      if (this.incrementalSigs.get(toolItem.id) === sig) continue;
+      this.incrementalSigs.set(toolItem.id, sig);
       // timeline item id is already `tc-${tc.id}`; do NOT prefix again
       // (the old selector emitted `data-id="tc-tc-..."` and never matched).
       const el = this.ml.querySelector(`[data-id="${toolItem.id}"]`) as HTMLElement | null;
@@ -653,6 +1154,34 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
         }
       }
 
+      // 1.5) Stop button (terminal tools) — toggle visibility on status change.
+      const strip = el.querySelector(".strip") as HTMLElement | null;
+      if (strip) {
+        const btn = strip.querySelector(".strip-stop-btn");
+        if (btn) {
+          const wantRunning = toolItem.tc.status === "running" && metaFor(toolItem.tc.name).body === "terminal";
+          btn.setAttribute("data-running", wantRunning ? "true" : "false");
+        }
+        // 1.6) Sub-agent pixel loader — animate while running, freeze into the
+        // static chevron the moment the agent settles. The agent card has no
+        // `.strip-status` slot, so without this the grid would keep shimmering
+        // forever after the run finished.
+        const loader = strip.querySelector(".sa-loader");
+        if (loader) {
+          const wantRunning = toolItem.tc.status === "running";
+          if (loader.getAttribute("data-running") !== String(wantRunning)) {
+            loader.setAttribute("data-running", wantRunning ? "true" : "false");
+            const delays = [90, 180, 270, 0, 90, 180, 90, 180, 270];
+            const chevron = [2, 4, 8];
+            loader.querySelectorAll(":scope > i").forEach((cell, i) => {
+              cell.classList.toggle("sa-chevron", !wantRunning && chevron.includes(i));
+              if (wantRunning) cell.setAttribute("style", `--sa-d:${delays[i]}ms`);
+              else cell.removeAttribute("style");
+            });
+          }
+        }
+      }
+
       // 2) Summary text (strip-summary) — pick the right summary function
       //    per layout (inline vs expandable).
       const summaryEl = el.querySelector(".strip-summary") as HTMLElement | null;
@@ -664,17 +1193,28 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
         }
       }
 
-      // 3) Result body slot (expandable strip + terminal card). Filled
-      //    lazily when tc.result arrives; key flips structurally so the
-      //    first time it is rendered through fullRender too.
+      // 3) Result body slot (expandable strip + terminal card). Filled here
+      //    both when tc.result first arrives (tool_result patches the card, and
+      //    streamed progress appends) because result presence is not part of
+      //    the render key.
       const bodySlot = el.querySelector(".strip-body-slot, .terminal-body-slot") as HTMLElement | null;
       if (bodySlot) {
         const hasBody = !!toolItem.tc.result;
         const cur = bodySlot.getAttribute("data-has-body") === "1";
-        if (hasBody !== cur) {
+        // Streamed progress keeps appending to tc.result without a structural
+        // key change; compare lengths so the body follows the output instead
+        // of freezing on its first chunk.
+        const resultLen = String((toolItem.tc.result || "").length);
+        const curLen = bodySlot.getAttribute("data-result-len") || "";
+        if (hasBody !== cur || (hasBody && resultLen !== curLen)) {
           bodySlot.setAttribute("data-has-body", hasBody ? "1" : "0");
+          bodySlot.setAttribute("data-result-len", resultLen);
           if (hasBody) {
-            bodySlot.innerHTML = `<div class="${el.classList.contains("terminal-card") ? "terminal-body" : "strip-body"}">${getToolBodyText(toolItem.tc)}</div>`;
+            bodySlot.innerHTML = `<div class="${el.classList.contains("terminal-card") ? "terminal-body" : "strip-body"} tail-follow">${getToolBodyText(toolItem.tc)}</div>`;
+            // A result arriving fills the body for the first time; land on its
+            // tail so a long output reads from its last line, like the run that
+            // produced it.
+            pinBodyTails(bodySlot);
           } else {
             bodySlot.innerHTML = "";
           }
@@ -742,10 +1282,11 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
       });
     }
 
-    // Update assistant text content
-    // During streaming we use textContent (instant, no parsing) to avoid
-    // O(n^2) markdown re-parsing on every delta. Full markdown rendering
-    // happens once when the stream ends.
+    // Update assistant text content.
+    // The whole accumulated answer is re-parsed (and every fenced block
+    // re-highlighted) here, so while streaming this is rate-limited instead of
+    // running on every animation frame. The final markdown is written by the
+    // full render that runs when the turn ends.
     if (lastAssistantIndex >= 0) {
       const assistantItem = timeline[lastAssistantIndex] as Extract<TimelineItem, { kind: "assistant_text" }>;
       const newText = assistantItem.content;
@@ -764,17 +1305,46 @@ import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTas
       if (newText.trim().length > 0) {
         const contentEl = el.querySelector(".msg-text") as HTMLElement | null;
         if (contentEl) {
-          const newHtml = renderMarkdown(newText);
-          if (contentEl.innerHTML !== newHtml) {
-            contentEl.innerHTML = newHtml;
+          const running = getState().running;
+          const sameItem = this._streamMarkdownId === assistantItem.id;
+          if (!sameItem || newText !== this._streamMarkdownText) {
+            const now = performance.now();
+            // markdown-it re-parses the entire message and highlight.js
+            // re-highlights every fenced block, so running this on each frame
+            // costs tens of ms for a long answer and starves the WebSocket
+            // reader. Cap it while streaming; an open fence is slower still
+            // because partial code re-highlights yield no stable cache.
+            const fenceCount = (newText.match(/```/g) || []).length;
+            const interval = fenceCount % 2 === 1 ? 160 : 90;
+            // While the user has scrolled up to read history, the streaming
+            // block is offscreen: skip the parse so scrolling stays smooth.
+            const offscreen = running && this.userScrolledUp;
+            if (!offscreen && (!running || !sameItem || now - this._streamMarkdownAt >= interval)) {
+              const newHtml = renderMarkdown(newText);
+              // Compare against the cached string, not innerHTML: reading
+              // innerHTML serialises the whole subtree on every frame.
+              if (!sameItem || newHtml !== this._streamMarkdownHtml) {
+                // A block that started as the boot plain-text fallback is
+                // now real markdown; drop the pre-wrap styling with it.
+                contentEl.classList.remove("msg-text--raw");
+                contentEl.innerHTML = newHtml;
+                // Re-hydrate the code-block copy icons this write replaced
+                // (scoped to this block only -- a document-wide pass would
+                // churn every icon in the app on every stream tick).
+                if (newHtml.includes("data-lucide=")) createLucideIcons(contentEl);
+              }
+              this._streamMarkdownId = assistantItem.id;
+              this._streamMarkdownText = newText;
+              this._streamMarkdownHtml = newHtml;
+              this._streamMarkdownAt = now;
+            }
           }
         }
       }
     }
 
     this.autoScroll();
-    const userMsgs = getState().messages.filter(m => m.role === "user");
-    this.scrollIndicator.update(userMsgs.length, userMsgs.map(m => m.content));
+    updateScrollIndicatorImpl.call(this);
     this.syncScrollButton();
   }
 

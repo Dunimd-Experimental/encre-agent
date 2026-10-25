@@ -1,0 +1,42 @@
+; import-linter contracts for the Encre Agent Harness.
+;
+; Optional gate: `pip install import-linter` then `lint-imports` from harness/.
+; The same rules are enforced by `python harness/tools/arch_check.py --strict`
+; (stdlib-only, always available) and by harness/tests/test_architecture.py.
+
+[importlinter]
+root_package = encre
+include_external_packages = False
+
+[importlinter:contract:kernel-no-surface]
+name = The kernel must never import the surface layer
+type = forbidden
+source_modules =
+    encre.loop
+forbidden_modules =
+    encre.agent
+
+[importlinter:contract:contracts-are-pure]
+name = The contracts package imports nothing outside itself
+type = forbidden
+source_modules =
+    encre.contracts
+forbidden_modules =
+    encre.events
+    encre.loop
+    encre.kernel
+    encre.backends
+    encre.tools
+    encre.agent
+    encre.sdk
+
+[importlinter:contract:kernel-no-surface-modules]
+name = The kernel must not import surface modules
+type = forbidden
+source_modules =
+    encre.kernel
+forbidden_modules =
+    encre.agent
+    encre.sdk
+    encre.lifecycle
+    encre.contract

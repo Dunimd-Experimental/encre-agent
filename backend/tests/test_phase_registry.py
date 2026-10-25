@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -25,25 +25,16 @@ from __future__ import annotations
 
 """Tests for the pluggable phase pipeline (P1.1).
 
-The loop under test is the **real** ``EncreLoop`` -- real wiring, real
-session, real event backbone, real phase adapters registered by the wiring --
-with only the model backend replaced by a scripted ``BaseBackend`` subclass
-that streams a canned text-only response through the genuine async-generator
-streaming path (the same isolation strategy as
-``test_memory_runtime_wiring.py``).  The data root is redirected to
-``tmp_path`` via ``ENCRE_DATA_DIR``.
+The loop under test is the real ``EncreLoop`` -- genuine wiring, genuine
+session, genuine event backbone, genuine phase adapters -- with only the
+model backend swapped for a scripted ``BaseBackend`` subclass that streams a
+canned text-only response through the real async-generator streaming path.
+The data root is redirected to ``tmp_path`` via ``ENCRE_DATA_DIR`` so no
+session, job or telemetry state can leak into the real workspace.
 
-Covered invariants:
-
-1. the default wiring registers the built-in phases in the exact order the
-   runner used to hard-code, and GENERAL mode runs all of them;
-2. registering a phase under an existing name swaps the built-in **in
-   place** (same pipeline position) and the custom phase really executes;
-3. unregistering an optional phase leaves the loop able to complete a full
-   turn, removal is a safe no-op when repeated, and reversible;
-4. ``pipeline(mode)`` filters phases by their ``modes`` frozenset;
-5. a minimal pipeline (prompt + compaction + model + recovery + tools +
-   end-of-turn) completes a real turn end-to-end.
+The suite checks five invariants: the default wiring order, same-name
+in-place replacement, safe and reversible unregistration, mode-based
+pipeline filtering, and a minimal pipeline completing one real turn.
 """
 
 from unittest.mock import patch
@@ -115,6 +106,7 @@ class _ScriptedBackend(BaseBackend):
     """
 
     def __init__(self, text: str) -> None:
+        """Store the canned response text and reset the call counter."""
         self._text = text
         self.chat_calls = 0
 
@@ -129,6 +121,13 @@ class _ScriptedBackend(BaseBackend):
         enable_caching: bool = False,
         cache_edits_state=None,
     ):
+        """Stream the canned text, then a clean ``stop`` finish event.
+
+        The single ``yield`` pair mirrors the shape of a live provider: one
+        text chunk followed by a terminal finish carrying usage numbers.
+        Request arguments are accepted and ignored so the loop can pass its
+        full parameter set unchanged.
+        """
         self.chat_calls += 1
         yield BackendText(text=self._text)
         yield BackendFinish(
@@ -136,12 +135,15 @@ class _ScriptedBackend(BaseBackend):
         )
 
     def supports_tool_calling(self) -> bool:
+        """Report tool calling as available so the tools phases stay live."""
         return True
 
     def context_window_size(self) -> int:
+        """Advertise a 128k window so no compaction threshold is tripped."""
         return 128000
 
     def supports_prompt_caching(self) -> bool:
+        """Disable prompt caching to match the fixture's config flag."""
         return False
 
 
@@ -173,10 +175,12 @@ async def _run_turn(loop: EncreLoop, prompt: str = _PROMPT) -> list:
 
 
 def _finishes(events: list) -> list[Finish]:
+    """Filter the streamed events down to their terminal ``Finish`` events."""
     return [event for event in events if isinstance(event, Finish)]
 
 
 def _streamed_text(events: list) -> str:
+    """Concatenate every ``text`` attribute across the streamed events."""
     return "".join(e.text for e in events if hasattr(e, "text"))
 
 
@@ -185,11 +189,13 @@ class _MarkerPhase:
     tests that need custom ``modes``."""
 
     def __init__(self, name: str, modes: frozenset | None = None) -> None:
+        """Record the phase name, its optional mode restriction and its scope."""
         self.name = name
         self.modes = modes
         self.scope = PhaseScope.TURN
 
     async def run(self, ctx: PhaseContext) -> PhaseResult:
+        """Always continue; the phase exists only to be counted and filtered."""
         return PhaseResult.continue_()
 
 
@@ -199,12 +205,14 @@ class _RecordingSwap(LoopPhase):
     semantics."""
 
     def __init__(self, loop, name: str, inner, calls: list) -> None:
+        """Bind the replaced built-in phase and the list that records calls."""
         super().__init__(loop)
         self.name = name
         self._inner = inner
         self._calls = calls
 
     async def run(self, ctx: PhaseContext) -> PhaseResult:
+        """Record that this swap ran, then forward to the built-in phase."""
         self._calls.append(self.name)
         return await self._inner.run(ctx)
 
@@ -237,8 +245,8 @@ async def test_same_name_registration_swaps_builtin_in_place(loop):
     swap = _RecordingSwap(loop, "post_stream", builtin, calls)
     registry.register(swap)
 
-    # Swap keeps the pipeline position (names unchanged) and get() returns
-    # the replacement.
+    # The swap keeps the pipeline position (names unchanged) and get()
+    # returns the replacement.
     assert registry.names() == _EXPECTED_ORDER
     assert registry.get("post_stream") is swap
 

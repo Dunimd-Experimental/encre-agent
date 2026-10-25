@@ -30,7 +30,7 @@
 | Hizmet | Açıklama | Durum |
 |---|---|---|
 | **Encre Agent Masaüstü** | Yerel öncelikli yapay zekâ ajan uygulaması | Windows, macOS, Linux |
-| **Encre Agent Framework** | Python framework + Rust çekirdek | Açık kaynak, github.com/mf2023/Encre |
+| **Encre Agent** | Python gateway + Rust çekirdek | Açık kaynak, github.com/mf2023/Encre |
 | **Sohbet platform entegrasyonları** | 18 platform bağlayıcısı | Platform kullanılabilirliğine göre |
 | **PiscesLx** | Barındırılan LLM çıkarımı (isteğe bağlı) | Abonelik |
 | **StadionOS** | İşletim sistemi projesi | Ayrı lisans |

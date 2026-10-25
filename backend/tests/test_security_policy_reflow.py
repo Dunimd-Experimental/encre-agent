@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,15 +25,16 @@ from __future__ import annotations
 
 """Tests for behaviour -> safety-policy reflow (``encre.safety_policy``).
 
-Covers the three hard invariants of the learned-policy layer:
+These tests exercise the learned-policy layer that compiles user corrections
+into enforceable permission entries, and they assert the three hard safety
+invariants of that layer: a learned ``deny`` takes effect and rejects the
+offending call; a preference that would widen access is compiled to ``ask``
+and never to ``allow``; and the dangerous-command blacklist cannot be
+weakened by any learned entry.
 
-1. A learned ``deny`` takes effect and rejects the offending call.
-2. A preference that would widen access is compiled to ``ask`` -- never
-   ``allow`` (the core assertion).
-3. The dangerous-command blacklist cannot be weakened by a learned entry.
-
-Plus the persistence round-trip, the Python <-> Rust bridge, and the event
-publication.
+They also cover the encrypted persistence round-trip, the Python <-> Rust
+bridge between the reflow layer and the native permission engine, and the
+publication of policy changes on the event backbone.
 """
 
 import json
@@ -51,6 +52,8 @@ try:
 except Exception:  # pragma: no cover - native build absent
     _native = None
 
+# The learned-policy entry points only exist when the Rust permission engine
+# was built with support for them, so probe once and gate the whole module.
 _HAS_LEARNED_API = _native is not None and hasattr(
     _native, "permission_set_learned_policies"
 )
@@ -151,7 +154,7 @@ async def test_deny_policy_from_correction_is_enforced(reflow, learner, engine):
     )
     assert blocked.behavior == "deny"
 
-    # The deny is path-scoped: an unrelated read is untouched.
+    # The deny is path-scoped, so an unrelated read elsewhere still passes.
     allowed = await engine.check_tool_permission(
         "file_read", {"path": "/home/user/public/readme.txt"}
     )
@@ -174,12 +177,12 @@ async def test_escalation_preference_is_downgraded_to_ask(reflow, learner, engin
 
     entries = reflow.apply()
     assert entries, "expected a compiled policy entry"
-    # Core assertion: nothing is ever `allow`.
+    # Core assertion: nothing compiled from a preference is ever `allow`.
     assert not any(e.policy == "allow" for e in entries)
     assert all(e.policy in {"deny", "ask"} for e in entries)
     assert any(e.policy == "ask" for e in entries)
 
-    # Rust enforces the same invariant on its own.
+    # The Rust engine enforces the same invariant independently.
     native_entries = json.loads(_native.permission_get_learned_policies())
     assert native_entries
     assert all(e["policy"] in {"deny", "ask"} for e in native_entries)
@@ -210,7 +213,7 @@ def test_compile_never_yields_allow(tmp_path):
     )
     assert all(e.policy in {"deny", "ask"} for e in entries)
     assert {e.policy for e in entries} == {"ask", "deny"}
-    # The escalation entry is scoped to the command it mentioned.
+    # The escalation entry is scoped to the command it was derived from.
     assert any(e.policy == "ask" and e.command_scope == "ls" for e in entries)
     assert any(e.policy == "deny" and e.path_scope == "/var/secret" for e in entries)
 
@@ -233,13 +236,13 @@ async def test_dangerous_command_not_bypassed_by_learned_policy(reflow, learner,
     assert entries
     assert all(e.policy != "allow" for e in entries)
 
-    # Default mode: still requires confirmation / refuses -- never auto-allowed.
+    # Default mode still requires confirmation or refuses; never auto-allowed.
     default_decision = _decision("bash", {"command": dangerous}, "default")
     assert default_decision["behavior"] in {"ask", "deny"}
     assert default_decision["behavior"] != "allow"
 
-    # Bypass mode: the blacklist refuses outright; the learned `ask` must not
-    # downgrade that `deny` to a pass.
+    # Bypass mode: the blacklist refuses outright, and a learned `ask` must
+    # not downgrade that `deny` into a pass.
     bypass_decision = _decision("bash", {"command": dangerous}, "bypass")
     assert bypass_decision["behavior"] == "deny"
 
@@ -267,7 +270,7 @@ def test_learned_deny_is_stricter_than_dangerous_ask(tmp_path):
         ]
     )
     reflow.sync_to_native(entries)
-    # Default mode would normally ask; the learned deny makes it a hard deny.
+    # Default mode would normally ask; the learned deny hardens it to a deny.
     assert _decision("bash", {"command": dangerous}, "default")["behavior"] == "deny"
 
 
@@ -287,7 +290,7 @@ def test_policy_persists_and_reloads_from_disk(reflow, learner):
     applied = reflow.apply()
     assert applied
 
-    # Real file on disk, written as ciphertext by secure_io.
+    # A real file on disk, written as ciphertext by secure_io.
     assert reflow.storage_path.exists()
     raw = reflow.storage_path.read_text(encoding="utf-8")
     assert sensitive not in raw, "policy document must not store plaintext"
@@ -336,7 +339,7 @@ def test_set_policies_does_not_wipe_learned_layer(reflow, learner):
     assert before
 
     # Re-submit the current table (as the settings panel would) without a
-    # `learned` field.
+    # `learned` field; the learned layer must survive the round trip.
     current = json.loads(_native.permission_get_policies())
     _native.permission_set_policies(
         json.dumps({"tools": current.get("tools", {}), "capabilities": current.get("capabilities", {})})

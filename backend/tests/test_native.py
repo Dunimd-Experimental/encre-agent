@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for encre.native -- Rust native bridge with Python fallbacks."""
+"""Tests for encre.native -- the Rust native bridge and its Python fallbacks.
+
+Exercises the Python shim's import surface, the mirrored API of the
+optional Rust extension, and the behavioural contracts of every
+wrapped native operation (files, grep, glob, tokens, diffs, sandbox
+execution, and codebase search).
+"""
 
 from pathlib import Path
 
@@ -32,14 +38,14 @@ from encre import native
 
 
 class TestNativeImport:
-    """Engineered to validate the native bridge module import contract.
+    """Validate the native bridge module import contract.
 
-The class confirms that the encre.native Python shim is always
-importable regardless of whether the Rust extension is compiled, that
-all functions declared in the _native.pyi stubs exist and are
-callable on the shim, and that the actual Rust extension (when
-present) exposes the same API surface.
-"""
+    Confirms that the encre.native Python shim is always importable
+    regardless of whether the Rust extension is compiled, that every
+    function declared in the ``_native.pyi`` stubs exists and is
+    callable on the shim, and that the actual Rust extension (when
+    present) exposes the same API surface.
+    """
 
     def test_verify_native_module_importable(self):
         """Validate that the native bridge module is always importable regardless of Rust extension availability."""
@@ -94,12 +100,12 @@ present) exposes the same API surface.
 
 
 class TestReadWriteFile:
-    """Engineered to validate native file read/write operations.
+    """Validate native file read/write operations.
 
-Tests exercise write_file and read_file across normal content,
-offset-based reads, combined offset+limit windows, missing-file
-errors, and implicit parent-directory creation.
-"""
+    Tests exercise ``write_file`` and ``read_file`` across normal
+    content, offset-based reads, combined offset+limit windows,
+    missing-file errors, and implicit parent-directory creation.
+    """
 
     def test_verify_native_write_and_read_file(self, tmp_path: Path):
         """Validate that write_file and read_file round-trip content correctly."""
@@ -143,13 +149,13 @@ errors, and implicit parent-directory creation.
 
 
 class TestGrep:
-    """Engineered to validate the native grep implementation.
+    """Validate the native grep implementation.
 
-Tests cover basic regex matching, case-insensitive search, no-match
-empty-result handling, invalid-regex error propagation, multiline
-mode, and head_limit truncation -- ensuring the grep wrapper
-mirrors core grep semantics.
-"""
+    Tests cover basic regex matching, case-insensitive search,
+    no-match empty-result handling, invalid-regex error propagation,
+    multiline mode, and head_limit truncation -- ensuring the grep
+    wrapper mirrors core grep semantics.
+    """
 
     def test_verify_native_grep_finds_matches(self, tmp_path: Path):
         """Validate that grep returns matching lines with correct structure."""
@@ -198,12 +204,12 @@ mirrors core grep semantics.
 
 
 class TestGlobPattern:
-    """Engineered to validate the glob pattern matcher.
+    """Validate the glob pattern matcher.
 
-Tests assert that glob_pattern returns only matching paths, returns
-an empty list for non-matching globs, and resolves the default
-search path correctly.
-"""
+    Tests assert that ``glob_pattern`` returns only matching paths,
+    returns an empty list for non-matching globs, and resolves the
+    default search path correctly.
+    """
 
     def test_verify_native_glob_finds_files(self, tmp_path: Path):
         """Validate that glob_pattern returns only matching file paths."""
@@ -230,13 +236,13 @@ search path correctly.
 
 
 class TestCountTokens:
-    """Engineered to validate token counting across input types.
+    """Validate token counting across input types.
 
-Tests confirm that count_tokens returns a positive integer for
-non-empty text, zero for empty strings, scales monotonically with
-text length, and returns a well-typed result for whitespace-only
-input regardless of platform-specific counting implementation.
-"""
+    Tests confirm that ``count_tokens`` returns a positive integer for
+    non-empty text, zero for empty strings, scales monotonically with
+    text length, and returns a well-typed result for whitespace-only
+    input regardless of platform-specific counting implementation.
+    """
 
     def test_verify_native_count_tokens_returns_int(self):
         """Validate that count_tokens returns a positive integer for non-empty text."""
@@ -263,13 +269,13 @@ input regardless of platform-specific counting implementation.
 
 
 class TestDiff:
-    """Engineered to validate diff computation and application.
+    """Validate diff computation and application.
 
-Tests verify that compute_diff returns a deterministic string
-representation (empty for identical inputs), that apply_diff
-successfully reverses a diff to reconstruct the original text, and
-that both functions handle empty-string arguments without error.
-"""
+    Tests verify that ``compute_diff`` returns a deterministic string
+    representation (empty for identical inputs), that ``apply_diff``
+    successfully reverses a diff to reconstruct the original text, and
+    that both functions handle empty-string arguments without error.
+    """
 
     def test_verify_native_compute_diff_identical(self):
         """Validate that compute_diff returns an empty string for identical inputs."""
@@ -305,12 +311,12 @@ that both functions handle empty-string arguments without error.
 
 
 class TestSandboxExecute:
-    """Engineered to validate the sandboxed command execution interface.
+    """Validate the sandboxed command execution interface.
 
-Tests assert that sandbox_execute returns a dict with stdout,
-stderr, and exit_code keys; that successful commands yield exit code
-0; and that stderr output is captured correctly.
-"""
+    Tests assert that ``sandbox_execute`` returns a dict with stdout,
+    stderr, and exit_code keys; that successful commands yield exit
+    code 0; and that stderr output is captured correctly.
+    """
 
     def test_verify_native_sandbox_echo(self):
         """Validate that sandbox_execute returns structured output with stdout/stderr/exit_code."""
@@ -333,12 +339,12 @@ stderr, and exit_code keys; that successful commands yield exit code
 
 
 class TestSandboxFileOps:
-    """Engineered to validate sandboxed file read/write operations.
+    """Validate sandboxed file read/write operations.
 
-Tests confirm that sandbox_write_file creates a file and
-sandbox_read_file retrieves the exact content, and that reading a
-non-existent path raises FileNotFoundError.
-"""
+    Tests confirm that ``sandbox_write_file`` creates a file and
+    ``sandbox_read_file`` retrieves the exact content, and that
+    reading a non-existent path raises FileNotFoundError.
+    """
 
     def test_verify_native_sandbox_write_and_read(self, tmp_path: Path):
         """Validate that sandbox_write_file and sandbox_read_file round-trip content."""
@@ -355,12 +361,13 @@ non-existent path raises FileNotFoundError.
 
 
 class TestSearchCodebase:
-    """Engineered to validate the codebase search function.
+    """Validate the codebase search function.
 
-Tests assert that search_codebase returns a list of match records
-containing file paths, returns zero matches for non-existent terms,
-and falls back to a default search path when none is supplied.
-"""
+    Tests assert that ``search_codebase`` returns a list of match
+    records containing file paths, returns zero matches for
+    non-existent terms, and falls back to a default search path when
+    none is supplied.
+    """
 
     def test_verify_native_search_finds_content(self, tmp_path: Path):
         """Validate that search_codebase returns match records with file paths."""

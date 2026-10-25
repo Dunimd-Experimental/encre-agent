@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,14 @@
 
 from __future__ import annotations
 
-"""Tests for GroqBackend -- construction, capabilities, context window, tokens."""
+"""Tests for GroqBackend -- construction, capabilities, context window, tokens.
+
+Covers ``GroqBackend`` construction and default configuration, capability flags
+(tool calling, thinking, prompt caching), the context-window report, token-counting
+resilience, ``_build_request_data`` request-body assembly and the ``aclose()``
+lifecycle path. No network calls are made; every assertion is against local
+state built by the constructor and the request builder.
+"""
 
 import asyncio
 
@@ -35,7 +42,7 @@ from encre.backends.groq import GroqBackend
 
 
 class TestGroqBackendConstruction:
-    """Engineered to validate ``GroqBackend`` instantiation across parameter combinations.
+    """Validates ``GroqBackend`` instantiation across parameter combinations.
 
     This test class exercises constructor behavior across 6 scenarios covering
     default model and base URL, custom model selection, GPT-OSS variant, custom
@@ -120,7 +127,7 @@ class TestGroqBackendConstruction:
 
 
 class TestGroqBackendCapabilities:
-    """Engineered to validate capability flags for Groq-hosted models.
+    """Validates capability flags for Groq-hosted models.
 
     This test class exercises ``supports_tool_calling``, ``supports_thinking``,
     and ``supports_prompt_caching`` across 4 scenarios. The design ensures
@@ -180,7 +187,7 @@ class TestGroqBackendCapabilities:
 
 
 class TestGroqBackendContextWindow:
-    """Engineered to validate context-window sizes for Groq-hosted models.
+    """Validates context-window sizes for Groq-hosted models.
 
     This test class exercises ``context_window_size()`` across 4 scenarios
     covering the default model, Llama 4 Scout, GPT-OSS 120B, and a positivity
@@ -234,7 +241,7 @@ class TestGroqBackendContextWindow:
 
 
 class TestGroqBackendTokens:
-    """Engineered to validate token-counting resilience and model attribute access.
+    """Validates token-counting resilience and model attribute access.
 
     This test class exercises ``count_tokens()`` across 4 scenarios covering
     normal text, empty strings, long text, and direct model attribute access.
@@ -292,7 +299,7 @@ class TestGroqBackendTokens:
 
 
 class TestGroqBackendRequestBuilding:
-    """Engineered to validate ``_build_request_data`` request-body assembly.
+    """Validates ``_build_request_data`` request-body assembly.
 
     This test class exercises request-body construction across 3 scenarios
     covering max_tokens propagation, model injection, and streaming toggle.
@@ -356,7 +363,7 @@ class TestGroqBackendRequestBuilding:
 
 
 class TestGroqBackendLifecycle:
-    """Engineered to validate backend resource cleanup and lifecycle safety.
+    """Validates backend resource cleanup and lifecycle safety.
 
     This test class exercises ``aclose()`` across 2 scenarios covering lazy
     client initialization and idempotent double-close. The design ensures

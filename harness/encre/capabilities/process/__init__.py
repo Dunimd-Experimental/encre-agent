@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,19 +21,25 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Process capability seam.
 
 Single implementation for every subprocess power in Encre:
 - spawning with window suppression (:mod:`encre.capabilities.process.spawn`)
 - background shells (:class:`BackgroundShellManager`)
 - persistent terminals (:class:`TerminalSessionManager`)
-- path sandboxing (:mod:`encre.capabilities.process.sandbox`)
+- path sandboxing + Rust-owned process confinement
+  (:mod:`encre.capabilities.process.sandbox`)
 
+OS-level confinement for model-driven shells lives in the Rust core
+(``SandboxSession``); :func:`spawn_confined` is the only sanctioned entry.
 The Rust ``permission_check`` call path is unaffected: permission
 decisions happen in the tools layer before reaching this seam.
 """
 
 from encre.capabilities.process.sandbox import (
+    ConfinedProcess,
     PathViolation,
     check_path_safety,
     filter_allowed_env,
@@ -41,6 +47,7 @@ from encre.capabilities.process.sandbox import (
     get_session_files_dir,
     remap_path,
     remap_tool_path,
+    spawn_confined,
 )
 from encre.capabilities.process.shell_manager import BackgroundShellManager
 from encre.capabilities.process.spawn import (
@@ -56,9 +63,10 @@ from encre.capabilities.process.terminal_manager import (
 )
 
 __all__ = [
-    "BackgroundShellManager",
-    "PathViolation",
     "SHELL_LAUNCH",
+    "BackgroundShellManager",
+    "ConfinedProcess",
+    "PathViolation",
     "TerminalSessionManager",
     "check_path_safety",
     "create_subprocess_exec",
@@ -71,4 +79,5 @@ __all__ = [
     "marker_cmd",
     "remap_path",
     "remap_tool_path",
+    "spawn_confined",
 ]

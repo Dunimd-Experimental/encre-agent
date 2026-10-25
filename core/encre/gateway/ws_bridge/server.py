@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,22 +23,37 @@
 
 from __future__ import annotations
 
-"""WS Bridge server: accepts remote adapter connections over WebSocket.
+"""Agent-side WebSocket bridge for remote platform adapters.
 
-Implements :class:`WsBridgeServer`, a localhost WebSocket server that accepts
-connections from remote/plugin adapters and wraps each one as a
-:class:`~encre.gateway.ws_bridge.remote_adapter.RemotePlatformAdapter`
-registered with the GatewayRunner.
+This module implements :class:`WsBridgeServer`, a localhost WebSocket
+server that accepts connections from remote or plugin adapters and
+routes their traffic into
+:class:`encre.gateway.run.GatewayRunner`.  Each accepted connection is
+wrapped as a :class:`~encre.gateway.ws_bridge.remote_adapter.RemotePlatformAdapter`
+so the runner drives it exactly like an in-process adapter.
 
-This is used ONLY for remote adapters that cannot run in-process. Core adapters
-run in the same process and interact directly with the GatewayRunner, bypassing
-this server entirely.
+It is used ONLY for adapters that cannot run in-process.  Core adapters
+(:mod:`encre.gateway.platforms`) run in the same process and interact
+directly with the runner, bypassing this server entirely.  Note that
+this server is unrelated to
+:class:`encre.transport.ws.EncreWSHandler`, which serves the desktop
+renderer over a different protocol.
 
-The server is the bridge's server half: it owns the listening socket, performs
-the HELLO handshake, tracks live connections, answers heartbeats, and routes
-inbound ``SUBMIT`` / ``SUBMIT_STREAM`` frames to the runner while streaming the
-runner's reply events back out as ``TEXT_DELTA`` / ``TOOL_RESULT`` / ``FINISH``
+The server is the bridge's server half: it owns the listening socket,
+performs the HELLO handshake, tracks live connections, answers
+heartbeats, enforces the connection cap, and routes inbound
+``SUBMIT`` / ``SUBMIT_STREAM`` / ``CANCEL`` / ``ADAPTER_UPDATE`` /
+``SHUTDOWN`` frames into the runner while streaming the runner's reply
+events back out as ``TEXT_DELTA`` / ``TOOL_RESULT`` / ``FINISH``
 frames.
+
+Architecture::
+
+    RemoteAdapter  <== WS ==>  WsBridgeServer  <== in-process ==>  GatewayRunner -> EventRouter
+    RemoteAdapter  <== WS ==>  WsBridgeServer  <== in-process ==>  GatewayRunner <- EventRouter
+
+Public API: :class:`WsBridgeServer` with :meth:`WsBridgeServer.start`,
+:meth:`WsBridgeServer.stop`, and :meth:`WsBridgeServer.get_status`.
 """
 
 import asyncio
@@ -64,13 +79,33 @@ MAX_PENDING = 256
 
 
 class _AdapterConnection:
-    """Lightweight, mutable record describing one live remote connection.
+    """Mutable record describing one live remote adapter connection.
 
-    Holds the socket plus bookkeeping the server needs to track an adapter:
-    identity, capabilities, connection timestamp, and heartbeat liveness.
+    Holds the socket plus the bookkeeping the server needs to reason
+    about an adapter without holding it: identity, capabilities, the
+    connection timestamp, and heartbeat liveness.  One instance is
+    created per accepted socket in
+    :meth:`WsBridgeServer._handle_connection`, stored in the server's
+    adapter registry under the adapter's name, and dropped when the
+    socket closes.
+
+    Everything here is intentionally a plain mutable attribute rather
+    than a dataclass field with validation, because ADAPTER_UPDATE
+    frames rewrite ``status`` and ``capabilities`` in place over the
+    connection's lifetime.
     """
 
     def __init__(self, name: str, ws: Any) -> None:
+        """Record a freshly accepted socket.
+
+        Args:
+            name: A provisional name (``remote-N``) used until the
+                adapter declares its own name in the HELLO frame.
+            ws: The connected WebSocket object for this adapter.
+
+        Raises:
+            Nothing.
+        """
         self.name = name
         self.ws = ws
         self.connected_at = time.time()
@@ -80,25 +115,69 @@ class _AdapterConnection:
 
     @property
     def uptime(self) -> float:
-        """Return how many seconds this connection has been alive."""
+        """Return how many seconds this connection has been alive.
+
+        Computed on demand rather than cached so status snapshots are
+        always current without a background updater task.
+
+        Returns:
+            Seconds since :attr:`connected_at`, as a float.
+        """
         return time.time() - self.connected_at
 
 
 class WsBridgeServer:
-    """WebSocket bridge that accepts connections from remote adapters
-    and routes messages to/from the GatewayRunner.
+    """WebSocket bridge accepting remote adapter connections.
+
+    Accepts WebSocket connections from remote adapters and routes
+    messages to and from the GatewayRunner.
 
     Architecture::
 
-        RemoteAdapter 鈹€鈹€WS鈹€鈹€> WsBridgeServer 鈹€鈹€> GatewayRunner -> EventRouter
-        RemoteAdapter <鈹€WS鈹€鈹€鈹€ WsBridgeServer <鈹€鈹€ GatewayRunner <- EventRouter
+        RemoteAdapter  <== WS ==>  WsBridgeServer  <== in-process ==>  GatewayRunner -> EventRouter
+        RemoteAdapter  <== WS ==>  WsBridgeServer  <== in-process ==>  GatewayRunner <- EventRouter
 
-    Each remote adapter connection is tracked in ``_adapters``. The bridge
-    performs the HELLO handshake, answers HEARTBEAT pings, enforces the maximum
-    connection cap, and dispatches inbound ``SUBMIT`` / ``SUBMIT_STREAM`` /
-    ``CANCEL`` / ``ADAPTER_UPDATE`` / ``SHUTDOWN`` frames to the parent
-    GatewayRunner. Replies from the runner are streamed back as gateway wire
-    messages.
+    Each remote adapter connection is tracked in :attr:`_adapters`.  The
+    bridge performs the HELLO handshake, answers HEARTBEAT pings,
+    enforces the maximum connection cap, and dispatches inbound
+    ``SUBMIT`` / ``SUBMIT_STREAM`` / ``CANCEL`` / ``ADAPTER_UPDATE`` /
+    ``SHUTDOWN`` frames into the parent
+    :class:`encre.gateway.run.GatewayRunner`.  Replies from the runner's
+    event router are streamed back as bridge wire messages.
+
+    Lifecycle: construct with the runner (and optionally a non-default
+    host/port/cap), :meth:`start` to bind the listening socket,
+    :meth:`stop` to close every adapter socket and the listener.  The
+    runner owns this object; :mod:`encre.gateway.run` starts and stops
+    it with the gateway itself.
+
+    Invariants:
+
+    * :attr:`_adapters` maps adapter name to
+      :class:`_AdapterConnection` and is the single source of truth for
+      "which remote adapters are live".  Every exit path of the per-
+      connection coroutine removes its entry, so the registry never
+      holds a dead socket.
+    * :attr:`_seq` is monotonic across the server's whole lifetime and
+      shared by all connections, because it exists only for cross-
+      connection log correlation.
+    * Background submit tasks are added to :attr:`_background_tasks` so
+      they cannot be garbage-collected mid-flight; the set is a plain
+      reference holder, not a cancellation mechanism.
+
+    Attributes:
+        _runner: The :class:`encre.gateway.run.GatewayRunner` that
+            executes submitted prompts.  Accessed through its private
+            ``_router``, ``_instances`` attributes, so this server is
+            coupled to the runner's internals by design.
+        _host, _port: Listen address of the bridge endpoint.
+        _max_connections: Hard cap on simultaneous adapter sockets.
+        _server: The bound :class:`asyncio.AbstractServer`, ``None``
+            before :meth:`start` or after :meth:`stop`.
+        _running: Whether the server is serving.
+        _adapters: Registry of live remote adapter connections.
+        _seq: Monotonic send counter for log correlation.
+        _background_tasks: Owned submit background tasks.
     """
 
     def __init__(
@@ -108,6 +187,23 @@ class WsBridgeServer:
         port: int = 18792,
         max_connections: int = 32,
     ) -> None:
+        """Bind the server to a runner without listening yet.
+
+        Args:
+            runner: The gateway runner that executes submitted prompts
+                and owns the event router plus the in-process adapter
+                instances.
+            host: Interface to listen on.  ``127.0.0.1`` keeps the
+                bridge unreachable from the network, which is the
+                security default: adapters are trusted local processes.
+            port: TCP port for the bridge endpoint.
+            max_connections: Maximum number of simultaneous remote
+                adapter sockets; further connections are refused with
+                close code 4001.
+
+        Raises:
+            Nothing; binding happens in :meth:`start`.
+        """
         self._runner = runner
         self._host = host
         self._port = port
@@ -120,16 +216,25 @@ class WsBridgeServer:
 
     @property
     def adapter_count(self) -> int:
-        """Return the number of currently connected remote adapters."""
+        """Return the number of currently connected remote adapters.
+
+        Returns:
+            The size of the connection registry.  Used both for the
+            capacity check in :meth:`_handle_connection` and for status
+            snapshots.
+        """
         return len(self._adapters)
 
     @property
     def adapters(self) -> dict[str, dict[str, Any]]:
         """Return a snapshot of each connected adapter's public metadata.
 
+        Builds a fresh dict per call so a caller that holds the result
+        cannot mutate the server's internal records.
+
         Returns:
-            A mapping of adapter name to a dict with ``name``, ``status``,
-            ``uptime`` and ``capabilities``.
+            A mapping of adapter name to a dict with ``name``,
+            ``status``, ``uptime`` and ``capabilities``.
         """
         return {
             name: {
@@ -142,16 +247,29 @@ class WsBridgeServer:
         }
 
     async def start(self) -> None:
-        """Begin listening for WebSocket connections on the configured host/port.
+        """Begin listening for WebSocket connections.
 
-        Imports ``websockets`` lazily and serves ``_handle_connection`` for each
-        inbound socket. Logs the listen address on success.
+        Imports :mod:`websockets` lazily so that deployments which never
+        enable the bridge do not pay for the dependency import, then
+        serves :meth:`_handle_connection` for every inbound socket.
 
         Args:
             None.
 
         Returns:
-            None.
+            ``None`` once the socket is bound and accepting.
+
+        Raises:
+            OSError: If the configured port is already in use; the
+                caller (the gateway runner) is expected to surface this
+                as a startup failure.
+
+        Note:
+            ``ping_interval`` uses the application
+            :data:`HEARTBEAT_INTERVAL`, which doubles as the WebSocket
+            protocol keepalive period; the bridge's own HEARTBEAT op
+            then runs on the same cadence through the adapter's
+            client-side loop.
         """
         self._running = True
         import websockets
@@ -168,14 +286,20 @@ class WsBridgeServer:
     async def stop(self) -> None:
         """Stop listening and close every open adapter connection.
 
-        Closes all live sockets, clears the adapter registry, and stops the
-        underlying server. Safe to call even if ``start`` was never called.
+        Closes all live sockets, clears the adapter registry, and stops
+        the underlying server.  Safe to call even if :meth:`start` was
+        never called or was already stopped.
 
         Args:
             None.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing; individual socket close errors are suppressed so
+            teardown never fails halfway and leaves the registry
+            populated.
         """
         self._running = False
         for conn in list(self._adapters.values()):
@@ -189,11 +313,17 @@ class WsBridgeServer:
         logger.info("WS bridge stopped")
 
     def get_status(self) -> dict[str, Any]:
-        """Return a status snapshot for health/diagnostic endpoints.
+        """Return a status snapshot for health and diagnostic endpoints.
+
+        Consumed by the gateway's admin surface and re-serialized into
+        the ``gateway_status`` frame that
+        :class:`encre.transport.ws.EncreWSHandler` pushes to the desktop
+        renderer, which is how the UI shows whether remote adapters are
+        attached.
 
         Returns:
-            A dict with ``running``, ``host``, ``port``, ``adapter_count`` and
-            the per-adapter ``adapters`` snapshot.
+            A dict with ``running``, ``host``, ``port``,
+            ``adapter_count`` and the per-adapter ``adapters`` snapshot.
         """
         return {
             "running": self._running,
@@ -204,22 +334,43 @@ class WsBridgeServer:
         }
 
     async def _handle_connection(self, ws: Any, _path: str | None = None) -> None:
-        """Per-connection coroutine: handshake and dispatch loop for one socket.
+        """Per-connection coroutine: handshake, then dispatch loop.
 
-        Rejects the connection (close code 4001) when at capacity. Otherwise it
-        reads frames in a loop, parsing each JSON message into a
-        :class:`GatewayMessage` and dispatching on its ``op``: HELLO performs the
-        handshake and registers the adapter, HEARTBEAT is acknowledged, SUBMIT /
-        SUBMIT_STREAM spawn background handler tasks, and CANCEL / ADAPTER_UPDATE
-        / SHUTDOWN update local state. A SHUTDOWN frame or any read error breaks
-        the loop; cleanup unregisters the adapter either way.
+        Runs one instance per accepted socket.  It rejects the
+        connection (close code 4001) when the capacity cap is reached,
+        then reads frames in a loop, parsing each JSON message into a
+        :class:`GatewayMessage` and dispatching on its ``op``:
+
+        * HELLO performs the handshake and registers the adapter under
+          the name it declared (replacing the provisional ``remote-N``).
+        * HEARTBEAT refreshes the liveness timestamp and is answered.
+        * SUBMIT / SUBMIT_STREAM spawn background tasks so one slow turn
+          cannot stall the connection's frame loop or block other
+          requests on the same socket.
+        * CANCEL forwards the session id to the runner's event router.
+        * ADAPTER_UPDATE rewrites this connection's status and
+          capabilities in place.
+        * SHUTDOWN is the remote's clean-teardown request and breaks the
+          loop.
 
         Args:
             ws: The WebSocket protocol object for this connection.
-            _path: The request path (unused; present for the websockets API).
+            _path: The request path, unused; present for the websockets
+                callback signature.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing; read and parse errors leave the loop, and the
+            ``finally`` clause always unregisters the adapter so the
+            registry cannot retain a dead socket.
+
+        Invariant:
+            The adapter is registered only after a HELLO frame arrives.
+            A socket that connects and immediately dies therefore never
+            appears in the registry, which keeps
+            :meth:`_sync_adapter_list` free of phantom adapters.
         """
         if len(self._adapters) >= self._max_connections:
             await ws.close(4001, "Server at capacity")
@@ -281,21 +432,29 @@ class WsBridgeServer:
             self._sync_adapter_list()
 
     async def _handle_submit(self, ws: Any, conn: _AdapterConnection, msg: GatewayMessage) -> None:
-        """Handle a one-shot SUBMIT frame: run the turn, return the full reply.
+        """Handle a one-shot SUBMIT frame: run the turn, return the reply.
 
-        Validates the prompt, resolves the target session (from a ``source``
-        dict when present, otherwise the adapter's default session), calls the
-        runner's synchronous ``submit`` (collecting the whole text), then sends
-        a single ``TEXT_DELTA`` followed by ``FINISH``. Errors are reported as
-        ``ERROR`` frames.
+        Validates the prompt, resolves the target session (from a
+        ``source`` dict when present, otherwise from an explicit
+        ``session_id`` or the adapter's default session), runs the
+        runner's synchronous submit path (collecting the whole reply),
+        then writes one ``TEXT_DELTA`` followed by a terminal
+        ``FINISH``.  Failures are reported as ``ERROR`` frames rather
+        than raising, so the remote adapter always receives a terminal
+        frame for the ``request_id`` it sent.
 
         Args:
             ws: The connection socket to write replies to.
-            conn: The originating :class:`_AdapterConnection`.
-            msg: The parsed SUBMIT ``GatewayMessage``.
+            conn: The originating :class:`_AdapterConnection`, used as
+                the channel name when no platform source is supplied.
+            msg: The parsed SUBMIT message.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing; every failure mode is converted into an ``ERROR``
+            frame carrying the original ``request_id``.
         """
         prompt = msg.data.get("prompt", "")
         request_id = str(msg.data.get("request_id", ""))
@@ -320,7 +479,12 @@ class WsBridgeServer:
                     channel_name = source.platform
                 else:
                     if not session_id:
-                        session_id = await self._runner.ensure_adapter_session(conn.name)
+                        # A remote adapter that omits a structured source cannot
+                        # be routed per-conversation; fall back to a per-adapter
+                        # source so the session is still persisted rather than
+                        # held only in process memory.
+                        source = SessionSource(platform=conn.name, chat_id=conn.name, chat_type="dm")
+                        session_id = await self._runner.resolve_session(conn.name, source)
                     channel_name = conn.name
                 result = await router.submit(
                     channel_name, prompt,
@@ -337,20 +501,33 @@ class WsBridgeServer:
     async def _handle_submit_stream(self, ws: Any, conn: _AdapterConnection, msg: GatewayMessage) -> None:
         """Handle a SUBMIT_STREAM frame: run the turn and stream events back.
 
-        Like :meth:`_handle_submit` for session resolution, but iterates the
-        runner's ``submit_stream`` async generator and forwards each event:
-        ``TextDelta`` -> ``TEXT_DELTA`` frame, ``ToolResult`` -> ``TOOL_RESULT``
-        frame, ``Finish`` -> terminal ``FINISH`` frame (carrying reason, usage
-        and error). Logs text length for observability. Errors become ``ERROR``
-        frames.
+        Resolves the session exactly like :meth:`_handle_submit`, but
+        instead of collecting a single reply it iterates the runner's
+        ``submit_stream`` async generator and forwards every event as it
+        arrives: ``TextDelta`` becomes a ``TEXT_DELTA`` frame,
+        ``ToolResult`` becomes a ``TOOL_RESULT`` frame, and ``Finish``
+        becomes the terminal ``FINISH`` frame carrying reason, usage and
+        error detail.  Cumulative text length is tracked for the finish
+        log line so a stalled stream is diagnosable without decoding
+        every frame.
 
         Args:
             ws: The connection socket to write replies to.
             conn: The originating :class:`_AdapterConnection`.
-            msg: The parsed SUBMIT_STREAM ``GatewayMessage``.
+            msg: The parsed SUBMIT_STREAM message.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing; every failure mode is converted into an ``ERROR``
+            frame carrying the original ``request_id``.
+
+        Note:
+            Usage is copied with ``dict(event.usage)`` only when the
+            value exposes ``items``; anything else (a dataclass without
+            dict mapping) becomes ``{}`` so the frame always carries a
+            JSON-serializable object.
         """
         prompt = msg.data.get("prompt", "")
         request_id = str(msg.data.get("request_id", ""))
@@ -376,7 +553,11 @@ class WsBridgeServer:
                     channel_name = source.platform
                 else:
                     if not session_id:
-                        session_id = await self._runner.ensure_adapter_session(conn.name)
+                        # See _handle_submit: a source-less remote adapter gets a
+                        # persisted per-adapter fallback instead of an in-memory
+                        # shared session.
+                        source = SessionSource(platform=conn.name, chat_id=conn.name, chat_type="dm")
+                        session_id = await self._runner.resolve_session(conn.name, source)
                     channel_name = conn.name
                 async for event in router.submit_stream(
                     channel_name, prompt,
@@ -394,27 +575,38 @@ class WsBridgeServer:
                         usage = None
                         if event.usage:
                             usage = dict(event.usage) if hasattr(event.usage, "items") else {}
+                        context_usage = None
+                        if event.context_usage:
+                            context_usage = dict(event.context_usage) if hasattr(event.context_usage, "items") else {}
                         if event.error:
                             logger.warning("[ws-bridge] %s finish with error: %s (text_len=%d)", conn.name, event.error, text_len)
                         else:
                             logger.info("[ws-bridge] %s finish reason=%s text_len=%d", conn.name, event.reason, text_len)
-                        await self._send(ws, GatewayMessage.finish(event.reason, usage, event.error or "", request_id=request_id))
+                        await self._send(ws, GatewayMessage.finish(event.reason, usage, event.error or "", request_id=request_id, context_usage=context_usage))
         except Exception as e:
             logger.error("[ws-bridge] %s submit_stream error: %s %s", conn.name, type(e).__name__, e)
             await self._send(ws, GatewayMessage.error(str(e), request_id=request_id))
 
     def _sync_adapter_list(self) -> None:
-        """Sync connected remote adapter names to the runner's router.
+        """Publish the merged adapter list to the runner's event router.
 
-        Combines the in-process adapter instances with the currently connected
-        remote adapters and pushes the merged list to the router so the gateway
-        knows the full set of available adapters.
+        Called after every registration and deregistration so the runner
+        always sees the full set of available adapters: in-process
+        instances plus currently connected remote adapters.  Without
+        this sync the runner would route submissions to names it no
+        longer has, or fail to route to a freshly connected remote
+        adapter.
 
         Args:
             None.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing; a runner without an event router or without a
+            ``set_connected_adapters`` hook is silently ignored, which
+            is how older runner shapes stay compatible.
         """
         router = getattr(self._runner, "_router", None)
         if router and hasattr(router, "set_connected_adapters"):
@@ -424,17 +616,24 @@ class WsBridgeServer:
             router.set_connected_adapters(in_process + remote)
 
     async def _send(self, ws: Any, msg: GatewayMessage) -> None:
-        """Serialize and write a ``GatewayMessage`` to a connection socket.
+        """Serialize and write one message to a connection socket.
 
-        Assigns the next ``seq`` then writes the JSON form; send failures are
-        logged but not raised so a dead socket does not crash the dispatcher.
+        Assigns the next :attr:`_seq` value then writes the JSON form.
+        Send failures are logged and swallowed rather than raised, so a
+        dead socket cannot crash the dispatch loop; the socket's own
+        read loop exits on the next iteration and cleanup removes the
+        adapter from the registry.
 
         Args:
             ws: The target WebSocket protocol object.
-            msg: The message to transmit.
+            msg: The message to transmit.  Its ``seq`` field is
+                overwritten in place with the server-wide counter.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing.
         """
         self._seq += 1
         msg.seq = self._seq

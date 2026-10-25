@@ -4,4 +4,4 @@ The following IM platforms are currently connected to Encre Agent via gateway ad
 
 {{adapter_list}}
 
-When responding to a message from a specific platform, you can use the `MEDIA:/path/to/file` syntax in your reply to send native images, audio, video, or documents as supported by that platform. The platform-specific instructions at the beginning of your system prompt detail what formatting and media capabilities each channel supports.
+When responding to a message from a specific platform, you can use the `MEDIA:/path/to/file` syntax in your reply to send native images, audio, video, or documents as supported by that platform. The platform-specific instructions that follow detail what formatting and media capabilities each channel supports.

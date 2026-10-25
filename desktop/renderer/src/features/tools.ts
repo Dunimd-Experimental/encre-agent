@@ -30,6 +30,7 @@
  */
 
 import { getState, subscribe } from "../core/state.js";
+import { scheduleRender } from "../core/render_scheduler.js";
 import { t } from "./i18n.js";
 
 /**
@@ -42,7 +43,8 @@ import { t } from "./i18n.js";
 export class Tools {
   private panel: HTMLElement;
   private content: HTMLElement;
-  private rafPending = false;
+  /** Tool whose detail markup is currently painted (scroll preservation). */
+  private paintedToolId: string | null = null;
 
   /**
    * Constructor: grabs the panel/container elements and subscribes to state.
@@ -53,17 +55,20 @@ export class Tools {
   constructor() {
     this.panel = document.getElementById("detail-panel")!;
     this.content = document.getElementById("detail-content")!;
-    subscribe(() => this.requestRender());
+    // With no tool selected the panel is hidden and has nothing to update;
+    // scheduling a frame per streamed token was pure churn. Still render on
+    // the transition back to "no selection" so the panel hides.
+    let wasActive = !!getState().activeToolId;
+    subscribe(() => {
+      const active = !!getState().activeToolId;
+      if (active || wasActive) this.requestRender();
+      wasActive = active;
+    }, ["activeToolId", "messages"]);
   }
 
   /** RAF-throttled render — prevents layout thrash during dense tool_call_delta streams. */
   requestRender(): void {
-    if (this.rafPending) return;
-    this.rafPending = true;
-    requestAnimationFrame(() => {
-      this.rafPending = false;
-      this.render();
-    });
+    scheduleRender("tools", () => this.render(), 40);
   }
 
   /**
@@ -88,6 +93,11 @@ export class Tools {
     this.panel.classList.remove("hidden");
     const statusIcon = toolCall.status === "done" ? "✓" : toolCall.status === "pending" ? "◌" : "●";
     const statusClass = toolCall.status === "done" ? "done" : toolCall.status === "pending" ? "pending" : "running";
+    // Keep the reader's place while one tool's params/result streams;
+    // selecting another tool starts at the top.
+    const prevTop = this.content.scrollTop;
+    const sameTool = this.paintedToolId === state.activeToolId;
+    this.paintedToolId = state.activeToolId;
     this.content.innerHTML = `
       <div class="detail-header">
         <h3>${toolCall.name}</h3>
@@ -107,6 +117,7 @@ export class Tools {
           : `<div class="detail-section"><p>${t("chat.running")}</p></div>`
       }
     `;
+    this.content.scrollTop = sameTool ? prevTop : 0;
 
     const btn = document.getElementById("btn-detail-close");
     btn?.addEventListener("click", () => {

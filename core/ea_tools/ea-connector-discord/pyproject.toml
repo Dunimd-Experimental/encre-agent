@@ -1,0 +1,58 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-connector-discord"
+version = "0.5.0"
+description = "EA (Encre Agent) — system-default Discord connector plugin."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "connector",
+    "discord",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+    "encre-core>=0.5.0",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.entry-points."ea.plugins"]
+discord = "ea_connector_discord.plugin:create_plugin"
+
+[project.optional-dependencies]
+all = [
+    "aiohttp>=3.9",
+    "discord.py>=2.3",
+    "PyNaCl>=1.5",
+]
+
+[tool.ea]
+icon = "gamepad-2"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_connector_discord*",
+]

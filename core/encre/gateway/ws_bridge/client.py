@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,28 +23,39 @@
 
 from __future__ import annotations
 
-"""WS Bridge client: SDK for remote adapters.
+"""Adapter-side dialer for the remote-adapter WebSocket bridge.
 
-Implements :class:`GatewayClient`, the WebSocket client used by remote adapters
-to talk to :class:`encre.gateway.ws_bridge.server.WsBridgeServer`. It is a thin
-transport layer that serializes :class:`~encre.gateway.ws_bridge.protocol.GatewayMessage`
-objects over a single WebSocket and hides the connection bookkeeping from callers.
+This module implements :class:`GatewayClient`, the SDK a remote or
+plugin platform adapter uses to talk to
+:class:`encre.gateway.ws_bridge.server.WsBridgeServer`.  It is a thin
+transport layer: it serialises
+:class:`~encre.gateway.ws_bridge.protocol.GatewayMessage` objects over
+one WebSocket and hides all the connection bookkeeping from callers,
+so a plugin author only needs to call :meth:`GatewayClient.connect` and
+:meth:`GatewayClient.submit` / :meth:`GatewayClient.submit_stream`.
+
+Only remote adapters instantiate this client.  In-process core adapters
+(:mod:`encre.gateway.platforms`) are driven directly by
+:class:`encre.gateway.run.GatewayRunner` and never cross a socket.
 
 Responsibilities handled here:
-    * Connection lifecycle -- connect, automatic reconnect with exponential
-      backoff capped at ``RECONNECT_MAX``, and graceful disconnect.
-    * Liveness -- a heartbeat loop that pings the server every
-      ``HEARTBEAT_INTERVAL`` seconds.
-    * Request/response correlation -- every outbound request carries a
-      ``request_id``; server replies with the same id are routed to a per-
-      request queue so :meth:`submit` and :meth:`submit_stream` return the
-      right data.
-    * Two high-level entry points: :meth:`submit` (collect the whole reply into
-      a string) and :meth:`submit_stream` (an async generator yielding
-      :class:`~encre.utils.types.AgentEvent` objects as they arrive).
 
-Used only by remote/plugin adapters that cannot run in-process. Core adapters
-talk to the gateway directly and never instantiate this client.
+* Connection lifecycle -- connect, automatic reconnect with exponential
+  backoff capped at :data:`RECONNECT_MAX`, and graceful disconnect.
+* Liveness -- an application-level heartbeat loop pinging every
+  :data:`HEARTBEAT_INTERVAL` seconds, on top of the WebSocket PING/PONG
+  that :mod:`websockets` already performs.
+* Request/response correlation -- every outbound request carries a
+  ``request_id``; inbound frames bearing the same id are routed to a
+  per-request queue so :meth:`submit` and :meth:`submit_stream` return
+  the right data.  Frames with no matching ``request_id`` fall through
+  to a shared broadcast queue.
+* Two high-level entry points: :meth:`submit` (collect the whole reply
+  into a string) and :meth:`submit_stream` (an async generator yielding
+  :class:`~encre.utils.types.AgentEvent` objects as they arrive).
+
+Public API: :class:`GatewayClient`; the backoff/heartbeat constants are
+module-level tunables.
 """
 
 import asyncio
@@ -64,20 +75,59 @@ logger = logging.getLogger("encre.gateway.ws_bridge.client")
 RECONNECT_BASE = 1.0
 # Upper bound on reconnect delay so retries never wait indefinitely.
 RECONNECT_MAX = 30.0
-# Seconds between heartbeat pings sent to keep the connection alive.
+# Seconds between application-level heartbeat pings sent to keep the
+# connection alive.
 HEARTBEAT_INTERVAL = 15.0
 
 
 class GatewayClient:
-    """WebSocket client that connects to a WsBridgeServer.
+    """WebSocket client connecting a remote adapter to a WsBridgeServer.
 
-    Thin transport layer -- sends and receives ``GatewayMessage`` objects.
-    Handles reconnection with exponential backoff and heartbeats, and routes
-    server replies back to the in-flight request that is waiting for them.
+    Thin transport layer: sends and receives
+    :class:`~encre.gateway.ws_bridge.protocol.GatewayMessage` objects,
+    handles reconnection with exponential backoff and heartbeats, and
+    routes server replies back to the in-flight request that is waiting
+    for them.
 
-    Used by remote/plugin adapters that cannot run in-process. Intended to be
-    created once, then :meth:`connect` called to begin the connection; the
-    object manages background tasks for reading and heartbeats internally.
+    Lifecycle: construct with the adapter name and target URL, call
+    :meth:`connect` (which returns once the HELLO handshake succeeds and
+    keeps reconnecting in the same coroutine if it later drops), then
+    :meth:`submit` / :meth:`submit_stream` at will, and finish with
+    :meth:`disconnect`.  Background read and heartbeat tasks are created
+    by :meth:`connect` and are owned by :attr:`_background_tasks`.
+
+    Invariants:
+
+    * :attr:`_connected` is only ever ``True`` between a successful HELLO
+      handshake and the moment a read loop exits or
+      :meth:`disconnect` is called.  All public entry points check it
+      first and fail fast, so a caller never blocks on a dead socket.
+    * Every pending ``request_id`` has at most one queue in
+      :attr:`_pending`, inserted before the request is sent and removed
+      on every exit path (terminal frame, timeout, cancellation, or
+      disconnect).  Forgetting a removal would leak the queue forever
+      because ``_pending`` is never garbage collected on its own.
+    * Queue consumers treat ``None`` as a sentinel meaning "the
+      connection is gone, stop waiting", which is how
+      :meth:`disconnect` and the read loop's ``finally`` clause wake
+      every blocked waiter at once.
+
+    Thread/async safety: all state is touched only from the caller's own
+    event loop, so there is no locking.  Running two event loops against
+    one client instance is unsupported.
+
+    Attributes:
+        _name: Adapter identifier sent in the HELLO handshake.
+        _url: Bridge server URL to dial.
+        _capabilities: Capability strings advertised in the HELLO.
+        _ws: The live WebSocket, ``None`` when disconnected.
+        _running: Intent flag; ``False`` stops the reconnect loop.
+        _connected: Whether the handshake is currently live.
+        _seq: Monotonic send counter for log correlation.
+        _listeners: Emitter-style lifecycle callback registry.
+        _msg_queue: Shared queue for frames without a matching request.
+        _pending: Per-``request_id`` reply queues.
+        _background_tasks: Owned heartbeat/read background tasks.
     """
 
     def __init__(
@@ -86,6 +136,22 @@ class GatewayClient:
         url: str = "ws://127.0.0.1:18792/gateway",
         capabilities: list[str] | None = None,
     ) -> None:
+        """Construct the client without opening any connection.
+
+        Args:
+            adapter_name: The identifier this adapter presents to the
+                server in the HELLO frame.  It becomes the adapter's key
+                in the server's registry and is what the runner uses as
+                the channel name for adapter-default sessions.
+            url: The bridge server WebSocket URL.  Defaults to the
+                documented localhost endpoint, which is what a
+                containerised adapter in the same host would use.
+            capabilities: Optional capability strings advertised during
+                the handshake so the server can gate features.
+
+        Raises:
+            Nothing; :meth:`connect` performs the first network attempt.
+        """
         self._name = adapter_name
         self._url = url
         self._capabilities = capabilities or []
@@ -100,48 +166,81 @@ class GatewayClient:
 
     @property
     def is_connected(self) -> bool:
-        """Return True while the WebSocket handshake has completed and the
-        connection is live."""
+        """Report whether the bridge link is currently live.
+
+        Returns:
+            ``True`` between a successful HELLO handshake and the next
+            disconnect.  Callers use this to decide whether to buffer a
+            message or report failure, since :meth:`submit` and
+            :meth:`submit_stream` both fail fast when it is ``False``.
+        """
         return self._connected
 
     def on(self, event: str, callback: Any) -> None:
-        """Register a ``callback`` for a client lifecycle ``event``.
+        """Register a callback for a client lifecycle event.
 
-        Supported events are emitter-style strings such as ``"connected"`` and
-        ``"disconnected"``. Multiple callbacks per event are allowed.
+        Supported events are emitter-style strings such as
+        ``"connected"`` and ``"disconnected"``, emitted by
+        :meth:`connect` and :meth:`_read_loop`.  Multiple callbacks per
+        event are allowed and invoked in registration order.
 
         Args:
             event: The lifecycle event name to subscribe to.
-            callback: The callable invoked when the event fires.
+            callback: A sync callable invoked with no arguments when the
+                event fires.
+
+        Raises:
+            Nothing.
         """
         self._listeners.setdefault(event, []).append(callback)
 
     def off(self, event: str, callback: Any) -> None:
-        """Remove a previously registered ``callback`` for ``event``.
+        """Remove a previously registered callback for an event.
 
         Args:
             event: The lifecycle event name.
-            callback: The callback to detach; if absent, no error is raised.
+            callback: The callback to detach.  Removing a callback that
+                was never registered is a no-op, never an error, so
+                teardown code can call :meth:`off` unconditionally.
+
+        Raises:
+            Nothing.
         """
         self._listeners.setdefault(event, []).append(callback)
         self._listeners[event] = [cb for cb in self._listeners[event] if cb is not callback]
 
     async def connect(self) -> None:
-        """Open the WebSocket and run the handshake; return once connected.
+        """Open the WebSocket, run the handshake, and keep the link alive.
 
-        Loops forever (until :meth:`disconnect` or cancellation) reconnecting
-        with exponential backoff on failure. On a successful connect it sends a
-        HELLO with the adapter's capabilities, waits for the server's HELLO
-        reply, then spins up the heartbeat and read loops and returns.
+        The method returns as soon as one connection succeeds: the HELLO
+        frame is sent, the server's HELLO reply is awaited, and the
+        heartbeat and read background tasks are started.  After a
+        successful return the link keeps itself alive in the background,
+        and if the socket later drops the read loop flips
+        :attr:`is_connected` off and any *new* call to :meth:`connect`
+        re-establishes it.
+
+        On failure the method loops forever -- until
+        :attr:`_running` is cleared by :meth:`disconnect` or the
+        surrounding task is cancelled -- retrying with exponential
+        backoff: ``RECONNECT_BASE * 2**(attempt - 1)``, capped at
+        :data:`RECONNECT_MAX`.  Attempt numbering restarts from zero on
+        every successful handshake, so a client that reconnects cleanly
+        pays no accumulated delay on the next outage.
 
         Args:
             None.
 
         Returns:
-            None once the connection is established.
+            ``None`` once the connection is established.
 
         Raises:
-            asyncio.CancelledError: If the surrounding task is cancelled.
+            asyncio.CancelledError: If the surrounding task is cancelled
+                during a backoff sleep or a handshake attempt.
+
+        Raises:
+            Nothing else; a bad handshake response raises
+            ``ConnectionError`` internally and is retried.
         """
         import websockets
         self._running = True
@@ -185,17 +284,25 @@ class GatewayClient:
                     await asyncio.sleep(delay)
 
     async def disconnect(self) -> None:
-        """Close the connection and signal all waiting queues to stop.
+        """Close the connection and wake every waiting reader.
 
-        Sets the running/connected flags false, closes the socket (ignoring
-        errors), then pushes ``None`` sentinels into the shared message queue
-        and every pending request queue so blocked readers wake up and exit.
+        Clears the running and connected flags, closes the socket
+        (ignoring errors since it may already be gone), and pushes
+        ``None`` sentinels into the shared message queue and every
+        pending request queue.  The sentinels are what unblock
+        :meth:`submit` / :meth:`submit_stream` callers that are waiting
+        on ``asyncio.wait_for``; without them they would hang until
+        their own timeout expired.
 
         Args:
             None.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing; socket close failures are suppressed so teardown is
+            always safe to call, even twice.
         """
         self._running = False
         self._connected = False
@@ -209,21 +316,37 @@ class GatewayClient:
         logger.info("%s disconnected from WS bridge", self._name)
 
     async def submit(self, prompt: str, session_id: str | None = None, system_prompt: str | None = None) -> str:
-        """Send a one-shot prompt and return the entire reply as a string.
+        """Send a one-shot prompt and return the entire reply as text.
 
-        Registers a per-request queue keyed by a fresh ``request_id``, sends a
-        SUBMIT message, then drains that queue accumulating ``TEXT_DELTA``
-        payloads until a ``FINISH`` or ``ERROR`` arrives (or the connection drops
-        / times out). Text deltas are concatenated and returned.
+        A fresh ``request_id`` is generated and registered in
+        :attr:`_pending` before the SUBMIT frame is written, so a reply
+        that arrives before the send returns cannot be lost.  The
+        method then drains that queue, appending every ``TEXT_DELTA``
+        payload until a terminal ``FINISH`` / ``ERROR`` frame arrives,
+        the connection drops, or the wait is abandoned.
 
         Args:
             prompt: The user prompt to submit.
-            session_id: Optional session identifier for conversation continuity.
-            system_prompt: Optional system prompt overriding the default.
+            session_id: Optional session identifier for conversation
+                continuity; omit to let the server pick the
+                adapter-default session.
+            system_prompt: Optional system prompt overriding the
+                server's default.
 
         Returns:
-            The full concatenated reply text, or ``""`` if not connected or the
-            turn ended without text.
+            The concatenated reply text, or ``""`` when the client is
+            not connected or the turn ended without producing text.
+
+        Note:
+            Empty-string returns mean different things -- "not
+            connected", "empty reply", or "server timed out" -- so a
+            caller that must distinguish them should use
+            :meth:`submit_stream`, which always yields a terminal
+            ``Finish`` carrying the reason.
+
+        Raises:
+            asyncio.CancelledError: Propagated after removing this
+                request's queue from :attr:`_pending`.
         """
         if not self._connected:
             return ""
@@ -267,26 +390,39 @@ class GatewayClient:
         *,
         source: dict[str, Any] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
-        """Submit a prompt and stream back agent events as an async generator.
+        """Submit a prompt and stream back agent events.
 
-        Like :meth:`submit` but instead of collecting text it yields one
+        Same correlation scheme as :meth:`submit`, but instead of
+        collecting text the generator yields one
         :class:`~encre.utils.types.AgentEvent` per server message:
-        ``TEXT_DELTA`` -> ``TextDelta``, ``TOOL_RESULT`` -> ``ToolResult``,
-        ``FINISH``/``ERROR`` -> terminal ``Finish``. The generator closes on the
-        terminal event, on a closed connection, or after sustained timeouts.
+        ``TEXT_DELTA`` becomes a ``TextDelta``, ``TOOL_RESULT`` becomes
+        a ``ToolResult``, and either ``FINISH`` or ``ERROR`` becomes a
+        terminal ``Finish`` with the appropriate reason and detail.  A
+        ``Finish`` is always yielded exactly once, whether the turn
+        completed or the transport failed, so callers can rely on a
+        single terminal event per request.
 
         Args:
             prompt: The user prompt to submit.
-            session_id: Optional session identifier for conversation continuity.
-            system_prompt: Optional system prompt overriding the default.
-            source: Optional metadata describing the message origin, forwarded
-                to the server.
+            session_id: Optional session identifier for conversation
+                continuity.
+            system_prompt: Optional system prompt overriding the
+                server's default.
+            source: Optional origin metadata describing the message
+                origin, forwarded to the server so it can resolve a
+                session instead of using the adapter default.
 
         Yields:
-            :class:`~encre.utils.types.AgentEvent` objects as they arrive.
+            :class:`~encre.utils.types.AgentEvent` objects as they
+            arrive, terminated by exactly one ``Finish``.
 
         Returns:
-            An async generator (this method is an async generator function).
+            An async generator (this is an async generator function, so
+            iteration is required before any network activity happens).
+
+        Raises:
+            asyncio.CancelledError: Propagated after removing this
+                request's queue from :attr:`_pending`.
         """
         if not self._connected:
             yield Finish(reason="error", error="WS bridge not connected")
@@ -312,7 +448,12 @@ class GatewayClient:
                     yield ToolResult(id=d.get("id", ""), content=d.get("content", ""), is_error=d.get("is_error", False))
                 elif response.op == GatewayOp.FINISH:
                     self._pending.pop(request_id, None)
-                    yield Finish(reason=response.data.get("reason", "done"), error=response.data.get("error", ""), usage=response.data.get("usage"))
+                    yield Finish(
+                        reason=response.data.get("reason", "done"),
+                        error=response.data.get("error", ""),
+                        usage=response.data.get("usage"),
+                        context_usage=response.data.get("context_usage"),
+                    )
                     return
                 elif response.op == GatewayOp.ERROR:
                     self._pending.pop(request_id, None)
@@ -335,17 +476,24 @@ class GatewayClient:
         self._pending.pop(request_id, None)
 
     async def _send(self, msg: GatewayMessage) -> None:
-        """Serialize and send a ``GatewayMessage`` over the socket.
+        """Serialize and write one message over the socket.
 
-        Assigns a monotonically increasing ``seq`` for diagnostics, then writes
-        the JSON form. Failures are logged but not raised so a transient send
-        error does not tear down the caller.
+        Assigns the next :attr:`_seq` value for log correlation, then
+        writes the JSON form.  Failures are logged and swallowed rather
+        than raised, so a transient write error does not tear down the
+        caller; the read loop is responsible for noticing a dead socket
+        and flipping :attr:`_connected` off.
 
         Args:
-            msg: The message to transmit.
+            msg: The message to transmit.  Its ``seq`` field is
+                overwritten in place.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing; a ``None`` socket (pre-connect) is silently a
+            no-op so handshake frames can be sent defensively.
         """
         self._seq += 1
         msg.seq = self._seq
@@ -357,17 +505,23 @@ class GatewayClient:
             logger.warning("[ws-client] %s send error: %s", self._name, e)
 
     async def _heartbeat_loop(self) -> None:
-        """Periodically emit heartbeat pings while connected.
+        """Periodically emit application-level heartbeat pings.
 
-        Runs as a background task. Sleeps ``HEARTBEAT_INTERVAL`` then sends a
-        heartbeat; any exception (e.g. a dead socket) breaks the loop and lets
-        the read loop's cleanup take over.
+        Runs as a background task owned by :attr:`_background_tasks`.
+        It sleeps :data:`HEARTBEAT_INTERVAL` seconds between pings, so
+        it costs one frame every 15 s per connection.  Any exception
+        breaks the loop and lets :meth:`_read_loop`'s cleanup take over
+        rather than retrying, because a send failure here almost always
+        means the read side will also fail shortly.
 
         Args:
             None.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing.
         """
         while self._running and self._connected:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -377,20 +531,32 @@ class GatewayClient:
                 break
 
     async def _read_loop(self) -> None:
-        """Continuously read server frames and route them to the right queue.
+        """Continuously read server frames and route them to a queue.
 
-        For each inbound message it parses the JSON, answers server heartbeats
-        with an ack, then dispatches the message: if it carries a ``request_id``
-        matching a pending request it goes to that request's queue, otherwise to
-        the shared broadcast queue. On loop exit (socket closed or error) it
-        marks the client disconnected and pushes ``None`` sentinels everywhere
-        so blocked waiters wake.
+        For each inbound frame the loop parses JSON and resolves the
+        opcode, answers server heartbeats with an ack, then dispatches:
+        a frame whose payload carries a ``request_id`` matching an entry
+        in :attr:`_pending` goes to that request's queue; anything else
+        goes to the shared :attr:`_msg_queue`.  Frames that fail to
+        parse are dropped silently so a malformed message from a foreign
+        peer cannot wedge the connection.
 
         Args:
             None.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing.
+
+        Invariant:
+            The ``finally`` clause runs on *every* exit -- clean socket
+            close, parse-independent exception, or cancellation -- and is
+            what flips ``_connected`` off, fires ``"disconnected"``, and
+            pushes ``None`` sentinels into every queue.  Removing the
+            sentinels would leave blocked :meth:`submit` callers hanging
+            for their full 30 s timeout each.
         """
         try:
             async for raw in self._ws:
@@ -416,10 +582,12 @@ class GatewayClient:
                 await queue.put(None)
 
     def _emit(self, event: str, *args: Any, **kwargs: Any) -> None:
-        """Fire every listener registered for ``event``.
+        """Fire every listener registered for one lifecycle event.
 
-        Each callback is invoked best-effort; exceptions raised by a listener are
-        swallowed so one bad subscriber cannot break the emit loop.
+        Each callback is invoked best-effort: exceptions raised by a
+        listener are swallowed so one bad subscriber cannot break the
+        emit loop or, worse, the read loop that calls
+        :meth:`_emit("disconnected")`.
 
         Args:
             event: The lifecycle event name.
@@ -427,7 +595,10 @@ class GatewayClient:
             **kwargs: Keyword arguments forwarded to each listener.
 
         Returns:
-            None.
+            ``None``.
+
+        Raises:
+            Nothing.
         """
         for cb in self._listeners.get(event, []):
             with contextlib.suppress(Exception):

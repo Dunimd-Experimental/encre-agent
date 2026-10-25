@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -25,15 +25,14 @@ from __future__ import annotations
 
 """Guard tests: context compaction must never write into the memory system.
 
-Core invariant (project principle): **context != memory**.  Compaction manages
-the temporary reasoning window and may archive the pre-compact messages, but it
-must never create persistent memory entries.  Only the agent's own explicit
-memory tools (``memory_create`` / ``memory_update``) may do that.
+The core invariant is **context != memory**. Compaction manages the temporary
+reasoning window and may archive the pre-compact messages, but it must never
+create persistent memory entries; only the agent's explicit memory tools
+(``memory_create`` / ``memory_update``) are allowed to do that.
 
-These tests drive the real :class:`CompactEngine` against a real
-:class:`EncreMemorySystem` on a temporary memory directory.  Only the external
-backend dependency is stubbed (it merely streams a valid compact summary); the
-objects under test are the project's own implementations.
+The tests drive the real :class:`CompactEngine` against a real
+:class:`EncreMemorySystem` on a temporary memory directory, stubbing only the
+external backend dependency (which merely streams a valid compact summary).
 """
 
 import os
@@ -48,7 +47,7 @@ from encre.memdir.recall import RecallEngine
 from encre.memdir.system import EncreMemorySystem
 from encre.utils.types import BackendText
 
-# A distinctive token present in every archived message.  It must never become
+# A distinctive token embedded in every archived message. It must never become
 # retrievable through the memory system.
 _NEEDLE = "zqxneedle9917"
 
@@ -86,27 +85,30 @@ Continue.
 
 
 class _StubSummaryBackend:
-    """External backend dependency stub.
+    """Stub for the external backend dependency used by ``CompactEngine``.
 
-    Implements the real backend protocol surface used by ``CompactEngine``:
+    It implements the real backend protocol surface the engine calls:
     ``context_window_size()`` and an async ``chat()`` generator that streams a
-    valid 9-section compact summary.  ``CompactEngine`` and
-    ``EncreMemorySystem`` remain the real project objects.
+    valid 9-section compact summary. ``CompactEngine`` and
+    ``EncreMemorySystem`` stay as the real project objects under test.
     """
 
     def __init__(self) -> None:
+        """Initialize the stub with a zeroed counter of chat() invocations."""
         self.chat_calls = 0
 
     def context_window_size(self) -> int:
+        """Return a fixed 128K-token context window size."""
         return 128_000
 
     async def chat(self, messages=None, **kwargs):  # noqa: ANN001, ANN003
+        """Stream the canned compact summary and count the call."""
         self.chat_calls += 1
         yield BackendText(text=_SUMMARY)
 
 
 def _make_messages() -> list[dict]:
-    """Build a conversation long enough to compact, carrying the needle token."""
+    """Build a 12-turn conversation long enough to compact, carrying the needle token."""
     msgs: list[dict] = [{"role": "system", "content": "You are an assistant."}]
     for i in range(12):
         msgs.append({"role": "user", "content": f"Question {i} about the task {_NEEDLE}"})
@@ -116,7 +118,7 @@ def _make_messages() -> list[dict]:
 
 @pytest.fixture
 def memory_dir():
-    """Provide an isolated temporary memory directory."""
+    """Provide an isolated temporary memory directory, removed after each test."""
     d = tempfile.mkdtemp()
     try:
         yield d
@@ -125,6 +127,7 @@ def memory_dir():
 
 
 def _write_memory(directory: str, name: str, content: str) -> None:
+    """Write a memory markdown file into the given directory."""
     with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -151,7 +154,7 @@ async def test_compact_does_not_create_memory_entries(memory_dir):
         session_id="sess-sep-1",
     )
 
-    # Compaction really happened (fewer messages than the original history).
+    # Compaction really happened: the history shrank.
     assert compacted is not None
     assert len(compacted) < len(messages)
 

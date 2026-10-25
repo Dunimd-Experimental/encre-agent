@@ -1,27 +1,7 @@
 ## Operational Guidance
 
-### Act, Don't Narrate
-Some models produce long narration of intent without acting. Counter this:
-- Every "I will..." statement must be immediately followed by the corresponding tool call.
-- Do not write paragraphs describing your plan when a tool call would make progress. Plan briefly (one or two sentences), then execute.
-- Prefer acting over explaining. A tool call is worth a paragraph of narration.
-
 ### Tool Persistence
-- Do not stop early. If the task needs five tool calls, make five tool calls — do not stop after two and describe the rest.
-- If a tool fails, analyze the error and retry with a different approach. Do not report failure without trying alternatives.
 
-### Grounding
-- Read files before referencing their contents. Never state file contents you haven't read in this session.
-- Check dependency files (requirements.txt, package.json, etc.) before assuming a library is available.
-- Use search to confirm paths exist rather than guessing from naming patterns.
-
-### Absolute Paths
-- Use absolute paths for all file operations.
-- Resolve user-supplied relative paths against the working directory in the environment block.
-
-### Parallel Tool Calls
-- Batch independent reads, searches, and web fetches into a single response.
-- Only serialize when a later call depends on an earlier call's result.
-
-### Conciseness
-- Keep responses focused. State the action, take it, report the result. Avoid restating the user's request back to them.
+- **Diff-as-deliverable.** The drift is pasting a proposed change into chat instead of applying it with `file_edit` / `file_write` and reading the result back.
+- **Long preamble.** A multi-paragraph plan before the first call usually means the first call will not happen this turn.
+- **Recalled library availability.** Check the manifest before importing; this environment is not the one the weights remember.

@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,24 +21,27 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Capability seams: single-implementation boundaries for core powers.
 
 Every capability the agent uses (processes, filesystem safety, networking,
 search, UI feedback) lives behind one module with one implementation.
 Tools, loop phases, and plugins consume the seam instead of re-implementing
-the power.  Dependency direction: tools/loop 鈫?capabilities 鈫?platform
+the power.  Dependency direction: tools/loop → capabilities → platform
 (Rust native, engine, event stream).
 
 Capabilities
 ------------
 - ``encre.capabilities.process``  subprocess spawning, background shells,
   persistent terminals, path sandboxing.
-- ``encre.capabilities.search``   codebase / text search over the Rust engine
-  (lsp, grep, code index).
+- ``encre.capabilities.search``   text search / language-server intelligence
+  (lsp, grep).
+- ``encre.capabilities.document_manager``  the Library document store.
 - fs safety is provided by :mod:`encre.capabilities.process.sandbox`.
 - net safety is provided by :mod:`encre.ssrf` (unchanged seam).
 - ui feedback is provided by the typed event stream
-  (:mod:`encre.events`) 鈥?never direct frontend calls.
+  (:mod:`encre.events`) — never direct frontend calls.
 
 New capabilities must follow the same rule: one seam module, one default
 provider, consumers import only the seam.

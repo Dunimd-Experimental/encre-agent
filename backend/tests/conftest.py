@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,12 +23,17 @@
 
 from __future__ import annotations
 
-"""Shared pytest fixtures for the encre test suite.
+"""Shared pytest fixtures for the Encre backend test suite.
 
-Provides reusable test infrastructure so individual test modules can focus on
-validating behavior rather than boilerplate setup. Fixtures cover a temporary
-filesystem tree, a minimal configuration instance, and a pre-wired tool
-registry populated with every builtin tool type.
+This module exposes the reusable test infrastructure shared by every test
+module in the package. Keeping the boilerplate in one place lets individual
+test files focus on the behavior under verification instead of repeating
+setup logic.
+
+The fixtures cover three concerns: an isolated temporary filesystem tree
+that mimics a small real-world project layout, a deliberately small
+configuration instance suitable for fast unit tests, and a fully wired
+tool registry that mirrors the production tool set.
 """
 
 import os
@@ -45,26 +50,27 @@ from encre.tools.registry import ToolRegistry
 def temp_dir():
     """Provide an isolated temporary filesystem tree for file-tool tests.
 
-    The fixture constructs a deterministic directory layout containing a README,
-    a Python module, a nested ``src/`` package with utilities, an empty file,
-    a hidden directory, and a binary extension file. Changing into that tree
-    at the start of the test and restoring ``os.getcwd()`` in a finally block
-    means every test sees the same working directory without polluting the
+    The fixture builds a deterministic directory layout holding a README, a
+    top-level Python module, a nested ``src/`` package with helper utilities
+    and a JSON config, an empty file, a hidden directory containing a secret
+    file, and a binary-suffixed file. The working directory is switched into
+    that tree before the test body and restored in a ``finally`` block, so
+    every test observes the same starting directory without polluting the
     repository root.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         base = Path(tmpdir)
 
-        # Readme
+        # Human-readable project readme used by listing and read tests.
         (base / "README.md").write_text("# Test Project\n\nHello, world!\n", encoding="utf-8")
 
-        # Python file
+        # Executable-looking Python module used by execution and import tests.
         (base / "main.py").write_text(
             "def hello():\n    return 'Hello, world!'\n\n\nif __name__ == '__main__':\n    print(hello())\n",  # noqa: E501
             encoding="utf-8",
         )
 
-        # Nested directory with files
+        # Nested package so recursive search and path-resolution tests have depth.
         (base / "src").mkdir(exist_ok=True)
         (base / "src" / "utils.py").write_text(
             "def add(a, b):\n    return a + b\n\n\ndef subtract(a, b):\n    return a - b\n",
@@ -72,14 +78,14 @@ def temp_dir():
         )
         (base / "src" / "config.json").write_text('{"key": "value", "debug": true}', encoding="utf-8")  # noqa: E501
 
-        # Empty file
+        # Zero-length file for the empty-read edge case.
         (base / "empty.txt").write_text("", encoding="utf-8")
 
-        # Hidden directory for edge-case tests
+        # Hidden directory so dotfile-visibility behavior can be asserted.
         (base / ".hidden").mkdir(exist_ok=True)
         (base / ".hidden" / "secret.txt").write_text("secret content\n", encoding="utf-8")
 
-        # Binary-like extension
+        # Binary-suffixed file so extension filtering can be exercised.
         (base / "data.bin").write_text("binary\x00content", encoding="utf-8")
 
         old_cwd = os.getcwd()
@@ -94,8 +100,8 @@ def temp_dir():
 def sample_config():
     """Return a minimal :class:`EncreConfig` tuned for fast unit-test runs.
 
-    Using a small token budget and a high log level keeps fixture
-    construction lightweight and avoids noise in test output.
+    A small token budget and a quiet log level keep fixture construction
+    cheap and stop configuration chatter from leaking into test output.
     """
     return EncreConfig(
         model="gpt-5.6",
@@ -110,8 +116,9 @@ def sample_config():
 def tool_registry():
     """Return a :class:`ToolRegistry` pre-populated with every builtin tool.
 
-    This eliminates per-test registration boilerplate and ensures regression
-    tests operate against a registry that mirrors production wiring.
+    Pre-registering the tools removes per-test registration boilerplate and
+    guarantees that regression tests run against a registry shaped like the
+    production wiring rather than against a hand-built stub.
     """
     registry = ToolRegistry()
     plugin_registry = PluginRegistry()

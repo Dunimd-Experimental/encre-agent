@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -22,6 +22,15 @@
 # Non-compliance may result in service termination or legal liability.
 
 from __future__ import annotations
+
+"""Tests for AgentMode profiles and Plan-Do-Review (PDR) integration.
+
+Verifies that WORKSPACE, GENERAL and AUTOMATION modes each carry the
+correct PDR wiring, tool-set defaults and system-prompt gains, and that
+the PDR engine only advances past steps marked complete. Also asserts
+that the unknown-mode fallback degrades to the GENERAL profile and that
+a failed lightweight review rolls the current step back to IN_PROGRESS.
+"""
 
 import os
 import sys
@@ -38,7 +47,12 @@ from encre.session import EncreSession
 
 
 def _make_loop(mode) -> EncreLoop:
-    """Build an EncreLoop for the given AgentMode with a default config."""
+    """Build an EncreLoop for the given AgentMode with a default config.
+
+    Supplies a fresh ToolRegistry and session so each test gets an
+    independent loop whose profile, PDR engine and tool resolution
+    come only from the requested mode.
+    """
     config = EncreConfig()
     from encre.tools.registry import ToolRegistry
     return EncreLoop(
@@ -61,7 +75,7 @@ async def test_verify_workspace_mode_activates_pdr_and_delegation():
     loop = _make_loop(AgentMode.WORKSPACE)
     assert loop._profile.workspace_delegation is True
     assert loop._profile.verify_budget_total() > 0
-    # Simulate a plan-worthy task running a single turn.
+    # Seed the PDR engine with a plan-worthy prompt to drive one step.
     loop._pdr.initialize("Refactor the scheduler module and add unit tests for it.")
     loop._pdr_active = True
     loop._pdr.start_next_step()
@@ -77,13 +91,13 @@ async def test_verify_general_mode_keeps_pdr_inactive_and_no_delegation():
 
     The test exercises loop construction with AgentMode.GENERAL and asserts
     _pdr_active is False and steps are empty because GENERAL mode must not
-    trigger planning even when the prompt is plan-worthy 鈥?that is the
+    trigger planning even when the prompt is plan-worthy -- that is the
     explicit contract of the mode profile.
     """
     loop = _make_loop(AgentMode.GENERAL)
     assert loop._profile.workspace_delegation is False
-    # Even if a plan-worthy prompt arrives, should_plan gates the init;
-    # here we assert the default state stays inactive.
+    # should_plan gates initialisation for this mode, so the default
+    # state must stay inactive with no steps materialised at all.
     assert loop._pdr_active is False
     assert loop._pdr.plan.steps == []
 
@@ -111,7 +125,8 @@ async def test_verify_unknown_mode_falls_back_to_general_profile():
 
     The test exercises the factory with invalid inputs and asserts the
     returned mode is GENERAL because an undefined mode must never crash
-    the loop constructor 鈥?it should degrade gracefully to the base profile.
+    the loop constructor -- it should degrade gracefully to the base
+    profile.
     """
     assert get_mode_profile("not-a-real-mode").mode == AgentMode.GENERAL
     assert get_mode_profile(None).mode == AgentMode.GENERAL
@@ -146,7 +161,7 @@ async def test_verify_pdr_advances_only_on_completed_step():
     assert nxt is None or nxt.status == StepStatus.IN_PROGRESS
 
 
-# 鈹€鈹€ Mode behavior matrix: distinct tool bases + prompt gains 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Mode behavior matrix: distinct tool bases + prompt gains ----
 
 
 @pytest.mark.asyncio

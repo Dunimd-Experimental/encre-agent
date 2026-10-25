@@ -3,8 +3,8 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Verification gate and versioning for auto-generated skills.
 
@@ -81,7 +83,6 @@ observe promotions without this module knowing anything about storage.  The
 ``skill_promoted`` event is the equivalent, decoupled signal.
 """
 
-from __future__ import annotations
 
 import contextlib
 import json
@@ -95,6 +96,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from encre.logging_config import get_logger
+from encre.secure_io import read_json, read_text, write_json, write_text
 
 logger = get_logger("encre.improve.verification")
 
@@ -781,9 +783,10 @@ class SkillVerifier:
 
         migrated = 0
         for path in sorted(directory.glob("*.md")):
-            try:
-                content = path.read_text(encoding="utf-8")
-            except OSError:
+            # Tolerant read: legacy plaintext files come back as-is, files the
+            # verifier wrote encrypted are decrypted transparently.
+            content = read_text(path)
+            if not content:
                 continue
             metadata, body = parse_yaml_frontmatter(content)
             name = str(metadata.get("name", "")).strip()
@@ -815,9 +818,10 @@ class SkillVerifier:
             with self._lock:
                 self._artifacts.append(artifact)
             # Rewrite the frontmatter in place so the registry loader skips it.
+            # Encrypted at rest, like every other runtime-generated artifact.
             try:
-                path.write_text(self._render_md(artifact, SkillStatus.PROPOSED), encoding="utf-8")
-            except OSError:
+                write_text(path, self._render_md(artifact, SkillStatus.PROPOSED))
+            except Exception:
                 logger.warning("Failed to rewrite legacy skill %s", path, exc_info=True)
                 continue
 
@@ -849,14 +853,18 @@ class SkillVerifier:
         return self._skills_dir / "proposed.json"
 
     def _load_store(self) -> None:
-        """Load previously proposed artifacts from disk, tolerating corruption."""
+        """Load previously proposed artifacts from disk, tolerating corruption.
+
+        The store is encrypted at rest (see :meth:`_persist_locked`); the
+        tolerant read also keeps legacy plaintext stores readable so an old
+        build's data migrates transparently on the next persist.
+        """
         path = self._store_path()
         if not path.is_file():
             return
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            logger.warning("Could not read proposed skill store %s", path, exc_info=True)
+        data = read_json(path)
+        if data is None:
+            logger.warning("Could not read proposed skill store %s", path)
             return
         records = data.get("artifacts", []) if isinstance(data, dict) else []
         for item in records:
@@ -868,15 +876,21 @@ class SkillVerifier:
                 logger.warning("Skipping malformed artifact record in %s", path)
 
     def _persist_locked(self) -> None:
-        """Write the proposed store atomically. Caller holds ``_lock``."""
+        """Write the proposed store atomically, encrypted at rest.
+
+        The store carries model-produced skill bodies and metadata, so it is
+        persisted as AES-256-GCM ciphertext through :mod:`encre.secure_io`.
+        Caller holds ``_lock``.
+        """
         path = self._store_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {"artifacts": [a.to_dict() for a in self._artifacts]}
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(path)
-        except OSError:
+            # write_json encrypts before the atomic replace: an encryption
+            # failure raises before anything touches the disk, so no plaintext
+            # copy can land on storage.
+            write_json(path, payload)
+        except Exception:
             logger.warning("Failed to persist proposed skill store %s", path, exc_info=True)
 
     def _find_duplicate(self, name: str, body: str) -> SkillArtifact | None:
@@ -1054,17 +1068,23 @@ class SkillVerifier:
         return self._skills_dir / f"{artifact.name}.md"
 
     def _write_active_md(self, artifact: SkillArtifact) -> None:
-        """Write the active markdown, replacing any disabled copy."""
+        """Write the active markdown, replacing any disabled copy.
+
+        The markdown carries the model-generated skill body, so it is stored
+        encrypted at rest; the skill registry loader decrypts transparently
+        when it re-registers the skill on the next startup.
+        """
         try:
             self._skills_dir.mkdir(parents=True, exist_ok=True)
             disabled = self._skills_dir / f"{artifact.name}.md.disabled"
             if disabled.exists():
                 with contextlib.suppress(OSError):
                     disabled.unlink()
-            self._active_md_path(artifact).write_text(
-                self._render_md(artifact, SkillStatus.ACTIVE), encoding="utf-8"
+            write_text(
+                self._active_md_path(artifact),
+                self._render_md(artifact, SkillStatus.ACTIVE),
             )
-        except OSError:
+        except Exception:
             logger.warning("Failed to write active skill markdown for %s", artifact.name, exc_info=True)
 
     def _remove_active_md(self, artifact: SkillArtifact) -> None:

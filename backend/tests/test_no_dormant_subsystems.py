@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -31,7 +31,6 @@ the learned safety-policy reflow was never instantiated.  Both were fixed by
 wiring them into the runtime (Tasks 1-4).  These tests exist so the same class
 of defect cannot silently return: they assert the *production* call sites, not
 the units' own behaviour.
-
 They are deliberately source-level where a behavioural assertion cannot express
 "this is reached from the running loop": a subsystem can be fully functional and
 still be dead code, and only the call graph can tell the difference.
@@ -47,12 +46,20 @@ _HARNESS = Path(__file__).resolve().parents[2] / "harness" / "encre"
 
 
 def _production_sources() -> list[Path]:
-    """Every production ``.py`` under ``harness/encre``."""
+    """Every production ``.py`` under ``harness/encre``.
+
+    Scans the harness package and drops compiled artefacts so the scan
+    only sees real source modules.
+    """
     return sorted(p for p in _HARNESS.rglob("*.py") if "__pycache__" not in p.parts)
 
 
 def _callers(needle: str, *, exclude: tuple[str, ...] = ()) -> list[str]:
-    """Files under ``harness/encre`` whose source contains ``needle``."""
+    """Files under ``harness/encre`` whose source contains ``needle``.
+
+    Returns relative POSIX paths so the results are stable and readable
+    in assertion messages; unreadable files are skipped silently.
+    """
     hits: list[str] = []
     for path in _production_sources():
         rel = path.relative_to(_HARNESS).as_posix()
@@ -67,9 +74,7 @@ def _callers(needle: str, *, exclude: tuple[str, ...] = ()) -> list[str]:
     return hits
 
 
-# ----------------------------------------------------------------------
-# Memory recall is reachable from the running loop
-# ----------------------------------------------------------------------
+# ---- Memory recall is reachable from the running loop ----
 
 
 def test_recall_engine_has_a_production_caller():
@@ -133,9 +138,7 @@ def test_recall_engine_is_injected_into_the_context_builder():
     )
 
 
-# ----------------------------------------------------------------------
-# The learned safety-policy reflow is reachable from the running loop
-# ----------------------------------------------------------------------
+# ---- The learned safety-policy reflow is reachable from the running loop ----
 
 
 def test_policy_reflow_has_a_production_instantiation():
@@ -165,9 +168,7 @@ def test_reflow_restores_policies_at_startup():
     )
 
 
-# ----------------------------------------------------------------------
-# No dual-track remnants
-# ----------------------------------------------------------------------
+# ---- No dual-track remnants ----
 
 
 def test_no_legacy_memory_retrieval_calls_remain():

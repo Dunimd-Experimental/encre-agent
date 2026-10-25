@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Compatibility layer for OpenAI Codex CLI configuration.
 
@@ -287,6 +289,30 @@ def _extract_skill_configs(raw: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _is_codex_internal_mcp(name: str, raw: dict[str, Any]) -> bool:
+    """Whether an ``[mcp_servers.<name>]`` entry is Codex's own plumbing.
+
+    The Codex desktop app injects helper MCP servers (its computer-use
+    ``node_repl`` runtime, ...) into ``config.toml`` with commands that live
+    inside the Codex installation directories.  These are not user
+    configuration: they are meaningless outside a live Codex session (they
+    need Codex's native pipes) and, because they are re-merged on every
+    agent start, they kept re-appearing in Encre's MCP settings even after
+    the user deleted them there.  Such entries are never merged.
+    """
+    command = str(raw.get("command", "") or "").strip()
+    if not command:
+        return False
+    norm = command.replace("/", "\\").lower()
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        runtime_root = os.path.join(local, "OpenAI", "Codex").replace("/", "\\").lower()
+        if norm.startswith(runtime_root + "\\"):
+            return True
+    # Belt and braces: the known helper binary, whatever install path it has.
+    return os.path.basename(norm) in ("node_repl.exe", "node_repl")
+
+
 def build_codex_context(
     workspace_path: str,
     cwd: str | None = None,
@@ -349,7 +375,11 @@ def build_codex_context(
 
     mcp_data = merged.get("mcp_servers")
     if isinstance(mcp_data, dict):
-        ctx.mcp_servers = dict(mcp_data)
+        ctx.mcp_servers = {
+            str(name): raw
+            for name, raw in mcp_data.items()
+            if isinstance(raw, dict) and not _is_codex_internal_mcp(str(name), raw)
+        }
 
     return ctx
 

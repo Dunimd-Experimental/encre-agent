@@ -25,7 +25,7 @@
 | Item | Detail |
 |---|---|
 | Controller | Dunimd |
-| Services | Encre Agent desktop app · Encre Agent framework (Python/Rust core) · PiscesLx LLM hosting · StadionOS · Enterprise/Cloud/Studio/Support |
+| Services | Encre Agent Desktop · Encre Agent (Python/Encre Agent Core) · PiscesLx LLM hosting · StadionOS · Enterprise/Cloud/Studio/Support |
 | Contact | dunimd@outlook.com · dunimd.com |
 | Code | github.com/mf2023/Encre |
 

@@ -23,12 +23,18 @@
 /**
  * Container-aware modal dialog system with priority queues.
  *
- * Every dialog is rendered inside a container element (defaulting to #app).
- * Each container maintains its own independent priority queue, so dialogs
- * from different containers can coexist (e.g. one in the settings panel and
- * one in the chat view). Within a single container only one modal dialog is
- * visible at a time; when it is dismissed the next-highest-priority dialog
- * from that container's queue is shown automatically.
+ * Every dialog declares the SCOPE it belongs to — `app` for global actions,
+ * `session` for one conversation, `panel` for one settings panel — and the
+ * scope decides both where it paints and what happens to it when the user
+ * switches views (see core/scope.ts). `options.container` only overrides the
+ * paint target for a dialog confined to a widget (a sidebar, a tab body); it
+ * never carries ownership any more.
+ *
+ * Each mount element maintains its own independent priority queue, so dialogs
+ * from different scopes can coexist (e.g. one global confirm and one session
+ * permission prompt). Within a single queue only one modal dialog is visible
+ * at a time; when it is dismissed the next-highest-priority dialog from that
+ * queue is shown automatically.
  *
  * z-index values are assigned from a global monotonically-increasing
  * counter so that later dialogs always stack above earlier ones, regardless
@@ -37,12 +43,18 @@
  * Progress dialogs use a separate overlay layer per container and do not
  * participate in the modal queue — they can coexist with a modal dialog in
  * the same container.
- *
- * swapSession() detaches all dialogs belonging to the chat-view container
- * so they can be reattached when the user switches back to that session.
  */
 
 import { t } from "../features/i18n.js";
+import { removeAnimated } from "./animate.js";
+import {
+  defaultSurfaceScope,
+  hasSurface,
+  registerSurface,
+  surfaceRoot,
+  unregisterSurface,
+  type SurfaceScope,
+} from "../core/scope.js";
 
 type Resolve<T> = (value: T) => void;
 
@@ -60,8 +72,17 @@ const PRIORITY_RANK: Record<DialogPriority, number> = {
 
 export interface DialogOptions {
   priority?: DialogPriority;
+  /** Explicit paint target. Leave unset to mount on the scope's root; pass it
+   *  only to confine a dialog inside a widget. */
   container?: HTMLElement;
   inline?: boolean;
+  /** Who this dialog belongs to. Defaults to the view the user is in: the
+   *  open settings panel, otherwise the active conversation. */
+  scope?: SurfaceScope;
+  /** Session-scope only: the backend is waiting on this answer, so keep the
+   *  dialog alive across a switch to another conversation (it comes back only
+   *  while that session is still running). */
+  restore?: boolean;
 }
 
 export interface ConfirmOptions extends DialogOptions {
@@ -94,6 +115,8 @@ export interface ProgressOptions {
   onCancel?: () => void;
   indeterminate?: boolean;
   container?: HTMLElement;
+  scope?: SurfaceScope;
+  restore?: boolean;
 }
 
 export interface ProgressHandle {
@@ -112,6 +135,8 @@ interface ModalEntry {
   build: () => HTMLElement;
   resolve: Resolve<any>;
   reject: (reason?: any) => void;
+  scope: SurfaceScope;
+  restore: boolean;
 }
 
 interface ContainerState {
@@ -139,16 +164,25 @@ export class Dialog {
    * a non-blocking hover aid and may legitimately appear over dialogs.
    */
   private static zCounter: number = 100000;
-  private static sessionDialogStore: Map<string, HTMLElement[]> = new Map();
 
-  // ── Container helpers ─────────────────────────────────────────────
+  // ── Mount + scope helpers ─────────────────────────────────────────
 
-  private static defaultContainer(): HTMLElement {
-    return document.getElementById("app") || document.body;
-  }
-
-  private static resolveContainer(container?: HTMLElement): HTMLElement {
-    return container || this.defaultContainer();
+  /**
+   * Turn the caller's declaration into a concrete mount: the scope decides the
+   * default paint target, and an explicit `container` only ever overrides
+   * WHERE the dialog is painted — never what owns it.
+   */
+  private static resolveMount(opts?: DialogOptions & ProgressOptions): {
+    container: HTMLElement;
+    scope: SurfaceScope;
+    restore: boolean;
+  } {
+    const scope = opts?.scope || defaultSurfaceScope();
+    return {
+      container: opts?.container || surfaceRoot(scope),
+      scope,
+      restore: opts?.restore ?? false,
+    };
   }
 
   private static getContainerState(container: HTMLElement): ContainerState {
@@ -227,6 +261,19 @@ export class Dialog {
    */
   private static processQueue(container: HTMLElement): void {
     const cs = this.getContainerState(container);
+    // A panel re-render can wipe a mounted overlay without dismissing it.
+    // Treat an overlay that is both out of the DOM and no longer owned as
+    // closed (resolve as cancelled) so the per-container queue cannot
+    // deadlock: otherwise every later dialog would queue forever behind a node
+    // that no longer exists. A surface the scope host is only shelving stays
+    // registered, so it keeps its slot — and its unanswered promise — instead
+    // of being silently cancelled because a session switch took it off-screen.
+    if (cs.currentOverlay && !cs.currentOverlay.isConnected && !hasSurface(cs.currentOverlay)) {
+      cs.currentOverlay = null;
+      const staleResolve = cs.currentResolve;
+      cs.currentResolve = null;
+      if (staleResolve) staleResolve(undefined);
+    }
     if (cs.currentOverlay) return;
     if (cs.queue.length === 0) return;
 
@@ -241,10 +288,37 @@ export class Dialog {
     }
 
     const entry = cs.queue.splice(bestIdx, 1)[0];
-    cs.currentOverlay = entry.build();
+    const overlay = entry.build();
+    cs.currentOverlay = overlay;
     cs.currentResolve = entry.resolve;
-    cs.currentOverlay.style.zIndex = String(++this.zCounter);
-    container.appendChild(cs.currentOverlay);
+    overlay.style.zIndex = String(++this.zCounter);
+    container.appendChild(overlay);
+    registerSurface(overlay, {
+      scope: entry.scope,
+      parent: container,
+      restore: entry.restore,
+      onClose: () => this.forceDismiss(container, overlay),
+    });
+  }
+
+  /**
+   * Close a dialog that the scope host decided cannot survive — its session
+   * went idle, or its view was destroyed. The node leaves at once (the view
+   * switch already took it away, so there is nothing to animate) and its
+   * promise settles as cancelled, which every caller already treats as
+   * "the user did not confirm".
+   */
+  private static forceDismiss(container: HTMLElement, overlay: HTMLElement): void {
+    const cs = this.getContainerState(container);
+    unregisterSurface(overlay);
+    overlay.remove();
+    if (cs.currentOverlay === overlay) {
+      cs.currentOverlay = null;
+      const resolve = cs.currentResolve;
+      cs.currentResolve = null;
+      resolve?.(undefined);
+    }
+    this.processQueue(container);
   }
 
   /**
@@ -255,12 +329,42 @@ export class Dialog {
   private static dismissCurrent(container: HTMLElement, value: any): void {
     const cs = this.getContainerState(container);
     if (!cs.currentOverlay) return;
-    cs.currentOverlay.remove();
-    cs.currentOverlay = null;
+    const overlay = cs.currentOverlay;
     const resolve = cs.currentResolve;
-    cs.currentResolve = null;
-    if (resolve) resolve(value);
-    this.processQueue(container);
+    this.dismissAnimated(container, overlay, () => {
+      if (resolve) resolve(value);
+    });
+  }
+
+  /**
+   * Play the dialog's shared exit motion on `overlay`, then detach it and
+   * settle the container: release the overlay/resolve slot, resolve the
+   * dialog's promise and paint the next queued dialog.
+   *
+   * The slot is only released once the node is gone, so a dialog enqueued by
+   * the resolution continuation cannot be painted on top of the one still
+   * fading out, and dismissing the same overlay twice is a no-op — the first
+   * dismissal wins (`removeAnimated` bails on the marker class).
+   */
+  private static dismissAnimated(
+    container: HTMLElement,
+    overlay: HTMLElement,
+    settle: () => void,
+  ): void {
+    removeAnimated(
+      overlay,
+      () => {
+        unregisterSurface(overlay);
+        const cs = this.getContainerState(container);
+        if (cs.currentOverlay === overlay) {
+          cs.currentOverlay = null;
+          cs.currentResolve = null;
+        }
+        settle();
+        this.processQueue(container);
+      },
+      "encre-dialog-dismissing",
+    );
   }
 
   /**
@@ -270,19 +374,21 @@ export class Dialog {
    * removed when the dialog is dismissed.
    */
   private static enqueue<T>(
-    container: HTMLElement,
+    mount: { container: HTMLElement; scope: SurfaceScope; restore: boolean },
     priority: DialogPriority,
     build: (resolve: Resolve<T>) => HTMLElement,
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const cs = this.getContainerState(container);
+      const cs = this.getContainerState(mount.container);
       cs.queue.push({
         priority,
         build: () => build(resolve),
         resolve,
         reject,
+        scope: mount.scope,
+        restore: mount.restore,
       });
-      this.processQueue(container);
+      this.processQueue(mount.container);
     });
   }
 
@@ -302,8 +408,8 @@ export class Dialog {
     message: string,
     options?: ConfirmOptions,
   ): Promise<boolean> {
-    const target = this.resolveContainer(options?.container);
-    return this.enqueue<boolean>(target, options?.priority ?? "normal", (resolve) => {
+    const mount = this.resolveMount(options);
+    return this.enqueue<boolean>(mount, options?.priority ?? "normal", (resolve) => {
       const overlay = this.makeOverlay();
       const card = this.card(overlay);
       if (options?.inline) this.applyInline(overlay, card);
@@ -316,12 +422,7 @@ export class Dialog {
       );
 
       const done = (val: boolean) => {
-        overlay.remove();
-        const cs = this.getContainerState(target);
-        cs.currentOverlay = null;
-        cs.currentResolve = null;
-        resolve(val);
-        this.processQueue(target);
+        this.dismissAnimated(mount.container, overlay, () => resolve(val));
       };
 
       primaryBtn.addEventListener("click", () => done(true));
@@ -364,8 +465,8 @@ export class Dialog {
     message: string,
     options?: PromptOptions,
   ): Promise<string | null> {
-    const target = this.resolveContainer(options?.container);
-    return this.enqueue<string | null>(target, options?.priority ?? "normal", (resolve) => {
+    const mount = this.resolveMount(options);
+    return this.enqueue<string | null>(mount, options?.priority ?? "normal", (resolve) => {
       const overlay = this.makeOverlay();
       const card = this.card(overlay);
       if (options?.inline) this.applyInline(overlay, card);
@@ -386,12 +487,7 @@ export class Dialog {
       );
 
       const done = (val: string | null) => {
-        overlay.remove();
-        const cs = this.getContainerState(target);
-        cs.currentOverlay = null;
-        cs.currentResolve = null;
-        resolve(val);
-        this.processQueue(target);
+        this.dismissAnimated(mount.container, overlay, () => resolve(val));
       };
 
       primaryBtn.addEventListener("click", () => done(input.value));
@@ -433,8 +529,8 @@ export class Dialog {
     message: string,
     options?: DialogOptions,
   ): Promise<void> {
-    const target = this.resolveContainer(options?.container);
-    return this.enqueue<void>(target, options?.priority ?? "normal", (resolve) => {
+    const mount = this.resolveMount(options);
+    return this.enqueue<void>(mount, options?.priority ?? "normal", (resolve) => {
       const overlay = this.makeOverlay();
       const card = this.card(overlay);
       if (options?.inline) this.applyInline(overlay, card);
@@ -443,12 +539,7 @@ export class Dialog {
       const { primaryBtn } = this.buttons(card, t("dialog.ok"), "");
 
       const done = () => {
-        overlay.remove();
-        const cs = this.getContainerState(target);
-        cs.currentOverlay = null;
-        cs.currentResolve = null;
-        resolve();
-        this.processQueue(target);
+        this.dismissAnimated(mount.container, overlay, () => resolve());
       };
 
       primaryBtn.addEventListener("click", done);
@@ -471,8 +562,8 @@ export class Dialog {
     body: string,
     options?: ConfirmInstallOptions,
   ): Promise<boolean> {
-    const target = this.resolveContainer(options?.container);
-    return this.enqueue<boolean>(target, options?.priority ?? "normal", (resolve) => {
+    const mount = this.resolveMount(options);
+    return this.enqueue<boolean>(mount, options?.priority ?? "normal", (resolve) => {
       const overlay = this.makeOverlay();
       const card = this.card(overlay);
       if (options?.inline) this.applyInline(overlay, card);
@@ -491,12 +582,7 @@ export class Dialog {
       );
 
       const done = (val: boolean) => {
-        overlay.remove();
-        const cs = this.getContainerState(target);
-        cs.currentOverlay = null;
-        cs.currentResolve = null;
-        resolve(val);
-        this.processQueue(target);
+        this.dismissAnimated(mount.container, overlay, () => resolve(val));
       };
 
       primaryBtn.addEventListener("click", () => done(true));
@@ -525,9 +611,9 @@ export class Dialog {
     body: string,
     options?: TripleConfirmOptions,
   ): Promise<"primary" | "tertiary" | "secondary"> {
-    const target = this.resolveContainer(options?.container);
+    const mount = this.resolveMount(options);
     return this.enqueue<"primary" | "tertiary" | "secondary">(
-      target,
+      mount,
       options?.priority ?? "normal",
       (resolve) => {
         const overlay = this.makeOverlay();
@@ -562,12 +648,7 @@ export class Dialog {
         footer.appendChild(priBtn);
 
         const done = (choice: "primary" | "tertiary" | "secondary") => {
-          overlay.remove();
-          const cs = this.getContainerState(target);
-          cs.currentOverlay = null;
-          cs.currentResolve = null;
-          resolve(choice);
-          this.processQueue(target);
+          this.dismissAnimated(mount.container, overlay, () => resolve(choice));
         };
 
         priBtn.addEventListener("click", () => done("primary"));
@@ -602,19 +683,20 @@ export class Dialog {
     initialMessage: string,
     options?: ProgressOptions,
   ): ProgressHandle {
-    const target = this.resolveContainer(options?.container);
+    const mount = this.resolveMount(options);
 
     // Remove any existing progress overlay for this container
-    const existing = this.progressOverlays.get(target);
+    const existing = this.progressOverlays.get(mount.container);
     if (existing) {
+      unregisterSurface(existing);
       existing.remove();
-      this.progressOverlays.delete(target);
+      this.progressOverlays.delete(mount.container);
     }
 
     const overlay = document.createElement("div");
     overlay.className = "encre-dialog-overlay";
     overlay.style.zIndex = String(++this.zCounter);
-    this.progressOverlays.set(target, overlay);
+    this.progressOverlays.set(mount.container, overlay);
     overlay.onclick = (e) => {
       if (e.target !== overlay) return;
       if (options?.cancellable === false) return;
@@ -664,13 +746,16 @@ export class Dialog {
     let done = false;
 
     const close = () => {
-      overlay.classList.add("encre-dialog-dismissing");
-      setTimeout(() => {
-        overlay.remove();
-        if (this.progressOverlays.get(target) === overlay) {
-          this.progressOverlays.delete(target);
-        }
-      }, 150);
+      removeAnimated(
+        overlay,
+        () => {
+          unregisterSurface(overlay);
+          if (this.progressOverlays.get(mount.container) === overlay) {
+            this.progressOverlays.delete(mount.container);
+          }
+        },
+        "encre-dialog-dismissing",
+      );
     };
 
     const setFill = (value: number) => {
@@ -757,7 +842,19 @@ export class Dialog {
       }
     });
 
-    target.appendChild(overlay);
+    mount.container.appendChild(overlay);
+    registerSurface(overlay, {
+      scope: mount.scope,
+      parent: mount.container,
+      restore: mount.restore,
+      onClose: () => {
+        unregisterSurface(overlay);
+        overlay.remove();
+        if (this.progressOverlays.get(mount.container) === overlay) {
+          this.progressOverlays.delete(mount.container);
+        }
+      },
+    });
 
     return handle;
   }
@@ -768,8 +865,8 @@ export class Dialog {
     contentEl: HTMLElement,
     options?: DialogOptions,
   ): Promise<void> {
-    const target = this.resolveContainer(options?.container);
-    return this.enqueue<void>(target, options?.priority ?? "normal", (resolve) => {
+    const mount = this.resolveMount(options);
+    return this.enqueue<void>(mount, options?.priority ?? "normal", (resolve) => {
       const overlay = this.makeOverlay();
       const card = this.card(overlay);
       if (options?.inline) this.applyInline(overlay, card);
@@ -785,12 +882,7 @@ export class Dialog {
       card.appendChild(footer);
 
       const done = () => {
-        overlay.remove();
-        const cs = this.getContainerState(target);
-        cs.currentOverlay = null;
-        cs.currentResolve = null;
-        resolve();
-        this.processQueue(target);
+        this.dismissAnimated(mount.container, overlay, () => resolve());
       };
 
       closeBtn.addEventListener("click", done);
@@ -806,46 +898,5 @@ export class Dialog {
 
       return overlay;
     });
-  }
-
-  // ── Session-level dialog swap ──────────────────────────────────────
-
-  /**
-   * Detach all dialogs (modal + progress) belonging to the main content
-   * container so they can be reattached when the user switches back to
-   * that session.
-   *
-   * Called by Session when switching between sessions. When switching
-   * from oldSid to newSid:
-   *   1. All .encre-dialog-overlay children of #main-content are removed
-   *      from the DOM and stored under oldSid.
-   *   2. Any previously-stored dialogs for newSid are reattached.
-   *
-   * This makes dialogs "follow" their session: a permission prompt
-   * triggered by session 2 is only visible when session 2 is active.
-   */
-  static swapSession(oldSid: string | null, newSid: string | null): void {
-    const container = document.getElementById("main-content");
-    if (!container) return;
-
-    // Detach old session's dialogs
-    if (oldSid) {
-      const dialogs = Array.from(
-        container.querySelectorAll<HTMLElement>(".encre-dialog-overlay"),
-      );
-      if (dialogs.length) {
-        this.sessionDialogStore.set(oldSid, dialogs);
-        dialogs.forEach((d) => d.remove());
-      }
-    }
-
-    // Attach new session's dialogs
-    if (newSid) {
-      const stored = this.sessionDialogStore.get(newSid);
-      if (stored) {
-        stored.forEach((d) => container.appendChild(d));
-        this.sessionDialogStore.delete(newSid);
-      }
-    }
   }
 }

@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>进化 Dashboard</title>
+<style>
+  :root {
+    --bg: #f5f1e8;
+    --card: #ffffff;
+    --accent: #1b6b5c;
+    --accent-light: #e8f0ee;
+    --text: #2c2c2c;
+    --text-sub: #6b6560;
+    --border: #e0dbd3;
+    --success: #1b6b5c;
+    --warning: #b8860b;
+    --danger: #c0392b;
+    --radius: 10px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+
+  /* ── Top nav ── */
+  .top-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 0 24px; position: sticky; top: 0; z-index: 100; }
+  .top-inner { max-width: 960px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+  .brand { font-size: 16px; font-weight: 700; padding: 14px 0; color: var(--accent); letter-spacing: -0.3px; }
+  .tabs { display: flex; gap: 0; }
+  .tab { padding: 14px 18px; font-size: 14px; font-weight: 500; color: var(--text-sub); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; user-select: none; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .updated { font-size: 12px; color: var(--text-sub); }
+
+  /* ── Content ── */
+  .page { max-width: 960px; margin: 0 auto; padding: 28px 24px 60px; display: none; }
+  .page.active { display: block; }
+
+  /* ── Shared ── */
+  h2 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .page-sub { color: var(--text-sub); font-size: 13px; margin-bottom: 24px; }
+  .cards-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 28px; }
+  .cards-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+  .cards-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 28px; }
+  .card { background: var(--card); border-radius: var(--radius); padding: 16px; border: 1px solid var(--border); }
+  .card .label { font-size: 12px; color: var(--text-sub); margin-bottom: 3px; }
+  .card .value { font-size: 26px; font-weight: 700; }
+  .card .value.accent { color: var(--accent); }
+  .card .value.warn { color: var(--warning); }
+  .card .value.danger { color: var(--danger); }
+  .card .value.muted { color: var(--text-sub); }
+  .card .delta { font-size: 11px; margin-top: 3px; color: var(--text-sub); }
+  .delta.up { color: var(--success); }
+  .section { margin-bottom: 28px; }
+  .section-title { font-size: 15px; font-weight: 600; margin-bottom: 12px; padding-bottom: 7px; border-bottom: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: var(--radius); overflow: hidden; border: 1px solid var(--border); }
+  th { text-align: left; font-size: 11px; color: var(--text-sub); text-transform: uppercase; letter-spacing: 0.5px; padding: 9px 12px; background: #faf8f4; border-bottom: 1px solid var(--border); }
+  td { padding: 9px 12px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; white-space: nowrap; }
+  .badge-green { background: #e8f5e9; color: #2e7d32; }
+  .badge-yellow { background: #fff8e1; color: #f57f17; }
+  .badge-red { background: #fce4ec; color: #c62828; }
+  .badge-blue { background: #e3f2fd; color: #1565c0; }
+  .badge-gray { background: #f0ede6; color: #6b6560; }
+  .mono { font-family: "SF Mono", "Consolas", monospace; }
+
+  /* ── Bar chart ── */
+  .bar-chart { display: flex; align-items: flex-end; gap: 6px; min-height: 80px; }
+  .bar-group { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; }
+  .bar { width: 100%; border-radius: 3px 3px 0 0; min-height: 2px; }
+  .bar.sig { background: var(--accent); opacity: 0.5; }
+  .bar.mut { background: var(--accent); }
+  .bar-lbl { font-size: 10px; color: var(--text-sub); }
+  .bar-num { font-size: 10px; color: var(--text-sub); font-weight: 500; min-height: 14px; }
+  .bar-row-label { font-size: 11px; color: var(--text-sub); font-weight: 600; margin-bottom: 4px; }
+  .legend { display: flex; gap: 14px; justify-content: center; margin-top: 8px; font-size: 11px; color: var(--text-sub); }
+  .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; vertical-align: middle; margin-right: 3px; }
+
+  /* ── Verify grid ── */
+  .verify-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .verify-card { background: var(--card); border-radius: var(--radius); padding: 14px; border: 1px solid var(--border); }
+  .verify-card .vc-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+  .verify-item { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 12px; padding: 3px 0; }
+  .verify-item span:last-child { white-space: nowrap; flex-shrink: 0; }
+  .verify-more { font-size: 11px; color: var(--accent); margin-top: 4px; cursor: pointer; }
+  .verify-more:hover { text-decoration: underline; }
+  .verify-hidden { display: none; }
+  .verify-hidden.show { display: block; }
+
+  /* ── Quick commands ── */
+  .cmd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 28px; }
+  .cmd-item { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+  .cmd-name { font-size: 13px; font-weight: 600; font-family: "SF Mono","Consolas",monospace; color: var(--accent); margin-bottom: 2px; }
+  .cmd-desc { font-size: 12px; color: var(--text-sub); }
+  @media (max-width: 700px) { .cmd-grid { grid-template-columns: 1fr; } }
+
+  /* ── Date picker ── */
+  .date-bar { display: flex; gap: 6px; margin-bottom: 24px; flex-wrap: wrap; }
+  .date-btn { padding: 6px 14px; font-size: 13px; font-weight: 500; border-radius: 20px; border: 1px solid var(--border); background: var(--card); color: var(--text-sub); cursor: pointer; transition: all 0.15s; }
+  .date-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .date-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .date-page { display: none; }
+  .date-page.active { display: block; }
+
+  /* ── Evolution report inside Activity ── */
+  .evo-summary { background: var(--card); border-radius: var(--radius); padding: 20px; border: 1px solid var(--border); margin-bottom: 24px; }
+  .evo-summary-text { font-size: 14px; line-height: 1.8; }
+  .evo-summary-stats { display: flex; gap: 20px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .evo-stat { text-align: center; }
+  .evo-stat .num { font-size: 22px; font-weight: 700; color: var(--accent); }
+  .evo-stat .lbl { font-size: 11px; color: var(--text-sub); }
+
+  .fb-source { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; }
+  .fb-row { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: flex-start; }
+  .fb-row:last-child { border-bottom: none; }
+  .fb-type { font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 8px; white-space: nowrap; margin-top: 1px; }
+  .fb-text { font-size: 13px; flex: 1; }
+  .fb-arrow { font-size: 12px; color: var(--text-sub); white-space: nowrap; }
+
+  .no-evo { background: var(--card); border-radius: var(--radius); padding: 28px; border: 1px solid var(--border); text-align: center; color: var(--text-sub); font-size: 14px; }
+
+  /* ── Change card ── */
+  .chg-card { background: var(--card); border-radius: 8px; padding: 14px; border: 1px solid var(--border); margin-bottom: 8px; }
+  .chg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .chg-file { font-size: 12px; font-weight: 600; color: var(--accent); }
+  .chg-desc { font-size: 12px; margin-bottom: 4px; }
+  .chg-reason { font-size: 11px; color: var(--text-sub); }
+  .chg-reason strong { color: var(--text); font-weight: 500; }
+  .chg-diff { background: #faf8f4; border-radius: 6px; padding: 8px 10px; font-size: 11px; line-height: 1.7; margin-top: 6px; overflow-x: auto; }
+  .diff-add { color: #2e7d32; }
+  .diff-del { color: #c62828; text-decoration: line-through; opacity: 0.7; }
+  .chg-gene-wrap { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .chg-gene { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; background: var(--accent-light); color: var(--accent); padding: 2px 7px; border-radius: 8px; cursor: pointer; transition: opacity 0.15s; }
+  .chg-gene:hover { opacity: 0.7; }
+  .gene-meta { display: flex; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
+  .gene-meta-item { font-size: 11px; color: var(--text-sub); }
+  .gene-meta-item strong { color: var(--text); font-weight: 600; }
+
+  /* ── Gene table with accordion ── */
+  .gene-table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: var(--radius); overflow: hidden; border: 1px solid var(--border); table-layout: fixed; }
+  .gene-table th { text-align: left; font-size: 11px; color: var(--text-sub); text-transform: uppercase; letter-spacing: 0.5px; padding: 9px 14px; background: #faf8f4; border-bottom: 1px solid var(--border); }
+  .gene-row { cursor: pointer; transition: background 0.1s; }
+  .gene-row:hover { background: #fdfcf9; }
+  .gene-row td { padding: 10px 14px; font-size: 13px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  .gene-row .arrow { color: var(--text-sub); font-size: 11px; transition: transform 0.2s; display: inline-block; }
+  .gene-id { white-space: nowrap; }
+  .gene-row.open .arrow { transform: rotate(90deg); }
+  .gene-expand { display: none; }
+  .gene-expand.open { display: table-row; }
+  .gene-expand td { padding: 0; border-bottom: 1px solid var(--border); }
+  .gene-expand-inner { padding: 14px 18px; background: #faf8f4; word-break: break-word; }
+  .gene-rule-text { font-size: 12px; line-height: 1.7; margin-bottom: 10px; color: var(--text); }
+  .gene-mut-item { display: flex; justify-content: space-between; align-items: center; font-size: 12px; padding: 5px 0; border-bottom: 1px solid var(--border); }
+  .gene-mut-item:last-child { border-bottom: none; }
+  .gene-empty { font-size: 12px; color: var(--text-sub); font-style: italic; }
+  .gene-id { font-size: 12px; color: var(--accent); font-weight: 600; }
+  .hit { font-weight: 700; font-size: 15px; }
+  .hit.active { color: var(--accent); }
+  .hit.zero { color: var(--border); }
+  .mut-status { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 6px; }
+
+  @media (max-width: 700px) {
+    .cards-3, .cards-4, .cards-5 { grid-template-columns: repeat(2, 1fr); }
+    .verify-grid { grid-template-columns: 1fr; }
+    .tabs { overflow-x: auto; }
+    .tab { padding: 14px 12px; font-size: 13px; white-space: nowrap; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ════ Top Bar ════ -->
+<div class="top-bar">
+  <div class="top-inner">
+    <span class="brand">Evolution</span>
+    <div class="tabs">
+      <div class="tab active" data-tab="overview">总览</div>
+      <div class="tab" data-tab="activity">动态</div>
+      <div class="tab" data-tab="genes">基因库</div>
+    </div>
+    <span class="updated" id="updated-at"></span>
+  </div>
+</div>
+
+<div class="page active" id="overview"></div>
+<div class="page" id="activity"></div>
+<div class="page" id="genes"></div>
+
+<script>
+const DATA = __DASHBOARD_DATA__;
+
+// ── Helpers ──
+function esc(s) { if (!s && s !== 0) return ''; const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
+
+const TYPE_STYLE = {
+  correction: 'background:#fce4ec;color:#c62828;',
+  negative: 'background:#fff3e0;color:#e65100;',
+  positive: 'background:#e8f5e9;color:#2e7d32;',
+  suggestion: 'background:#e3f2fd;color:#1565c0;',
+  preference: 'background:#f3e5f5;color:#7b1fa2;',
+  clarification: 'background:#e0f2f1;color:#00695c;'
+};
+const TYPE_CN = { correction:'纠正', negative:'负面', positive:'正面', suggestion:'建议', preference:'偏好', clarification:'澄清' };
+const STATUS_BADGE = {
+  verified: 'badge-green', applied: 'badge-green', proposed: 'badge-yellow',
+  pending: 'badge-yellow', rejected: 'badge-red', approved: 'badge-blue'
+};
+const STATUS_CN = {
+  verified:'已验证', applied:'已应用', proposed:'待处理',
+  pending:'待处理', rejected:'拒绝', approved:'已批准'
+};
+
+// ── Overview ──
+function renderOverview() {
+  const o = DATA.overview;
+  let h = '<h2>总览</h2><p class="page-sub">Agent 自进化系统全局状态</p>';
+  h += '<div class="cards-3">';
+  o.cards.forEach(c => {
+    const cls = c.cls ? ' ' + c.cls : '';
+    h += `<div class="card"><div class="label">${esc(c.label)}</div><div class="value${cls}">${esc(c.value)}</div>`;
+    if (c.delta) h += `<div class="delta${c.delta_up ? ' up' : ''}">${esc(c.delta)}</div>`;
+    h += '</div>';
+  });
+  h += '</div>';
+
+  // Trend
+  if (o.trend && o.trend.length) {
+    const CAP = 20;
+    const maxH = 60;
+    h += '<div class="section"><div class="section-title">趋势 (近 ' + o.trend.length + ' 周)</div>';
+    h += '<div style="background:var(--card);border-radius:var(--radius);padding:16px;border:1px solid var(--border);">';
+
+    // Row 1: Signals
+    h += '<div class="bar-row-label">反馈</div>';
+    h += '<div class="bar-chart">';
+    o.trend.forEach(t => {
+      const capped = Math.min(t.signals, CAP);
+      const bh = t.signals > 0 ? Math.max(Math.round(capped / CAP * maxH), 2) : 0;
+      h += `<div class="bar-group"><div class="bar-num">${t.signals || ''}</div><div class="bar sig" style="height:${bh}px"></div></div>`;
+    });
+    h += '</div>';
+
+    // Row 2: Mutations
+    h += '<div class="bar-row-label" style="margin-top:10px;">改动</div>';
+    h += '<div class="bar-chart">';
+    o.trend.forEach(t => {
+      const capped = Math.min(t.mutations, CAP);
+      const bh = t.mutations > 0 ? Math.max(Math.round(capped / CAP * maxH), 2) : 0;
+      h += `<div class="bar-group"><div class="bar-num">${t.mutations || ''}</div><div class="bar mut" style="height:${bh}px"></div></div>`;
+    });
+    h += '</div>';
+
+    // Labels row
+    h += '<div class="bar-chart" style="min-height:auto;">';
+    o.trend.forEach(t => {
+      h += `<div class="bar-group"><div class="bar-lbl">${esc(t.label)}</div></div>`;
+    });
+    h += '</div>';
+
+    h += '</div></div>';
+  }
+
+  // Verification
+  if (o.verified_items || o.pending_items) {
+    h += '<div class="section"><div class="section-title">改动验证</div><div class="verify-grid">';
+    if (o.verified_items) {
+      const vis = o.verified_items.slice(0, 3);
+      const hidden = o.verified_items.slice(3);
+      h += `<div class="verify-card"><div class="vc-title" style="color:var(--success);">已验证 (${o.verified_items.length})</div>`;
+      vis.forEach(v => { h += `<div class="verify-item"><span>${esc(v.file)} &mdash; ${esc(v.desc)}</span><span style="color:var(--success);font-weight:500;">${v.count ? v.count + '次' : '等待'}</span></div>`; });
+      if (hidden.length > 0) {
+        h += `<div class="verify-hidden" id="verified-rest">`;
+        hidden.forEach(v => { h += `<div class="verify-item"><span>${esc(v.file)} &mdash; ${esc(v.desc)}</span><span style="color:var(--success);font-weight:500;">${v.count ? v.count + '次' : '等待'}</span></div>`; });
+        h += `</div>`;
+        h += `<div class="verify-more" onclick="toggleVerify('verified-rest', this)">+${hidden.length} 更多</div>`;
+      }
+      h += '</div>';
+    }
+    if (o.pending_items) {
+      const vis = o.pending_items.slice(0, 3);
+      const hidden = o.pending_items.slice(3);
+      h += `<div class="verify-card"><div class="vc-title" style="color:var(--warning);">待观察 (${o.pending_items.length})</div>`;
+      vis.forEach(v => { h += `<div class="verify-item"><span>${esc(v.file)} &mdash; ${esc(v.desc)}</span><span style="color:var(--warning);font-weight:500;">等待</span></div>`; });
+      if (hidden.length > 0) {
+        h += `<div class="verify-hidden" id="pending-rest">`;
+        hidden.forEach(v => { h += `<div class="verify-item"><span>${esc(v.file)} &mdash; ${esc(v.desc)}</span><span style="color:var(--warning);font-weight:500;">等待</span></div>`; });
+        h += `</div>`;
+        h += `<div class="verify-more" onclick="toggleVerify('pending-rest', this)">+${hidden.length} 更多</div>`;
+      }
+      h += '</div>';
+    }
+    h += '</div></div>';
+  }
+
+  // Quick commands
+  h += '<div class="section"><div class="section-title">快捷指令</div>';
+  h += '<div class="cmd-grid">';
+  const cmds = [
+    { name: '/evolve', desc: '主动触发一次完整进化分析，查看改进建议' },
+    { name: '/evolve init', desc: '首次安装时执行：初始化扫描 + 生成文件注册表' },
+    { name: '/evolve scan', desc: '扫描历史对话，提取已有的反馈信号' },
+    { name: '/evolve dashboard', desc: '生成并打开进化 Dashboard' },
+    { name: '/evolve help', desc: '查看新手引导' },
+    { name: '"进化状态"', desc: '查看当前反馈积累量和验证状态' },
+    { name: '"进化报告"', desc: '生成 HTML 格式进化报告' },
+    { name: '"gene 列表"', desc: '查看基因模板库及命中情况' },
+  ];
+  cmds.forEach(c => {
+    h += `<div class="cmd-item"><div class="cmd-name">${esc(c.name)}</div><div class="cmd-desc">${esc(c.desc)}</div></div>`;
+  });
+  h += '</div></div>';
+
+  // Layer distribution
+  if (o.layers) {
+    h += '<div class="section"><div class="section-title">反馈分布</div><div class="cards-5">';
+    const names = ['identity','context','protocol','capability','runtime'];
+    const labels = ['身份层','上下文层','协议层','能力层','运行时层'];
+    const maxL = Math.max(...names.map(n => o.layers[n] || 0));
+    names.forEach((n, i) => {
+      const v = o.layers[n] || 0;
+      const cls = v === maxL && v > 0 ? ' accent' : '';
+      h += `<div class="card" style="text-align:center;padding:12px;"><div class="label">${labels[i]}</div><div class="value${cls}" style="font-size:20px;">${v}</div></div>`;
+    });
+    h += '</div></div>';
+  }
+
+  document.getElementById('overview').innerHTML = h;
+}
+
+// ── Activity ──
+function renderActivity() {
+  const reviews = DATA.reviews || [];
+  let h = '<h2>进化动态</h2><p class="page-sub">选择日期查看进化详情</p>';
+
+  if (!reviews.length) {
+    h += '<div class="no-evo">暂无进化记录</div>';
+    document.getElementById('activity').innerHTML = h;
+    return;
+  }
+
+  // Date bar
+  h += '<div class="date-bar">';
+  reviews.forEach((r, i) => {
+    h += `<div class="date-btn" data-date="dp${i}">${esc(r.date_label)}</div>`;
+  });
+  h += '</div>';
+
+  // Each review page
+  reviews.forEach((r, i) => {
+    h += `<div class="date-page" id="dp${i}">`;
+
+    // Summary
+    h += '<div class="evo-summary">';
+    h += `<div class="evo-summary-text">${r.summary_html || esc(r.summary_text)}</div>`;
+    h += '<div class="evo-summary-stats">';
+    (r.stats || []).forEach(s => {
+      h += `<div class="evo-stat"><div class="num">${esc(s.value)}</div><div class="lbl">${esc(s.label)}</div></div>`;
+    });
+    h += '</div></div>';
+
+    // Signals
+    if (r.signals && r.signals.length) {
+      h += '<div class="section"><div class="section-title">来源反馈</div><div class="fb-source">';
+      r.signals.forEach(s => {
+        const style = TYPE_STYLE[s.type] || '';
+        const label = TYPE_CN[s.type] || s.type;
+        h += `<div class="fb-row"><span class="fb-type" style="${style}">${esc(label)}</span>`;
+        h += `<span class="fb-text">${esc(s.text)}</span>`;
+        h += `<span class="fb-arrow">${esc(s.meta || '')}</span></div>`;
+      });
+      h += '</div></div>';
+    }
+
+    // Applied mutations
+    const applied = (r.mutations || []).filter(m => m.status !== 'rejected');
+    const rejected = (r.mutations || []).filter(m => m.status === 'rejected');
+
+    if (applied.length) {
+      const title = applied.some(m => m.status === 'proposed' || m.status === 'pending') ? '待处理改动' : '已应用的改动';
+      h += `<div class="section"><div class="section-title">${title}</div>`;
+      applied.forEach(m => { h += renderMutation(m); });
+      h += '</div>';
+    }
+
+    // Rejected
+    if (rejected.length) {
+      h += '<div class="section"><div class="section-title">被拒绝的改动</div>';
+      rejected.forEach(m => { h += renderMutation(m, true); });
+      h += '</div>';
+    }
+
+    h += '</div>';
+  });
+
+  document.getElementById('activity').innerHTML = h;
+  bindDateButtons();
+}
+
+function renderMutation(m, isRejected) {
+  const badgeCls = STATUS_BADGE[m.status] || 'badge-gray';
+  const badgeTxt = STATUS_CN[m.status] || m.status;
+  let h = `<div class="chg-card"${isRejected ? ' style="opacity:0.6;"' : ''}>`;
+  h += `<div class="chg-head"><span class="chg-file mono">${esc(m.target_file)}</span><span class="badge ${badgeCls}">${esc(badgeTxt)}</span></div>`;
+  h += `<div class="chg-desc">${esc(m.description)}</div>`;
+  if (m.reason) h += `<div class="chg-reason"><strong>原因：</strong>${esc(m.reason)}</div>`;
+  if (m.diff_lines && m.diff_lines.length) {
+    h += '<div class="chg-diff mono">';
+    m.diff_lines.forEach(line => {
+      if (line.startsWith('+')) h += `<div class="diff-add">${esc(line)}</div>`;
+      else if (line.startsWith('-')) h += `<div class="diff-del">${esc(line)}</div>`;
+      else h += `<div>${esc(line)}</div>`;
+    });
+    h += '</div>';
+  }
+  if (m.gene_id) {
+    const geneIds = m.gene_id.split(',').map(s => s.trim()).filter(Boolean);
+    const geneNames = (m.gene_name || '').split(',').map(s => s.trim());
+    h += '<div class="chg-gene-wrap">';
+    geneIds.forEach((gid, idx) => {
+      const gname = geneNames[idx] && geneNames[idx] !== gid ? ' — ' + esc(geneNames[idx]) : '';
+      h += `<div class="chg-gene" onclick="switchToGene('${esc(gid)}')">${esc(gid)}${gname} &#8594;</div>`;
+    });
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+// ── Genes ──
+function renderGenes() {
+  const g = DATA.genes || {};
+  const items = g.items || [];
+  let h = '<h2>基因库</h2><p class="page-sub">基因模板库 &mdash; 点击行展开查看关联改动</p>';
+
+  h += '<div class="cards-4">';
+  h += `<div class="card"><div class="label">基因总数</div><div class="value">${g.total || 0}</div></div>`;
+  h += `<div class="card"><div class="label">已命中</div><div class="value accent">${g.matched || 0}</div></div>`;
+  h += `<div class="card"><div class="label">关联改动</div><div class="value accent">${g.mutations_linked || 0}</div></div>`;
+  h += `<div class="card"><div class="label">未使用</div><div class="value muted">${g.unused || 0}</div></div>`;
+  h += '</div>';
+
+  if (items.length) {
+    h += '<div class="section"><div class="section-title">全部基因</div>';
+    h += '<table class="gene-table"><thead><tr><th style="width:28px"></th><th style="width:120px;white-space:nowrap;">ID</th><th style="width:140px;">名称</th><th>简介</th><th style="text-align:center;width:60px;">命中数</th><th style="width:90px;">最近使用</th><th style="width:60px;">状态</th></tr></thead><tbody>';
+
+    items.forEach((gene, i) => {
+      const hasHits = gene.hits > 0;
+      const idStyle = hasHits ? '' : ' style="opacity:0.5;"';
+      const nameStyle = hasHits ? ' style="font-weight:500;"' : ' style="color:var(--text-sub);"';
+      const hitCls = hasHits ? 'hit active' : 'hit zero';
+      const badgeCls = hasHits ? 'badge-green' : 'badge-gray';
+      const badgeTxt = hasHits ? '活跃' : '未使用';
+      const lastUsed = gene.last_used || '&mdash;';
+
+      h += `<tr class="gene-row" data-gene="g${i}" data-gene-id="${esc(gene.id)}"><td><span class="arrow">&#9654;</span></td>`;
+      h += `<td><span class="gene-id mono"${idStyle}>${esc(gene.id)}</span></td>`;
+      h += `<td${nameStyle}>${esc(gene.name)}</td>`;
+      h += `<td style="font-size:12px;color:var(--text-sub);">${esc(gene.summary)}</td>`;
+      h += `<td style="text-align:center;"><span class="${hitCls}">${gene.hits}</span></td>`;
+      h += `<td style="font-size:12px;color:var(--text-sub);">${lastUsed}</td>`;
+      h += `<td><span class="badge ${badgeCls}">${badgeTxt}</span></td></tr>`;
+
+      // Expand row
+      h += `<tr class="gene-expand" data-gene="g${i}"><td colspan="7"><div class="gene-expand-inner">`;
+
+      // Gene metadata
+      const metaParts = [];
+      if (gene.layer) metaParts.push(`<span class="gene-meta-item"><strong>Layer:</strong> ${esc(gene.layer)}</span>`);
+      if (gene.mutation_space) metaParts.push(`<span class="gene-meta-item"><strong>Mutation Space:</strong> ${esc(gene.mutation_space)}</span>`);
+      if (gene.fitness != null) metaParts.push(`<span class="gene-meta-item"><strong>Fitness:</strong> ${(gene.fitness * 100).toFixed(0)}%</span>`);
+      if (gene.gene_status && gene.gene_status !== 'unused') metaParts.push(`<span class="gene-meta-item"><strong>Status:</strong> ${esc(gene.gene_status)}</span>`);
+      if (metaParts.length) h += `<div class="gene-meta">${metaParts.join('')}</div>`;
+
+      if (gene.rule_text) h += `<div class="gene-rule-text"><strong>规则：</strong>${esc(gene.rule_text)}</div>`;
+      const muts = gene.mutations || [];
+      if (muts.length) {
+        h += `<div style="font-size:12px;font-weight:600;margin-bottom:6px;">关联改动 (${muts.length})</div>`;
+        muts.forEach(m => {
+          const mStatus = STATUS_CN[m.status] || m.status;
+          const mBg = m.status === 'verified' ? 'background:#e8f5e9;color:#2e7d32;' : m.status === 'applied' ? 'background:#e8f5e9;color:#2e7d32;' : 'background:#fff8e1;color:#f57f17;';
+          h += `<div class="gene-mut-item"><span class="mono">${esc(m.file)} &mdash; ${esc(m.desc)}</span>`;
+          h += `<span style="font-size:11px;color:var(--text-sub);">${esc(m.date || '')}</span>`;
+          h += `<span class="mut-status" style="${mBg}">${esc(mStatus)}</span></div>`;
+        });
+      } else {
+        h += '<div class="gene-empty">暂无关联改动</div>';
+      }
+      h += '</div></td></tr>';
+    });
+
+    h += '</tbody></table>';
+    const shown = items.length;
+    if (g.total > shown) h += `<div style="text-align:center;font-size:12px;color:var(--text-sub);margin-top:10px;">显示 ${shown} / ${g.total} 个基因</div>`;
+    h += '</div>';
+  }
+
+  document.getElementById('genes').innerHTML = h;
+  bindGeneAccordion();
+}
+
+// ── Bindings ──
+function bindDateButtons() {
+  document.querySelectorAll('.date-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.date-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.date-page').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById(btn.dataset.date).classList.add('active');
+    });
+  });
+  const first = document.querySelector('.date-btn');
+  if (first) first.click();
+}
+
+function bindGeneAccordion() {
+  document.querySelectorAll('.gene-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const id = row.dataset.gene;
+      const expand = document.querySelector('.gene-expand[data-gene="' + id + '"]');
+      const isOpen = row.classList.contains('open');
+      document.querySelectorAll('.gene-row').forEach(r => r.classList.remove('open'));
+      document.querySelectorAll('.gene-expand').forEach(e => e.classList.remove('open'));
+      if (!isOpen) { row.classList.add('open'); expand.classList.add('open'); }
+    });
+  });
+}
+
+// ── Toggle verify sections ──
+function toggleVerify(id, btn) {
+  const el = document.getElementById(id);
+  if (el.classList.contains('show')) {
+    el.classList.remove('show');
+    btn.textContent = '+' + el.children.length + ' 更多';
+  } else {
+    el.classList.add('show');
+    btn.textContent = '收起';
+  }
+}
+
+// ── Cross-navigation: Activity gene badge → Genes tab ──
+function switchToGene(geneId) {
+  // Switch to genes tab
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelector('.tab[data-tab="genes"]').classList.add('active');
+  document.getElementById('genes').classList.add('active');
+
+  // Find and open the gene row
+  const row = document.querySelector('.gene-row[data-gene-id="' + geneId + '"]');
+  if (row) {
+    document.querySelectorAll('.gene-row').forEach(r => r.classList.remove('open'));
+    document.querySelectorAll('.gene-expand').forEach(e => e.classList.remove('open'));
+    row.classList.add('open');
+    const expand = document.querySelector('.gene-expand[data-gene="' + row.dataset.gene + '"]');
+    if (expand) expand.classList.add('open');
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tab.dataset.tab).classList.add('active');
+  });
+});
+
+// Init
+document.getElementById('updated-at').textContent = DATA.generated_at || '';
+renderOverview();
+renderActivity();
+renderGenes();
+</script>
+
+</body>
+</html>

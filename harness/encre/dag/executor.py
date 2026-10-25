@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,28 +21,55 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-"""DAG workflow executor -- runs :class:`TaskTree` nodes in dependency order.
+from __future__ import annotations
 
-Independent nodes execute concurrently via :func:`asyncio.gather`, and
-failures propagate according to a configurable policy (skip downstream,
-abort all, or retry individual nodes).
+"""DAG workflow executor -- the single TaskTree execution engine.
+
+Runs :class:`TaskTree` nodes (from ``encre.swarm.planner``) in dependency
+order.  Independent nodes execute concurrently via :func:`asyncio.gather`
+(optionally bounded by a concurrency semaphore) and failures propagate
+downstream: any node whose dependency failed or was skipped is itself
+marked ``skipped`` so every node of the tree shows up in the results.
+
+Optional hooks integrate the multi-agent collaboration channel:
+
+- ``blackboard``: a shared :class:`~encre.swarm.blackboard.EncreBlackboard`;
+  the executor publishes the goal and each completed node's result, and
+  exposes the instance to node runners via ``context["blackboard"]``.
+- ``context["mailboxes"]``: a per-node :class:`~encre.swarm.mailbox.EncreMailbox`
+  registry created for every run, so sub-agent runners can send/receive
+  point-to-point messages between nodes.
+- ``reviewer_gate``: an async-or-sync ``(node, result) -> bool`` callback;
+  returning ``False`` fails the node with "Reviewer rejected the output".
+- ``progress_cb``: sync-or-async ``(node_id, NodeResult)`` notifications.
+
+Node runners may be plain callables (executed in a worker thread) or async
+callables (awaited on the loop).
 """
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from encre.swarm.mailbox import EncreMailbox
 from encre.swarm.planner import TaskNode, TaskTree
 
 logger = logging.getLogger("encre.dag.executor")
 
-# Type alias: an async callable that receives (node, context) and returns a
-# result string.  ``context`` is a mutable dict shared across all nodes
-# in the workflow, useful for passing intermediate results.
-NodeRunner = Callable[[TaskNode, dict[str, Any]], str | None]
+# Type alias: a node runner receives (node, context) and returns a result
+# string, either synchronously or as an awaitable.  ``context`` is a mutable
+# dict shared across all nodes in the workflow; the executor injects
+# ``context["blackboard"]`` (when a blackboard is configured) and
+# ``context["mailboxes"]`` (per-node mailboxes) so runners can coordinate.
+NodeRunner = Callable[[TaskNode, dict[str, Any]], Any]
+
+# Type alias: a reviewer gate receives (node, result) and returns -- directly
+# or as an awaitable -- whether the output is approved.
+ReviewerGate = Callable[..., Any]
 
 
 class SkipNodeError(Exception):
@@ -89,11 +116,17 @@ class DagExecutor:
         max_retries: int = 2,
         retry_delay: float = 1.0,
         fail_fast: bool = False,
+        max_concurrent: int = 0,
+        blackboard: Any = None,
+        reviewer_gate: ReviewerGate | None = None,
     ) -> None:
         self._runner = runner
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._fail_fast = fail_fast
+        self._semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
+        self._blackboard = blackboard
+        self._reviewer_gate = reviewer_gate
         self._node_results: dict[str, NodeResult] = {}
         self._context: dict[str, Any] = {}
         self._queue: asyncio.Queue[str] = asyncio.Queue()
@@ -101,22 +134,34 @@ class DagExecutor:
         self._failed: set[str] = set()
         self._skipped: set[str] = set()
         self._tree: TaskTree | None = None
+        self._cancelled = False
 
-    # 鈹€鈹€ Public API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation.
+
+        Stops the scheduling loop before the next batch of ready nodes;
+        nodes already in flight finish their current attempt.  Unresolved
+        nodes are then reported as ``skipped`` in the final result.
+        """
+        self._cancelled = True
 
     async def run(
         self,
         tree: TaskTree,
         context: dict[str, Any] | None = None,
-        progress_cb: Callable[[str, NodeResult], None] | None = None,
+        progress_cb: Callable[[str, NodeResult], Any] | None = None,
     ) -> DagExecutionResult:
         """Execute a ``TaskTree`` from root to leaves.
 
         Args:
             tree: The DAG to execute.
             context: Shared mutable dict passed to every node runner.
-            progress_cb: Optional callback fired after each node completes
-                (receives node_id and NodeResult).
+            progress_cb: Optional sync-or-async callback fired after each
+                node reaches a terminal state (receives node_id, NodeResult).
 
         Returns:
             Aggregated ``DagExecutionResult``.
@@ -127,9 +172,20 @@ class DagExecutor:
         self._completed.clear()
         self._failed.clear()
         self._skipped.clear()
+        self._cancelled = False
 
         if not tree.nodes:
             return self._build_result(success=True)
+
+        # Inter-agent collaboration channel: publish the goal on the shared
+        # blackboard, expose it to runners, and create one point-to-point
+        # mailbox per node so sub-agents can coordinate.
+        if self._blackboard is not None:
+            self._blackboard.put("__orchestrator__", "goal", tree.goal)
+            self._context["blackboard"] = self._blackboard
+        self._context["mailboxes"] = {
+            nid: EncreMailbox(owner_id=nid) for nid in tree.nodes
+        }
 
         # Validate DAG -- check for missing dependencies and cycles
         validation_error = self._validate(tree)
@@ -139,122 +195,171 @@ class DagExecutor:
         started = time.monotonic()
 
         # Seed the queue with entry nodes
+        enqueued: set[str] = set()
         for nid in tree.entry_nodes:
             if nid in tree.nodes:
                 self._queue.put_nowait(nid)
+                enqueued.add(nid)
 
-        # Track which nodes have been queued
-        enqueued: set[str] = set(tree.entry_nodes)
         in_flight: set[str] = set()
 
-        while True:
-            # Dequeue as many ready nodes as possible
-            ready_nodes: list[str] = []
-            while not self._queue.empty():
-                try:
-                    nid = self._queue.get_nowait()
-                    if nid not in enqueued or nid in self._completed or nid in self._failed or nid in self._skipped:
+        try:
+            while not self._cancelled:
+                # Dequeue as many ready nodes as possible
+                ready_nodes: list[str] = []
+                while not self._queue.empty():
+                    try:
+                        nid = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if (nid not in enqueued or nid in self._completed
+                            or nid in self._failed or nid in self._skipped):
                         continue
                     ready_nodes.append(nid)
-                except asyncio.QueueEmpty:
+
+                if ready_nodes:
+                    # Execute ready nodes concurrently (bounded by the
+                    # optional concurrency semaphore).
+                    tasks = {nid: self._run_node(nid, tree.nodes[nid]) for nid in ready_nodes}
+                    in_flight.update(ready_nodes)
+                    enqueued.update(ready_nodes)
+
+                    completed = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+                    for nid, outcome in zip(tasks.keys(), completed, strict=False):
+                        in_flight.discard(nid)
+                        if not isinstance(outcome, NodeResult):
+                            outcome = NodeResult(
+                                node_id=nid,
+                                node_name=tree.nodes[nid].name,
+                                status="failed",
+                                error=str(outcome),
+                            )
+                        self._node_results[nid] = outcome
+                        if outcome.status == "completed":
+                            self._completed.add(nid)
+                        elif outcome.status == "failed":
+                            self._failed.add(nid)
+                        elif outcome.status == "skipped":
+                            self._skipped.add(nid)
+                        await self._notify(progress_cb, nid, outcome)
+
+                    if self._fail_fast and self._failed:
+                        break
+
+                # Schedule to a fixpoint: enqueue newly-ready nodes and
+                # transitively mark nodes with failed/skipped dependencies
+                # as skipped so they appear in the results.
+                while await self._schedule_pass(tree, enqueued, progress_cb):
+                    pass
+
+                if self._queue.empty() and not in_flight:
                     break
+        except asyncio.CancelledError:
+            # The run() coroutine itself was cancelled (e.g. by a timeout):
+            # mark in-flight nodes so none is left dangling in "running".
+            for nid in in_flight:
+                node = tree.nodes.get(nid)
+                if node is not None and node.status == "running":
+                    node.status = "cancelled"
+                    node.error = "Cancelled by executor"
+            raise
 
-            if not ready_nodes and not in_flight:
-                # All done
-                break
-
-            # Execute ready nodes concurrently
-            tasks = {nid: self._execute_node(nid, tree.nodes[nid]) for nid in ready_nodes}
-            in_flight.update(ready_nodes)
-            enqueued.update(ready_nodes)
-
-            # Wait for all concurrent tasks to finish
-            completed = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-            results: dict[str, NodeResult] = {}
-            for nid, outcome in zip(tasks.keys(), completed, strict=False):
-                in_flight.discard(nid)
-                if isinstance(outcome, NodeResult):
-                    results[nid] = outcome
-                    self._node_results[nid] = outcome
-                    if outcome.status == "completed":
-                        self._completed.add(nid)
-                    elif outcome.status == "failed":
-                        self._failed.add(nid)
-                    elif outcome.status == "skipped":
-                        self._skipped.add(nid)
-                    if progress_cb:
-                        progress_cb(nid, outcome)
-                elif isinstance(outcome, Exception):
-                    results[nid] = NodeResult(
-                        node_id=nid,
-                        node_name=tree.nodes[nid].name,
-                        status="failed",
-                        error=str(outcome),
-                    )
-                    self._node_results[nid] = results[nid]
-                    self._failed.add(nid)
-                    if progress_cb:
-                        progress_cb(nid, results[nid])
-
-            # Abort on failure if fail_fast
-            if self._fail_fast and self._failed:
-                # Cancel any remaining in-flight nodes by marking them as skipped
-                for fid in in_flight:
-                    if fid not in self._completed:
-                        self._skipped.add(fid)
-                break
-
-            # Enqueue newly ready nodes (all dependencies satisfied)
+        # Finalization: after a cooperative cancel() or a fail_fast abort,
+        # mark every node that never ran as skipped so the result set always
+        # covers the full tree.
+        if self._cancelled or (self._fail_fast and self._failed):
+            note = "Cancelled by executor" if self._cancelled else "Aborted by fail_fast"
             for nid, node in tree.nodes.items():
-                if nid in enqueued or nid in self._completed or nid in self._failed or nid in self._skipped:
+                if nid in self._node_results:
                     continue
-                if self._deps_met(node):
-                    # Check if any dependency failed -- if so, skip this node
-                    failed_deps = [d for d in node.dependencies if d in self._failed]
-                    if failed_deps:
-                        self._skipped.add(nid)
-                        skip_result = NodeResult(
-                            node_id=nid,
-                            node_name=node.name,
-                            status="skipped",
-                            result="",
-                            error=f"dependency failed: {failed_deps[0]}",
-                        )
-                        self._node_results[nid] = skip_result
-                        enqueued.add(nid)
-                        if progress_cb:
-                            progress_cb(nid, skip_result)
-                        continue
-                    enqueued.add(nid)
-                    self._queue.put_nowait(nid)
+                node.status = "skipped"
+                node.error = note
+                self._node_results[nid] = NodeResult(
+                    node_id=nid,
+                    node_name=node.name,
+                    status="skipped",
+                    error=note,
+                )
+                self._skipped.add(nid)
 
         total_duration = time.monotonic() - started
-        success = len(self._failed) == 0 and len(tree.nodes) > 0
+        success = len(self._failed) == 0 and len(self._node_results) == len(tree.nodes)
         return self._build_result(
             success=success,
             duration=total_duration,
         )
 
-    # 鈹€鈹€ Internal 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    async def _notify(self, cb: Callable[..., Any] | None, *args: Any) -> None:
+        """Invoke a sync-or-async callback, swallowing its failures.
+
+        Progress callbacks must never take down the execution engine.
+        """
+        if cb is None:
+            return
+        try:
+            outcome = cb(*args)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:
+            logger.warning("[dag] progress callback failed", exc_info=True)
+
+    async def _run_node(self, nid: str, node: TaskNode) -> NodeResult:
+        """Run one node, bounded by the concurrency semaphore when set."""
+        if self._semaphore is None:
+            return await self._execute_node(nid, node)
+        async with self._semaphore:
+            return await self._execute_node(nid, node)
 
     async def _execute_node(self, nid: str, node: TaskNode) -> NodeResult:
-        """Run a single node with retry logic."""
+        """Run a single node with retry logic, the reviewer gate, and a
+        blackboard write on success."""
         node.status = "running"
         started = time.monotonic()
         last_error = ""
         for attempt in range(1, self._max_retries + 2):
             try:
-                result = await asyncio.to_thread(self._runner, node, self._context)
+                outcome = self._runner(node, self._context)
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+                result = outcome or ""
+                node.result = result
+                node.error = ""
+                finished = time.monotonic()
+
+                # Reviewer gate (optional): a rejected output fails the node.
+                if self._reviewer_gate is not None:
+                    approved = self._reviewer_gate(node, result)
+                    if inspect.isawaitable(approved):
+                        approved = await approved
+                    if not approved:
+                        node.status = "failed"
+                        node.error = "Reviewer rejected the output"
+                        return NodeResult(
+                            node_id=nid,
+                            node_name=node.name,
+                            status="failed",
+                            result=result,
+                            error="Reviewer rejected the output",
+                            started_at=started,
+                            finished_at=finished,
+                            attempts=attempt,
+                        )
+
                 node.status = "completed"
-                node.result = result or ""
+                if self._blackboard is not None:
+                    self._blackboard.put(f"task:{nid}", "result", result, owner=nid)
                 return NodeResult(
                     node_id=nid,
                     node_name=node.name,
                     status="completed",
-                    result=result or "",
+                    result=result,
                     started_at=started,
-                    finished_at=time.monotonic(),
+                    finished_at=finished,
                     attempts=attempt,
                 )
             except SkipNodeError:
@@ -286,6 +391,51 @@ class DagExecutor:
             finished_at=time.monotonic(),
             attempts=self._max_retries + 1,
         )
+
+    async def _schedule_pass(
+        self,
+        tree: TaskTree,
+        enqueued: set[str],
+        progress_cb: Callable[[str, NodeResult], Any] | None,
+    ) -> bool:
+        """One scheduling pass over unresolved nodes.
+
+        Enqueues nodes whose dependencies are all completed and marks nodes
+        with failed or skipped dependencies as ``skipped``.  Returns True
+        when any node changed state; the caller loops until this returns
+        False so skips propagate transitively.
+        """
+        changed = False
+        for nid, node in tree.nodes.items():
+            if (nid in enqueued or nid in self._completed
+                    or nid in self._failed or nid in self._skipped):
+                continue
+            failed_deps = [d for d in node.dependencies if d in self._failed]
+            skipped_deps = [d for d in node.dependencies if d in self._skipped]
+            if failed_deps or skipped_deps:
+                if failed_deps:
+                    reason = f"dependency failed: {failed_deps[0]}"
+                else:
+                    reason = f"dependency skipped: {skipped_deps[0]}"
+                node.status = "skipped"
+                node.error = reason
+                skip_result = NodeResult(
+                    node_id=nid,
+                    node_name=node.name,
+                    status="skipped",
+                    error=reason,
+                )
+                self._node_results[nid] = skip_result
+                self._skipped.add(nid)
+                enqueued.add(nid)
+                await self._notify(progress_cb, nid, skip_result)
+                changed = True
+                continue
+            if self._deps_met(node):
+                enqueued.add(nid)
+                self._queue.put_nowait(nid)
+                changed = True
+        return changed
 
     def _deps_met(self, node: TaskNode) -> bool:
         """Check whether all dependencies of *node* are completed."""

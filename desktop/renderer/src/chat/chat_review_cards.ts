@@ -6,6 +6,7 @@ import type { TimelineItem } from "./timeline.js";
 import { getState } from "../core/state.js";
 import { t } from "../features/i18n.js";
 import { escapeHtml } from "./chat_markdown.js";
+import { getFileIcon } from "../features/files.js";
 
 export function renderSpecCardImpl(self: Chat, item: Extract<TimelineItem, { kind: "spec_card" }>): string {
   const spec = item.spec;
@@ -41,9 +42,9 @@ export function renderSpecCardImpl(self: Chat, item: Extract<TimelineItem, { kin
         <div class="q-field-text">${sectionsHtml}</div>
       </div>
       ${feedbackHtml}
-      <div class="q-actions" style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">
-        <button class="q-action-btn" data-spec-reject="${sessionId}" style="background:var(--bg-tertiary);color:var(--tool-text);border:1px solid var(--border)">${t("chat.reviewCancel") || "Cancel"}</button>
-        <button class="q-action-btn" data-spec-approve="${sessionId}" style="background:var(--accent);color:#fff;border:1px solid var(--accent)">${t("chat.reviewExecute") || "Execute"}</button>
+      <div class="q-actions">
+        <button class="q-action-btn q-action-btn--ghost" data-spec-reject="${sessionId}">${t("chat.reviewCancel") || "Cancel"}</button>
+        <button class="q-action-btn q-action-btn--primary" data-spec-approve="${sessionId}">${t("chat.reviewExecute") || "Execute"}</button>
       </div>
     </div>`;
   } else if (isApproved) {
@@ -54,7 +55,7 @@ export function renderSpecCardImpl(self: Chat, item: Extract<TimelineItem, { kin
         <div class="q-field-text">${sectionsHtml}</div>
       </div>
       ${feedbackHtml}
-      <div class="q-step" style="color:var(--success-color);margin-top:8px"><i data-lucide="check-circle"></i> ${t("chat.reviewExecuted") || "Executed"}</div>
+      <div class="review-state review-state--ok"><i data-lucide="check-circle"></i> ${t("chat.reviewExecuted") || "Executed"}</div>
     </div>`;
   } else if (isRejected) {
     bodyHtml = `<div class="question-card-body">
@@ -64,17 +65,18 @@ export function renderSpecCardImpl(self: Chat, item: Extract<TimelineItem, { kin
         <div class="q-field-text">${sectionsHtml}</div>
       </div>
       ${feedbackHtml}
-      <div class="q-step" style="color:var(--danger-color);margin-top:8px"><i data-lucide="x-circle"></i> ${t("chat.reviewCancelled") || "Cancelled"}</div>
+      <div class="review-state review-state--no"><i data-lucide="x-circle"></i> ${t("chat.reviewCancelled") || "Cancelled"}</div>
     </div>`;
   } else {
     bodyHtml = `<div class="question-card-body">${sectionsHtml}</div>`;
   }
 
+  // Header mirrors the question card: icon + fixed tool name. The long
+  // status copy lives in the body (q-step), not in the header.
   return `<div class="question-card" id="${cardId}">
     <div class="question-card-header">
       <i data-lucide="file-text" class="question-card-icon"></i>
-      <span class="question-card-title">${escapeHtml(t("chat.reviewSpecMain") || "Specification Review")}</span>
-      <span class="question-card-badge">${isReview ? (t("chat.waitingForAnswer") || "Pending") : (isApproved ? (t("chat.reviewExecuted") || "Executed") : (t("chat.reviewCancelled") || "Cancelled"))}</span>
+      <span class="question-card-title">Spec Review</span>
     </div>
     ${bodyHtml}
   </div>`;
@@ -82,97 +84,69 @@ export function renderSpecCardImpl(self: Chat, item: Extract<TimelineItem, { kin
 
 export function renderPlanCardImpl(self: Chat, item: Extract<TimelineItem, { kind: "plan_card" }>): string {
   const review = item.review;
-  const status = review.status;
-  const isApproved = status === "approved";
-  const isRejected = status === "rejected";
-  const isReview = status === "review" || status === "draft";
-  const sessionId = getState().sessionId;
-  const cardId = `plan-card-${review.review_id}`;
+  const status = review.status === "approved" || review.status === "rejected" || review.status === "cancelled"
+    ? review.status
+    : "review";
+  const isSpec = review.mode === "spec";
+  const rid = review.review_id || "";
+  // One-shot card: it exists only while the decision is owed. `plan_review`
+  // clears the slot on every terminal status, and `session_ready` only
+  // replays pending ones, so a decided record never renders a card.
+  if (status !== "review") return "";
+  const cardId = `plan-card-${rid}`;
+  const title = isSpec ? t("chat.reviewSpecMain") : t("chat.reviewPlanMain");
 
-  // Parse sections from the full content using ## Plan/## Steps/## Checklist headers
-  const sections = self.parsePlanSections(review.content);
-
-  // File rows that open in the sidebar markdown tab on click
-  const fileRows = [
-    { name: "plan.md", content: sections.plan, icon: "file-text" },
-    { name: "steps.md", content: sections.steps, icon: "list-ordered" },
-    { name: "checklist.md", content: sections.checklist, icon: "check-square" },
-  ];
-
-  const fileRowsHtml = fileRows.map((f, i) => {
-    const fileKey = `plan-${review.review_id}-${i}`;
-    self._planFileLookup.set(fileKey, f.content);
-    return `<div class="review-file" data-open-md="${fileKey}" data-md-title="${escapeHtml(f.name)}">
-      <div class="review-file-row">
-        <span class="review-file-icon"><i data-lucide="${f.icon}"></i></span>
-        <span class="review-file-name">${escapeHtml(f.name)}</span>
-      </div>
-    </div>`;
-  }).join("");
-
-  let bodyHtml: string;
-  if (isReview) {
-    bodyHtml = `<div class="question-card-body">
-      <div class="q-step">${escapeHtml(t("chat.reviewPlanSub") || "If it does not match your intent, review and edit the files, or enter guidance in the input box.")}</div>
-      <div class="q-field">
-        <div class="q-field-label">${t("chat.reviewArtifact") || "Files"}</div>
-        <div class="q-field-text">${fileRowsHtml}</div>
-      </div>
-      <div class="q-actions" style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">
-        <button class="q-action-btn" data-plan-reject="${sessionId}" style="background:var(--bg-tertiary);color:var(--tool-text);border:1px solid var(--border)">${t("chat.reviewCancel") || "Cancel"}</button>
-        <button class="q-action-btn" data-plan-approve="${sessionId}" style="background:var(--accent);color:#fff;border:1px solid var(--accent)">${t("chat.reviewExecute") || "Execute"}</button>
-      </div>
-    </div>`;
-  } else if (isApproved) {
-    bodyHtml = `<div class="question-card-body">
-      <div class="q-step">${escapeHtml(t("chat.reviewPlanMain") || "The plan has been generated.")}</div>
-      <div class="q-field">
-        <div class="q-field-label">${t("chat.planContent")}</div>
-        <div class="q-field-text">${fileRowsHtml}</div>
-      </div>
-      <div class="q-step" style="color:var(--success-color);margin-top:8px"><i data-lucide="check-circle"></i> ${t("chat.reviewExecuted") || "Executed"}</div>
-    </div>`;
-  } else if (isRejected) {
-    bodyHtml = `<div class="question-card-body">
-      <div class="q-step">${escapeHtml(t("chat.reviewPlanMain") || "The plan has been generated.")}</div>
-      <div class="q-field">
-        <div class="q-field-label">${t("chat.planContent")}</div>
-        <div class="q-field-text">${fileRowsHtml}</div>
-      </div>
-      <div class="q-step" style="color:var(--danger-color);margin-top:8px"><i data-lucide="x-circle"></i> ${t("chat.reviewCancelled") || "Cancelled"}</div>
-    </div>`;
+  // Artifact rows come from the model's submit_review call.  Records
+  // persisted before that flow only carry the three fixed section names,
+  // which still resolve against the stored review directory.
+  let files: { path: string; label: string }[];
+  if (review.files && review.files.length) {
+    files = review.files;
   } else {
-    bodyHtml = `<div class="question-card-body">${fileRowsHtml}</div>`;
+    const dir = (review.dir_path || "").replace(/[/\\]+$/, "");
+    files = ["plan.md", "steps.md", "checklist.md"].map(n => ({
+      path: dir ? `${dir}/${n}` : "", label: n,
+    }));
   }
 
-  return `<div class="question-card" id="${cardId}">
-    <div class="question-card-header">
-      <i data-lucide="list-checks" class="question-card-icon"></i>
-      <span class="question-card-title">${escapeHtml(t("chat.reviewPlanMain") || "Plan Review")}</span>
-      <span class="question-card-badge">${isReview ? (t("chat.waitingForAnswer") || "Pending") : (isApproved ? (t("chat.reviewExecuted") || "Executed") : (t("chat.reviewCancelled") || "Cancelled"))}</span>
-    </div>
-    ${bodyHtml}
+  // Artifact cards: the file's own name is the title (the model's free-form
+  // label is not shown -- it decorated the row with things like "（一页）"),
+  // and the full path rides on the tooltip.
+  const filesHtml = `<div class="model-table">${files.map(f => {
+    const path = f.path || "";
+    const name = path ? (path.split(/[/\\]/).pop() || f.label) : f.label;
+    return `
+    <div class="model-table-row model-table-row--file"${path ? ` data-md-path="${escapeHtml(path)}" title="${escapeHtml(path)}"` : ""}>
+      <div class="model-table-cell model-cell-name">
+        <span class="review-file-icon"><img src="${getFileIcon(path || name)}" alt=""></span>
+        <span class="model-name-text">${escapeHtml(name)}</span>
+      </div>
+      <i data-lucide="arrow-up-right" class="lucide review-file-open"></i>
+    </div>`;
+  }).join("")}
   </div>`;
-}
 
-export function parsePlanSectionsImpl(text: string): { plan: string; steps: string; checklist: string } {
-  const result = { plan: "", steps: "", checklist: "" };
-  const re = /^##\s+(Plan|Steps|Checklist)\s*$/gmi;
-  const parts = text.split(re);
-  if (parts.length < 3) {
-    result.plan = text;
-    return result;
-  }
-  let key: "plan" | "steps" | "checklist" | "" = "";
-  for (let i = 1; i < parts.length; i++) {
-    const trimmed = parts[i].trim();
-    if (trimmed === "Plan" || trimmed === "Steps" || trimmed === "Checklist") {
-      key = trimmed.toLowerCase() as any;
-    } else if (key) {
-      result[key] = (result[key] + "\n\n" + parts[i]).trim();
-    }
-  }
-  return result;
+  const actionsHtml = `<div class="q-actions">
+        <button class="q-action-btn q-action-btn--ghost" onclick="event.stopPropagation();window.__reviewDecision('reject','${escapeHtml(rid)}')">${t("chat.reviewCancel")}</button>
+        <button class="q-action-btn q-action-btn--primary" onclick="event.stopPropagation();window.__reviewDecision('approve','${escapeHtml(rid)}')">${t("chat.reviewExecute")}</button>
+      </div>`;
+
+  // Header mirrors the question card: icon + fixed tool name in plain
+  // English (same convention as "Question"), not translated. The long
+  // status copy ("plan generated, proceed?") belongs to the body.
+  const headerTitle = isSpec ? "Spec Review" : "Plan Review";
+
+  return `<div class="question-card review-card" id="${cardId}" data-review-id="${escapeHtml(rid)}">
+    <div class="question-card-header">
+      <i data-lucide="${isSpec ? "file-text" : "list-checks"}" class="question-card-icon"></i>
+      <span class="question-card-title">${escapeHtml(headerTitle)}</span>
+    </div>
+    <div class="question-card-body">
+      <div class="q-step">${escapeHtml(title)}</div>
+      ${filesHtml}
+      ${actionsHtml}
+    </div>
+  </div>`;
 }
 
 export function renderWorkflowCardImpl(_self: Chat, _item: Extract<TimelineItem, { kind: "workflow" }>): string {

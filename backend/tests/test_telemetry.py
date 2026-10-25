@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,11 +23,13 @@
 
 from __future__ import annotations
 
-"""Tests for encre.telemetry -- agent event recording and session summaries.
+"""Tests for encre.telemetry: EncreTelemetry aggregation, session summaries,
+and the ToolCallRecord, TurnRecord, and RetryRecord dataclasses.
 
-Note: test_security_config.py already covers basic ToolCallRecord, TurnRecord,
-RetryRecord, record_tool_call, record_turn, record_retry, get_summary, flush,
-reset, and disabled telemetry. This file adds edge case and comprehensive tests.
+test_security_config.py already covers the basic happy paths for
+record_tool_call, record_turn, record_retry, get_summary, flush, reset, and
+disabled telemetry; this file adds the edge cases, aggregation math,
+reset semantics, and timestamp-ordering invariants.
 """
 
 import os
@@ -36,21 +38,23 @@ import time
 
 from encre.telemetry import EncreTelemetry, RetryRecord, ToolCallRecord, TurnRecord
 
-# Redirect telemetry data to a temp directory so tests never pollute
-# the real production telemetry directory (~/.dunimd/encre/telemetry/).
+# Redirect telemetry data to a temp directory so tests never pollute the
+# real production telemetry directory (~/.dunimd/encre/telemetry/).
 _test_telemetry_dir = tempfile.mkdtemp(prefix="encre_test_telemetry_")
 os.environ["ENCRE_DATA_DIR"] = _test_telemetry_dir
 
-# 鈹€鈹€ Edge Cases: Empty Telemetry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Edge Cases: Empty Telemetry ------------------------------------------
+
 
 class TestEmptyTelemetry:
-    """Engineered to validate that get_summary and flush return sensible defaults on empty state.
+    """Validate that get_summary and flush return sensible defaults on empty state.
 
-    This test class exercises the telemetry summary and flush paths with zero
-    recorded events across 2 scenarios to ensure the aggregation functions
-    never raise on empty lists and always return zeroed metrics rather than
-    NaN or None, which downstream dashboards and log formatters expect.
+    This class exercises the summary and flush paths with zero recorded
+    events across 2 scenarios to ensure the aggregation functions never raise
+    on empty lists and always return zeroed metrics rather than NaN or None,
+    which downstream dashboards and log formatters expect.
     """
+
     def test_verify_get_summary_returns_all_zero_fields_when_empty(self):
         """Validate that get_summary returns zeroed counters and empty dicts on no recorded events.
 
@@ -87,17 +91,19 @@ class TestEmptyTelemetry:
         assert result["total_tool_calls"] == 0
 
 
-# 鈹€鈹€ Tool Call Records 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Tool Call Records ----------------------------------------------------
+
 
 class TestToolCallRecordFields:
-    """Engineered to validate the ToolCallRecord default fields and optional overrides.
+    """Validate the ToolCallRecord default fields and optional overrides.
 
-    This test class exercises tokens_used default, error_message default,
+    This class exercises tokens_used default, error_message default,
     auto-generated timestamp, and explicit error_message setting across
-    4 scenarios to ensure the record carries correct defaults and can
-    store failure diagnostics without requiring every field to be
-    explicitly supplied by the caller.
+    4 scenarios to ensure the record carries correct defaults and can store
+    failure diagnostics without requiring every field to be explicitly
+    supplied by the caller.
     """
+
     def test_verify_default_tokens_used_is_zero(self):
         """Validate that tokens_used defaults to 0 when not supplied.
 
@@ -151,16 +157,18 @@ class TestToolCallRecordFields:
         assert rec.success is False
 
 
-# 鈹€鈹€ Turn Records 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Turn Records ---------------------------------------------------------
+
 
 class TestTurnRecordFields:
-    """Engineered to validate the TurnRecord default fields and optional overrides.
+    """Validate the TurnRecord default fields and optional overrides.
 
-    This test class exercises compact_triggered default, token_usage default,
+    This class exercises compact_triggered default, token_usage default,
     explicit token_usage, and explicit compact_triggered across 4 scenarios
     to ensure the turn record accurately captures LLM turn metrics including
     whether a context compaction was triggered during the turn.
     """
+
     def test_verify_default_compact_triggered_is_false(self):
         """Validate that compact_triggered defaults to False when not supplied.
 
@@ -216,16 +224,18 @@ class TestTurnRecordFields:
         assert rec.compact_triggered is True
 
 
-# 鈹€鈹€ Retry Records 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Retry Records --------------------------------------------------------
+
 
 class TestRetryRecordFields:
-    """Engineered to validate the RetryRecord default fields and full-record construction.
+    """Validate the RetryRecord default fields and full-record construction.
 
-    This test class exercises auto-generated timestamp and full-field
-    construction across 2 scenarios to ensure retry records carry attempt
-    number, error type, error detail, delay, and a wall-clock timestamp
-    so that retry histograms can be rendered by the observability layer.
+    This class exercises auto-generated timestamp and full-field construction
+    across 2 scenarios to ensure retry records carry attempt number, error
+    type, error detail, delay, and a wall-clock timestamp so that retry
+    histograms can be rendered by the observability layer.
     """
+
     def test_verify_retry_timestamp_is_auto_generated_within_call_bounds(self):
         """Validate that RetryRecord.timestamp falls between the times recorded before and after construction.
 
@@ -259,17 +269,20 @@ class TestRetryRecordFields:
         assert rec.delay_s == 5.0
 
 
-# 鈹€鈹€ Comprehensive Summary Tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Comprehensive Summary Tests ------------------------------------------
+
 
 class TestSummaryComprehensive:
-    """Engineered to validate that get_summary aggregates recorded events correctly.
+    """Validate that get_summary aggregates recorded events correctly.
 
-    This test class exercises tool-usage counting, success/failure separation,
+    This class exercises tool-usage counting, success/failure separation,
     average latency computation, turn latency averaging, total event counting,
-    compaction counting, session duration, and retry counting across 8 scenarios
-    to ensure the summary function computes every metric from the raw record
-    lists without hard-coded defaults that would mask aggregation bugs.
+    compaction counting, session duration, and retry counting across 8
+    scenarios to ensure the summary function computes every metric from the
+    raw record lists without hard-coded defaults that would mask aggregation
+    bugs.
     """
+
     def setup_method(self):
         """Initialize a fresh EncreTelemetry instance before each test for isolation."""
         self.tel = EncreTelemetry()
@@ -338,8 +351,8 @@ class TestSummaryComprehensive:
 
         The test records three turns with event_counts 5, 3, and 7 and asserts
         total_events == 15 because the event count tracks the number of
-        individual tool calls and LLM interactions within each turn, and
-        the sum is the standard measure of total telemetry volume.
+        individual tool calls and LLM interactions within each turn, and the
+        sum is the standard measure of total telemetry volume.
         """
         self.tel.record_turn(1, 5, 1000.0)
         self.tel.record_turn(2, 3, 2000.0)
@@ -365,8 +378,9 @@ class TestSummaryComprehensive:
         """Validate that session_duration_s is >= 0.0 for a freshly created telemetry instance.
 
         The test constructs a new telemetry object and asserts summary['session_duration_s']
-        >= 0.0 because the session duration is computed from _session_started_at and
-        must never be negative; a negative value would indicate a clock regression bug.
+        >= 0.0 because the session duration is computed from _session_started_at
+        and must never be negative; a negative value would indicate a clock
+        regression bug.
         """
         tel = EncreTelemetry()
         summary = tel.get_summary()
@@ -376,8 +390,8 @@ class TestSummaryComprehensive:
         """Validate that total_retries equals the number of recorded retry events.
 
         The test records three retries and asserts summary['total_retries'] == 3
-        because the retry counter is the inputs to the retry-rate calculation
-        and must faithfully reflect every recorded retry regardless of error type.
+        because the retry counter feeds the retry-rate calculation and must
+        faithfully reflect every recorded retry regardless of error type.
         """
         self.tel.record_retry(1, "http_status", "429", 1.0)
         self.tel.record_retry(2, "http_status", "503", 2.0)
@@ -386,17 +400,19 @@ class TestSummaryComprehensive:
         assert summary["total_retries"] == 3
 
 
-# 鈹€鈹€ Reset Behavior 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Reset Behavior -------------------------------------------------------
+
 
 class TestReset:
-    """Engineered to validate that reset clears all telemetry state and reinitializes session tracking.
+    """Validate that reset clears all telemetry state and reinitializes session tracking.
 
-    This test class exercises list clearing, session start reset, and
-    post-reset summary emptiness across 3 scenarios to ensure reset is
-    a complete teardown operation that leaves the telemetry object in
-    the same state as a freshly constructed one, so it can be reused
-    across test cases without leaking events.
+    This class exercises list clearing, session start reset, and post-reset
+    summary emptiness across 3 scenarios to ensure reset is a complete
+    teardown operation that leaves the telemetry object in the same state as
+    a freshly constructed one, so it can be reused across sessions without
+    leaking events.
     """
+
     def test_verify_reset_clears_tool_calls_turns_and_retries(self):
         """Validate that reset empties all three internal record lists.
 
@@ -421,10 +437,10 @@ class TestReset:
     def test_verify_reset_advances_session_start_timestamp(self):
         """Validate that reset sets _session_started_at to a time >= the previous value.
 
-        The test records the old start time, calls reset, and asserts the
-        new _session_started_at is >= the old value because reset must
-        reinitialize the session timer so that subsequent session_duration_s
-        measurements start from zero rather than accumulating across tests.
+        The test records the old start time, calls reset, and asserts the new
+        _session_started_at is >= the old value because reset must reinitialize
+        the session timer so that subsequent session_duration_s measurements
+        start from zero rather than accumulating across sessions.
         """
         tel = EncreTelemetry()
         old_start = tel._session_started_at
@@ -435,9 +451,9 @@ class TestReset:
         """Validate that get_summary after reset returns the same zeroed structure as an empty telemetry object.
 
         The test records a tool call, resets, and asserts total_tool_calls,
-        total_turns, and total_retries are all 0 because reset must make
-        the telemetry object indistinguishable from a fresh instance for
-        any code that inspects the summary post-reset.
+        total_turns, and total_retries are all 0 because reset must make the
+        telemetry object indistinguishable from a fresh instance for any code
+        that inspects the summary post-reset.
         """
         tel = EncreTelemetry()
         tel.record_tool_call("bash", 100.0, True)
@@ -448,17 +464,19 @@ class TestReset:
         assert summary["total_retries"] == 0
 
 
-# 鈹€鈹€ Disabled Telemetry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Disabled Telemetry ---------------------------------------------------
+
 
 class TestDisabledTelemetry:
-    """Engineered to validate that disabled telemetry performs no-ops without errors.
+    """Validate that disabled telemetry performs no-ops without errors.
 
-    This test class exercises record_tool_call, record_turn, record_retry,
+    This class exercises record_tool_call, record_turn, record_retry, the
     constructor default enabled state, explicit disabled construction, and
     flush behavior when disabled across 6 scenarios to ensure that turning
-    telemetry off is a hard no-op 鈥?no records are stored, no side effects
+    telemetry off is a hard no-op: no records are stored, no side effects
     occur, and flush still returns a valid empty summary dict.
     """
+
     def test_verify_record_tool_call_is_noop_when_disabled(self):
         """Validate that record_tool_call does not append to tool_calls when enabled=False.
 
@@ -474,10 +492,10 @@ class TestDisabledTelemetry:
     def test_verify_record_turn_is_noop_when_disabled(self):
         """Validate that record_turn does not append to turns when enabled=False.
 
-        The test constructs a disabled telemetry object, records a turn,
-        and asserts len(tel.turns) == 0 because the turn recording path
-        must be equally suppressed so that long-running sessions do not
-        accumulate hidden turn records when telemetry is disabled.
+        The test constructs a disabled telemetry object, records a turn, and
+        asserts len(tel.turns) == 0 because the turn recording path must be
+        equally suppressed so that long-running sessions do not accumulate
+        hidden turn records when telemetry is disabled.
         """
         tel = EncreTelemetry(enabled=False)
         tel.record_turn(1, 2, 1000.0)
@@ -486,10 +504,10 @@ class TestDisabledTelemetry:
     def test_verify_record_retry_is_noop_when_disabled(self):
         """Validate that record_retry does not append to retries when enabled=False.
 
-        The test constructs a disabled telemetry object, records a retry,
-        and asserts len(tel.retries) == 0 because retry tracking must also
-        be fully suppressed in disabled mode so that the error path does
-        not leak telemetry writes when the feature is turned off.
+        The test constructs a disabled telemetry object, records a retry, and
+        asserts len(tel.retries) == 0 because retry tracking must also be
+        fully suppressed in disabled mode so that the error path does not
+        leak telemetry writes when the feature is turned off.
         """
         tel = EncreTelemetry(enabled=False)
         tel.record_retry(1, "e", "d", 1.0)
@@ -499,8 +517,8 @@ class TestDisabledTelemetry:
         """Validate that EncreTelemetry() constructs with enabled=True by default.
 
         The test asserts tel.enabled is True because the default must be
-        enabled so that production sessions collect telemetry out of the
-        box without requiring an explicit constructor argument.
+        enabled so that production sessions collect telemetry out of the box
+        without requiring an explicit constructor argument.
         """
         tel = EncreTelemetry()
         assert tel.enabled is True
@@ -508,9 +526,9 @@ class TestDisabledTelemetry:
     def test_verify_explicitly_disabled_instance_has_enabled_false(self):
         """Validate that EncreTelemetry(enabled=False) sets the enabled flag to False.
 
-        The test asserts tel.enabled is False because callers must be able
-        to disable telemetry explicitly at construction time, for example
-        in test fixtures or privacy-sensitive deployments.
+        The test asserts tel.enabled is False because callers must be able to
+        disable telemetry explicitly at construction time, for example in test
+        fixtures or privacy-sensitive deployments.
         """
         tel = EncreTelemetry(enabled=False)
         assert tel.enabled is False
@@ -519,9 +537,9 @@ class TestDisabledTelemetry:
         """Validate that flush returns a zeroed summary dict when telemetry is disabled.
 
         The test constructs a disabled telemetry object, calls flush, and
-        asserts the result is a dict with total_tool_calls == 0 because
-        flush must remain callable and safe even when no records were
-        ever collected during a disabled session.
+        asserts the result is a dict with total_tool_calls == 0 because flush
+        must remain callable and safe even when no records were ever collected
+        during a disabled session.
         """
         tel = EncreTelemetry(enabled=False)
         result = tel.flush()
@@ -529,16 +547,18 @@ class TestDisabledTelemetry:
         assert result["total_tool_calls"] == 0
 
 
-# 鈹€鈹€ Timestamp Consistency 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ---- Timestamp Consistency ------------------------------------------------
+
 
 class TestTimestampConsistency:
-    """Engineered to validate that recorded events are timestamped in monotonically non-decreasing order.
+    """Validate that recorded events are timestamped in monotonically non-decreasing order.
 
-    This test class exercises tool call timestamp ordering and turn record
-    timestamp ordering across 2 scenarios to ensure that the telemetry
-    system does not produce out-of-order timestamps, which would break
-    time-series aggregation and session-duration calculations.
+    This class exercises tool call timestamp ordering and turn record timestamp
+    ordering across 2 scenarios to ensure the telemetry system does not produce
+    out-of-order timestamps, which would break time-series aggregation and
+    session-duration calculations.
     """
+
     def test_verify_tool_call_records_are_ordered_by_timestamp(self):
         """Validate that tool call timestamps are in non-decreasing order after sequential recordings.
 
@@ -557,10 +577,10 @@ class TestTimestampConsistency:
     def test_verify_turn_records_are_ordered_by_timestamp(self):
         """Validate that turn timestamps are in non-decreasing order after sequential recordings.
 
-        The test records five turns, asserts len(tel.turns) == 5, and
-        asserts the timestamp list equals its sorted version because turn
-        ordering is the foundation of session timeline reconstruction and
-        any inversion would corrupt the perceived session flow.
+        The test records five turns, asserts len(tel.turns) == 5, and asserts
+        the timestamp list equals its sorted version because turn ordering is
+        the foundation of session timeline reconstruction and any inversion
+        would corrupt the perceived session flow.
         """
         tel = EncreTelemetry()
         for i in range(5):

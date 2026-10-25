@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -31,8 +31,14 @@ import tempfile
 import time
 import uuid
 
-from encre.sandbox.types import SandboxConfig, SandboxResult
+from encre.sandbox.types import NetworkPolicy, SandboxConfig, SandboxResult
 
+
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
 
 class EncreContainerSandbox:
     def __init__(self, workspace: str, config: SandboxConfig | None = None) -> None:
@@ -41,35 +47,47 @@ class EncreContainerSandbox:
         self._container_id: str | None = None
         self._active: bool = False
         self._temp_seccomp: str | None = None
+        # Name assigned to the one-shot ``docker run`` container of the
+        # current execute() call so it can be killed on timeout (the docker
+        # CLI dying does NOT stop the container itself).
+        self._current_container_name: str | None = None
 
     def _build_docker_command(self, command: str) -> list[str]:
         cmd = ["docker", "run", "--rm"]
 
-        if self.config.network == "none":
+        # Deterministic name so a timed-out run can be killed explicitly.
+        self._current_container_name = f"yim_sandbox_{uuid.uuid4().hex[:12]}"
+        cmd.extend(["--name", self._current_container_name])
+
+        network_policy = self.config.network.policy
+        if network_policy == NetworkPolicy.NONE:
             cmd.append("--network=none")
-        elif self.config.network == "host":
+        elif network_policy == NetworkPolicy.HOST:
             cmd.append("--network=host")
-        elif self.config.network == "limited":
+        elif network_policy == NetworkPolicy.LIMITED:
+            # Domain-level allow-listing is not expressible via ``docker run``
+            # flags; ``--add-host`` needs host:ip pairs and cannot filter
+            # outbound DNS.  LIMITED therefore degrades to the default bridge
+            # network here; domain enforcement lives in the policy layer.
             cmd.append("--network=bridge")
-            for domain in self.config.allowed_domains:
-                cmd.extend(["--add-host", domain])
 
-        cmd.extend(["--memory", self.config.memory_limit])
-        cmd.extend(["--cpus", str(self.config.cpu_limit)])
+        cmd.extend(["--memory", self.config.resource.memory_limit])
+        cmd.extend(["--cpus", str(self.config.resource.cpu_limit)])
 
-        mount_mode = "ro" if self.config.read_only else "rw"
+        read_only = self.config.file_protection.read_only_root
+        mount_mode = "ro" if read_only else "rw"
         cmd.extend(["-v", f"{self.workspace}:{self.config.workspace_mount}:{mount_mode}"])
 
         for host_path, container_path in self.config.extra_mounts.items():
-            mount_opts = "ro" if self.config.read_only else "rw"
+            mount_opts = "ro" if read_only else "rw"
             cmd.extend(["-v", f"{host_path}:{container_path}:{mount_opts}"])
 
-        if self.config.read_only:
+        if read_only:
             cmd.append("--read-only")
             cmd.append("--tmpfs=/tmp:exec")
             cmd.append("--tmpfs=/var/tmp:exec")
 
-        for k, v in self.config.env_vars.items():
+        for k, v in self.config.env.env_vars.items():
             cmd.extend(["-e", f"{k}={v}"])
 
         self._temp_seccomp = self._build_seccomp_profile()
@@ -81,6 +99,27 @@ class EncreContainerSandbox:
 
         return cmd
 
+    def _kill_current_container(self) -> None:
+        """Best-effort kill of the current one-shot container (timeout path)."""
+        name = self._current_container_name
+        self._current_container_name = None
+        if not name:
+            return
+        try:
+            subprocess.run(
+                ["docker", "kill", name],
+                capture_output=True, timeout=15,
+            )
+        except Exception:
+            logger.debug("exception suppressed", exc_info=True)
+        # --rm should clean up after kill; force-remove as a backstop.
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", name],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            logger.debug("exception suppressed", exc_info=True)
     def _build_seccomp_profile(self) -> str | None:
         profile = {
             "defaultAction": "SCMP_ACT_ALLOW",
@@ -105,7 +144,7 @@ class EncreContainerSandbox:
             ],
         }
 
-        if self.config.network == "none":
+        if self.config.network.policy == NetworkPolicy.NONE:
             profile["syscalls"][0]["names"].extend([
                 "socket", "bind", "connect", "listen", "accept",
                 "sendto", "recvfrom", "sendmsg", "recvmsg",
@@ -141,6 +180,9 @@ class EncreContainerSandbox:
                 duration_ms=(time.time() - start) * 1000,
             )
         except subprocess.TimeoutExpired:
+            # Killing the docker CLI does not stop the container; kill it
+            # explicitly so no orphan keeps running.
+            self._kill_current_container()
             return SandboxResult(
                 stdout="",
                 stderr="Command timed out",
@@ -168,8 +210,7 @@ class EncreContainerSandbox:
                     os.unlink(self._temp_seccomp)
                     self._temp_seccomp = None
                 except OSError:
-                    pass
-
+                    logger.debug("exception suppressed", exc_info=True)
     async def execute_async(self, command: str, timeout: int | None = None) -> SandboxResult:
         start = time.time()
         cmd = self._build_docker_command(command)
@@ -197,7 +238,11 @@ class EncreContainerSandbox:
                     proc.kill()
                     await proc.wait()
                 except Exception:
-                    pass
+                    logger.debug("exception suppressed", exc_info=True)
+                # Killing the docker CLI does not stop the container; kill it
+                # explicitly so no orphan keeps running.
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self._kill_current_container)
                 return SandboxResult(
                     stdout="",
                     stderr="Command timed out",
@@ -225,37 +270,38 @@ class EncreContainerSandbox:
                     os.unlink(self._temp_seccomp)
                     self._temp_seccomp = None
                 except OSError:
-                    pass
-
+                    logger.debug("exception suppressed", exc_info=True)
     def run_container(self) -> str:
         container_name = f"yim_sandbox_{uuid.uuid4().hex[:12]}"
         cmd = ["docker", "run", "-d", "--name", container_name]
 
-        if self.config.network == "none":
+        network_policy = self.config.network.policy
+        if network_policy == NetworkPolicy.NONE:
             cmd.append("--network=none")
-        elif self.config.network == "host":
+        elif network_policy == NetworkPolicy.HOST:
             cmd.append("--network=host")
-        elif self.config.network == "limited":
+        elif network_policy == NetworkPolicy.LIMITED:
+            # See _build_docker_command: domain allow-listing is not
+            # expressible via docker run flags.
             cmd.append("--network=bridge")
-            for domain in self.config.allowed_domains:
-                cmd.extend(["--add-host", domain])
 
-        cmd.extend(["--memory", self.config.memory_limit])
-        cmd.extend(["--cpus", str(self.config.cpu_limit)])
+        cmd.extend(["--memory", self.config.resource.memory_limit])
+        cmd.extend(["--cpus", str(self.config.resource.cpu_limit)])
 
-        mount_mode = "ro" if self.config.read_only else "rw"
+        read_only = self.config.file_protection.read_only_root
+        mount_mode = "ro" if read_only else "rw"
         cmd.extend(["-v", f"{self.workspace}:{self.config.workspace_mount}:{mount_mode}"])
 
         for host_path, container_path in self.config.extra_mounts.items():
-            mount_opts = "ro" if self.config.read_only else "rw"
+            mount_opts = "ro" if read_only else "rw"
             cmd.extend(["-v", f"{host_path}:{container_path}:{mount_opts}"])
 
-        if self.config.read_only:
+        if read_only:
             cmd.append("--read-only")
             cmd.append("--tmpfs=/tmp:exec")
             cmd.append("--tmpfs=/var/tmp:exec")
 
-        for k, v in self.config.env_vars.items():
+        for k, v in self.config.env.env_vars.items():
             cmd.extend(["-e", f"{k}={v}"])
 
         seccomp_path = self._build_seccomp_profile()
@@ -319,16 +365,14 @@ class EncreContainerSandbox:
                 capture_output=True, timeout=15,
             )
         except Exception:
-            pass
-
+            logger.debug("exception suppressed", exc_info=True)
         try:
             subprocess.run(
                 ["docker", "rm", "-f", self._container_id],
                 capture_output=True, timeout=10,
             )
         except Exception:
-            pass
-
+            logger.debug("exception suppressed", exc_info=True)
         self._container_id = None
         self._active = False
 
@@ -342,7 +386,7 @@ class EncreContainerSandbox:
             try:
                 os.unlink(self._temp_seccomp)
             except OSError:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
         self._temp_seccomp = None
 
     def is_available(self) -> bool:

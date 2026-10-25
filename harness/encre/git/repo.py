@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Repository inspection wrapper for the Encre agent.
 
@@ -375,7 +377,7 @@ class EncreGitRepo:
                     insertions += add
                     deletions += dlt
                 except ValueError:
-                    pass
+                    logger.debug("exception suppressed", exc_info=True)
         return {"files": files, "insertions": insertions, "deletions": deletions}
 
     def _run_git(self, args: list[str], timeout: float = 15.0) -> str:
@@ -413,7 +415,13 @@ class EncreGitRepo:
         """Walk up from the workspace to locate the nearest ``.git`` path.
 
         Returns:
-            The ``.git`` path if found, otherwise None.
+            The ``.git`` path if found
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
+, otherwise None.
         """
         import os
         # Start at the absolute workspace path and ascend toward the filesystem root.

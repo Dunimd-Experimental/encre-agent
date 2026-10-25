@@ -1,0 +1,60 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-connector-wecom"
+version = "0.5.0"
+description = "EA (Encre Agent) — system-default WeCom (Enterprise WeChat) connector plugin."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "connector",
+    "wecom",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+    "encre-core>=0.5.0",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.entry-points."ea.plugins"]
+wecom = "ea_connector_wecom.plugin:create_plugin"
+
+[project.optional-dependencies]
+all = [
+    "aiohttp>=3.9",
+    "httpx>=0.27",
+    "qrcode>=7.0",
+    "cryptography>=41.0",
+    "defusedxml>=0.7",
+]
+
+[tool.ea]
+icon = "briefcase"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_connector_wecom*",
+]

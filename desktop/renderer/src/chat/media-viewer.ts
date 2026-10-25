@@ -98,6 +98,30 @@ export class MediaViewer {
   private volIconEl: HTMLElement | null = null;
   private playBtnEl: HTMLElement | null = null;
 
+  /** Window-level wheel handler (capture phase) so scroll-to-zoom works no
+   *  matter which descendant the pointer is over. Bound in bindImageEvents,
+   *  removed in destroy(). */
+  private _onWheel = (e: WheelEvent): void => {
+    if (this.media.type !== "image") return;
+    const target = (this.imgEl ?? this.el) as HTMLElement;
+    const r = target.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return;
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return;
+    if ((e.target as HTMLElement)?.closest?.(".media-viewer-toolbar")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? r.height : 1;
+    const delta = e.deltaY * unit;
+    const newZoom = Math.min(5, Math.max(0.25, this.zoom * Math.exp(-delta * 0.0015)));
+    const cx = r.width / 2;
+    const cy = r.height / 2;
+    this.panX = cx - (cx - this.panX) * newZoom / this.zoom;
+    this.panY = cy - (cy - this.panY) * newZoom / this.zoom;
+    this.zoom = newZoom;
+    this.clampPan();
+    this.applyImgTransform();
+  };
+
   constructor(el: HTMLElement, media: MediaData) {
     this.el = el;
     this.media = media;
@@ -143,6 +167,7 @@ export class MediaViewer {
         : "");
     this.imgEl = this.el.querySelector(".media-viewer-img");
     this.toolbarEl = this.el.querySelector(".media-viewer-toolbar");
+    if (this.imgEl) this.imgEl.style.transition = "none";
     if (typeof (window as any).lucide !== "undefined") {
       (window as any).lucide.createIcons({ root: this.el });
     }
@@ -178,28 +203,16 @@ export class MediaViewer {
     });
     window.addEventListener("mousemove", (e) => {
       if (!this.dragging) return;
-      this.panX = this.dragPanX + (e.clientX - this.dragStartX);
-      this.panY = this.dragPanY + (e.clientY - this.dragStartY);
+      this.panX = this.dragPanX + (e.clientX - this.dragStartX) * 0.5;
+      this.panY = this.dragPanY + (e.clientY - this.dragStartY) * 0.5;
       this.clampPan();
       this.applyImgTransform();
     });
     window.addEventListener("mouseup", () => { this.dragging = false; });
 
-    // Scroll to zoom (centered on cursor)
-    this.el.addEventListener("wheel", (e: WheelEvent) => {
-      if ((e.target as HTMLElement).closest(".media-viewer-toolbar")) return;
-      e.preventDefault();
-      const factor = 1 - e.deltaY * 0.001;
-      const newZoom = Math.min(5, Math.max(0.25, this.zoom * factor));
-      const rect = this.el.getBoundingClientRect();
-      const cx = e.clientX - rect.left;
-      const cy = e.clientY - rect.top;
-      this.panX = cx - (cx - this.panX) * newZoom / this.zoom;
-      this.panY = cy - (cy - this.panY) * newZoom / this.zoom;
-      this.zoom = newZoom;
-      this.clampPan();
-      this.applyImgTransform();
-    }, { passive: false });
+    // Scroll to zoom (centered on element). Window-level capture listener so
+    // it fires regardless of which descendant is under the pointer.
+    window.addEventListener("wheel", this._onWheel, { passive: false, capture: true });
 
     window.addEventListener("resize", () => { this.measureBase(); this.clampPan(); this.applyImgTransform(); });
 
@@ -457,6 +470,7 @@ export class MediaViewer {
   }
 
   destroy(): void {
+    window.removeEventListener("wheel", this._onWheel, { capture: true });
     if (this.videoEl) {
       this.videoEl.pause();
       this.videoEl.removeAttribute("src");

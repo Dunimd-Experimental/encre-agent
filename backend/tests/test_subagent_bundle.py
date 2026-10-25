@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,7 @@
 
 from __future__ import annotations
 
-"""Tests for sub-agent bundles (P1.4): external agent CLIs as real tools.
+"""Tests for sub-agent bundles (P1.4): external agent CLIs exposed as real tools.
 
 Every test drives REAL processes on this machine (``python -c ...``) — no
 fake binaries, no mocks.  The permission-gating test uses the real Rust
@@ -67,6 +67,13 @@ def _collect_bus() -> tuple[EventSourcedBus, dict[str, list]]:
 # ---------------------------------------------------------------------------
 
 async def test_happy_path_runs_real_command_and_publishes_both_events():
+    """Validate that a real python command runs and emits both started and finished events.
+
+    Executes a genuine ``python -c`` subprocess through the bundle tool and
+    asserts the command output is returned, that both subagent_started and
+    subagent_finished are published with the session id and bundle name, and
+    that the finished payload reports a zero exit code with the full key set.
+    """
     bus, collected = _collect_bus()
     bundle = SubAgentBundle(
         name="py_agent",
@@ -104,6 +111,12 @@ async def test_happy_path_runs_real_command_and_publishes_both_events():
 # ---------------------------------------------------------------------------
 
 async def test_prompt_is_passed_as_single_argv_element_no_injection():
+    """Validate that the prompt is a single inert argv element and cannot inject shell commands.
+
+    Feeds shell metacharacters (&&, ;, |, rm) through a script that echoes
+    argv[1] and asserts the payload comes back verbatim and unexecuted, so
+    command chaining, redirection and deletion never run.
+    """
     malicious = "hello && echo PWNED; rm -rf / | echo hacked"
     bundle = SubAgentBundle(
         name="echo_agent",
@@ -124,6 +137,13 @@ async def test_prompt_is_passed_as_single_argv_element_no_injection():
 # ---------------------------------------------------------------------------
 
 async def test_timeout_kills_process_tree_and_returns_error_fast():
+    """Validate that an over-long subprocess is killed fast with a clear timeout error and no orphan.
+
+    Runs a 30 second sleeper under a 2 second timeout, asserts the error
+    surfaces well under 10 seconds with timeout and kill wording, then scans
+    psutil for any surviving process whose command line carries a unique
+    marker so an escaped child cannot outlive the bundle.
+    """
     marker = f"encre-orphan-check-{uuid.uuid4().hex}"
     script = f"import os, time; print('{marker}', os.getpid(), flush=True); time.sleep(30)"
     bundle = SubAgentBundle(
@@ -164,6 +184,13 @@ async def test_timeout_kills_process_tree_and_returns_error_fast():
 # ---------------------------------------------------------------------------
 
 async def test_failing_command_surfaces_stderr_and_ok_false():
+    """Validate that a non-zero exit surfaces the exit code, stderr, and ok=False in the event.
+
+    Runs a subprocess that writes to stderr and exits 1, then asserts the
+    error string contains the exit code and the stderr text, the finished
+    event reports ok False with exit code 1, and a started event was emitted
+    for the process that did actually launch.
+    """
     bus, collected = _collect_bus()
     bundle = SubAgentBundle(
         name="failing_agent",
@@ -193,6 +220,12 @@ async def test_failing_command_surfaces_stderr_and_ok_false():
 # ---------------------------------------------------------------------------
 
 async def test_missing_binary_is_refused_with_clear_error():
+    """Validate that a missing executable is refused up front with no process spawned.
+
+    Points the bundle at a guaranteed-absent binary name and asserts the error
+    names it with "not found" wording, that no subagent_started event fired,
+    and that exactly one failed subagent_finished event was published.
+    """
     bus, collected = _collect_bus()
     ghost = f"encre-no-such-binary-{uuid.uuid4().hex[:8]}"
     bundle = SubAgentBundle(
@@ -220,6 +253,12 @@ async def test_missing_binary_is_refused_with_clear_error():
 # ---------------------------------------------------------------------------
 
 async def test_child_env_is_minimal_sentinel_leaks_only_via_allowlist(monkeypatch):
+    """Validate that parent environment secrets stay hidden unless explicitly allowlisted.
+
+    Sets a sentinel variable in the parent, then asserts a bundle without an
+    allowlist never sees it while a bundle carrying env_allowlist receives the
+    exact secret value.
+    """
     sentinel = "ENCRE_BUNDLE_TEST_SENTINEL"
     monkeypatch.setenv(sentinel, "top-secret-value")
 
@@ -254,6 +293,12 @@ async def test_child_env_is_minimal_sentinel_leaks_only_via_allowlist(monkeypatc
 # ---------------------------------------------------------------------------
 
 async def test_oversized_output_is_truncated_with_marker():
+    """Validate that oversized stdout is capped to the configured budget with a truncation marker.
+
+    Captures 100000 characters of output under a 500 character limit and
+    asserts the returned text is small and carries the truncation notice so
+    callers know the output was cut rather than complete.
+    """
     bundle = SubAgentBundle(
         name="chatty_agent",
         command=["python", "-c", "print('x' * 100000)"],
@@ -271,6 +316,13 @@ async def test_oversized_output_is_truncated_with_marker():
 # ---------------------------------------------------------------------------
 
 def test_register_subagent_bundle_produces_valid_registry_tool():
+    """Validate that register_subagent_bundle() yields a fully valid ToolRegistry tool.
+
+    Registers a bundle through the helper into a real ToolRegistry and asserts
+    the registry hands back the same tool object, the tool metadata and
+    input_schema are correct, the OpenAI function format is shaped right, and
+    the bundle retains its configured timeout.
+    """
     registry = ToolRegistry()
     bundle, tool = register_subagent_bundle(
         registry,

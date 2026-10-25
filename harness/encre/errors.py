@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Unified error taxonomy for the agent platform.
 
@@ -37,7 +39,6 @@ The frontend SHOULD use ``category`` for icon/color selection and
 ``code`` for precise error handling, NEVER parse the ``message`` text.
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -51,48 +52,48 @@ class ErrorCode(str, Enum):
     ``ERROR_METADATA``.
     """
 
-    # 鈹€鈹€ Auth (4) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Auth (4) ────────────────────────────────────────────────────
     AUTH_INVALID_KEY = "auth_invalid_key"
     AUTH_EXPIRED = "auth_expired"
     AUTH_PERMISSION = "auth_permission"
     AUTH_QUOTA_EXCEEDED = "auth_quota_exceeded"
 
-    # 鈹€鈹€ Rate limit (2) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Rate limit (2) ──────────────────────────────────────────────
     RATE_LIMIT = "rate_limit"
     RATE_LIMIT_UPSTREAM = "rate_limit_upstream"
 
-    # 鈹€鈹€ Context (3) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Context (3) ─────────────────────────────────────────────────
     CONTEXT_OVERFLOW = "context_overflow"
     CONTEXT_TOO_LONG = "context_too_long"
     MAX_OUTPUT_TOKENS = "max_output_tokens"
 
-    # 鈹€鈹€ Network (4) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Network (4) ─────────────────────────────────────────────────
     NETWORK_TIMEOUT = "network_timeout"
     NETWORK_CONNECTION = "network_connection"
     NETWORK_DNS = "network_dns"
     NETWORK_SSL = "network_ssl"
 
-    # 鈹€鈹€ Server (2) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Server (2) ──────────────────────────────────────────────────
     SERVER_ERROR = "server_error"
     SERVER_OVERLOADED = "server_overloaded"
 
-    # 鈹€鈹€ Model (3) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Model (3) ───────────────────────────────────────────────────
     MODEL_NOT_FOUND = "model_not_found"
     MODEL_UNAVAILABLE = "model_unavailable"
     MODEL_THINKING_SIGNATURE = "model_thinking_signature"
 
-    # 鈹€鈹€ Tool (5) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Tool (5) ────────────────────────────────────────────────────
     TOOL_NOT_FOUND = "tool_not_found"
     TOOL_EXECUTION = "tool_execution"
     TOOL_PERMISSION_DENIED = "tool_permission_denied"
     TOOL_INPUT_INVALID = "tool_input_invalid"
     TOOL_SANDBOX = "tool_sandbox"
 
-    # 鈹€鈹€ Session (2) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Session (2) ─────────────────────────────────────────────────
     SESSION_NOT_FOUND = "session_not_found"
     SESSION_CANCELLED = "session_cancelled"
 
-    # 鈹€鈹€ Unknown 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Unknown ─────────────────────────────────────────────────────
     UNKNOWN = "unknown"
 
 
@@ -379,7 +380,7 @@ class WithheldError:
         return str(self.exception)
 
 
-# 鈹€鈹€ Prompt-injection defense helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Prompt-injection defense helpers ─────────────────────────────────────
 
 _UNTRUSTED_DELIMITER_OPEN = "<untrusted_tool_result>"
 _UNTRUSTED_DELIMITER_CLOSE = "</untrusted_tool_result>"

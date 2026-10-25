@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,7 +23,12 @@
 
 from __future__ import annotations
 
-"""Tests for encre.autosafety -- ML-based safety classifier for auto permission mode."""
+"""Tests for encre.autosafety -- ML-based safety classifier for auto permission mode.
+
+Exercises the AutoDecision enum and the ClassificationResult / UserDecisionRecord data
+records, then the EncreAutoSafetyClassifier state machine, pattern pre-classifier,
+cache-key generation and LLM response parser that gate tool permissions.
+"""
 
 import pytest
 from encre.autosafety import (
@@ -36,7 +41,7 @@ from encre.autosafety import (
 # ---- AutoDecision Enum ----
 
 class TestAutoDecision:
-    """Engineered to validate the AutoDecision enum structure and value uniqueness.
+    """Validates the AutoDecision enum structure and value uniqueness.
 
     This test class exercises the five decision levels (SAFE, LOW_RISK, ASK_USER,
     HIGH_RISK, BLOCK) across 3 scenarios to ensure every member exists, all values are
@@ -61,7 +66,7 @@ class TestAutoDecision:
         """Validate that all five decision levels map to unique enum values.
 
         The test collects all members into a set and asserts the cardinality is 5, confirming
-        no two levels share the same underlying value — a collision would cause the classifier
+        no two levels share the same underlying value -- a collision would cause the classifier
         to conflate semantically distinct outcomes.
         """
         values = {AutoDecision.SAFE, AutoDecision.LOW_RISK, AutoDecision.ASK_USER,
@@ -81,7 +86,7 @@ class TestAutoDecision:
 # ---- ClassificationResult ----
 
 class TestClassificationResult:
-    """Engineered to validate the ClassificationResult data record construction.
+    """Validates the ClassificationResult data record construction.
 
     This test class exercises the result record across 3 scenarios: default field
     population, full-constructor usage with all fields populated, and confidence bounds.
@@ -146,7 +151,7 @@ class TestClassificationResult:
 # ---- UserDecisionRecord ----
 
 class TestUserDecisionRecord:
-    """Engineered to validate the UserDecisionRecord data record.
+    """Validates the UserDecisionRecord data record.
 
     This test class exercises the record across 2 scenarios: default timestamp population
     and explicit approval/denial storage. The record is appended to the classifier's
@@ -186,7 +191,7 @@ class TestUserDecisionRecord:
 # ---- EncreAutoSafetyClassifier ----
 
 class TestEncreAutoSafetyClassifier:
-    """Engineered to validate the EncreAutoSafetyClassifier state machine and learning loop.
+    """Validates the EncreAutoSafetyClassifier state machine and learning loop.
 
     This test class exercises the classifier's internal state, parameterised construction,
     statistics property, and the learn_from_user / get_user_pattern learning pathway across
@@ -326,7 +331,7 @@ class TestEncreAutoSafetyClassifier:
 # ---- Pattern Classification (sync) ----
 
 class TestPatternClassification:
-    """Engineered to validate the synchronous pattern-based pre-classifier.
+    """Validates the synchronous pattern-based pre-classifier.
 
     This test class exercises the _pattern_classify method across 10 scenarios covering
     benign commands, destructive commands, sensitive paths, credential files, unknown tools,
@@ -438,7 +443,7 @@ class TestPatternClassification:
 # ---- Cache Key Generation ----
 
 class TestCacheKey:
-    """Engineered to validate the classification cache key generation logic.
+    """Validates the classification cache key generation logic.
 
     This test class exercises _make_cache_key across 6 scenarios to ensure keys are
     deterministic for identical inputs, differentiated for different arguments, truncated
@@ -475,7 +480,7 @@ class TestCacheKey:
         """Validate that identical arguments produce an identical cache key (determinism).
 
         The test constructs two keys from the same tool and argument dict and asserts equality,
-        confirming the key function is deterministic — a prerequisite for cache correctness.
+        confirming the key function is deterministic -- a prerequisite for cache correctness.
         """
         k1 = self.classifier._make_cache_key("bash", {"command": "ls", "path": "/tmp"})
         k2 = self.classifier._make_cache_key("bash", {"command": "ls", "path": "/tmp"})
@@ -515,7 +520,7 @@ class TestCacheKey:
 # ---- Parse Response ----
 
 class TestParseResponse:
-    """Engineered to validate the LLM response parser for safety classification JSON.
+    """Validates the LLM response parser for safety classification JSON.
 
     This test class exercises _parse_response across 8 scenarios covering every decision
     level (SAFE, LOW_RISK, ASK_USER, HIGH_RISK, BLOCK), malformed JSON fallback, markdown

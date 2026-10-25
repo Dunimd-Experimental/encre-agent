@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Built-in backend adapters -- the real dispatch table of the factory (P1.2).
 
@@ -47,7 +49,6 @@ metadata already lives in the static registry
 (:mod:`encre.backends.registry`), so they always decline enrichment.
 """
 
-from __future__ import annotations
 
 from typing import Any
 
@@ -60,6 +61,32 @@ from encre.backends.base import BaseBackend
 from encre.backends.bedrock import BedrockBackend
 from encre.backends.deepseek import DeepSeekBackend
 from encre.backends.failover import FailoverBackend
+from encre.backends.gateway_providers import (
+    AtomicChatBackend,
+    AzureCognitiveBackend,
+    AzureOpenAIBackend,
+    BasetenBackend,
+    CerebrasBackend,
+    CortecsBackend,
+    DeepInfraBackend,
+    FireworksBackend,
+    FrogBotBackend,
+    HeliconeBackend,
+    IONetBackend,
+    LlamaCppBackend,
+    NebiusBackend,
+    OVHCloudBackend,
+    OllamaCloudBackend,
+    OpenAI302Backend,
+    ScalewayBackend,
+    STACKITBackend,
+    TogetherBackend,
+    VeniceBackend,
+    VercelAIGatewayBackend,
+    XAIBackend,
+    ZAIBackend,
+    ZenMuxBackend,
+)
 from encre.backends.github_copilot import GitHubCopilotBackend
 from encre.backends.glm import GLMBackend
 from encre.backends.gmi import GMIBackend
@@ -148,7 +175,9 @@ def _build_thinking_kwargs(
             result["thinking_budget"] = budget
         return result
 
-    # OpenAI-protocol backends that accept reasoning_effort (o-series, GPT-5.x).
+    # OpenAI-protocol backends that accept reasoning_effort (o-series, GPT-5.x,
+    # and the gateway/infra providers verified to forward it -- the level probe
+    # in encre.backends.multimodal decides the real set per endpoint live).
     if backend_type in (
         "openai",
         "openai_compatible",
@@ -161,6 +190,26 @@ def _build_thinking_kwargs(
         "opencode-zen",
         "opencode-go",
         "huggingface",
+        "302ai",
+        "azure-openai",
+        "azure-cognitive",
+        "baseten",
+        "cerebras",
+        "cortecs",
+        "deep-infra",
+        "fireworks",
+        "helicone",
+        "ionet",
+        "nebius",
+        "ollama-cloud",
+        "ovhcloud",
+        "scaleway",
+        "stackit",
+        "together",
+        "venice",
+        "vercel",
+        "xai",
+        "zenmux",
     ):
         result = {"thinking_enabled": enabled}
         if level:
@@ -194,6 +243,7 @@ def _build_thinking_kwargs(
         "minimax",
         "kilocode",
         "ollama",
+        "zai",
     ):
         return {"thinking_enabled": enabled}
 
@@ -224,6 +274,11 @@ def _build_failover_backends(
             md = m.model_id or default_model
             tc = getattr(m, "thinking_config", None)
             cw = getattr(m, "context_window", 0) or 0
+            eh = getattr(m, "headers", None) or None
+            # Provider "advanced config" sampling overrides (None = unset).
+            temp = getattr(m, "temperature", None)
+            topp = getattr(m, "top_p", None)
+            topk = getattr(m, "top_k", None)
         elif isinstance(m, dict):  # Raw dict
             name = m.get("name") or m.get("model_id", "unknown")
             bt = m.get("backend_type", "openai")
@@ -232,6 +287,10 @@ def _build_failover_backends(
             md = m.get("model_id", default_model)
             tc = m.get("thinking_config")
             cw = m.get("context_window", 0) or 0
+            eh = m.get("headers") or None
+            temp = m.get("temperature")
+            topp = m.get("top_p")
+            topk = m.get("top_k")
         else:
             continue
         be = create_backend(
@@ -241,6 +300,10 @@ def _build_failover_backends(
             model=md,
             thinking_config=tc,
             context_window=cw,
+            extra_headers=eh,
+            temperature=temp,
+            top_p=topp,
+            top_k=topk,
         )
         if be is not None:
             result.append((name, be))
@@ -373,4 +436,30 @@ BUILTIN_ADAPTERS: tuple[Any, ...] = (
     SimpleBackendAdapter("lmstudio", LMStudioBackend),
     SimpleBackendAdapter("github-copilot", GitHubCopilotBackend),
     SimpleBackendAdapter("volcengine-ark", VolcengineArkBackend),
+    # OpenAI-compatible gateway providers (base URLs verified against each
+    # provider's official documentation; see gateway_providers.py).
+    SimpleBackendAdapter("302ai", OpenAI302Backend),
+    SimpleBackendAdapter("atomic-chat", AtomicChatBackend),
+    SimpleBackendAdapter("azure-openai", AzureOpenAIBackend),
+    SimpleBackendAdapter("azure-cognitive", AzureCognitiveBackend),
+    SimpleBackendAdapter("baseten", BasetenBackend),
+    SimpleBackendAdapter("cerebras", CerebrasBackend),
+    SimpleBackendAdapter("cortecs", CortecsBackend),
+    SimpleBackendAdapter("deep-infra", DeepInfraBackend),
+    SimpleBackendAdapter("fireworks", FireworksBackend),
+    SimpleBackendAdapter("frogbot", FrogBotBackend),
+    SimpleBackendAdapter("helicone", HeliconeBackend),
+    SimpleBackendAdapter("ionet", IONetBackend),
+    SimpleBackendAdapter("llamacpp", LlamaCppBackend),
+    SimpleBackendAdapter("nebius", NebiusBackend),
+    SimpleBackendAdapter("ollama-cloud", OllamaCloudBackend),
+    SimpleBackendAdapter("ovhcloud", OVHCloudBackend),
+    SimpleBackendAdapter("scaleway", ScalewayBackend),
+    SimpleBackendAdapter("stackit", STACKITBackend),
+    SimpleBackendAdapter("together", TogetherBackend),
+    SimpleBackendAdapter("venice", VeniceBackend),
+    SimpleBackendAdapter("vercel", VercelAIGatewayBackend),
+    SimpleBackendAdapter("xai", XAIBackend),
+    SimpleBackendAdapter("zai", ZAIBackend),
+    SimpleBackendAdapter("zenmux", ZenMuxBackend),
 )

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
  *
  * This file is part of Encre.

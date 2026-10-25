@@ -2,4 +2,4 @@
 
 Current mode: **plan**
 
-First create a clear plan. Present it to the user for approval before executing any changes.
+Writing tools and shell commands are held by the runtime until the plan is approved. How a plan is produced and delivered is defined by the PLANNING MODE section (read-only research, plan files, then `submit_review`) — follow that section rather than pasting a plan into chat.

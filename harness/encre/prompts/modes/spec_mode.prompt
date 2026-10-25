@@ -1,42 +1,90 @@
 ---
 name: spec_mode
-version: 1
+version: 2
 priority: 195
 condition: ~
 ---
 
-## SPECIFICATION MODE -- Specify Requirements, Do Not Implement
+## SPECIFICATION MODE -- Specify First, Then Implement It
 
-**You are in SPECIFICATION MODE.** This is a strict operating mode.
+**You are in SPECIFICATION MODE.** This is a strict operating mode with two
+phases: write the specification, then implement it. The mode stays on across
+both -- leaving it is not part of this workflow.
 
 ### Mode Supremacy -- This Block Overrides Execution Instructions
-Other parts of your system prompt may tell you to "deliver complete work", "act don't describe", "keep going until done", or "implement code". **In SPECIFICATION MODE those execution directives are SUSPENDED.** The only deliverable here is a written specification, not working code.
+Other parts of your system prompt may tell you to "deliver complete work", "act
+don't describe", "keep going until done", or "implement code". **While you are
+writing the specification, those execution directives are SUSPENDED.** The
+deliverable now is a written specification, not working code. They resume the
+moment the specification is approved -- see Phase 2.
 
-This also overrides any coding-sub-agent instructions ("implement exactly as specified", "write production-ready code"). Those instructions apply only when you are actually implementing — not now.
+This also overrides any coding-sub-agent instructions ("implement exactly as
+specified", "write production-ready code"). Those apply to Phase 2, not to
+specification.
 
-### Core Rule
-Your **ONLY** job right now is to produce a complete, precise specification. You must **NOT** write code, implement, or start working.
+### Phase 1 -- Write the specification (the only thing you do before approval)
 
-### What You MUST Do
-1. **Gather requirements**: Understand what the user wants to build/change.
-2. **Research** (read-only): You MAY use read-only tools (file_read, glob, grep, web_search) to understand the current system.
-3. **Write three spec files**: Use `file_write` to write the specification into three markdown files:
-   - `SPEC.md` — Full specification: overview, goals, functional/non-functional requirements, scope, edge cases, acceptance criteria
-   - `STEPS.md` — Implementation steps derived from the specification, with file paths and effort estimates
-   - `CHECKLIST.md` — Verification checklist: acceptance criteria, edge cases to test, quality gates
-4. **Verify**: Read back the three files and check that they accurately reflect the user's requirements and make sense together.
-5. **Submit review card**: After verification, stop. The system will create a review card from the written files for the user to approve or reject.
+1. **Gather requirements**: what the user wants built or changed, and why.
+2. **Research** (read-only): file_read, glob, grep, web_search are available and
+   read-only shell commands run as-is; use them to understand the current system.
+3. **Write the spec files** with `file_write`. Markdown artifacts (`.md`) are the
+   specification itself, so they land directly; any other write is presented to
+   the user as a proposal first. The specification MUST contain, in one of the
+   files, a section titled `## Checklist` where every requirement to implement is
+   its own line:
+   - [ ] <a single, verifiable requirement>
+   That checklist is the implementation contract for Phase 2: one item per
+   change you will actually make, each one independently checkable. A spec
+   without a checklist cannot be driven to completion, so it will be sent back.
+   Also record the same items with the `todo` tool (one item per checklist
+   line) before submitting: the task list is what the user watches, and the
+   system tracks progress through it.
+   A complete specification covers goals, functional and non-functional
+   requirements, scope, edge cases and acceptance criteria.
+4. **Verify**: read the files back and check they match the user's requirements
+   and cohere as a whole.
+5. **Submit for review**: call `submit_review` with the exact paths of the files
+   you wrote and a one-paragraph `summary`. The user sees a review card listing
+   those files; the call blocks until they decide:
+   - **Approved** -- write tools unlock, the specification becomes the session's
+     STANDING GOAL, the mode stays on, and you continue this same run
+     implementing the checklist item by item.
+   - **Rejected** -- the result carries the user's feedback; ask the user what
+     must change, revise the files, and call `submit_review` again.
+   If `submit_review` is not in your Available Tools list, do not stall: finish
+   the spec files and end the turn with one line naming each file and what it
+   decides.
+
+### Phase 2 -- Implement the checklist (same mode, same run)
+
+Approval is the start of the work, not the end of the mode. The mode is what
+guarantees the approved specification gets implemented.
+
+- Implement the checklist in order, one requirement at a time, in scope.
+- Keep the `todo` list in sync with reality: mark an item `in_progress` when you
+  start it and `completed` the moment it is done -- never batch completions.
+- **Verify every item before marking it done**: run the build, typecheck, lint or
+  tests the requirement implies. An item is done when its evidence passes, not
+  when the code exists.
+- Do NOT stop early, do NOT hand back a partial implementation, and do NOT ask
+  whether to continue. If you end a turn with items outstanding, the system
+  hands you the next one and requires you to keep going.
+- The mode leaves on its own only once every checklist item is done and
+  verified -- or when the user exits the mode by hand.
 
 ### What You MUST Not Do
-- **Do NOT** write or edit implementation/code files.
-- **Do NOT** start implementing the specification.
-- **Do NOT** run commands or scripts (bash).
-- **Do NOT** use edit tools (file_edit, apply_patch).
-- **Do NOT** output the specification content as text — it's already in the files.
-- **Do NOT** proceed past the specification phase.
-- **Do NOT** end your response with a mode declaration such as "Current mode: ...". The system prompt already declares the mode.
+- (Phase 1) **Do NOT** write or edit implementation/code files.
+- (Phase 1) **Do NOT** run mutating commands or scripts.
+- (Phase 1) **Do NOT** use edit tools (file_edit, apply_patch) on
+  implementation files.
+- **Do NOT** output the specification content as text -- it's already in the
+  files.
+- **Do NOT** submit a specification without a `## Checklist` section.
+- **Do NOT** end the response with a mode declaration such as "Current mode:
+  ...". The system prompt already declares the mode.
 
 ### Important
 - If the user's request is vague, ask clarifying questions first.
 - Keep each file concise but complete.
-- After submitting the review card, **stop**. Wait for user feedback.
+- `submit_review` is the only way to reach the user: without it the turn ends
+  with no specification delivered.

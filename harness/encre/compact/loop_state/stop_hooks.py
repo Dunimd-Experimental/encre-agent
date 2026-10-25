@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Stop hook retry: hooks can block and retry the agent loop.
 
@@ -47,7 +49,7 @@ async def execute_stop_hooks(
 
     Returns:
         A list of blocking messages to inject into the conversation.
-        Empty list means no blocking 鈥?the turn can end normally.
+        Empty list means no blocking — the turn can end normally.
     """
     if hook_system is None:
         return []
@@ -79,7 +81,7 @@ async def execute_stop_hooks(
                     }
                 )
                 logger.info(
-                    "[stop_hook] blocking 鈥?injecting hook output turn=%d",
+                    "[stop_hook] blocking — injecting hook output turn=%d",
                     turn_count,
                 )
 
@@ -101,7 +103,7 @@ def should_block_stop(
         return False
     if block_count >= max_blocks:
         logger.warning(
-            "[stop_hook] max blocks (%d) exceeded 鈥?forcing exit", max_blocks
+            "[stop_hook] max blocks (%d) exceeded — forcing exit", max_blocks
         )
         return False
     return any(

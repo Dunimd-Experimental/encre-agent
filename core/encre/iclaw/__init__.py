@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -36,6 +36,21 @@ What remains here is the daemon shell: PID/log lifecycle, the
 ``ICLAW_READY`` stdout handshake consumed by parent processes, and the
 top-level start/wait/stop orchestration.  Background daemon behaviour
 (pid file, log file, ``--stop`` / ``--status``) is unchanged.
+
+Position in Encre: iClaw is the autonomous agent mode, the counterpart of
+the gateway mode in :mod:`encre.gateway`.  Where the gateway bridges
+third-party IM platforms to the Rust agent core, iClaw runs that same core
+as a long-lived background process on a local WebSocket and layers the
+self-improvement subsystems (evolution, feedback, memory consolidation,
+soul learning) on top of it.  Desktop UI and headless drivers reach it
+through the same WS endpoint the gateway does not use.
+
+Public API:
+    * :func:`run_iclaw` -- async entry point for embedding the daemon.
+    * :class:`IClawDaemon` -- object form of the same lifecycle.
+    * :func:`is_running`, :func:`stop_daemon` -- control-plane helpers.
+    * :class:`IclawProfile`, :class:`DaemonStats` -- re-exported from
+      :mod:`encre.iclaw.profile`.
 """
 
 import asyncio
@@ -153,6 +168,37 @@ async def run_iclaw(
     Boots an :class:`EncreServer` (transport + sessions + scheduler),
     attaches the :class:`IclawProfile` add-ons, prints ``ICLAW_READY`` for
     the parent process, then serves until cancelled.
+
+    Args:
+        agent: An existing :class:`encre.agent.EncreAgent`.  When ``None`` a
+            fresh agent with default :class:`EncreConfig` is created here.
+            Passing one in is how a host application shares its own model and
+            settings with the daemon.
+        host: Bind address for the daemon WebSocket server.
+        port: Bind port.  The same value is announced in the ``ICLAW_READY``
+            line, so it must be the address a parent process should connect to.
+        max_concurrent: Upper bound on concurrent agent runs.  Shared by the
+            server and the profile so neither can admit a run the other will
+            not service.
+        consolidation_interval: Seconds between memory-consolidation passes.
+        scheduler_poll_interval: Poll cadence passed through for scheduling.
+        enable_evolution: Enable the evolution learner.
+        enable_reflex: Enable reflexive self-review.
+        enable_metacognition: Enable the metacognition subsystem.
+        enable_feedback: Enable the feedback learner.
+        enable_swarm: Enable swarm-style task splitting.
+        enable_compact: Enable the context compaction engine on the profile.
+        enable_hooks: Enable turn-start/turn-end hook emission on the profile.
+
+    Returns:
+        None.  The coroutine runs until cancelled, so callers await it inside
+        a task they can cancel to shut the daemon down.
+
+    Note:
+        The PID file is written before the server starts, so its presence
+        means "a daemon is booting or running", not "it is serving".  It is
+        cleared in the final ``finally`` block, so a crash anywhere inside the
+        coroutine removes it as long as the event loop is still alive.
     """
     _write_pid(os.getpid())
     try:
@@ -184,6 +230,8 @@ async def run_iclaw(
             enable_metacognition=enable_metacognition,
             enable_feedback=enable_feedback,
             enable_swarm=enable_swarm,
+            enable_compact=enable_compact,
+            enable_hooks=enable_hooks,
         )
         await profile.start()
 
@@ -202,12 +250,24 @@ async def run_iclaw(
 
 
 class IClawDaemon:
-    """Headless background daemon managed by the desktop application.
+    """Headless background daemon managed by the Encre Agent Desktop.
 
     Thin lifecycle shell around :func:`run_iclaw`: wraps the core server
     launcher plus the iClaw profile with PID management and start/wait/stop
     orchestration.  Parent processes spawn this as a child process, parse
     the ``ICLAW_READY`` line from stdout, and connect to the WS endpoint.
+
+    Invariant: ``self.profile`` is ``None`` until :meth:`start` completes and
+    stays set until :meth:`stop`.  Every read method treats ``None`` as the
+    "never started" or "already stopped" state and returns a neutral value
+    instead of raising, so the desktop UI can poll health without coordinating
+    shutdown.
+
+    Note:
+        This class clears the PID file but never writes it.  A caller that
+        drives :class:`IClawDaemon` directly (rather than
+        :func:`run_iclaw`) is responsible for writing it, otherwise
+        :func:`is_running` reports the daemon as down.
     """
 
     def __init__(
@@ -227,6 +287,39 @@ class IClawDaemon:
         enable_compact: bool = True,
         enable_hooks: bool = True,
     ) -> None:
+        """Record daemon launch parameters without starting anything.
+
+        Construction is deliberately inert: the core server and profile are only
+        built inside :meth:`start`, so a caller may assemble an
+        :class:`IClawDaemon` with non-default host, port, or subsystem toggles
+        and defer boot. Every argument here is captured verbatim and handed to
+        :class:`encre.server.app.EncreServer` or
+        :class:`encre.iclaw.profile.IclawProfile` at start time.
+
+        Args:
+            agent: Pre-built :class:`encre.agent.EncreAgent` to reuse. When
+                omitted, :meth:`start` constructs one from a fresh
+                :class:`encre.config.EncreConfig`.
+            host: Bind address for the daemon's WebSocket endpoint.
+            port: Bind port for the WebSocket endpoint advertised in the
+                ``ICLAW_READY`` line.
+            max_concurrent: Session concurrency limit passed to the core server.
+            consolidation_interval: Period, in seconds, between memory
+                consolidation passes on the profile.
+            scheduler_poll_interval: Poll cadence, in seconds, for the cron
+                scheduler owned by the core server.
+            enable_evolution: Enable the evolution learning subsystem.
+            enable_reflex: Enable reflex action capture.
+            enable_metacognition: Enable metacognitive self-review.
+            enable_feedback: Enable feedback learning.
+            enable_swarm: Enable swarm delegation.
+            enable_compact: Enable context compaction.
+            enable_hooks: Enable the hook pipeline.
+
+        Invariant:
+            ``self.profile`` is ``None`` on return and ``self.started_at`` is
+            ``0.0``; both are set only by :meth:`start`.
+        """
         self._agent = agent
         self._host = host
         self._port = port
@@ -274,6 +367,8 @@ class IClawDaemon:
             enable_metacognition=self._enable_metacognition,
             enable_feedback=self._enable_feedback,
             enable_swarm=self._enable_swarm,
+            enable_compact=self._enable_compact,
+            enable_hooks=self._enable_hooks,
         )
         await self.profile.start()
         print(f"ICLAW_READY ws://{self._host}:{self._port}/ws", flush=True)
@@ -292,7 +387,7 @@ class IClawDaemon:
             self.profile = None
         _clear_pid()
 
-    # 鈹€鈹€ Stats passthrough 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # Stats passthrough
 
     def get_stats(self) -> dict[str, Any]:
         """Return the profile stats snapshot, or idle zeros."""

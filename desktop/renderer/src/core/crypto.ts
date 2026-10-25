@@ -33,13 +33,16 @@
  *   decryptRaw(packed)     → plainBytes
  *
  * Ciphertexts are then base64-encoded before being sent over WebSocket.
+ *
+ * Every frame in both directions is encrypted — including per-token deltas,
+ * keepalives and error frames. There is no plaintext fallback anywhere in
+ * this module: `encrypt`/`decrypt` throw if the master key is unavailable,
+ * and the backend closes any connection whose first frame is not ciphertext.
  */
 
 const KEY_LENGTH = 32;       // AES-256
 const NONCE_LENGTH = 12;     // GCM standard
 const TAG_LENGTH = 16;       // GCM 128-bit auth tag
-
-const HKDF_SALT = new TextEncoder().encode("encre-crypto-hkdf-v1");
 
 let _masterKey: CryptoKey | null = null;
 let _ready = false;
@@ -48,27 +51,70 @@ let _ready = false;
 let _lastInitAttempt = 0;
 const INIT_RETRY_INTERVAL_MS = 2_000;
 
-// ── Machine identity for key wrapping ────────────────────────────
+// ── Machine identity for key wrapping (scheme v3) ────────────────
+// MUST match harness/encre/crypto.py exactly: HKDF-SHA256 over an IKM made of
+// the length-prefixed multi-source machine fingerprint and the vendor
+// application secret. The fingerprint itself is assembled in the main
+// process (registry/files are not reachable from the renderer).
 
-/** Reads the machine identity used to derive the per-machine key-wrapping key. */
-async function getMachineId(): Promise<Uint8Array> {
-  const raw = await window.electronAPI?.readMachineId();
-  if (raw && raw !== "uninitialized") {
-    return new TextEncoder().encode(raw);
-  }
-  throw new Error("Unable to determine machine identity for key wrapping");
+const HKDF_SALT = new TextEncoder().encode("encre-crypto-hkdf-v3");
+const HKDF_INFO = new TextEncoder().encode("encre-machine-binding-wrapping-key-v3");
+const WRAP_CTX_AAD = new TextEncoder().encode("encre-keywrap-v1");
+const KEYFILE_VERSION = 0x03;
+
+/** HMAC-SHA256 over WebCrypto (used to build RFC 5869 HKDF by hand). */
+async function hmacSha256(keyBytes: Uint8Array, data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes.buffer as ArrayBuffer,
+    { name: "HMAC", hash: "SHA-256" } as HmacImportParams,
+    false,
+    ["sign"] as KeyUsage[]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, data.buffer as ArrayBuffer);
+  return new Uint8Array(sig);
 }
 
-/** Derives the raw AES-GCM wrapping key from the machine id (HKDF-extract-like). */
+/** RFC 5869 Expand step. */
+async function hkdfExpand(prk: Uint8Array, info: Uint8Array, length: number): Promise<Uint8Array> {
+  const okm = new Uint8Array(length);
+  let block = new Uint8Array(0);
+  let offset = 0;
+  let counter = 1;
+  while (offset < length) {
+    const input = new Uint8Array(block.byteLength + info.byteLength + 1);
+    input.set(block, 0);
+    input.set(info, block.byteLength);
+    input[input.byteLength - 1] = counter++;
+    block = await hmacSha256(prk, input);
+    const n = Math.min(block.byteLength, length - offset);
+    okm.set(block.subarray(0, n), offset);
+    offset += n;
+  }
+  return okm;
+}
+
+/** Derives the raw AES-GCM wrapping key (scheme v3, matches Python _derive_wrapping_key). */
 async function deriveWrappingKeyRaw(): Promise<Uint8Array> {
-  const ikm = await getMachineId();
-  // SHA-256(salt || ikm) — matches Python _hkdf_extract
-  const saltHash = await crypto.subtle.digest("SHA-256", HKDF_SALT.buffer as ArrayBuffer);
-  const combined = new Uint8Array(saltHash.byteLength + ikm.byteLength);
-  combined.set(new Uint8Array(saltHash), 0);
-  combined.set(ikm, saltHash.byteLength);
-  const hash = await crypto.subtle.digest("SHA-256", combined.buffer as ArrayBuffer);
-  return new Uint8Array(hash);
+  const mat = await window.electronAPI?.readKeyWrapMaterial();
+  if (!mat || !mat.fingerprint) {
+    throw new Error("Unable to determine machine identity for key wrapping");
+  }
+  const machine = new TextEncoder().encode(mat.fingerprint);
+  const secret = new TextEncoder().encode(mat.appSecret);
+
+  // IKM = len4(machine) || machine || len4(secret) || secret (big-endian lengths)
+  const ikm = new Uint8Array(8 + machine.byteLength + secret.byteLength);
+  const view = new DataView(ikm.buffer);
+  view.setUint32(0, machine.byteLength, false);
+  ikm.set(machine, 4);
+  view.setUint32(4 + machine.byteLength, secret.byteLength, false);
+  ikm.set(secret, 8 + machine.byteLength);
+
+  // HKDF-SHA256 Extract + Expand (RFC 5869), salt pre-hashed as in Python
+  const saltSha = new Uint8Array(await crypto.subtle.digest("SHA-256", HKDF_SALT.buffer as ArrayBuffer));
+  const prk = await hmacSha256(saltSha, ikm);
+  return hkdfExpand(prk, HKDF_INFO, 32);
 }
 
 /** Imports a raw byte array as an AES-GCM CryptoKey usable for wrap/unwrap. */
@@ -84,16 +130,26 @@ async function importWrappingKey(rawKey: Uint8Array): Promise<CryptoKey> {
 
 // ── Master key management ────────────────────────────────────────
 
-/** Unwraps the on-disk keyfile (nonce || ciphertext+tag) into the master CryptoKey. */
+/**
+ * Unwraps the on-disk keyfile (version byte || nonce || ciphertext+tag) into
+ * the master CryptoKey.  Fail-closed on unknown versions like Python — the
+ * backend will (re)write a v3 keyfile and the retry loop picks it up.
+ */
 async function unwrapMasterKey(keyfileBytes: Uint8Array): Promise<CryptoKey> {
-  const nonce = keyfileBytes.slice(0, NONCE_LENGTH);
-  const ct = keyfileBytes.slice(NONCE_LENGTH);  // ciphertext + tag
+  if (
+    keyfileBytes.byteLength < 1 + NONCE_LENGTH + KEY_LENGTH + TAG_LENGTH ||
+    keyfileBytes[0] !== KEYFILE_VERSION
+  ) {
+    throw new Error("Unsupported keyfile version (expected scheme v3)");
+  }
+  const nonce = keyfileBytes.slice(1, 1 + NONCE_LENGTH);
+  const ct = keyfileBytes.slice(1 + NONCE_LENGTH);  // ciphertext + tag
 
   const wrappingKeyRaw = await deriveWrappingKeyRaw();
   const wrappingKey = await importWrappingKey(wrappingKeyRaw);
 
   const masterKeyRaw = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: nonce.buffer as ArrayBuffer, additionalData: new TextEncoder().encode("encre-keywrap-v1").buffer as ArrayBuffer } as AesGcmParams,
+    { name: "AES-GCM", iv: nonce.buffer as ArrayBuffer, additionalData: WRAP_CTX_AAD.buffer as ArrayBuffer } as AesGcmParams,
     wrappingKey,
     ct.buffer as ArrayBuffer
   );
@@ -146,16 +202,27 @@ function getRandomNonce(): Uint8Array {
 }
 
 /**
+ * Returns the master key or throws. There is deliberately no plaintext
+ * fallback: the backend refuses any unencrypted frame (handshake fail-closed),
+ * so silently degrading to plaintext would just break the connection in a
+ * harder-to-diagnose way.
+ */
+function requireMasterKey(): CryptoKey {
+  if (!_masterKey) {
+    throw new Error("[encre/crypto] Master key unavailable — refusing to send/receive plaintext");
+  }
+  return _masterKey;
+}
+
+/**
  * Encrypt raw bytes → nonce(12) || ciphertext || tag(16).
  */
 export async function encryptRaw(plain: Uint8Array): Promise<Uint8Array> {
-  if (!_masterKey) {
-    return plain;  // fallback: no encryption
-  }
+  const masterKey = requireMasterKey();
   const nonce = getRandomNonce();
   const ct = new Uint8Array(await crypto.subtle.encrypt(
     { name: "AES-GCM", iv: nonce.buffer as ArrayBuffer } as AesGcmParams,
-    _masterKey,
+    masterKey,
     plain.buffer as ArrayBuffer
   ));
   const result = new Uint8Array(NONCE_LENGTH + ct.byteLength);
@@ -168,14 +235,15 @@ export async function encryptRaw(plain: Uint8Array): Promise<Uint8Array> {
  * Decrypt nonce(12) || ciphertext || tag(16) → raw bytes.
  */
 export async function decryptRaw(packed: Uint8Array): Promise<Uint8Array> {
-  if (!_masterKey) {
-    return packed;  // fallback: no encryption
+  const masterKey = requireMasterKey();
+  if (packed.byteLength < NONCE_LENGTH + TAG_LENGTH) {
+    throw new Error("[encre/crypto] Ciphertext too short to be a valid frame");
   }
   const nonce = packed.slice(0, NONCE_LENGTH);
   const ct = packed.slice(NONCE_LENGTH);
   const plain = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: nonce.buffer as ArrayBuffer } as AesGcmParams,
-    _masterKey!,
+    masterKey,
     ct.buffer as ArrayBuffer
   );
   return new Uint8Array(plain);
@@ -195,10 +263,26 @@ function toBase64(bytes: Uint8Array): string {
 }
 
 /**
+ * base64 → bytes, chunked so large frames do not overflow the argument limit
+ * of String.fromCharCode.apply. `Uint8Array.from(atob(s), cb)` is markedly
+ * slower (per-character callback) and this runs on every inbound frame.
+ */
+function fromBase64(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bin.length; i += CHUNK) {
+    const end = Math.min(i + CHUNK, bin.length);
+    for (let j = i; j < end; j++) out[j] = bin.charCodeAt(j);
+  }
+  return out;
+}
+
+/**
  * Encrypt a UTF‑8 string → base64(nonce || ciphertext || tag).
  */
 export async function encrypt(plaintext: string): Promise<string> {
-  if (!_masterKey) return plaintext;
+  requireMasterKey();
   const plain = new TextEncoder().encode(plaintext);
   const packed = await encryptRaw(plain);
   return toBase64(packed);
@@ -206,17 +290,14 @@ export async function encrypt(plaintext: string): Promise<string> {
 
 /**
  * Decrypt base64(nonce || ciphertext || tag) → UTF‑8 string.
+ *
+ * Throws when the key is unavailable or the frame is not authentic ciphertext.
+ * Callers must not substitute the input — that would reintroduce plaintext.
  */
 export async function decrypt(ciphertext: string): Promise<string> {
   if (!_ready) await initCrypto();
-  if (!_masterKey) return ciphertext;
-  try {
-    const packed = Uint8Array.from(atob(ciphertext), (c) => c.charCodeAt(0));
-    const plain = await decryptRaw(packed);
-    return new TextDecoder().decode(plain);
-  } catch {
-    return ciphertext;  // fallback: cannot decrypt, return as-is
-  }
+  const plain = await decryptRaw(fromBase64(ciphertext));
+  return new TextDecoder().decode(plain);
 }
 
 /** Check if crypto layer is active. */

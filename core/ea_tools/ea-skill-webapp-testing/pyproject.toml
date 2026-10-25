@@ -1,0 +1,65 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-skill-webapp-testing"
+version = "0.5.0"
+description = "EA (Encre Agent) system-default skill: webapp-testing."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Dunimd Team", email = "dunimd@outlook.com" },
+]
+keywords = [
+    "ea",
+    "agent",
+    "skill",
+    "webapp-testing",
+    "system-default",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "encre-harness>=0.5.0",
+    "playwright>=1.44",
+]
+
+[project.license]
+text = "Apache-2.0"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[project.entry-points."ea.plugins"]
+webapp-testing = "ea_skill_webapp_testing.plugin:create_plugin"
+
+[tool.ea]
+icon = "monitor-check"
+engines = { encre = ">=0.5" }
+tier = "system-default"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "ea_skill_webapp_testing*",
+]
+
+[tool.setuptools.package-data]
+ea_skill_webapp_testing = [
+    "skills/**/*",
+]

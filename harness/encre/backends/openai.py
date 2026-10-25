@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -54,17 +52,11 @@ model (``gpt-5.6``).
 
 from typing import Any
 
-import httpx
+import re
 
+from encre.backends.catalog import get_context_window
 from encre.backends.openai_sse import OpenAISSEBackend
-from encre.backends.retry import (
-    DEFAULT_RETRY_CONFIG,
-    RetryConfig,
-    retry_with_backoff,
-)
-from encre.logging_config import get_logger
-
-logger = get_logger("encre.backends.openai")
+from encre.backends.retry import DEFAULT_RETRY_CONFIG
 
 
 class OpenAIBackend(OpenAISSEBackend):
@@ -89,6 +81,9 @@ class OpenAIBackend(OpenAISSEBackend):
         - o3: $2.00/$8.00 per 1M tokens (200K context)
         - o4-mini: $1.10/$4.40 per 1M tokens (200K context)
     """
+
+    # OpenAI's API supports stream_options.include_usage.
+    _include_stream_usage = True
 
     def __init__(
         self,
@@ -115,10 +110,17 @@ class OpenAIBackend(OpenAISSEBackend):
         if not base_url:
             # Default to OpenAI's public API when no custom base URL is given.
             base_url = "https://api.openai.com/v1"
-        self.retry_config: RetryConfig = kwargs.pop("retry_config", DEFAULT_RETRY_CONFIG)
-        super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
+        # Preserve any custom retry config instead of silently dropping it.
+        retry_config = kwargs.pop("retry_config", DEFAULT_RETRY_CONFIG)
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            retry_config=retry_config,
+            **kwargs,
+        )
 
-    # 鈹€鈹€ Overrides 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Overrides ─────────────────────────────────────────────────────
 
     def _thinking_request_param(self) -> dict[str, Any] | None:
         """OpenAI chat completions uses ``reasoning_effort``.
@@ -141,46 +143,12 @@ class OpenAIBackend(OpenAISSEBackend):
         # Non-reasoning models: do not send the parameter.
         return None
 
-    async def _send_request(self, body: dict[str, Any]) -> httpx.Response:
-        """Send the request with exponential-backoff retry.
-
-        Wraps the HTTP POST to OpenAI's chat completions endpoint with
-        :func:`retry_with_backoff` to handle transient errors (429 rate limits,
-        502/503/504 server errors, connection timeouts).
-
-        Args:
-            body: The JSON request body containing model, messages, tools, etc.
-
-        Returns:
-            An :class:`httpx.Response` with a streaming body.
-
-        Raises:
-            httpx.HTTPStatusError: If the response status code is not retryable
-                or if all retry attempts are exhausted.
-        """
-        logger.debug(
-            f"Sending request to OpenAI: model={self.model}",
-            extra={"model": self.model},
-        )
-        try:
-            _retry_decorator = retry_with_backoff(config=self.retry_config)
-            _retried_request = _retry_decorator(
-                lambda: self._client.send(
-                    self._client.build_request("POST", self._get_endpoint(), json=body),
-                    stream=True,
-                )
-            )
-            return await _retried_request()
-        except Exception:
-            logger.error(
-                "OpenAI backend request failed",
-                extra={"model": self.model},
-                exc_info=True,
-            )
-            raise
-
     def context_window_size(self) -> int:
         """Return the context window size for the current model.
+
+        The model catalog (:func:`encre.backends.catalog.get_context_window`)
+        is the single source of truth; the family heuristics below only run
+        for names the catalog does not know.
 
         2026 reference:
             - GPT-4.1 / Mini / Nano: 1,048,576 tokens
@@ -192,6 +160,9 @@ class OpenAIBackend(OpenAISSEBackend):
             - o4-mini: 200,000 tokens
             - o5: 400,000 tokens
         """
+        catalog_window = get_context_window(self.model)
+        if catalog_window is not None:
+            return catalog_window
         model_lower = self.model.lower()
         # Check o-series FIRST to avoid o4-mini/o3-mini matching "mini" below
         if model_lower.startswith("o3") or model_lower.startswith("o4"):
@@ -204,7 +175,9 @@ class OpenAIBackend(OpenAISSEBackend):
         # GPT-4.1 family (nano/mini/4.1) -- 1M context
         if "nano" in model_lower or "mini" in model_lower or "4.1" in model_lower:
             return 1048576
-        if "5.5" in model_lower or "6" in model_lower:
+        # "6" as a standalone version token so e.g. "gpt-4o-16k" is not
+        # mistaken for the GPT-6 family.
+        if "5.5" in model_lower or re.search(r"\b6\b", model_lower):
             return 1048576
         if "5.4" in model_lower:
             return 400000

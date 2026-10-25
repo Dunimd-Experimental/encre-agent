@@ -1,0 +1,88 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Theme skin "winter" (霜岩) — generated from the theme-demo v5.2
+ * palette (自然材质色阶). One file per skin; the mode ("light" / "dark")
+ * stays on [data-theme], the skin on [data-skin]. Only colours live here;
+ * surfaces (content paper, chassis, form-control background) and the
+ * neutral hover/selection plates are NOT defined here — styles.css and
+ * themes/tokens.css own them and keep them identical across every skin. Text/semantic values meet WCAG 4.5 (body) / 4.0 (tertiary)
+ * / 3.4 (muted) against the mode paper. */
+
+/* ═══ 霜岩 · 浅 ═══ */
+html[data-skin="winter"] {
+  --text-primary: hsl(215 16% 19%);
+  --text-secondary: hsl(212 9% 42%);
+  --text-tertiary: hsl(212 6% 49%);
+  --text-muted: hsl(212 6% 53.5%);
+  --tool-text: hsl(212 9% 36%);
+  --accent: hsl(212 16% 42%);
+  --accent-hover: hsl(212 18% 36%);
+  --accent-light: hsl(212 16% 42% / .09);
+  --accent-contrast: hsl(210 14% 98%);
+  --success: hsl(150 20% 40%);
+  --error: hsl(8 36% 50%);
+  --warning: hsl(40 40% 38%);
+  --border: hsl(210 9% 85%);
+  --border-light: hsl(210 9% 87%);
+  --card-border: hsl(210 12% 84%);
+  --card-fill: hsl(210 9% 91%);
+  --border-control: hsl(210 9% 78%);
+  --checkbox-border: hsl(210 14% 73%);
+  --selection-bg: hsl(212 16% 56% / .24);
+  --seg-bg: hsl(210 10% 93.5%);
+  --seg-active-bg: #fdfeff;
+  --seg-text: hsl(212 9% 42%);
+  --seg-text-hover: hsl(215 16% 19%);
+  --seg-active-text: hsl(215 16% 19%);
+  --page:linear-gradient(170deg, #e5ebf5 0%, #e9edf6 46%, #e5e9f3 100%);
+  --blob1:radial-gradient(920px 540px at 84% -12%, hsl(218 55% 82% / .44), transparent 68%);
+  --blob2:radial-gradient(780px 500px at -14% 44%, hsl(195 45% 82% / .32), transparent 66%);
+}
+
+/* ═══ 霜岩 · 深 ═══ */
+html[data-skin="winter"][data-theme="dark"] {
+  --text-primary: hsl(208 8% 88%);
+  --text-secondary: hsl(208 6% 64%);
+  --text-tertiary: hsl(208 5% 49.5%);
+  --text-muted: hsl(208 5% 42%);
+  --tool-text: hsl(208 8% 88%);
+  --accent: hsl(210 18% 58%);
+  --accent-hover: hsl(210 16% 64%);
+  --accent-light: hsl(210 18% 58% / .10);
+  --accent-contrast: hsl(210 15% 11%);
+  --success: hsl(150 20% 55%);
+  --error: hsl(8 28% 58%);
+  --warning: hsl(42 30% 58%);
+  --border: hsl(210 5% 24%);
+  --border-light: hsl(210 5% 26%);
+  --card-border: hsl(210 5% 26%);
+  --card-fill: hsl(210 6% 15%);
+  --border-control: hsl(210 5% 30%);
+  --checkbox-border: hsl(210 6% 34%);
+  --selection-bg: hsl(210 16% 56% / .26);
+  --seg-bg: hsl(210 6% 19%);
+  --seg-active-bg: hsl(210 5% 23%);
+  --seg-text: hsl(208 6% 64%);
+  --seg-text-hover: hsl(208 8% 88%);
+  --seg-active-text: hsl(208 8% 88%);
+  --page:linear-gradient(172deg, hsl(214 10% 16%) 0%, hsl(210 8% 13%) 55%, hsl(206 7% 12%) 100%);
+  --blob1:radial-gradient(900px 520px at 82% -12%, hsl(210 40% 56% / .13), transparent 68%);
+  --blob2:radial-gradient(760px 480px at -12% 42%, hsl(195 35% 52% / .09), transparent 66%);
+}

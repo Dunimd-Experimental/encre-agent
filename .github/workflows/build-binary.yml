@@ -26,11 +26,7 @@ jobs:
             target: windows-x64
             arch: x64
             locale: all
-          - os: windows-11-arm
-            target: windows-arm64
-            arch: arm64
-            locale: all
-          - os: macos-13
+          - os: macos-15-intel
             target: macos-x64
             arch: x64
             locale: all
@@ -51,11 +47,7 @@ jobs:
             target: windows-x64-cn
             arch: x64
             locale: cn
-          - os: windows-11-arm
-            target: windows-arm64-cn
-            arch: arm64
-            locale: cn
-          - os: macos-13
+          - os: macos-15-intel
             target: macos-x64-cn
             arch: x64
             locale: cn
@@ -71,7 +63,7 @@ jobs:
             target: windows-x64-en
             arch: x64
             locale: en
-          - os: macos-13
+          - os: macos-15-intel
             target: macos-x64-en
             arch: x64
             locale: en
@@ -96,16 +88,20 @@ jobs:
         run: python build.py --locales ${{ matrix.locale }}
         env:
           TARGET_ARCH: ${{ matrix.arch }}
+          # Vendor application secret, baked into the native extension at
+          # compile time (option_env! in encre-py).  Configure it as a
+          # repository Actions secret; it never appears in source or logs.
+          ENCRE_EA_SECRET: ${{ secrets.ENCRE_EA_SECRET }}
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
           name: encre-${{ matrix.target }}
           path: |
-            Encre*Setup*.exe
-            Encre*.pkg
-            encre*.deb
-            encre*.rpm
+            *Setup*.exe
+            *Setup*.pkg
+            *Setup*.deb
+            *Setup*.rpm
 
       - name: Upload Python library wheels
         uses: actions/upload-artifact@v4

@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -52,94 +51,45 @@ OpenAI-compatible API.  The only customisation is the extraction of
 :class:`BackendThinking` events.
 """
 
-from typing import Any
+import hashlib
+import re
+from collections.abc import AsyncGenerator
+from typing import Any, ClassVar
 
 from encre.backends.openai_sse import OpenAISSEBackend
-
-
-# Standard OpenAI message fields that DeepSeek accepts.  DeepSeek's newer
-# validation rejects unknown/Encre-internal fields such as ``branch_id``,
-# ``seq_in_branch``, ``id``, ``parent_id``, ``usage``, ``segments`` and
-# ``reasoning_content`` on regular chat-completion requests, which causes
-# multi-turn tool loops to fail after the first tool result is appended.
-_ALLOWED_MSG_FIELDS: dict[str, frozenset[str]] = {
-    "system": frozenset({"role", "content", "name"}),
-    "user": frozenset({"role", "content", "name"}),
-    "assistant": frozenset({"role", "content", "name", "tool_calls"}),
-    "tool": frozenset({"role", "content", "tool_call_id"}),
-}
-
-# Fields allowed inside an OpenAI ``tool_calls`` item.
-_ALLOWED_TOOL_CALL_FIELDS: frozenset[str] = frozenset({"id", "type", "function"})
-
+from encre.utils.types import BackendToolCall
 
 # DeepSeek supports a subset of JSON Schema for tool parameters.  Keep the
 # standard structural keywords and value-type keywords; drop anything that
 # may have been valid in JSON Schema but is not documented/supported.
-_SUPPORTED_SCHEMA_KEYWORDS: frozenset[str] = frozenset({
-    "type", "properties", "required", "additionalProperties",
-    "items", "enum", "anyOf", "allOf", "oneOf", "$ref", "$def",
-    "description", "title", "default",
-    # string
-    "pattern", "format",
-    # number / integer
-    "const", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
-    "multipleOf",
-})
-
-
-def _coerce_content(content: Any) -> Any:
-    """Return a string or list content block; replace ``None`` with ``""``."""
-    if content is None:
-        return ""
-    if isinstance(content, list):
-        return content
-    return str(content)
-
-
-def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Strip Encre-internal fields from messages before sending to DeepSeek.
-
-    DeepSeek's chat-completion endpoint validates the message payload more
-    strictly than before and rejects unknown top-level fields.  This helper
-    keeps only the OpenAI-standard fields for each role and ensures that
-    ``content`` is never ``None`` (``None`` is accepted by OpenAI but rejected
-    by DeepSeek for assistant messages that carry ``tool_calls``).
-    """
-    out: list[dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        role = str(msg.get("role", ""))
-        allowed = _ALLOWED_MSG_FIELDS.get(role, _ALLOWED_MSG_FIELDS["user"])
-        clean: dict[str, Any] = {k: v for k, v in msg.items() if k in allowed}
-        clean["role"] = role
-        clean["content"] = _coerce_content(msg.get("content"))
-        if role == "assistant":
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                clean_tool_calls: list[dict[str, Any]] = []
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    clean_tc = {k: v for k, v in tc.items() if k in _ALLOWED_TOOL_CALL_FIELDS}
-                    func = tc.get("function")
-                    if isinstance(func, dict):
-                        args = func.get("arguments")
-                        if args is None:
-                            args = "{}"
-                        elif not isinstance(args, str):
-                            args = str(args)
-                        clean_tc["function"] = {
-                            "name": str(func.get("name", "")),
-                            "arguments": args,
-                        }
-                    clean_tool_calls.append(clean_tc)
-                clean["tool_calls"] = clean_tool_calls
-        elif role == "tool":
-            clean["tool_call_id"] = str(msg.get("tool_call_id", ""))
-        out.append(clean)
-    return out
+_SUPPORTED_SCHEMA_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "anyOf",
+        "allOf",
+        "oneOf",
+        "$ref",
+        "$def",
+        "description",
+        "title",
+        "default",
+        # string
+        "pattern",
+        "format",
+        # number / integer
+        "const",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    }
+)
 
 
 def _normalize_tool_schema_for_deepseek(schema: Any) -> Any:
@@ -179,8 +129,85 @@ def _normalize_tool_schema_for_deepseek(schema: Any) -> Any:
     return out
 
 
-def _sanitize_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sanitize tool definitions for DeepSeek's stricter validation."""
+_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """Return a tool name DeepSeek accepts (``^[a-zA-Z0-9_-]{1,64}$``).
+
+    Illegal characters (dots in MCP names, colons in plugin names, CJK
+    characters, ...) are replaced with underscores.  A name that ends up
+    empty (fully illegal) falls back to a short deterministic hash so the
+    request still passes validation.
+    """
+    original = str(name)
+    name = _TOOL_NAME_PATTERN.sub("_", original)[:64]
+    if not name:
+        name = "tool_" + hashlib.md5(original.encode()).hexdigest()[:8]
+    return name
+
+
+def _resolve_tool_names(
+    tools: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Resolve every function tool to its final API-visible name.
+
+    Single source of truth shared by :func:`_sanitize_tools` (renaming the
+    request payload) and ``DeepSeekBackend.chat`` (building the
+    ``sanitized -> original`` reverse map), so the names the API sees can
+    never drift from the names the reverse map knows about.
+
+    Collision rule: when two DIFFERENT original names sanitize to the same
+    value (e.g. ``a.b`` and ``a_b``), a deterministic ``_`` + 8-hex md5
+    suffix of the original name is appended (truncated to 64 chars) so both
+    stay distinct API-visible names and the reverse map stays injective --
+    without this, the naive ``map[sanitized] = original`` assignment let the
+    later tool silently steal the other's calls.  Identical duplicate
+    originals keep the first occurrence.
+
+    Returns:
+        Ordered ``sanitized -> original`` mapping covering every function
+        tool (identity entries included).
+    """
+    remap: dict[str, str] = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        func = tool.get("function")
+        if not isinstance(func, dict):
+            continue
+        original = str(func.get("name", ""))
+        sanitized = _sanitize_tool_name(original)
+        if sanitized in remap and remap[sanitized] != original:
+            suffix = "_" + hashlib.md5(original.encode("utf-8")).hexdigest()[:8]
+            candidate = sanitized[: 64 - len(suffix)] + suffix
+            while candidate in remap:
+                candidate = candidate[: 64 - len(suffix)] + "_" + hashlib.md5((original + candidate).encode("utf-8")).hexdigest()[:8]
+            sanitized = candidate
+        remap[sanitized] = original
+    return remap
+
+
+def _sanitize_tools(
+    tools: list[dict[str, Any]],
+    name_map: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Sanitize tool definitions for DeepSeek's stricter validation.
+
+    When *name_map* (the ``sanitized -> original`` map from
+    :func:`_resolve_tool_names`) is given, function tools are renamed with
+    the exact same disambiguation the reverse map was built from; when it
+    is omitted the map is recomputed (deterministic, so both paths agree).
+    Identical duplicate function names keep only the first definition --
+    the API rejects duplicate names with HTTP 400.
+    """
+    if name_map is None:
+        name_map = _resolve_tool_names(tools)
+    # Invert to original -> final sanitized name for per-tool lookup.
+    rename: dict[str, str] = {}
+    for sanitized, original in name_map.items():
+        rename.setdefault(original, sanitized)
+    seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -192,22 +219,26 @@ def _sanitize_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(func, dict):
             out.append(tool)
             continue
-        name = str(func.get("name", ""))
-        # DeepSeek allows a-z, A-Z, 0-9, underscore and hyphen, max 64 chars.
-        name = name[:64]
+        original = str(func.get("name", ""))
+        name = rename.get(original) or _sanitize_tool_name(original)
+        if name in seen:
+            continue
+        seen.add(name)
         parameters = func.get("parameters")
         if isinstance(parameters, dict):
             parameters = _normalize_tool_schema_for_deepseek(parameters)
         else:
             parameters = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
-        out.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": str(func.get("description", "")),
-                "parameters": parameters,
-            },
-        })
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(func.get("description", "")),
+                    "parameters": parameters,
+                },
+            }
+        )
     return out
 
 
@@ -233,10 +264,97 @@ class DeepSeekBackend(OpenAISSEBackend):
     DEFAULT_BASE_URL = "https://api.deepseek.com"
 
     # Deprecated model IDs and their V4 replacements.
-    _DEPRECATED_MODEL_MAP: dict[str, str] = {
+    _DEPRECATED_MODEL_MAP: ClassVar[dict[str, str]] = {
         "deepseek-chat": "deepseek-v4-flash",
         "deepseek-reasoner": "deepseek-v4-pro",
     }
+
+    # Tokens that mark a vision-capable model id in DeepSeek's naming
+    # (the deepseek-vl lineage, V4 vision variants, omni-style multimodal).
+    # Text-only ids (deepseek-v4-flash / -pro / legacy chat) match none.
+    _VISION_MODEL_TOKENS: ClassVar[tuple[str, ...]] = ("vision", "vl", "omni", "multimodal")
+
+    def finalize_history(
+        self,
+        messages: list[dict[str, Any]],
+        session: Any = None,
+    ) -> list[dict[str, Any]] | None:
+        """Finalize ``reasoning_content`` once at the tool-loop boundary.
+
+        Called by the harness at the start of a fresh user turn, when every
+        previous tool loop is closed.  Official thinking-mode rule
+        (api-docs.deepseek.com "Thinking Mode / Tool Calls"): the
+        ``reasoning_content`` of an assistant message that carries
+        ``tool_calls`` must be passed back to the API in ALL subsequent
+        requests, no matter how many user turns have passed since the tool
+        loop ran -- so it is NEVER stripped here.  The previous policy
+        (strip once the loop is closed) followed an obsolete rule and
+        caused HTTP 400 "reasoning_content must be passed back".  Reasoning
+        on assistants WITHOUT ``tool_calls`` is ignored by the API;
+        stripping it once here keeps the model context byte-stable instead
+        of dropping it per request, preserving the provider prompt cache.
+
+        Sessions compacted by older builds may already carry a view whose
+        tool-call assistants lost their ``reasoning_content`` (the
+        append-only branch history still has it).  When ``session`` is
+        given, such messages are healed: the original reasoning is looked
+        up in the active branch by ``seq_in_branch`` and restored, so
+        sessions poisoned by the stale pre-fix view recover instead of
+        failing with HTTP 400 forever.
+
+        This method is PURE with respect to the persisted history: it never
+        mutates ``messages`` (the turn files must stay append-only).
+
+        Args:
+            messages: The effective context (view + branch tail).  Read-only.
+            session: The harness session, used to heal reasoning that a
+                stale pre-fix view had stripped.  May be ``None``.
+
+        Returns:
+            A cleaned copy of ``messages``, or ``None`` when unchanged.
+        """
+        cleaned: list[dict[str, Any]] | None = None
+
+        # ---- Heal: restore reasoning stripped by a stale pre-fix view ----
+        if session is not None:
+            branch_by_seq: dict[int, dict[str, Any]] | None = None
+            for idx, msg in enumerate(messages):
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                    continue
+                if msg.get("reasoning_content"):
+                    continue
+                seq = msg.get("seq_in_branch")
+                if not isinstance(seq, int):
+                    continue
+                if branch_by_seq is None:
+                    try:
+                        branch_msgs = session.get_branch_messages(session.active_branch_id)
+                    except Exception:
+                        branch_msgs = []
+                    branch_by_seq = {
+                        m["seq_in_branch"]: m for m in branch_msgs if isinstance(m, dict) and isinstance(m.get("seq_in_branch"), int)
+                    }
+                original = branch_by_seq.get(seq)
+                reasoning = original.get("reasoning_content") if original else None
+                if isinstance(reasoning, str) and reasoning:
+                    if cleaned is None:
+                        cleaned = [dict(m) if isinstance(m, dict) else m for m in messages]
+                    cleaned[idx]["reasoning_content"] = reasoning
+
+        # ---- Strip: reasoning on non-tool-call assistants is ignored ----
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "assistant" or msg.get("tool_calls"):
+                continue
+            if "reasoning_content" not in msg:
+                continue
+            if cleaned is None:
+                cleaned = [dict(m) if isinstance(m, dict) else m for m in messages]
+            cleaned[idx] = {k: v for k, v in cleaned[idx].items() if k != "reasoning_content"}
+        return cleaned
 
     def __init__(
         self,
@@ -264,7 +382,7 @@ class DeepSeekBackend(OpenAISSEBackend):
         model = self._DEPRECATED_MODEL_MAP.get(model, model)
         super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
 
-    # 鈹€鈹€ Overrides 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ------------------------ Overrides --------------------------------------------------------------------------------------------------
 
     def context_window_size(self) -> int:
         """Return the context window size for DeepSeek V4 models.
@@ -282,10 +400,11 @@ class DeepSeekBackend(OpenAISSEBackend):
         """DeepSeek V4 models support prompt caching (80-92% discount)."""
         return True
 
-    # 鈹€鈹€ Multimodal/Extended API capabilities 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    # DeepSeek is a text-only chat API.  None of the OpenAI multimodal
-    # or extended endpoints (images, audio, embeddings, moderation, files,
-    # batch, fine-tuning, responses, realtime) are available.
+    # ── Multimodal/Extended API capabilities ──────────────────────
+    # The V4 lineup includes vision-capable variants that take standard
+    # OpenAI ``image_url`` content blocks.  Every other extended endpoint
+    # (images generation, audio, embeddings, moderation, files, batch,
+    # fine-tuning, responses, realtime) stays unavailable.
 
     def supports_image_generation(self) -> bool:
         return False
@@ -318,7 +437,16 @@ class DeepSeekBackend(OpenAISSEBackend):
         return False
 
     def supports_vision_input(self) -> bool:
-        return False
+        """Return True for vision-capable DeepSeek models, False otherwise.
+
+        The declared flag gates the offline shortcut in the capability
+        probe: text-only models (V4-Flash / V4-Pro, legacy chat) must stay
+        hard-False because the endpoint can accept ``image_url`` blocks
+        without honouring them, while vision variants must reach the live
+        probe instead of being excluded by a stale blanket negative.
+        """
+        model = (self.model or "").lower()
+        return any(token in model for token in self._VISION_MODEL_TOKENS)
 
     def _build_request_data(
         self,
@@ -329,19 +457,25 @@ class DeepSeekBackend(OpenAISSEBackend):
         max_tokens: int = 4096,
         stream: bool = True,
     ) -> dict[str, Any]:
-        """Build the DeepSeek request body with sanitized messages/tools.
+        """Build the DeepSeek request body with sanitized tools.
 
-        DeepSeek's newer validation rejects unknown fields on messages and
-        requires tool parameter schemas to be well-formed (all object
-        properties required, ``additionalProperties: false``).  We sanitize
-        both before delegating to the base request builder.
+        Message sanitization (unknown-field stripping, ``reasoning_content``
+        pass-back per the official thinking-mode rule, ``None``-content
+        coercion, ``tool_calls`` rebuild) is handled centrally by the base
+        ``_build_request_data`` via :func:`sanitize_openai_messages`, keyed
+        off ``thinking_enabled``.  Tools still need DeepSeek-specific schema
+        normalization, and tool names the reverse rename map.
 
         DeepSeek V4 models also accept ``reasoning_effort`` (e.g. ``"high"``
         or ``"max"``) to control reasoning intensity.
         """
+        # Reuse the reverse map chat() already resolved for this request so
+        # payload renaming and tool-call remapping share one disambiguation
+        # (recomputation is deterministic, this just removes any drift risk).
+        name_map = getattr(self, "_tool_name_remap", None)
         data = super()._build_request_data(
-            messages=_sanitize_messages(messages),
-            tools=_sanitize_tools(tools) if tools else None,
+            messages=messages,
+            tools=_sanitize_tools(tools, name_map) if tools else None,
             tool_choice=tool_choice,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -350,3 +484,29 @@ class DeepSeekBackend(OpenAISSEBackend):
         if getattr(self, "reasoning_effort", ""):
             data["reasoning_effort"] = self.reasoning_effort
         return data
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any]:
+        """Stream events, mapping sanitized tool names back to originals.
+
+        ``_resolve_tool_names`` rewrites tool names that violate DeepSeek's
+        ``^[a-zA-Z0-9_-]+$`` validation (MCP dots, plugin colons, CJK
+        names, ...) and disambiguates collisions deterministically.  The
+        model echoes those sanitized names in its tool calls, so without a
+        reverse mapping the harness would dispatch the call against a name
+        that does not exist in the registry.  The per-request
+        ``sanitized -> original`` map recorded here restores the registry
+        name on every emitted :class:`BackendToolCall`.
+        """
+        full_map = _resolve_tool_names(tools)
+        self._tool_name_remap = {sanitized: original for sanitized, original in full_map.items() if sanitized != original}
+        async for event in super().chat(messages, tools=tools, **kwargs):
+            if isinstance(event, BackendToolCall) and self._tool_name_remap:
+                original = self._tool_name_remap.get(event.name)
+                if original:
+                    event = BackendToolCall(id=event.id, name=original, arguments=event.arguments)
+            yield event

@@ -1,0 +1,49 @@
+# ============================================================
+# SFT LoRA 训练任务配置模板（FinetuneLoRA）
+# ------------------------------------------------------------
+# 使用说明：
+# 1. 将本文件复制到当前实验子目录（experiments/exp_xxx/job.yaml），再按实际情况改值。
+# 2. 所有字段都以 ark get foundation-model --model <X> --version <Y> --fields hyperparameters
+#    的查询结果为准；该查询输出中没有出现的 hyperparameters 字段一律不允许加到本文件里。
+# 3. 提交命令：`ark create mcj -f job.yaml`（是 mcj，不是 customization-job）。
+# 4. hyperparameters 的值可以写成裸数字（如 epoch: 3）或带引号字符串（如 epoch: '3'）；
+#    二者都被 ark-sdk 接受。本模板按裸数字风格示范。
+# ------------------------------------------------------------
+# 常见踩坑：
+# - model_version 必须是字符串（带引号），写成整数会被 pydantic 拒绝。
+# - data.training_set 必须是对象，且至少包含 local_files / tos_bucket / datasets 之一；
+#   不能直接 `training_set: <路径>` 这种字符串写法。
+# - SFT 任务严禁出现 custom_rl_pipeline / enable_trajectory 字段（那是 GRPO 专属）。
+# - hyperparameters 中 SFT 用 `learning_rate`，不是 GRPO 的 `lr`；两者不可互换。
+# - 不允许出现凭印象添加的字段（例如 dyn_bsz、freeze_vit 等），以查询到的白名单为准。
+# ============================================================
+
+name: sft-lora-demo                      # 任务名（必填）
+customization_type: FinetuneLoRA         # 训练方式（SFT-LoRA）
+
+model_reference:                         # 基础模型引用；foundation_model 与 custom_model_id 二选一
+  foundation_model:
+    name: doubao-seed-1-6                # 精确模型名（必须通过 list-models 查到的精确名）
+    model_version: '250615'              # 字符串！不要写成 250615
+
+data:
+  training_set:
+    local_files:                         # 单文件 ≤ 2GB，最多 20 个
+      - ./data/sft_train_data.jsonl
+  # 验证集二选一：validation_set + local_files  或  validation_percentage
+  validation_percentage: 10              # 从训练集切 10% 作为验证集
+  # validation_set:
+  #   local_files:
+  #     - ./data/sft_val_data.jsonl
+
+hyperparameters:                         # 只能填查询结果中的字段；不同模型/版本可能有差异，以查询为准
+  epoch: 1
+  batch_size: 8
+  learning_rate: 0.00001                 # 注意：SFT 字段是 learning_rate，不是 lr
+  warmup_step_rate: 0.05
+  seq_len: 32768                         # 必须在查询返回的取值集合内
+  lora_rank: 32
+  lora_alpha: 4
+  save_model_per_epoch: 1
+
+save_model_limit: 1                      # 保留的训练产物数量上限（可选）

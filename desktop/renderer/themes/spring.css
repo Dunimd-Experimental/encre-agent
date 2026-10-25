@@ -1,0 +1,88 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Theme skin "spring" (山樱) — generated from the theme-demo v5.2
+ * palette (自然材质色阶). One file per skin; the mode ("light" / "dark")
+ * stays on [data-theme], the skin on [data-skin]. Only colours live here;
+ * surfaces (content paper, chassis, form-control background) and the
+ * neutral hover/selection plates are NOT defined here — styles.css and
+ * themes/tokens.css own them and keep them identical across every skin. Text/semantic values meet WCAG 4.5 (body) / 4.0 (tertiary)
+ * / 3.4 (muted) against the mode paper. */
+
+/* ═══ 山樱 · 浅 ═══ */
+html[data-skin="spring"] {
+  --text-primary: hsl(345 16% 20%);
+  --text-secondary: hsl(345 9% 43%);
+  --text-tertiary: hsl(345 6% 50%);
+  --text-muted: hsl(345 6% 54.5%);
+  --tool-text: hsl(345 9% 37%);
+  --accent: hsl(345 32% 51%);
+  --accent-hover: hsl(345 35% 46%);
+  --accent-light: hsl(345 32% 54% / .11);
+  --accent-contrast: #fff;
+  --success: hsl(145 20% 40%);
+  --error: hsl(8 38% 50%);
+  --warning: hsl(40 40% 38%);
+  --border: hsl(345 10% 85%);
+  --border-light: hsl(345 10% 87%);
+  --card-border: hsl(345 13% 84%);
+  --card-fill: hsl(345 10% 91%);
+  --border-control: hsl(345 10% 78%);
+  --checkbox-border: hsl(345 14% 73%);
+  --selection-bg: hsl(345 30% 68% / .30);
+  --seg-bg: hsl(345 11% 93.5%);
+  --seg-active-bg: #fffdfd;
+  --seg-text: hsl(345 9% 43%);
+  --seg-text-hover: hsl(345 16% 20%);
+  --seg-active-text: hsl(345 16% 20%);
+  --page:linear-gradient(170deg, #f6e7ec 0%, #f7ebe7 46%, #f4ecdf 100%);
+  --blob1:radial-gradient(920px 540px at 84% -12%, hsl(345 60% 84% / .44), transparent 68%);
+  --blob2:radial-gradient(780px 500px at -14% 44%, hsl(90 40% 84% / .30), transparent 66%);
+}
+
+/* ═══ 山樱 · 深 ═══ */
+html[data-skin="spring"][data-theme="dark"] {
+  --text-primary: hsl(345 10% 89%);
+  --text-secondary: hsl(345 7% 64%);
+  --text-tertiary: hsl(345 5% 50.5%);
+  --text-muted: hsl(345 5% 42.5%);
+  --tool-text: hsl(345 10% 89%);
+  --accent: hsl(345 28% 62%);
+  --accent-hover: hsl(345 26% 68%);
+  --accent-light: hsl(345 28% 62% / .13);
+  --accent-contrast: hsl(345 25% 12%);
+  --success: hsl(145 20% 55%);
+  --error: hsl(8 30% 58%);
+  --warning: hsl(42 30% 58%);
+  --border: hsl(345 8% 24%);
+  --border-light: hsl(345 8% 26%);
+  --card-border: hsl(345 8% 26%);
+  --card-fill: hsl(345 9% 15%);
+  --border-control: hsl(345 8% 30%);
+  --checkbox-border: hsl(345 9% 34%);
+  --selection-bg: hsl(345 22% 58% / .30);
+  --seg-bg: hsl(345 8% 19%);
+  --seg-active-bg: hsl(345 8% 23%);
+  --seg-text: hsl(345 7% 64%);
+  --seg-text-hover: hsl(345 10% 89%);
+  --seg-active-text: hsl(345 10% 89%);
+  --page:linear-gradient(172deg, hsl(342 12% 16%) 0%, hsl(345 10% 13%) 55%, hsl(350 9% 12%) 100%);
+  --blob1:radial-gradient(900px 520px at 82% -12%, hsl(340 40% 60% / .16), transparent 68%);
+  --blob2:radial-gradient(760px 480px at -12% 42%, hsl(90 25% 52% / .09), transparent 66%);
+}

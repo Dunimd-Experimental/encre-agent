@@ -1,11 +1,34 @@
-﻿<!DOCTYPE html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" data-skin="ink" data-theme="light">
 <head>
   <meta charset="UTF-8" />
   <script>
-    // Apply the persisted UI locale/direction before first paint so an
-    // ar/he session does not flash a left-to-right layout (or wrong font
-    // stack) for a frame. setLocale() in i18n.ts keeps it in sync later.
+    // Apply the persisted theme/locale before first paint.
+    //
+    // The stylesheet's `:root` defaults are the dark palette, so without this
+    // the pre-painted splash (and the whole shell) paints dark for the first
+    // frames and then flips once the bundle runs. Only an explicit dark choice
+    // paints dark; anything else (`light`, `system`, or nothing stored) paints
+    // light — the main process pins `nativeTheme.themeSource` to light, so
+    // "system" resolves light too.
+    try {
+      var t = localStorage.getItem("encre-theme");
+      document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
+    } catch (e) {}
+    // Colour skin (水墨/山樱/…): the palettes live in themes/<skin>.css and
+    // ride on [data-skin]. Markup defaults to ink; only a stored, known skin
+    // overrides it before first paint. This list must stay in sync with
+    // src/core/state.ts THEME_SKINS (main.ts and tray-popup.html derive
+    // theirs from themes/*.css directly).
+    try {
+      var skin = localStorage.getItem("encre-theme-skin");
+      if (["ink","spring","autumn","winter","honey","grass","sky","sunset"].indexOf(skin) >= 0) {
+        document.documentElement.setAttribute("data-skin", skin);
+      }
+    } catch (e) {}
+    // Same reasoning for locale/direction: an ar/he session must not flash a
+    // left-to-right layout (or wrong font stack) for a frame. setLocale() in
+    // i18n.ts keeps it in sync later.
     try {
       var l = localStorage.getItem("encre-locale");
       if (l === "ar" || l === "he") {
@@ -24,11 +47,23 @@
   <link rel="stylesheet" href="design-system.css" />
   <link rel="stylesheet" href="xterm.css" />
   <link rel="stylesheet" href="codicon.css" />
+  <!-- Module preloads: the block below is injected by build.js on every build
+       (idempotent markers). Without it the 2.3MB bundle and its chunk graph
+       are only fetched once the stylesheets above finish parsing AND the whole
+       DOM body is parsed (the <script type="module"> tag sits at the end of
+       the body), which serialized the entire cold-start critical path.
+       Preloading here overlaps the bundle's disk reads / AV scans with the
+       CSS and lucide work instead of queueing behind them. -->
+  <!--modulepreload:start-->
+  <link rel="modulepreload" href="bundle.js" />
+  <link rel="modulepreload" href="chunks/chunk-BGEGSM47.js" />
+  <link rel="modulepreload" href="chunks/chunk-J4AB6Q6O.js" />
+  <!--modulepreload:end-->
   <!-- Vendored locally: no network round-trip at startup (was unpkg.com CDN).
        The Monaco editor is loaded on demand by monaco.ts (see getMonaco()). -->
   <script src="vendor/lucide.min.js"></script>
 </head>
-<body>
+<body class="splash-mode">
   <div id="app-shell">
   <!-- Unified header bar (sidebar header + topbar merged) -->
   <header id="header-bar">
@@ -55,12 +90,17 @@
           <svg class="seg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
           <span data-i18n="mode.iwork">Work</span>
         </button>
-        <button type="button" class="seg-item" data-mode="automation" role="tab" aria-selected="false">
-          <svg class="seg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M5 3 2 6"/><path d="m22 6-3-3"/><path d="M6.38 18.7 4 21"/><path d="M17.64 18.67 20 21"/></svg>
-          <span data-i18n="mode.automation">Automation</span>
-        </button>
+        <!-- Automation tab removed: its single entry point is now the sidebar
+             entry below "New task" (btn-sidebar-automation). -->
       </div>
     </div>
+    <!-- Subwindow title. Hidden everywhere except the ESD (see body.child-mode
+         in styles.css), where .header-left is dropped and this is what keeps
+         the window controls pinned to the trailing edge. -->
+    <span id="child-brand" class="header-brand">ESD</span>
+    <!-- The subwindow's tab strip: the tab layer renders its list in here, on
+         the title row, instead of the content area's own bar. -->
+    <div id="child-header-tabs"></div>
     <div class="header-right">
       <div class="header-window-controls">
         <button id="btn-minimize" class="window-btn" data-i18n-title="header.minimize" title="Minimize">
@@ -107,8 +147,12 @@
     <nav id="sidebar">
 
       <div class="sidebar-content-normal">
-        <div class="sidebar-nav" id="sidebar-main-nav">
-          <div class="nav-item-row">
+        <!-- Every sidebar group uses the same container pair:
+             .sidebar-section > .sidebar-section-header.  The new-task row,
+             the automation entry, the plugin-market entry and the all-tasks
+             header therefore share one padding/baseline/spacing system. -->
+        <div class="sidebar-section" id="sidebar-main-nav">
+          <div class="sidebar-section-header sidebar-nav-header">
             <button class="nav-item nav-item-grow" data-view="chat" data-shortcut="new_session">
               <i data-lucide="pen-line" class="lucide"></i>
               <span data-i18n="sidebar.newTask">New task</span>
@@ -117,14 +161,30 @@
               <i data-lucide="message-square-dashed" class="lucide"></i>
             </button>
             <!-- Workspace entry — iWork-mode counterpart of the temp-chat
-                 button. It sits in the same nav row (temp chat is hidden in
-                 iWork mode) and opens the workspace manager. -->
+                 button. It sits in the same header row (temp chat is hidden
+                 in iWork mode) and opens the workspace manager. -->
             <button class="nav-item-square" id="btn-workspace-nav" data-i18n-title="sidebar.workspace" title="Workspace">
               <i data-lucide="monitor" class="lucide"></i>
             </button>
           </div>
-          <!-- iWork entry removed: the top-bar .seg switch is the single
-               entry point for normal ↔ iwork ↔ automation mode. -->
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-header">
+            <button type="button" class="sidebar-entry" id="btn-sidebar-automation" data-i18n-title="mode.automation" title="Automation">
+              <span class="sidebar-section-title" data-i18n="mode.automation">Automation</span>
+              <i data-lucide="chevron-right" class="lucide"></i>
+            </button>
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-header">
+            <button type="button" class="sidebar-entry" id="btn-sidebar-market" data-i18n-title="sidebar.pluginMarket" title="Plugin market">
+              <span class="sidebar-section-title" data-i18n="sidebar.pluginMarket">Plugin market</span>
+              <i data-lucide="chevron-right" class="lucide"></i>
+            </button>
+          </div>
         </div>
 
         <div class="sidebar-section" id="session-section">
@@ -154,7 +214,7 @@
           </button>
         </div>
 <div class="sidebar-settings-items">
-          <!-- 通用 -->
+          <!-- 常规 -->
           <button class="settings-nav-item active" data-panel="general">
             <i data-lucide="settings" class="lucide"></i>
             <span data-i18n="sidebar.general">General</span>
@@ -164,55 +224,53 @@
             <span data-i18n="sidebar.usage">Usage</span>
           </button>
           <div class="settings-nav-divider"></div>
-          <!-- 模型与能力 -->
+          <!-- 工作 -->
           <button class="settings-nav-item" data-panel="model">
             <i data-lucide="cpu" class="lucide"></i>
             <span data-i18n="sidebar.models">Models</span>
-          </button>
-          <button class="settings-nav-item" data-panel="agent">
-            <i data-lucide="sparkles" class="lucide"></i>
-            <span data-i18n="sidebar.agent">Agent</span>
-          </button>
-          <button class="settings-nav-item" data-panel="mcp">
-            <i data-lucide="server" class="lucide"></i>
-            <span data-i18n="sidebar.mcp">MCP Server</span>
           </button>
           <button class="settings-nav-item" data-panel="skills">
             <i data-lucide="wand-2" class="lucide"></i>
             <span data-i18n="sidebar.skills">Skills &amp; Commands</span>
           </button>
+          <button class="settings-nav-item" data-panel="flow">
+            <i data-lucide="message-circle" class="lucide"></i>
+            <span data-i18n="sidebar.flow">Flow</span>
+          </button>
+          <button class="settings-nav-item" data-panel="agent">
+            <span class="sa-loader" data-running="false"><i></i><i></i><i class="sa-chevron"></i><i></i><i class="sa-chevron"></i><i></i><i></i><i></i><i class="sa-chevron"></i></span>
+            <span data-i18n="sidebar.agent">Agent</span>
+          </button>
+          <button class="settings-nav-item" data-panel="library">
+            <i data-lucide="file-text" class="lucide"></i>
+            <span data-i18n="sidebar.library">Library</span>
+          </button>
           <div class="settings-nav-divider"></div>
           <!-- 集成 -->
-          <button class="settings-nav-item" data-panel="gateway">
-            <i data-lucide="network" class="lucide"></i>
-            <span data-i18n="sidebar.gateway">Gateway</span>
+          <button class="settings-nav-item" data-panel="plugins">
+            <i data-lucide="layout-grid" class="lucide"></i>
+            <span data-i18n="sidebar.plugins">Plugins</span>
           </button>
-          <button class="settings-nav-item" data-panel="browser">
-            <i data-lucide="globe" class="lucide"></i>
-            <span data-i18n="sidebar.browser">Browser</span>
+          <button class="settings-nav-item" data-panel="gateway">
+            <i data-lucide="cable" class="lucide"></i>
+            <span data-i18n="sidebar.gateway">Connector</span>
+          </button>
+          <button class="settings-nav-item" data-panel="mcp">
+            <i data-lucide="server" class="lucide"></i>
+            <span data-i18n="sidebar.mcp">MCP Server</span>
           </button>
           <div class="settings-nav-divider"></div>
-          <!-- 知识与治理 -->
-          <button class="settings-nav-item" data-panel="index">
-             <i data-lucide="file-text" class="lucide"></i>
-            <span data-i18n="sidebar.index">Index &amp; Document</span>
+          <!-- 工作区辅助面板（终端 / 资源管理器 / 审查 / 浏览器 合并入同一页） -->
+          <button class="settings-nav-item" data-panel="assist">
+            <i data-lucide="layout-dashboard" class="lucide"></i>
+            <span data-i18n="sidebar.assist">Assist Panels</span>
           </button>
+          <div class="settings-nav-divider"></div>
+          <!-- 记忆 / 快捷键 / 存储 -->
           <button class="settings-nav-item" data-panel="memory">
             <i data-lucide="brain" class="lucide"></i>
             <span data-i18n="sidebar.memory">Memory</span>
           </button>
-          <button class="settings-nav-item" data-panel="rules">
-            <i data-lucide="file-check" class="lucide"></i>
-            <span data-i18n="sidebar.rules">Rules</span>
-          </button>
-          <div class="settings-nav-divider"></div>
-          <!-- 安全与权限 -->
-          <button class="settings-nav-item" data-panel="permissions">
-            <i data-lucide="shield" class="lucide"></i>
-            <span data-i18n="sidebar.permissions">Permissions</span>
-          </button>
-          <div class="settings-nav-divider"></div>
-          <!-- 个性化 -->
           <button class="settings-nav-item" data-panel="shortcuts">
             <i data-lucide="keyboard" class="lucide"></i>
             <span data-i18n="sidebar.shortcuts">Shortcuts</span>
@@ -221,12 +279,8 @@
             <i data-lucide="hard-drive" class="lucide"></i>
             <span data-i18n="sidebar.storage">Storage</span>
           </button>
-          <button class="settings-nav-item" data-panel="search">
-            <i data-lucide="filter" class="lucide"></i>
-            <span data-i18n="sidebar.searchFilter">Search Filter</span>
-          </button>
           <div class="settings-nav-divider"></div>
-          <!-- 系统 -->
+          <!-- 关于（永远在最底部，开发者模式之上） -->
           <button class="settings-nav-item" data-panel="about">
             <i data-lucide="info" class="lucide"></i>
             <span data-i18n="sidebar.about">About</span>
@@ -268,6 +322,11 @@
               <!-- Message list (hidden when welcome shown) -->
               <div id="message-list" class="hidden"></div>
 
+              <!-- Per-turn status line: lives INSIDE the scroll container so it
+                   renders right under the model's latest output while a turn is
+                   running, and scrolls away with the conversation. -->
+              <div id="chat-status-bar" class="chat-status-bar hidden"></div>
+
             </div>
             <!-- Right-side scroll progress indicator (outside chat-container so it doesn't scroll) -->
             <div id="chat-scroll-indicator" class="chat-scroll-indicator hidden" aria-hidden="true">
@@ -286,35 +345,38 @@
           <div id="settings-view" class="hidden">
             <div id="settings-content-wrap">
               <div class="settings-panel active" id="panel-general"></div>
-              <div class="settings-panel" id="panel-usage"></div>
+              <div class="settings-panel" id="panel-flow"></div>
+              <div class="settings-panel" id="panel-memory"></div>
               <div class="settings-panel" id="panel-shortcuts"></div>
               <div class="settings-panel" id="panel-storage"></div>
+              <div class="settings-panel" id="panel-usage"></div>
               <div class="settings-panel" id="panel-model"></div>
               <div class="settings-panel" id="panel-gateway"></div>
-              <div class="settings-panel" id="panel-browser"></div>
-              <div class="settings-panel" id="panel-index"></div>
+              <div class="settings-panel" id="panel-library"></div>
               <div class="settings-panel" id="panel-skills"></div>
-              <div class="settings-panel" id="panel-rules"></div>
+              <div class="settings-panel" id="panel-plugins"></div>
               <div class="settings-panel" id="panel-mcp"></div>
               <div class="settings-panel" id="panel-agent"></div>
               <div class="settings-panel" id="panel-about"></div>
               <div class="settings-panel" id="panel-developer"></div>
-              <div class="settings-panel" id="panel-permissions"></div>
-              <div class="settings-panel" id="panel-memory"></div>
-              <div class="settings-panel" id="panel-search"></div>
-              <div class="settings-panel" id="panel-memory-detail"></div>
+              <div class="settings-panel" id="panel-assist"></div>
             </div>
           </div>
 
-          <!-- Child view (for sub-windows like license viewer) -->
-          <div id="child-view" class="hidden"></div>
-
           <!-- Input area -->
           <div id="input-area">
-            <div id="chat-status-bar" class="chat-status-bar hidden"></div>
-            <!-- Queue card: swaps with status bar when queue is active -->
-            <div id="queue-card" class="queue-card hidden">
-              <div id="queue-card-body" class="queue-card-body"></div>
+            <!-- Pending panel: the floating card above the composer.  One card,
+                 many sources (submit queue today, background shells later); the
+                 tab strip along its bottom edge switches between the sources. -->
+            <div id="pending-panel" class="pending-panel hidden">
+              <div id="pending-panel-body" class="pending-panel-body"></div>
+              <div class="pending-panel-foot">
+                <div id="pending-panel-tabs" class="pending-panel-tabs"></div>
+                <span id="pending-panel-status" class="pending-panel-status"></span>
+                <button type="button" class="pending-panel-toggle" id="pending-panel-toggle" aria-expanded="true">
+                  <i data-lucide="chevron-down" class="lucide pending-panel-toggle-icon"></i>
+                </button>
+              </div>
             </div>
 
             <div class="input-wrapper">
@@ -322,35 +384,84 @@
                 <div id="prompt-input" class="prompt-input" contenteditable="true" role="textbox" aria-multiline="true"></div>
                 <div id="prompt-placeholder" class="prompt-placeholder" data-i18n="input.placeholder">Ask Encre anything...</div>
               </div>
-              <!-- @ dropdown (above input box) -->
-              <div id="mention-dropdown" class="mention-dropdown hidden">
-                <div class="mention-page" data-page="main">
-                  <button class="mention-dropdown-item" data-action="upload-file">
-                    <i data-lucide="upload" class="lucide"></i>
-                    <span data-i18n="mention.uploadFile">Files</span>
-                  </button>
-                  <button class="mention-dropdown-item" data-action="select-folder">
-                    <i data-lucide="folder-open" class="lucide"></i>
-                    <span data-i18n="mention.selectFolder">Folder</span>
-                  </button>
-                  <button class="mention-dropdown-item" data-action="sub-slash">
-                    <i data-lucide="terminal" class="lucide"></i>
-                    <span data-i18n="slashCommands.title">Slash Commands</span>
-                    <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
-                  </button>
-                </div>
-                <div class="mention-page hidden" data-page="slash">
-                  <!-- rendered dynamically by app.ts -->
-                </div>
-              </div>
-
               <div class="input-toolbar">
                 <div class="toolbar-left">
                   <div class="toolbar-actions">
+                    <!-- Attach dropdown: anchored INSIDE the trigger's wrap so the
+                         base `.mention-dropdown` rule (bottom: 100%) opens it
+                         directly above the + button — same unified anchoring
+                         as the model / workspace selectors. -->
                     <div class="mention-wrap">
-                      <button class="btn-icon input-btn" id="btn-mention" data-i18n-title="input.attachFiles" title="@ Attach">
-                        <i data-lucide="at-sign" class="lucide"></i>
+                      <button class="btn-icon input-btn" id="btn-mention" data-i18n-title="input.more" title="More">
+                        <i data-lucide="plus" class="lucide"></i>
                       </button>
+                      <div id="mention-dropdown" class="mention-dropdown hidden">
+                        <div class="mention-page" data-page="main">
+                          <!-- Mode commands (Plan / Spec, and any server-side
+                               kind:"mode" commands) rendered by app.ts -->
+                          <div id="mention-modes"></div>
+                          <!-- User-defined resources. The entries are always
+                               visible (empty groups open to an empty page) and
+                               each opens a sub-page, like the model / reasoning
+                               pickers do. Labels reuse the app's existing
+                               terminology keys (sidebar / market) so every
+                               surface names these the same way. -->
+                          <!-- Icons mirror the settings sidebar one-to-one:
+                               agent = the settled sa-loader chevron,
+                               skills = wand-2, connector = cable, rules =
+                               list-checks, library = file-text. No tools
+                               entry: tools are what the model calls, not
+                               something the user picks into a message. -->
+                          <button class="mention-dropdown-item" data-action="sub-res" data-res-kind="agents">
+                            <span class="sa-loader" data-running="false"><i></i><i></i><i class="sa-chevron"></i><i></i><i class="sa-chevron"></i><i></i><i></i><i></i><i class="sa-chevron"></i></span>
+                            <span data-i18n="sidebar.agent">Sub-agents</span>
+                            <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
+                          </button>
+                          <button class="mention-dropdown-item" data-action="sub-res" data-res-kind="skills">
+                            <i data-lucide="wand-2" class="lucide"></i>
+                            <span data-i18n="market.surfaceSkills">Skills</span>
+                            <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
+                          </button>
+                          <button class="mention-dropdown-item" data-action="sub-res" data-res-kind="connectors">
+                            <i data-lucide="cable" class="lucide"></i>
+                            <span data-i18n="market.surfaceMcp">Connectors</span>
+                            <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
+                          </button>
+                          <button class="mention-dropdown-item" data-action="sub-res" data-res-kind="rules">
+                            <i data-lucide="list-checks" class="lucide"></i>
+                            <span data-i18n="sidebar.rules">Rules</span>
+                            <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
+                          </button>
+                          <button class="mention-dropdown-item" data-action="sub-res" data-res-kind="library">
+                            <i data-lucide="file-text" class="lucide"></i>
+                            <span data-i18n="sidebar.library">Library</span>
+                            <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
+                          </button>
+                          <!-- Attachments: one entry, two actions behind the
+                               sub-page (Electron cannot offer file + folder
+                               in a single native dialog). -->
+                          <button class="mention-dropdown-item" data-action="sub-res" data-res-kind="attach">
+                            <i data-lucide="paperclip" class="lucide"></i>
+                            <span data-i18n="mention.addAttachment">Add attachment</span>
+                            <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
+                          </button>
+                          <button class="mention-dropdown-item" data-action="sub-slash">
+                            <i data-lucide="terminal" class="lucide"></i>
+                            <span data-i18n="slashCommands.title">Slash Commands</span>
+                            <i data-lucide="chevron-right" class="lucide" style="margin-left:auto;"></i>
+                          </button>
+                        </div>
+                        <div class="mention-page hidden" data-page="slash">
+                          <!-- rendered dynamically by app.ts -->
+                        </div>
+                        <!-- Resource sub-pages, filled in by app.ts on open -->
+                        <div class="mention-page hidden" data-page="res-agents"></div>
+                        <div class="mention-page hidden" data-page="res-skills"></div>
+                        <div class="mention-page hidden" data-page="res-connectors"></div>
+                        <div class="mention-page hidden" data-page="res-rules"></div>
+                        <div class="mention-page hidden" data-page="res-library"></div>
+                        <div class="mention-page hidden" data-page="res-attach"></div>
+                      </div>
                     </div>
                     <button type="button" id="btn-input-expand" class="btn-icon input-btn btn-hidden" data-i18n-title="input.expand" aria-label="Expand input">
                       <i data-lucide="maximize-2" class="lucide expand-icon"></i>
@@ -360,26 +471,13 @@
                   <div id="toolbar-mode-chip" class="toolbar-mode-chip hidden" data-mode="">
                     <i data-lucide="list-checks" class="chip-icon" style="width:12px;height:12px;"></i>
                     <span class="toolbar-mode-label"></span>
-                    <button class="toolbar-mode-close" id="btn-mode-close" data-i18n-title="input.cancelMode" title="Cancel mode">
-                      <i data-lucide="x" class="lucide" style="width:11px;height:11px;"></i>
-                    </button>
                   </div>
                   <div id="toolbar-command-chip" class="toolbar-command-chip hidden" data-command="">
                     <i data-lucide="wand-2" class="chip-icon" style="width:12px;height:12px;"></i>
                     <span class="toolbar-command-label"></span>
-                    <button class="toolbar-command-close" id="btn-command-close" data-i18n-title="input.cancelCommand" title="Clear command">
-                      <i data-lucide="x" class="lucide" style="width:11px;height:11px;"></i>
-                    </button>
                   </div>
                 </div>
                 <div class="toolbar-right">
-                  <div class="settings-dropdown-wrap hidden" id="input-workspace-selector-wrap">
-                    <button id="input-workspace-selector" class="input-selector" data-i18n-title="workspace.selectWorkspace" title="Select workspace">
-                      <span class="input-selector-label"></span>
-                      <i data-lucide="chevron-down" class="lucide input-selector-chevron"></i>
-                    </button>
-                    <div id="input-workspace-dropdown" class="mention-dropdown hidden"></div>
-                  </div>
                   <div class="settings-dropdown-wrap" id="input-model-selector-wrap">
                     <button id="input-model-selector" class="input-selector" data-i18n-title="input.selectModel" title="Select model">
                       <span class="input-selector-label"></span>
@@ -391,7 +489,7 @@
                     <i data-lucide="arrow-up" class="lucide"></i>
                   </button>
                   <button class="btn-stop" id="btn-stop" data-i18n-title="input.stop" title="Stop" style="display:none;">
-                    <i data-lucide="octagon" class="lucide"></i>
+                    <i data-lucide="circle" class="lucide"></i>
                   </button>
                 </div>
               </div>
@@ -401,6 +499,13 @@
           <!-- Summary floating panel -->
           <div id="summary-panel" class="summary-panel hidden">
             <div class="summary-panel-body">
+              <div class="summary-panel-section" id="summary-context">
+                <div class="summary-panel-header" id="summary-context-header">
+                  <span class="summary-panel-title" data-i18n="summary.context">Context</span>
+                  <span class="summary-ctx-usage" id="summary-context-usage"></span>
+                </div>
+                <div class="summary-panel-items" id="summary-context-items"></div>
+              </div>
               <div class="summary-panel-section" id="summary-progress">
                 <div class="summary-panel-header">
                   <span class="summary-panel-title" data-i18n="summary.progress">Progress</span>
@@ -518,6 +623,10 @@
           </div>
           <!-- /Automation view -->
 
+          <!-- Plugin market view (covers the whole #main-body exactly like
+               #automation-view; rendered by features/market.ts) -->
+          <div id="market-view" class="hidden"></div>
+
           <!-- Session inner sidebar -->
         <div id="session-inner-sidebar" class="hidden">
           <div class="si-resize-handle"></div>
@@ -540,8 +649,19 @@
   <div id="workspace-mgr-context-menu" class="hidden context-menu"></div>
 
   <!-- In-app splash / loading screen: covers boot while the startup mode's
-       data is filled, fades out on reveal, shown again for connection errors. -->
-  <div id="splash-screen"></div>
+       data is filled, fades out on reveal, shown again for connection errors.
+       The window is revealed by the main process on `ready-to-show`, which is
+       the first paint of THIS document — seconds before bundle.js runs. So the
+       splash has to be complete in markup: `body.splash-mode` above is what
+       keeps the app chrome out of that first frame, and the still logo below is
+       what replaces the loader SplashScreen.show() only mounts once JS runs.
+       SplashScreen.show() removes it when it takes the loader over. -->
+  <div id="splash-screen">
+    <div class="ea-loader ea-loader--static splash-preload">
+      <img class="splash-preload-dark" src="assets/Encre-dm.svg" alt="" />
+      <img class="splash-preload-light" src="assets/Encre-lm.svg" alt="" />
+    </div>
+  </div>
 
   </div><!-- /app-shell -->
 

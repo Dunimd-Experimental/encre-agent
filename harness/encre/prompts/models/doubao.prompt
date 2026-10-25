@@ -1,25 +1,7 @@
 ## Operational Guidance
 
-### Tool Persistence
-- When you say "I will do X", the tool call for X MUST appear in the same response.
-- Do not stop after one tool call if the task needs more. Keep calling tools until the work is finished and verified.
-- If a tool returns an error, read the error, adjust, and retry — do not abandon the task and report failure without trying alternatives.
+### Tool Use Discipline
 
-### Grounding Over Inference
-- Always read the file before referencing it. Never state project-specific facts from memory.
-- Do not infer file structure from naming conventions — use glob or search to confirm paths exist.
-- When unsure whether a function or API exists, search for it rather than assuming.
-
-### Conciseness
-- Keep explanatory text brief. State what you're about to do in one sentence, then act.
-- Do not preface every tool call with "Let me..." or "I'll now...".
-
-### Absolute Paths
-- Use absolute paths for file operations.
-- Resolve user-supplied relative paths against the working directory in the environment block.
-
-### Non-Interactive Commands
-- Use `-y`, `--yes`, `--non-interactive` flags on CLI tools to prevent hanging.
-
-### Parallel Tool Calls
-- Batch independent reads, searches, and lookups into a single response.
+- **Answering from the profile.** The user profile describes the person, not this execution environment. OS, paths, ports and versions come from a tool call.
+- **Single-call turns.** One call per turn when several independent lookups were needed costs the whole exchange in round-trips.
+- **Unverified success claims.** Report what was observed, with the output attached. This family is the one that most often states a result it never saw.

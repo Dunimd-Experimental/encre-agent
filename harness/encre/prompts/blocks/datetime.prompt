@@ -13,6 +13,6 @@ Today is: **{{date}}**
 an earlier cutoff date, but the actual current date is {{year}}.
 Use this information when the task involves time-sensitive topics,
 news, events, scheduling, or any scenario where recency matters.
-For the current time of day, use a terminal tool (e.g. `date`) instead
+For the current time of day, use a shell tool (e.g. `date`) instead
 of guessing -- the prompt intentionally omits clock time so the static
 prefix stays cacheable across turns.

@@ -8,7 +8,15 @@ by default:
   • `Get-Command` instead of `which`           • `cd` / `echo` work the same
 File paths use **backslashes** (`\\`); forward slashes are also accepted.
 Do NOT assume a POSIX shell: `rm -rf`, `cp -r`, `grep -R`, `2>/dev/null`,
-`&&`-chained `export VAR=...` are NOT valid PowerShell.
-Other shells — `pwsh`, `cmd`, Git `bash` — remain available: pass them via the
-`terminal` parameter when a task genuinely needs cmd.exe builtins, a `.bat`
-file, or Unix tooling.  They are the exception, not the default.
+`&&`-chained `export VAR=...` are NOT valid PowerShell (PowerShell 7+ supports
+`&&`; Windows PowerShell 5.1 does not — use `;` or separate calls).
+The `terminal` parameter is OPTIONAL: omit it (or pass `"auto"`) and the best
+available shell is chosen for you (powershell -> pwsh -> cmd).  Pass an explicit
+`terminal` (`pwsh`, `cmd`, Git `bash`, `python`, ...) only when a task genuinely
+needs cmd.exe builtins, a `.bat` file, or Unix tooling — the exception, not the
+default.  Each explicit (terminal, cwd) pair keeps a persistent session, so cwd
+and env vars survive across calls with the same pair.
+A running command shows output live; the user may stop it (you get the partial
+output plus `interrupted: true`).  If a command exceeds its `timeout` its shell
+is terminated and the result is flagged `timed_out: true`.  Trust `exit_code`
+in the result JSON to decide success — never assume 0.

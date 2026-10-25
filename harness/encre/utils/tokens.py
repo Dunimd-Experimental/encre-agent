@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,11 +21,19 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Shared token estimation using native Rust tokenizer, tiktoken, or fallback."""
 
 import importlib
 import json
+import re
 from typing import Any
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Native Rust tokenizer (fastest path)
@@ -141,6 +149,42 @@ _MODEL_ENCODING_PREFIXES: list[tuple[str, str]] = [
 
 _DEFAULT_ENCODING = "o200k_base"
 
+# ---------------------------------------------------------------------------
+# Inline binary payload handling
+# ---------------------------------------------------------------------------
+# Message text can carry inline binary payloads (data URLs, raw base64 runs
+# from pasted files or tool output).  No tokenizer prices these fairly: the
+# request path either converts them to image/document blocks (billed as a
+# fixed number of tiles) or strips them entirely, so counting their raw
+# characters produced fantasy figures (tens of "millions" of tokens for one
+# screenshot).  Strip them before estimation and charge the same flat
+# per-payload constant the image-tile rule uses below.
+_PAYLOAD_IMAGE_TOKENS = 170
+
+_DATA_URL_RE = re.compile(
+    r"data:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+"
+)
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{1024,}={0,2}")
+
+
+def _strip_binary_payloads(text: str) -> tuple[str, int]:
+    """Replace inline binary payloads with a marker; return (text, count).
+
+    Both patterns are linear scans; long base64 runs (>=1024 chars) are
+    payload-scale and never legitimate prose, so the false-positive risk is
+    negligible while the false-negative cost (13M-token gauges) was total.
+    """
+    count = 0
+
+    def _repl(_match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return "[binary payload]"
+
+    text = _DATA_URL_RE.sub(_repl, text)
+    text = _BASE64_RUN_RE.sub(_repl, text)
+    return text, count
+
 
 def _get_encoding(model: str) -> Any:
     """Return a tiktoken Encoding for *model*, cached per encoding name.
@@ -183,7 +227,7 @@ def estimate_tokens(text: str, model: str = "gpt-5.6") -> int:
             # Fastest path: the compiled Rust extension counts tokens natively.
             return _native_count_tokens(text)
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
     if _TIKTOKEN_AVAILABLE:
         enc = _get_encoding(model)
@@ -191,7 +235,7 @@ def estimate_tokens(text: str, model: str = "gpt-5.6") -> int:
             try:
                 return len(enc.encode(text))
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
 
     # Final fallback: ~4 characters per token is a reasonable English heuristic.
     return len(text) // 4
@@ -214,13 +258,16 @@ def count_message_tokens(
     for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, str):
-            total += estimate_tokens(content, model)
+            stripped, payloads = _strip_binary_payloads(content)
+            total += estimate_tokens(stripped, model) + payloads * _PAYLOAD_IMAGE_TOKENS
         elif isinstance(content, list):
             # Multi-part content blocks (vision / tool results, etc.).
             for block in content:
                 if isinstance(block, dict):
                     text = block.get("text", "")
-                    total += estimate_tokens(text, model)
+                    if text:
+                        stripped, payloads = _strip_binary_payloads(text)
+                        total += estimate_tokens(stripped, model) + payloads * _PAYLOAD_IMAGE_TOKENS
                     # Vision / document blocks carry no text but still consume
                     # tokens (image tiles + caption).  Counting them as zero
                     # previously under-estimated multimodal context, delaying
@@ -236,7 +283,12 @@ def count_message_tokens(
             # Account for the serialised tool name and arguments.
             for tc in tool_calls:
                 total += estimate_tokens(tc.get("name", ""), model)
-                total += estimate_tokens(tc.get("arguments", ""), model)
+                args = tc.get("arguments", "")
+                if isinstance(args, str) and args:
+                    stripped, payloads = _strip_binary_payloads(args)
+                    total += estimate_tokens(stripped, model) + payloads * _PAYLOAD_IMAGE_TOKENS
+                else:
+                    total += estimate_tokens(args, model)
         # Per-message overhead (role, formatting tokens)
         total += 8
     return total

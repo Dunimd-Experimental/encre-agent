@@ -1,0 +1,88 @@
+/**
+ * Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+ *
+ * This file is part of Encre.
+ * The Encre project belongs to the Dunimd Team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Theme skin "autumn" (枫土) — generated from the theme-demo v5.2
+ * palette (自然材质色阶). One file per skin; the mode ("light" / "dark")
+ * stays on [data-theme], the skin on [data-skin]. Only colours live here;
+ * surfaces (content paper, chassis, form-control background) and the
+ * neutral hover/selection plates are NOT defined here — styles.css and
+ * themes/tokens.css own them and keep them identical across every skin. Text/semantic values meet WCAG 4.5 (body) / 4.0 (tertiary)
+ * / 3.4 (muted) against the mode paper. */
+
+/* ═══ 枫土 · 浅 ═══ */
+html[data-skin="autumn"] {
+  --text-primary: hsl(22 18% 20%);
+  --text-secondary: hsl(24 10% 42%);
+  --text-tertiary: hsl(26 7% 48.5%);
+  --text-muted: hsl(26 7% 53%);
+  --tool-text: hsl(24 10% 36%);
+  --accent: hsl(18 36% 44%);
+  --accent-hover: hsl(18 38% 38%);
+  --accent-light: hsl(18 36% 44% / .10);
+  --accent-contrast: hsl(28 16% 98%);
+  --success: hsl(150 20% 40%);
+  --error: hsl(6 38% 48%);
+  --warning: hsl(38 40% 38.5%);
+  --border: hsl(28 10% 85%);
+  --border-light: hsl(28 10% 87%);
+  --card-border: hsl(28 14% 84%);
+  --card-fill: hsl(28 10% 91%);
+  --border-control: hsl(28 10% 78%);
+  --checkbox-border: hsl(28 15% 73%);
+  --selection-bg: hsl(16 24% 54% / .24);
+  --seg-bg: hsl(28 11% 93.5%);
+  --seg-active-bg: #fffdfa;
+  --seg-text: hsl(24 10% 42%);
+  --seg-text-hover: hsl(22 18% 20%);
+  --seg-active-text: hsl(22 18% 20%);
+  --page:linear-gradient(170deg, #f5e7d2 0%, #f6e6d4 46%, #f3e0d2 100%);
+  --blob1:radial-gradient(920px 540px at 84% -12%, hsl(26 60% 78% / .44), transparent 68%);
+  --blob2:radial-gradient(780px 500px at -14% 44%, hsl(10 50% 78% / .30), transparent 66%);
+}
+
+/* ═══ 枫土 · 深 ═══ */
+html[data-skin="autumn"][data-theme="dark"] {
+  --text-primary: hsl(24 10% 89%);
+  --text-secondary: hsl(24 7% 64%);
+  --text-tertiary: hsl(24 5% 49%);
+  --text-muted: hsl(24 5% 41%);
+  --tool-text: hsl(24 10% 89%);
+  --accent: hsl(18 32% 56%);
+  --accent-hover: hsl(18 30% 62%);
+  --accent-light: hsl(18 32% 56% / .12);
+  --accent-contrast: hsl(24 25% 11%);
+  --success: hsl(150 20% 55%);
+  --error: hsl(6 30% 58%);
+  --warning: hsl(40 32% 58%);
+  --border: hsl(24 7% 24%);
+  --border-light: hsl(24 7% 26%);
+  --card-border: hsl(24 7% 26%);
+  --card-fill: hsl(24 8% 15%);
+  --border-control: hsl(24 7% 30%);
+  --checkbox-border: hsl(24 8% 34%);
+  --selection-bg: hsl(16 24% 54% / .28);
+  --seg-bg: hsl(24 7% 19%);
+  --seg-active-bg: hsl(24 7% 23%);
+  --seg-text: hsl(24 7% 64%);
+  --seg-text-hover: hsl(24 10% 89%);
+  --seg-active-text: hsl(24 10% 89%);
+  --page:linear-gradient(172deg, hsl(24 12% 16%) 0%, hsl(22 10% 13%) 55%, hsl(18 9% 12%) 100%);
+  --blob1:radial-gradient(900px 520px at 82% -12%, hsl(24 55% 56% / .15), transparent 68%);
+  --blob2:radial-gradient(760px 480px at -12% 42%, hsl(8 40% 52% / .09), transparent 66%);
+}

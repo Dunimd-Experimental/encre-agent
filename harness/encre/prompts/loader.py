@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 Prompt file loader.
@@ -70,7 +72,7 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         return {}, text
 
     header = text[3:end_idx].strip()
-    body = text[end_idx + 4:].strip()
+    body = text[end_idx + 4 :].strip()
 
     meta: dict[str, Any] = {}
     lines = header.splitlines()
@@ -176,10 +178,7 @@ class PromptLoader:
             with open(path, encoding="utf-8") as f:
                 content = f.read().strip()
         except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Prompt file not found: {path}. "
-                f"Ensure the file exists under prompts/{category}/."
-            ) from None
+            raise FileNotFoundError(f"Prompt file not found: {path}. Ensure the file exists under prompts/{category}/.") from None
 
         _CACHE[cache_key] = content
         return content

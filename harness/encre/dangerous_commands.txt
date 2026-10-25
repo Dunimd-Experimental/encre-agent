@@ -22,19 +22,48 @@
 # Encre Dangerous Command Patterns — Blacklist for terminal operations
 #
 # Format: one regex pattern per line.
-# Section headers: [linux], [windows], [macos]
+# Section headers: [universal], [linux], [windows], [macos]
 # Lines starting with '#' are comments and ignored.
 # Empty lines are ignored.
+#
+# [universal] applies on every host. The other three apply when they match the
+# interpreter the command will actually run under: the engine uses the build's
+# target OS as the base and additionally enables the family named by the bash
+# tool's `terminal` argument (bash/zsh/sh -> linux, powershell/pwsh/cmd ->
+# windows), because that argument is model-supplied. Put a rule in [universal]
+# when it is about the SHAPE of a command rather than one platform's binaries.
 #
 # When permission_mode="blacklist", each subcommand produced by the shell
 # splitter is tested independently. Any subcommand matching a pattern below
 # triggers a permission prompt.
 # ==============================================================================
 
+# ── UNIVERSAL (every shell, every host) ──────────────────────────────────────
+[universal]
+
+# Download-and-execute chains. PowerShell runs on Linux and macOS too, so the
+#! severity=critical category=remote-exec
+# whole family is shell-independent and belongs here rather than under one OS.
+\bInvoke-Expression\b
+\biex\s
+\bInvoke-WebRequest\s+.*\|.*Invoke-Expression\b
+\bInvoke-RestMethod\s+.*\|.*Invoke-Expression\b
+\biwr\s+.*\|.*iex\b
+\birm\s+.*\|.*iex\b
+\bNew-Object\s+Net\.WebClient.*\.DownloadString\b
+\b\(New-Object\s+Net\.WebClient\).*\.DownloadFile\b
+\bStart-Process\s+.*\{.*\}.*-ArgumentList\b
+
+# Fork bomb -- no platform's binary is required, it is a pure shell shape, and
+# the table had no coverage of it at all.
+#! severity=critical category=resource
+:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:
+
 # ── LINUX ─────────────────────────────────────────────────────────────────────
 [linux]
 
 # File / directory destruction
+#! severity=critical category=fs
 \brm\s+.*-(?:[a-zA-Z]*r[a-zA-Z]*f|rf)\b
 \brm\s+.*--recursive.*--force\b
 \brm\s+-[a-zA-Z]*f.*(?:/\s*$|/\s+&&|/\s+\|)
@@ -49,12 +78,14 @@
 \btrash-empty\b
 
 # Privilege escalation
+#! severity=high category=priv-esc
 \bsudo\b
 \bsu\s+-
 \bdoas\b
 \bpkexec\b
 
 # Permission / ownership changes
+#! severity=high category=priv-esc
 \bchmod\s+.*777\b
 \bchmod\s+.*666\b
 \bchmod\s+.*000\b
@@ -66,11 +97,13 @@
 \bsetfacl\s+.*-m\b
 
 # Fork bombs & resource exhaustion
+#! severity=critical category=resource
 :\(\)\s*\{.*
-\b:(){ :\|:& };:
+:\(\)\{\s*:\s*\|\s*:\s*&\s*\}\s*;:
 \b:()\s*\{.*:\s*\|
 
 # Reverse / interactive shells
+#! severity=critical category=shell
 \bbash\s+-i\s*.*>&.*0>&1
 \bnc\s+.*-(?:e|(?:l|n)vp?)\s
 \bsocat\s+.*exec:
@@ -83,6 +116,7 @@
 \bphp\s+-r\s+.*sock
 
 # Download-to-shell pipelines
+#! severity=critical category=remote-exec
 \bcurl\s+\S+.*\|\s*(?:ba)?sh\b
 \bcurl\s+\S+.*\|\s*python[23]?\b
 \bwget\s+\S+.*-O\s*-\s*\|\s*(?:ba)?sh\b
@@ -91,6 +125,7 @@
 \becho\s+.*\|\s*base64\s+.*\|\s*(?:ba)?sh\b
 
 # Encoded / obfuscated evaluation
+#! severity=high category=obfuscation
 \bbase64\s+.*\|.*(?:ba)?sh\b
 \bxxd\s+.*-r.*(?:ba)?sh\b
 \beval\s
@@ -98,15 +133,19 @@
 \bsource\s+\S+\.(?:sh|bash|zsh)\s+.*\|
 
 # System service / process control
+#! severity=high category=system
 \bsystemctl\s+(?:stop|disable|mask|restart)\s
 \bservice\s+\S+\s+(?:stop|restart)\b
+#! severity=critical category=system
 \bmodprobe\s+-r\s
+#! severity=high category=system
 \bkill\s+-9\s
 \bkillall\s
 \bpkill\s
 \bxargs\s+.*\bkill\b
 
 # Data exfiltration & network tunnels
+#! severity=high category=exfil
 \bnc\s+\S+\s+\d+\s*<
 \bcurl\s+.*-F\s+\S+@\S+
 \bscp\s+\S+@
@@ -114,6 +153,7 @@
 \bss\s+.*-l\b
 
 # Redirects to system paths
+#! severity=critical category=fs
 >\s*/dev/(?:sd[a-z]+|nvme\d+n\d+|mmcblk\d+)
 >\s*/etc/(?:passwd|shadow|sudoers|hosts|resolv\.conf)
 >\s*/(?:etc|boot|sys|proc|dev)/
@@ -122,22 +162,26 @@
 \bcat\s+.*>\s*/etc/
 
 # Scheduled tasks & boot
+#! severity=high category=system
 \bcrontab\s+-
 \bat\s+\d
 
 # Network / firewall / routing
+#! severity=high category=network
 \biptables\s+-[ADIF]
 \bip6tables\s
 \bfirewall-cmd\s+--remove
 \broute\s+(?:add|del)\s
 
 # Mount / remount operations
+#! severity=high category=system
 \bmount\s+-o\s+remount.*,\s*rw\s+/
 \bumount\s+-l\s+/
 \bumount\s+/
 \bmount\s+\S+\s+/
 
 # Package manager destructive operations
+#! severity=medium category=package
 \bapt\s+remove\s+.*\b(systemd|linux-image|grub)
 \bapt-get\s+remove\s+.*\b(systemd|linux-image|grub)
 \byum\s+remove\s+.*\b(kernel|grub)
@@ -145,12 +189,15 @@
 \bpacman\s+-R\s+.*\b(base|linux)
 
 # Sensitive file reads
+#! severity=low category=disclosure
 \bcat\s+/etc/(?:shadow|passwd)\b
 \bcat\s+.*\.ssh/
 \bcat\s+.*\.env\b
 \bless\s+.*\.ssh
+\bcat\s+/proc/\d+/(?:environ|cmdline|maps)\b
 
 # Variable / environment manipulation
+#! severity=medium category=obfuscation
 \$\{(?:PATH|HOME|SHELL|IFS)[:#%/]
 \bIFS\s*=
 \bexport\s+PATH=
@@ -163,6 +210,7 @@
 \btee\s+/etc/(?:passwd|shadow|sudoers|hosts)
 
 # SSH key injection
+#! severity=high category=persistence
 \bssh-copy-id\b
 \bcurl\s+\S+\s+-o\s+.*\.ssh/authorized_keys\b
 
@@ -170,39 +218,62 @@
 \bsystemctl\s+enable\s+\S+\s*(?:--now)?\b
 
 # Cross-platform pwsh (PowerShell Core) on Linux / macOS
+#! severity=critical category=remote-exec
 \bpwsh\s+.*-EncodedCommand\b
 \bpwsh\s+.*-enc\b
 \bpwsh\s+.*-e\s+\S{20,}
 \bpwsh\s+.*[Ww]indow[Ss]tyle\s+[Hh]idden\b
 \bpwsh\s+.*-NoProfile\s+.*-NonInteractive\b
 
-# pwsh download-exec chains
-\bInvoke-Expression\b
-\bInvoke-WebRequest\s+.*\|.*Invoke-Expression\b
-\bInvoke-RestMethod\s+.*\|.*Invoke-Expression\b
-\biwr\s+.*\|.*iex\b
-\birm\s+.*\|.*iex\b
-\bNew-Object\s+Net\.WebClient.*\.DownloadString\b
-\(New-Object\s+Net\.WebClient\).*\.DownloadFile\b
-\bStart-Process\s+.*\{.*\}.*-ArgumentList\b
+# pwsh download-exec chains: moved to [universal] (PowerShell is cross-platform,
+# and duplicating the block per section let the copies drift).
 
 # Flatpak destructive (Linux)
+#! severity=medium category=package
 \bflatpak\s+(?:uninstall|remove)\s+--delete-data\b
 
 # Snap destructive (Linux)
+#! severity=medium category=package
 \bsnap\s+(?:remove|purge)\s+\S+\s+--purge\b
 
 # Nix destructive (Linux)
+#! severity=medium category=package
 \bnix-collect-garbage\s+-d\b
 \bnix\s+store\s+--delete\b
 
 # Redirects to hosts file (Linux)
+#! severity=high category=persistence
 >>?\s+/etc/hosts\b
+
+# ── Shell / encoding escape vectors (shared Unix) ────────────────────────────
+# Piping anything into a shell is the classic jailbreak channel
+#! severity=critical category=remote-exec
+\|\s*(?:ba|z|da)?sh\b
+\|\s*powershell\b
+\|\s*python[0-9.]*\b
+# Decode-then-execute
+#! severity=high category=obfuscation
+\bbase64\s+(?:-d|--decode|-D)\b
+\bopenssl\s+enc\s+.*-d\b
+\bxxd\s+-r\b
+\bprintf\b[^\n]*\\x[0-9a-fA-F]{2}
+# Scripting interpreters as command executors
+#! severity=high category=shell
+\bpython[0-9.]*\s+-c\s+.*(os\.system|subprocess|__import__|exec\s*\(|eval\s*\()
+\bperl\s+-e\s+
+\bruby\s+-e\s+
+\bnode\s+-e\s+
+# Command substitution executing downloads / nested shells
+#! severity=critical category=remote-exec
+\$\(\s*(?:curl|wget)\b
+\x60[^\x60]*(?:curl|wget)\b[^\x60]*\x60
+\b(?:ba)?sh\s+-c\b.*\$\(
 
 # ── WINDOWS (cmd.exe / PowerShell) ────────────────────────────────────────────
 [windows]
 
 # File & disk destruction
+#! severity=critical category=fs
 \brd\s+/s\s+/q\b
 \brmdir\s+/s\s+/q\b
 \bdel\s+/[a-zA-Z]*f[a-zA-Z]*\s+/[a-zA-Z]*s[a-zA-Z]*\b
@@ -212,7 +283,25 @@
 \bRemove-Item\s+.*-Recurse\s+.*-Force\b
 \bri\s+.*-r\s+.*-fo\b
 
+# Same destruction in the shapes the model actually writes. The block above
+# hardcodes cmd.exe flag ORDER (`/f` before `/s`) and PowerShell's cmdlet name,
+# so `del /q C:\*`, `del /s /q C:\Users`, `Remove-Item -Force -Recurse ...` and
+# PowerShell's Unix-style `rm -rf` alias all cleared the table unmatched.
+#! severity=critical category=fs
+\bdel\s+/s\s+/[a-zA-Z]+\b
+\bdel\s+/[a-zA-Z]+\s+/s\b
+\bdel\s+/[a-zA-Z]*[qs][a-zA-Z]*\s+[a-zA-Z]:\\+\*
+\brm\s+-(?:[a-zA-Z]*r[a-zA-Z]*f|rf|fr)\b
+\b(?:Remove-Item|rm|del|erase)\s+.*-Force\b.*-Recurse\b
+
+# Power state: an unattended reboot aborts the run mid-turn and is never
+#! severity=high category=power
+# something the agent needs to ask with a shell command.
+\bshutdown\s+/(?:r|s|p|f|m)\b
+\b(?:Restart-Computer|Stop-Computer)\b
+
 # Registry manipulation
+#! severity=high category=system
 \breg\s+(?:add|delete)\b
 \breg\s+delete\s+HKLM
 \breg\s+delete\s+HKCU
@@ -221,6 +310,7 @@
 \bRemove-ItemProperty\b
 
 # User & group management
+#! severity=medium category=system
 \bnet\s+user\s+\S+\s+/add\b
 \bnet\s+user\s+\S+\s+/delete\b
 \bnet\s+localgroup\s+Administrators\s+/add\b
@@ -229,6 +319,7 @@
 \bRemove-LocalUser\b
 
 # Service control
+#! severity=high category=system
 \bnet\s+stop\s
 \bsc\s+(?:stop|delete)\s
 \bsc\s+config\s+\S+\s+start=\s*disabled\b
@@ -236,12 +327,14 @@
 \bGet-Service\s+.*\|.*Stop-Service\b
 
 # Process termination
+#! severity=medium category=system
 \btaskkill\s+/f\b
 \btaskkill\s+/im\s
 \bStop-Process\s+.*-Force\b
 \bk\s+-f\b
 
 # System shutdown
+#! severity=high category=power
 \bshutdown\s+/s\s+/f\b
 \bshutdown\s+/p\b
 \bshutdown\s+/r\s+/f\b
@@ -249,24 +342,20 @@
 \bStop-Computer\s+.*-Force\b
 
 # PowerShell / pwsh encoded / obfuscated commands
+#! severity=high category=obfuscation
 \b(?:powershell|pwsh)\s+.*-EncodedCommand\b
 \b(?:powershell|pwsh)\s+.*-enc\b
 \b(?:powershell|pwsh)\s+.*-e\s+\S{20,}
 \b(?:powershell|pwsh)\s+.*[Ww]indow[Ss]tyle\s+[Hh]idden\b
 \b(?:powershell|pwsh)\s+.*-NoProfile\s+.*-NonInteractive\b
 
-# PowerShell / pwsh invocation & download-exec chains
-\bInvoke-Expression\b
-\biex\s
-\bInvoke-WebRequest\s+.*\|.*Invoke-Expression\b
-\biwr\s+.*\|.*iex\b
-\bInvoke-RestMethod\s+.*\|.*Invoke-Expression\b
-\birm\s+.*\|.*iex\b
-\bNew-Object\s+Net\.WebClient.*\.DownloadString\b
-\b\(New-Object\s+Net\.WebClient\).*\.DownloadFile\b
-\bStart-Process\s+.*\{.*\}.*-ArgumentList\b
+# PowerShell / pwsh invocation & download-exec chains: lifted to [universal].
+# Hidden-window / -NoProfile stealth flags stay here -- they are cmd.exe- and
+# powershell.exe-specific on this host.
+#! severity=medium category=obfuscation
 
 # WMI manipulation
+#! severity=high category=system
 \bwmic\s+process\s+call\s+create\b
 \bwmic\s+/node:
 \bInvoke-WmiMethod\b
@@ -280,11 +369,13 @@
 \bSet-Acl\b
 
 # Boot configuration
+#! severity=high category=system
 \bbcdedit\s+/set\b
 \bbcdedit\s+/delete\b
 \bbootcfg\s+/delete\b
 
 # Network configuration
+#! severity=medium category=network
 \bnetsh\s+interface\s+(?:set|delete|reset)\b
 \bnetsh\s+firewall\s+(?:set|delete|reset)\b
 \bnetsh\s+advfirewall\s+set\b
@@ -292,6 +383,7 @@
 \bRemove-NetFirewallRule\b
 
 # Scheduled tasks
+#! severity=medium category=system
 \bschtasks\s+/create\b
 \bschtasks\s+/delete\s+/f\b
 \bschtasks\s+/change\b
@@ -299,20 +391,40 @@
 \bUnregister-ScheduledTask\b
 
 # BitLocker sabotage
+#! severity=critical category=system
 \bmanage-bde\s+.*-off\b
 \bSuspend-BitLocker\b
 \bDisable-BitLocker\b
 
 # DNS & hosts
+#! severity=high category=persistence
 \nslookup\s
 \bAdd-Content\s+.*\\etc\\hosts\b
 \bipconfig\s+/flushdns\b
 
 # Live system binary abuse
+#! severity=critical category=shell
 \bcertutil\s+-urlcache\s+-split\s+-f\b
 \bcertutil\s+-decode\b
 \bcertutil\s+-encode\b
 \bmshta\s+\S+\.(?:hta|vbs|js)\b
+
+# ── Shell / encoding escape vectors (PowerShell / cmd) ──────────────────────
+(?i)powershell[0-9.]*\s+.*-(?:enc|encodedcommand|ec)\b
+(?i)invoke-expression\b
+(?i)\biex\s*\(
+(?i)invoke-command\b
+(?i)start-process\s+.*-verb\s+(?:runas|elevate)\b
+(?i)frombase64string\b
+(?i)downloadstring\b
+\|\s*(?:ba|z|da)?sh\b
+\|\s*python[0-9.]*\b
+\bbase64\s+(?:-d|--decode|-D)\b
+\bprintf\b[^\n]*\\x[0-9a-fA-F]{2}
+\bpython[0-9.]*\s+-c\s+.*(os\.system|subprocess|__import__|exec\s*\(|eval\s*\()
+\bnode\s+-e\s+
+\$\(\s*(?:curl|wget)\b
+\bcmd\s+/c\b.*\$\(
 
 # ── macOS ─────────────────────────────────────────────────────────────────────
 [macos]
@@ -321,39 +433,47 @@
 # Plus macOS-specific dangerous commands:
 
 # Disk management
+#! severity=critical category=fs
 \bdiskutil\s+(?:eraseDisk|eraseVolume|reformat|partitionDisk|zeroDisk|randomDisk)\b
 \bdiskutil\s+(?:unmountDisk|unmount\s+force)\b
 \bhdiutil\s+(?:compact|burn)\b
 
 # Service & daemon control
+#! severity=high category=system
 \blaunchctl\s+(?:unload|remove|disable)\s
 \blaunchctl\s+unload\s+/System/Library/LaunchDaemons/
 \blaunchctl\s+remove\s+
 
 # System Integrity Protection (SIP)
+#! severity=critical category=system
 \bcsrutil\s+disable\b
 \bcsrutil\s+clear\b
 
 # AppleScript execution
+#! severity=high category=shell
 \bosascript\s+.*-e\s
 \bosascript\s+.*-l\s
 
 # Package installation (potential malware)
+#! severity=medium category=package
 \binstaller\s+-pkg\s+.*-target\s+/\b
 \binstaller\s+-store\b
 
 # Firmware / boot modification
+#! severity=critical category=system
 \bnvram\s+.*boot-args\b
 \bnvram\s+-d\s
 \bsystemsetup\s+-set
 \bbless\s+.*--setBoot
 
 # Keychain & security
+#! severity=high category=disclosure
 \bsecurity\s+delete-keychain\b
 \bsecurity\s+delete-generic-password\b
 \bsecurity\s+lock-keychain\b
 
 # User & directory services
+#! severity=high category=system
 \bdscl\s+.*-create\b
 \bdscl\s+.*-delete\b
 \bdscl\s+.*-passwd\b
@@ -366,5 +486,22 @@
 \btmutil\s+disablelocal\b
 
 # File operations on system paths
+#! severity=critical category=fs
 \bditto\s+.*/System/Library
 \bditto\s+.*/Library/LaunchDaemons
+
+# ── Shell / encoding escape vectors (shared Unix) ────────────────────────────
+\|\s*(?:ba|z|da)?sh\b
+\|\s*powershell\b
+\|\s*python[0-9.]*\b
+\bbase64\s+(?:-d|--decode|-D)\b
+\bopenssl\s+enc\s+.*-d\b
+\bxxd\s+-r\b
+\bprintf\b[^\n]*\\x[0-9a-fA-F]{2}
+\bpython[0-9.]*\s+-c\s+.*(os\.system|subprocess|__import__|exec\s*\(|eval\s*\()
+\bperl\s+-e\s+
+\bruby\s+-e\s+
+\bnode\s+-e\s+
+\$\(\s*(?:curl|wget)\b
+\x60[^\x60]*(?:curl|wget)\b[^\x60]*\x60
+\b(?:ba)?sh\s+-c\b.*\$\(

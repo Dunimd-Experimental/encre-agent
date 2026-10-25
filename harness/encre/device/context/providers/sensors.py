@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,7 +21,9 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-"""Sensor info provider 鈥?accelerometer, gyroscope, magnetometer, ambient light.
+from __future__ import annotations
+
+"""Sensor info provider — accelerometer, gyroscope, magnetometer, ambient light.
 
 ``collect_async`` is the primary entry point and is non-blocking on the
 event loop: the Windows path uses WinRT directly with ``await``, while
@@ -33,6 +35,11 @@ import sys
 from typing import Any
 
 from encre.device.context.base import DeviceProvider
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 class SensorInfoProvider(DeviceProvider):
@@ -76,7 +83,7 @@ class SensorInfoProvider(DeviceProvider):
                     "z": r.acceleration_z,
                 }
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
         try:
             s = wds.Gyrometer.get_default()
@@ -88,7 +95,7 @@ class SensorInfoProvider(DeviceProvider):
                     "z": r.angular_velocity_z,
                 }
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
         try:
             s = wds.Magnetometer.get_default()
@@ -100,7 +107,7 @@ class SensorInfoProvider(DeviceProvider):
                     "z": r.magnetic_field_z,
                 }
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
         try:
             s = wds.LightSensor.get_default()
@@ -108,6 +115,6 @@ class SensorInfoProvider(DeviceProvider):
                 r = s.get_current_reading()
                 result["ambient_light"] = {"illuminance_lux": r.illuminance_in_lux}
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
         return result if result else None

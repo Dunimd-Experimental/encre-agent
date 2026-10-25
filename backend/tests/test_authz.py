@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -161,7 +161,10 @@ def test_verify_pairing_is_per_platform_user(pairing):
 
 
 def _checker(settings=None, pairing=None, monkeypatch_env=None):
-    """Helper: build an AuthorizationChecker with the given settings dict and optional pairing store.
+    """Build an AuthorizationChecker wired to the given settings dict and pairing store.
+
+    The settings mapping is wrapped in a zero-argument function so the checker sees the
+    same callable surface as a live EncreConfig object.
 
     Args:
         settings: Mapping of config keys to string values (simulates EncreConfig).
@@ -174,13 +177,14 @@ def _checker(settings=None, pairing=None, monkeypatch_env=None):
     cfg = settings or {}
 
     def config_fn():
+        """Return the captured settings mapping as the current config snapshot."""
         return cfg
 
     return AuthorizationChecker(pairing=pairing, config_fn=config_fn)
 
 
 def _src(platform="telegram", user_id="42", user_id_alt=None):
-    """Helper: build a SessionSource for the given platform and user identity.
+    """Build a SessionSource for the given platform and user identity.
 
     Args:
         platform: Platform identifier string (e.g. "telegram", "discord").
@@ -381,25 +385,30 @@ def test_verify_authz_no_user_id_denies_without_allow_all(pairing):
 
 class _AuthzAdapter(BasePlatformAdapter):
     """Minimal test adapter that records sent messages for assertion."""
+
     name = "telegram"
 
     def __init__(self):
+        """Initialise the base adapter and the list that captures outbound messages."""
         super().__init__()
         self.sent: list[tuple[str, str]] = []
 
     async def connect(self, *, is_reconnect=False) -> bool:
+        """Report a successful connection without touching any platform."""
         return True
 
     async def disconnect(self) -> None:
+        """Tear down nothing; there is no real connection to close."""
         pass
 
     async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+        """Record the chat target and body, then report success."""
         self.sent.append((chat_id, content))
         return SendResult(success=True, message_id="m1")
 
 
 def _event(text, chat_id="1", user_id="42"):
-    """Helper: build a MessageEvent for the given text, chat_id, and user_id."""
+    """Build a MessageEvent for the given text, chat_id and user_id."""
     return MessageEvent(
         text=text,
         source=SessionSource(platform="telegram", chat_id=chat_id, chat_type="dm", user_id=user_id),
@@ -421,6 +430,7 @@ async def test_verify_handle_message_rejects_unauthorized(tmp_path):
     dispatched = []
 
     async def handler(adapter, event):
+        """Record the event so the test can prove it was or was not called."""
         dispatched.append(event)
 
     a.set_message_handler(handler)
@@ -475,6 +485,7 @@ async def test_verify_handle_message_pair_redeem_flow(tmp_path):
     dispatched = []
 
     async def handler(adapter, event):
+        """Record the event so the test can count how many were dispatched."""
         dispatched.append(event)
 
     a2.set_message_handler(handler)
@@ -495,6 +506,7 @@ async def test_verify_handle_message_no_authz_allows_everything():
     dispatched = []
 
     async def handler(adapter, event):
+        """Record the event so the test can prove the legacy path dispatched it."""
         dispatched.append(event)
 
     a.set_message_handler(handler)

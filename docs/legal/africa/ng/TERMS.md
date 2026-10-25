@@ -29,7 +29,7 @@ Using a service or creating an account concludes a contract with us on these ter
 | Service | Description | Availability |
 |---|---|---|
 | **Encre Agent Desktop** | local-first AI Agent application | Windows, macOS, Linux |
-| **Encre Agent Framework** | Python framework + Rust native core | open source, github.com/mf2023/Encre |
+| **Encre Agent** | Python gateway + Rust native core | open source, github.com/mf2023/Encre |
 | **Chat integrations** | connectors to 18 chat platforms | per platform availability |
 | **PiscesLx** | hosted LLM inference (optional) | subscription |
 | **StadionOS** | operating-system project | separate licence |

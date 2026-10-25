@@ -23,13 +23,14 @@
 /**
  * Automation panel controller.
  *
- * Manages the full-screen "Automation" view that covers the main chat area.
- * (This module originated from the now-removed "iClaw" mode.)
+ * Manages the "Automation" content-area page (a demoted view — it covers the
+ * main slot like settings does, without touching the sidebar or the mode).
  *
- * Visibility is expressed as a single class on the panel (`hidden`), and the
- * slide itself lives in CSS — see the "Unified Motion" block near the end of
- * styles.css. The sidebar collapse is likewise a class on #app, whose width
- * transition is also declared in CSS.
+ * Visibility is expressed as the shared `hidden` class plus the shared
+ * sub-view motion: `showViewAnimated` / `hideViewAnimated` from ui/animate.ts
+ * drive the fade-up entrance and the `.view-exit` dissolve declared in the
+ * "Sub-view switch" block near the end of styles.css — the exact same motion
+ * settings / search / agents use.
  *
  * This controller therefore animates nothing itself. It flips state, fires
  * its callbacks and lets the stylesheet move things. That is deliberate: the
@@ -39,12 +40,10 @@
  * elements — the layout residue this rewrite removes.
  */
 
+import { showViewAnimated, hideViewAnimated } from "../ui/animate.js";
+
 export class AutomationPanel {
-  private _toggleBtn: HTMLElement | null = null;
   private _automationView: HTMLElement | null = null;
-  private readonly _appEl: HTMLElement | null = null;
-  /** Whether the sidebar was already collapsed before automation opened. */
-  private _sidebarWasCollapsed = false;
 
   /** Called each time the automation panel opens */
   public onShow: (() => void) | null = null;
@@ -52,9 +51,7 @@ export class AutomationPanel {
   public onHide: (() => void) | null = null;
 
   constructor() {
-    this._toggleBtn = document.getElementById("btn-toggle-sidebar");
     this._automationView = document.getElementById("automation-view");
-    this._appEl = document.getElementById("app");
   }
 
   /** Whether the automation view is currently visible. */
@@ -65,41 +62,22 @@ export class AutomationPanel {
     );
   }
 
-  /** Shows the automation view. No-op when already open. */
+  /** Shows the automation view. No-op when already open.
+   *
+   *  Demoted view: automation no longer hides the sidebar — it renders as a
+   *  plain content-area page (like settings), so the sidebar stays as-is.
+   *  Entrance rides the shared sub-view fade-up (`@starting-style`). */
   show(): void {
     if (!this._automationView || this.isActive) return;
-
-    // Collapse the sidebar for the duration of the automation view. The
-    // width transition is CSS, so adding the class is the whole job.
-    if (this._appEl) {
-      this._sidebarWasCollapsed =
-        this._appEl.classList.contains("sidebar-collapsed");
-      this._appEl.classList.add("sidebar-collapsed");
-    }
-
-    // The sidebar is force-collapsed here, so its toggle must not look
-    // clickable. The search button is deliberately left untouched.
-    if (this._toggleBtn) {
-      (this._toggleBtn as HTMLButtonElement).disabled = true;
-    }
-
-    this._automationView.classList.remove("hidden");
+    showViewAnimated(this._automationView);
     this.onShow?.();
   }
 
-  /** Hides the automation view. No-op when not open. */
+  /** Hides the automation view. No-op when not open.
+   *  Exit rides the shared `.view-exit` dissolve (ui/animate.ts). */
   hide(): void {
     if (!this._automationView || !this.isActive) return;
-
-    // Restore the sidebar, unless it was already collapsed on entry.
-    if (this._appEl && !this._sidebarWasCollapsed) {
-      this._appEl.classList.remove("sidebar-collapsed");
-    }
-    if (this._toggleBtn) {
-      (this._toggleBtn as HTMLButtonElement).disabled = false;
-    }
-
-    this._automationView.classList.add("hidden");
+    hideViewAnimated(this._automationView);
     this.onHide?.();
   }
 

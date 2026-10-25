@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,6 +21,8 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass
@@ -28,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from encre.config import get_data_dir
+
+from encre.logging_config import get_logger
 
 
 @dataclass
@@ -202,7 +206,7 @@ class RulesLoader:
                         name = entry.stem
                         rules.append(RuleFile(source=f"global:{name}", content=content, priority=50))
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
         self._cache[cache_key] = (signature, rules)
         return rules
@@ -223,7 +227,7 @@ class RulesLoader:
         try:
             from encre.codex_compat import build_codex_context
         except Exception as e:  # pragma: no cover - tomllib may be missing
-            logger = logging.getLogger(__name__)
+            logger = get_logger(__name__)
             logger.debug("Codex compatibility layer unavailable: %s", e)
             return []
 

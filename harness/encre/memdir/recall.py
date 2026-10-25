@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -27,8 +26,8 @@ Core principle (project-wide, non-negotiable): **context != memory**.
 
 Memory retrieval is not keyword lookup.  A remembered thing is *associated*
 with other remembered things, so recalling one should pull in the cluster it
-belongs to -- "由一条想起一串".  This module implements exactly that, on top of
-the storage tier in :mod:`encre.memdir.layers`:
+belongs to -- "one thread pulls up the whole chain".  This module implements
+exactly that, on top of the storage tier in :mod:`encre.memdir.layers`:
 
 1. **Seeds.**  The query is matched against visible memories with the existing
    local :class:`~encre.memdir.semantic.SemanticMemorySearch` (TF-IDF cosine
@@ -53,7 +52,7 @@ Embedding backend
 =================
 Local TF-IDF + Jaccard is the **default and always-available** path, so the
 engine stays fully usable offline.  A native embedding backend (Rust
-``cosine_similarity`` / ``search_embedding_index``) can be selected as an
+``cosine_similarity``) can be selected as an
 *optional stronger* scorer when the caller supplies an embedding function plus
 a vector index.  The backend is chosen explicitly via ``backend="auto" |
 "local" | "native"``; ``auto`` prefers native when it is actually usable and
@@ -66,13 +65,14 @@ raised into the caller.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 from encre import native as native_backend
 from encre.logging_config import get_logger
-from encre.memdir.layers import LinkRelation, MemoryEntry, MemoryLayerStore
+from encre.memdir.layers import LinkRelation, MemoryEntry, MemoryLayerStore, MemoryType
 from encre.memdir.semantic import SemanticMemorySearch
 
 logger = get_logger(__name__)
@@ -86,15 +86,19 @@ __all__ = [
 
 #: Propagation weight per link relation, applied on top of the edge's own
 #: ``weight``.  The ordering reflects how tightly the association binds two
-#: memories: a *causal* link means one thing produced the other, and a
-#: *dependency* means one cannot stand without the other, so both spread
-#: strongly; a *same_goal* link is a goal cluster (strong but looser); a bare
-#: *reference* is the weakest association, a citation without entailment.
+#: nodes: *causes* and *supersedes* are entailment-grade (one produced or
+#: replaced the other), *contradicts* and *refines* tie two nodes into the
+#: same argument (an opponent is still an associate), *supports* is strong
+#: corroboration, *mentions* is a bare citation and *co_occurs* the loosest
+#: statistical association.
 DEFAULT_RELATION_WEIGHTS: dict[str, float] = {
-    LinkRelation.CAUSAL.value: 0.90,
-    LinkRelation.DEPENDENCY.value: 0.85,
-    LinkRelation.SAME_GOAL.value: 0.80,
-    LinkRelation.REFERENCE.value: 0.60,
+    LinkRelation.CAUSES.value: 0.90,
+    LinkRelation.SUPERSEDES.value: 0.90,
+    LinkRelation.CONTRADICTS.value: 0.85,
+    LinkRelation.REFINES.value: 0.85,
+    LinkRelation.SUPPORTS.value: 0.80,
+    LinkRelation.MENTIONS.value: 0.65,
+    LinkRelation.CO_OCCURS.value: 0.55,
 }
 
 #: Fallback propagation weight for an unrecognised (free-form) relation.
@@ -118,6 +122,15 @@ DEFAULT_SEED_LIMIT = 10
 
 #: Maximum number of hits returned by :meth:`RecallEngine.recall`.
 DEFAULT_RESULT_LIMIT = 10
+
+#: Minimum seed score for a seed to trigger family expansion through an
+#: entity hub.  Below this the hit is too weak to vouch for its family.
+_FAMILY_SEED_FLOOR = 0.08
+
+#: Fixed activation fraction a hub member inherits from a seed that touched
+#: its hub.  Hubs are index nodes, not associations: one deterministic
+#: burst replaces the geometric decay that would kill two-hop reach.
+_FAMILY_BOOST = 0.5
 
 
 class EmbeddingBackend(str, Enum):
@@ -148,8 +161,12 @@ class RecallHit:
         hops: ``0`` for a similarity seed, otherwise the link distance.
         via_links: The link edges traversed to reach this hit, seed-first.
         origin_id: Id of the seed this hit originated from (its own id when it
-            is a seed).
+            is the seed).
         backend: The scoring backend actually used (``"local"`` / ``"native"``).
+        detail_text: The verbatim full statement loaded from the store's
+            detail layer (falls back to the node content).  Filled by the
+            engine at read-out: the graph decides *which* memory, the detail
+            layer carries *the whole memory*.
     """
 
     entry: MemoryEntry
@@ -158,6 +175,7 @@ class RecallHit:
     via_links: list[dict[str, Any]] = field(default_factory=list)
     origin_id: str = ""
     backend: str = EmbeddingBackend.LOCAL.value
+    detail_text: str = ""
 
     @property
     def entry_id(self) -> str:
@@ -175,6 +193,7 @@ class RecallHit:
             "entry_id": self.entry.id,
             "type": self.entry.type,
             "content": self.entry.content,
+            "confidence": self.entry.confidence,
             "score": self.score,
             "hops": self.hops,
             "is_seed": self.is_seed,
@@ -196,9 +215,6 @@ class RecallEngine:
         embedding_index: Optional ``{entry_id: vector}`` index.  When given
             together with ``embedding_fn``, native ``cosine_similarity`` scores
             the seeds.
-        embedding_workspace: Optional workspace holding a persisted native
-            embedding index; when given, native ``search_embedding_index`` is
-            used and each hit's ``file`` field is read as the memory entry id.
         relation_weights: Optional override merged onto
             :data:`DEFAULT_RELATION_WEIGHTS`.
         hop_decay: Activation multiplier per hop.
@@ -218,7 +234,6 @@ class RecallEngine:
         backend: str = EmbeddingBackend.AUTO.value,
         embedding_fn: Callable[[str], list[float]] | None = None,
         embedding_index: dict[str, list[float]] | None = None,
-        embedding_workspace: str | None = None,
         relation_weights: dict[str, float] | None = None,
         hop_decay: float = DEFAULT_HOP_DECAY,
         max_hops: int = DEFAULT_MAX_HOPS,
@@ -232,7 +247,6 @@ class RecallEngine:
         self._requested_backend = EmbeddingBackend(str(backend).strip().lower())
         self._embedding_fn = embedding_fn
         self._embedding_index = embedding_index
-        self._embedding_workspace = embedding_workspace
         self._relation_weights = dict(DEFAULT_RELATION_WEIGHTS)
         if relation_weights:
             self._relation_weights.update(
@@ -257,14 +271,11 @@ class RecallEngine:
         """Whether native embedding scoring is genuinely available here.
 
         Native is enabled only when the extension loaded *and* the caller
-        supplied both an embedder and something to score against (an in-memory
-        index or a persisted workspace index).  Otherwise the local backend is
-        used, unchanged.
+        supplied both an embedder and an in-memory vector index to score
+        against.  Otherwise the local backend is used, unchanged.
         """
         if not self._native_available or self._embedding_fn is None:
             return False
-        if self._embedding_workspace:
-            return callable(getattr(native_backend, "search_embedding_index", None))
         if self._embedding_index is not None:
             return callable(getattr(native_backend, "cosine_similarity", None))
         return False
@@ -336,7 +347,22 @@ class RecallEngine:
         if not seed_scores:
             return []
 
-        activations = self._spread(seed_scores, pool_by_id, hops_limit, floor)
+        # Confidence gates belief, similarity only gates relevance: a
+        # low-confidence node is a weak seed no matter how well it matches,
+        # because evolution has learned not to trust it.
+        seed_scores = {
+            entry_id: score * float(pool_by_id[entry_id].confidence)
+            for entry_id, score in seed_scores.items()
+            if entry_id in pool_by_id
+        }
+        if not seed_scores:
+            return []
+
+        adjacency = self._adjacency(list(pool_by_id.values()))
+        activations = self._spread(seed_scores, pool_by_id, hops_limit, floor, adjacency)
+        self._expand_family(
+            seed_scores, adjacency, activations, pool_by_id, floor,
+        )
 
         hits: list[RecallHit] = []
         for entry_id, activation in activations.items():
@@ -357,9 +383,41 @@ class RecallEngine:
         hits.sort(key=lambda hit: (-hit.score, hit.hops, hit.entry.id))
         hits = hits[:k]
 
+        # Two-layer read-out: the graph decided *which* memories matter
+        # (fast, statistical); the verbatim statements come from the store's
+        # detail layer so callers receive the whole memory, never the
+        # truncated node summary.  Only the delivered hits are loaded.
+        for hit in hits:
+            hit.detail_text = self._load_detail_text(hit.entry)
+
         if do_record:
             self._record_hits(hits)
         return hits
+
+    def _load_detail_text(self, entry: MemoryEntry) -> str:
+        """Fetch the verbatim detail for ``entry`` from its store.
+
+        Degrades to the node content when the store predates the detail
+        layer (no ``load_detail`` method) or a read fails -- recall never
+        raises into the caller.
+
+        Args:
+            entry: The recalled node.
+
+        Returns:
+            The full detail text, or the node content as the fallback.
+        """
+        loader = getattr(self._store, "load_detail", None)
+        if not callable(loader):
+            return entry.content
+        try:
+            text = loader(entry)
+        except Exception:
+            logger.warning(
+                "[memdir.recall] detail load failed for %s", entry.id, exc_info=True,
+            )
+            return entry.content
+        return str(text or "") or entry.content
 
     def _record_hits(self, hits: list[RecallHit]) -> None:
         """Record an access for every recalled (non-archived) memory.
@@ -380,11 +438,16 @@ class RecallEngine:
                 )
 
     def _visible_pool(self, include_archived: bool) -> list[MemoryEntry]:
-        """Long-term plus buffered memories, archived filtered by default."""
-        entries = self._store.long_term() + self._store.buffer()
-        if include_archived:
-            return entries
-        return [entry for entry in entries if not entry.decay.archived]
+        """Visible graph nodes, resolved by the store's canonical rule.
+
+        Delegates to :meth:`MemoryLayerStore.visible_entries`: archived
+        memories are hidden by default (audit-visible via
+        ``include_archived``), and superseded nodes stay hidden only while
+        their replacement lineage is alive -- a tombstone whose successor
+        vanished is healed back into recall instead of silently erasing the
+        last live copy of the content.
+        """
+        return self._store.visible_entries(include_archived)
 
     # ------------------------------------------------------------------
     # Seeds (similarity) -- local by default, native when configured
@@ -427,24 +490,6 @@ class RecallEngine:
         if not vector:
             return None
         query_vec = [float(value) for value in vector]
-
-        if self._embedding_workspace:
-            raw = native_backend.search_embedding_index(
-                self._embedding_workspace, json.dumps(query_vec), self._seed_limit,
-            )
-            hits = json.loads(raw) if isinstance(raw, str) else raw
-            valid_ids = {entry.id for entry in pool}
-            scores: dict[str, float] = {}
-            for hit in hits or []:
-                if not isinstance(hit, dict):
-                    continue
-                entry_id = str(hit.get("file") or hit.get("id") or "")
-                if entry_id not in valid_ids:
-                    continue
-                score = max(0.0, float(hit.get("score", 0.0)))
-                if score >= self._seed_min_score:
-                    scores[entry_id] = score
-            return scores
 
         index = self._embedding_index or {}
         scores = {}
@@ -498,9 +543,9 @@ class RecallEngine:
         pool_by_id: dict[str, MemoryEntry],
         max_hops: int,
         floor: float,
+        adjacency: dict[str, list[tuple[str, str, float]]],
     ) -> dict[str, _Activation]:
         """Propagate activation from the seeds along the association graph."""
-        adjacency = self._adjacency(list(pool_by_id.values()))
         best: dict[str, _Activation] = {}
         for entry_id, score in seed_scores.items():
             if entry_id not in pool_by_id:
@@ -515,7 +560,15 @@ class RecallEngine:
                     continue
                 for target_id, relation, link_weight in adjacency.get(source_id, ()):
                     edge_weight = self._relation_weight(relation) * link_weight
-                    contribution = activation.score * edge_weight * self._hop_decay
+                    # A low-confidence target also spreads less: belief
+                    # strength dampens both reception and re-propagation.
+                    target_confidence = float(
+                        getattr(pool_by_id.get(target_id), "confidence", 1.0)
+                    )
+                    contribution = (
+                        activation.score * edge_weight * self._hop_decay
+                        * max(0.0, min(1.0, target_confidence))
+                    )
                     if contribution < floor:
                         continue
                     existing = best.get(target_id)
@@ -529,7 +582,7 @@ class RecallEngine:
                         "hop": hop,
                     }
                     spread = _Activation(
-                        contribution, hop, activation.path + [edge], activation.origin_id,
+                        contribution, hop, [*activation.path, edge], activation.origin_id,
                     )
                     best[target_id] = spread
                     next_frontier[target_id] = spread
@@ -537,6 +590,53 @@ class RecallEngine:
             if not frontier:
                 break
         return best
+
+    def _expand_family(
+        self,
+        seed_scores: dict[str, float],
+        adjacency: dict[str, list[tuple[str, str, float]]],
+        activations: dict[str, _Activation],
+        pool_by_id: dict[str, MemoryEntry],
+        floor: float,
+    ) -> None:
+        """Pull in a seed's family through entity hubs, in one fixed burst.
+
+        Spreading activation decays geometrically, so a fact two hops from
+        the query through a hub never clears the activation floor -- yet the
+        hub's siblings are exactly what "one thread pulls up the whole chain"
+        means.  Hubs are statistical index nodes, not associations: when a
+        seed touches one, every member is activated at a fixed fraction of the
+        seed score.
+        """
+        for seed_id, score in list(seed_scores.items()):
+            if score < _FAMILY_SEED_FLOOR:
+                continue
+            for hub_id, _relation, _weight in adjacency.get(seed_id, ()):
+                hub = pool_by_id.get(hub_id)
+                if hub is None or hub.type != MemoryType.ENTITY.value:
+                    continue
+                for member_id, _m_rel, _m_weight in adjacency.get(hub_id, ()):
+                    if member_id == seed_id:
+                        continue
+                    member = pool_by_id.get(member_id)
+                    if member is None or member.type == MemoryType.ENTITY.value:
+                        continue
+                    boosted = score * _FAMILY_BOOST
+                    if boosted < floor:
+                        continue
+                    existing = activations.get(member_id)
+                    if existing is not None and existing.score >= boosted:
+                        continue
+                    edge = {
+                        "source_id": hub_id,
+                        "target_id": member_id,
+                        "relation": LinkRelation.MENTIONS.value,
+                        "weight": _FAMILY_BOOST,
+                        "hop": 1,
+                    }
+                    activations[member_id] = _Activation(
+                        boosted, 1, [edge], seed_id,
+                    )
 
     # ------------------------------------------------------------------
     # Forgetting / audit (delegates to the store's single implementation)

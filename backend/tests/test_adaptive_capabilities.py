@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -49,20 +49,28 @@ from encre.loop.turn_ctx import TurnContext
 # Minimal capability-reporting backend double for the unit tests.
 # ---------------------------------------------------------------------------
 class _Caps:
-    """Backend double exposing only the capability methods under test."""
+    """Backend double exposing only the capability-query methods under test.
+
+    Each keyword flag toggles one dimension independently, so the routing layer
+    can be exercised against any tools / vision / caching combination.
+    """
 
     def __init__(self, *, tool_calling=True, vision=True, caching=True):
+        """Remember the requested capability flags for the methods below."""
         self._tool_calling = tool_calling
         self._vision = vision
         self._caching = caching
 
     def supports_tool_calling(self) -> bool:
+        """Report whether the backend can execute function/tool calls."""
         return self._tool_calling
 
     def supports_vision_input(self) -> bool:
+        """Report whether the backend accepts image-bearing message parts."""
         return self._vision
 
     def supports_prompt_caching(self) -> bool:
+        """Report whether the backend honours prompt-cache breakpoints."""
         return self._caching
 
 
@@ -136,6 +144,7 @@ def test_caching_disabled_gates_enable_caching():
     assert plan.use_caching is False
     assert "caching" in plan.reasons
 
+    # The caller-side gate combines user config, backend support and the plan.
     config = SimpleNamespace(enable_prompt_caching=True)
     backend = _Caps(caching=True)
     enable_caching = (
@@ -216,13 +225,18 @@ def test_compute_plan_never_raises_on_malformed_input():
     assert plan.use_streaming is False
 
     class _Boom:
+        """Backend double whose capability probes raise, to test resilience."""
+
         def supports_tool_calling(self):
+            """Raise to simulate a backend that fails its tool-support probe."""
             raise RuntimeError("boom")
 
         def supports_vision_input(self):
+            """Raise to simulate a backend that fails its vision-support probe."""
             raise RuntimeError("boom")
 
         def supports_prompt_caching(self):
+            """Raise to simulate a backend that fails its cache-support probe."""
             raise RuntimeError("boom")
 
     plan = compute_plan(ModelInfo(name="x", provider="p"), backend=_Boom())
@@ -265,80 +279,131 @@ def test_capability_plan_defaults_are_permissive():
 # SubTask 9.2 -- integration through loop/phases/model.py
 # ---------------------------------------------------------------------------
 class _Span:
+    """No-op tracing span standing in for the real OpenTelemetry span."""
+
     def set_attribute(self, *_args, **_kwargs):
+        """Discard attribute writes; the tests never inspect span attributes."""
         pass
 
     def end(self):
+        """Discard the span-end signal."""
         pass
 
 
 class _Tracer:
+    """No-op tracer that hands back a throwaway span on every request."""
+
     def start_span(self, *_args, **_kwargs):
+        """Return a no-op span regardless of the requested span name."""
         return _Span()
 
 
 class _Discovery:
+    """Tool-discovery double returning one fixed tools payload."""
+
     def __init__(self, payload):
+        """Keep the payload that every lookup should return."""
         self.tool_set_name = ""
         self._payload = payload
 
-    def get_active_tools_payload(self, _session_id, fmt="openai"):
-        return self._payload
+    def get_active_tools_payload(self, _session_id, fmt="openai", profile=None):
+        """Return the stored payload, narrowed by the model profile if given.
+
+        Mirrors the real discovery semantics: visibility filtering happens
+        on tool *names* before materialisation, and an empty match falls
+        back to the unrestricted list.
+        """
+        if profile is None:
+            return self._payload
+        names = [
+            t.get("function", {}).get("name", "") for t in self._payload
+        ]
+        kept = set(profile.filter_tool_names([n for n in names if n]))
+        filtered = [
+            t for t in self._payload
+            if t.get("function", {}).get("name", "") in kept
+        ]
+        return filtered or self._payload
 
 
 class _EventBus:
+    """Event bus double that records the kinds it would publish."""
+
     def __init__(self):
+        """Start with empty publish and emit logs."""
         self.kinds = []
         self.published = []
 
     async def emit(self, _phase, **_payload):
+        """Accept phase events without forwarding them anywhere."""
         return None
 
     def publish(self, kind, *, session_id="", payload=None, refs=None):
+        """Record the event kind and payload so tests can assert on them."""
         self.kinds.append(kind)
         self.published.append((kind, payload))
         return None
 
 
 class _Session:
+    """Session double holding the conversation to be sent to the model."""
+
     def __init__(self, messages):
+        """Store the messages and the minimal session metadata the phase reads."""
         self.id = "s1"
         self.turn_count = 0
         self.messages = messages
         self.active_branch_id = "main"
 
     def get_context_messages(self):
+        """Return the stored conversation as the model context."""
         return self.messages
 
 
 class _SteerQueue:
+    """Steering queue double whose drains always come up empty."""
+
     def drain_system(self):
+        """Return no pending system-level steering instructions."""
         return []
 
     def drain(self):
+        """Return no pending user steering messages."""
         return []
 
 
 class _CompactEngine:
+    """Compaction double that passes messages through verbatim."""
+
     def sanitize(self, messages):
+        """Return the messages unchanged so the phase sees real content."""
         return messages
 
 
 class _Hooks:
+    """Hook system double that swallows the post-model-response hook."""
+
     async def emit_post_model_response(self, *_args, **_kwargs):
+        """Accept the hook invocation without running any subscriber."""
         return None
 
 
+
 class _ErrorOrch:
+    """Error orchestrator double with a no-op turn reset."""
+
     def reset_for_new_turn(self):
+        """Clear nothing; the phase only needs the method to exist."""
         pass
 
 
 class _StateMgr:
-    working_set: dict = {}
+    """State manager double exposing the class-level working set."""
 
 
 class _Config:
+    """Settings double with the values the model phase reads."""
+
     model = "deepseek-v4-flash"
     enable_prompt_caching = True
     enable_streaming_tool_execution = False
@@ -348,23 +413,33 @@ class _StubBackend:
     """Minimal controllable backend double used only by the integration test."""
 
     def __init__(self, model, *, tool_calling=True):
+        """Remember the model name, tool support flag and capture slot."""
         self.model = model
         self._tool_calling = tool_calling
         self.captured: dict = {}
 
     def supports_tool_calling(self) -> bool:
+        """Report the configured tool-calling capability."""
         return self._tool_calling
 
     def supports_vision_input(self) -> bool:
+        """Report vision support; always true here."""
         return True
 
     def supports_prompt_caching(self) -> bool:
+        """Report prompt-cache support; always true here."""
         return True
 
     def context_window_size(self) -> int:
+        """Return a large window so no compaction is triggered."""
         return 128000
 
     async def chat(self, **kwargs):
+        """Capture the chat kwargs, then yield nothing.
+
+        The trailing unreachable ``yield`` marks the function as an async
+        generator so the phase's ``async for`` loop terminates immediately.
+        """
         self.captured = kwargs
         return
         yield  # pragma: no cover - marks this as an async generator
@@ -374,6 +449,7 @@ class _Harness(PhaseModelMixin):
     """Drives the real ``_phase_model`` with lightweight collaborators."""
 
     def __init__(self, backend, messages):
+        """Wire every dependency the model phase touches onto one object."""
         self.backend = backend
         self.discovery = _Discovery(
             [
@@ -403,14 +479,17 @@ class _Harness(PhaseModelMixin):
         self._cancelled = lambda: False
 
     def _resolve_slot_budget(self) -> int:
+        """Return a fixed slot budget so budget math stays deterministic."""
         return 1024
 
     async def _chat_with_timeout(self, gen, timeout=120.0):
+        """Forward each event from the backend generator without a real timeout."""
         async for event in gen:
             yield event
 
 
 def _make_messages():
+    """Build a two-message conversation containing one image reference."""
     return [
         {"role": "system", "content": "SYS"},
         {
@@ -424,6 +503,7 @@ def _make_messages():
 
 
 async def _run_phase(harness):
+    """Construct a turn context and consume the phase generator to completion."""
     messages = harness.session.messages
     turn = TurnContext(
         prompt="hello",
@@ -439,6 +519,7 @@ async def _run_phase(harness):
 
 
 def _find_role(messages, role):
+    """Return the first message whose role matches the given string."""
     return next(m for m in messages if m.get("role") == role)
 
 
@@ -455,6 +536,7 @@ async def test_phase_model_does_not_send_tools_when_degraded():
     # The downgrade is recorded on the event backbone.
     assert "capability_degraded" in harness.event_bus.kinds
 
+    # Tool intent is summarised into the system prompt as a text fallback.
     system_msg = _find_role(backend.captured["messages"], "system")
     assert system_msg["content"].startswith("SYS")
     assert "工具意图说明" in system_msg["content"]

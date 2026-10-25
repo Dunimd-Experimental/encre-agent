@@ -69,6 +69,16 @@ export function attachInputExpand(root: ParentNode): void {
 
     wrap.classList.add("has-expand");
 
+    // The zone is absolutely positioned (top-right of the corner it reveals),
+    // so it anchors to the nearest positioned ancestor.  First-party dialogs
+    // happen to have one that lines up visually, but the same markup inside a
+    // plugin's card resolves to the CARD as the anchor — the toggle then lands
+    // on the card header instead of the textarea's corner.  Pin the anchor to
+    // the wrapper itself so the control always sits in the rich-text box.
+    if (window.getComputedStyle(wrap).position === "static") {
+      wrap.style.position = "relative";
+    }
+
     // Mirror the composer markup 1:1 — same classes, same icons — so the
     // control is visually indistinguishable from the one under the composer.
     const zone = document.createElement("div");
@@ -93,18 +103,21 @@ export function attachInputExpand(root: ParentNode): void {
       btn.setAttribute("aria-label", t(key));
     };
 
-    // The textarea's at-rest min/max, captured while it is still collapsed
+    // The textarea's at-rest geometry, captured while it is still collapsed
     // (i.e. before the first unfold).  `.is-expand-anim` lifts the clamps for
     // the duration of the glide, so they cannot be re-read at collapse time.
     let restMin = 0;
-    let restMax = Number.POSITIVE_INFINITY;
+    let restHeight = 0;
     const rememberRestBounds = (): void => {
       const cs = window.getComputedStyle(area);
       restMin = Number.parseFloat(cs.minHeight) || 0;
-      restMax =
-        cs.maxHeight === "none"
-          ? Number.POSITIVE_INFINITY
-          : Number.parseFloat(cs.maxHeight) || Number.POSITIVE_INFINITY;
+      // The height the dialog's auto-grow handler had settled on (inline
+      // `height`, capped at 300px by every dialog that owns this toggle).
+      // Folding back to the raw content height instead would leave the box
+      // TALLER than it started whenever the content overflows that cap — the
+      // dialog would drift bigger after every expand/collapse cycle and the
+      // next expand would set off from the drifted size.
+      restHeight = area.getBoundingClientRect().height;
     };
 
     /**
@@ -132,6 +145,14 @@ export function attachInputExpand(root: ParentNode): void {
       stopAnim();
     };
 
+    // The dialog's focus ring lives on the textarea itself
+    // (`.setting-rich-text:focus`), while the composer's lives on its wrapper
+    // (`:focus-within` — the expand button is inside it, so clicking the
+    // composer's toggle can never blink the ring).  Keep focus on the textarea
+    // across the click by suppressing the default mousedown focus shift, so
+    // the ring here is equally steady instead of blinking off→on mid-glide.
+    btn.addEventListener("mousedown", (e) => e.preventDefault());
+
     btn.addEventListener("click", (e) => {
       e.preventDefault();
       const expanding = !wrap.classList.contains("is-expanded");
@@ -152,9 +173,12 @@ export function attachInputExpand(root: ParentNode): void {
       // `auto` is not interpolable, which is what made the fold snap.
       const endH = expanding
         ? 0
-        // CSS resolves min-height over max-height when the two cross, so mirror
-        // that rather than a plain clamp.
-        : Math.max(restMin, Math.min(contentHeight(), restMax));
+        // Fold back to the pre-expand size, not the raw content height: the
+        // auto-grow handlers cap the resting height at 300px, so the raw
+        // content height can overshoot where the fold started.  Keeping
+        // `contentHeight` in the clamp also shrinks the target when text was
+        // deleted while expanded.
+        : Math.max(restMin, Math.min(contentHeight(), restHeight));
 
       // Pin + commit a definite start height, so both endpoints are lengths.
       area.style.height = `${startH}px`;

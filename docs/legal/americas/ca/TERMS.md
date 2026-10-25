@@ -29,8 +29,8 @@
 
 | Service | Description | Availability |
 |---|---|---|
-| **Encre Agent Desktop** | Local-first AI agent desktop application | Windows, macOS, Linux |
-| **Encre Agent Framework** | Python framework + Rust native core for agent development | Open source, github.com/mf2023/Encre |
+| **Encre Agent Desktop** | Local-first AI agent Encre Agent Desktop | Windows, macOS, Linux |
+| **Encre Agent** | Python gateway + Rust native core for agent development | Open source, github.com/mf2023/Encre |
 | **Chat platform integrations** | Connectors to 18 chat platforms | Per platform availability |
 | **PiscesLx** | Hosted LLM inference (optional) | Subscription |
 | **StadionOS** | Operating system project | Separate licensing |

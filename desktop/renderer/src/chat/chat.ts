@@ -35,18 +35,19 @@ import { setRequestedSessionId } from "../core/stream.js";
 import type { Message, ToolCallState, BranchMeta, AttachmentMeta } from "../core/types.js";
 import { t, onLocaleChange, getLocale } from "../features/i18n.js";
 import { Dialog } from "../ui/dialog.js";
-import { findSlashCommand } from "../features/slash_commands.js";
+import { findSlashCommand } from "../ui/slash-commands.js";
 import { EALoader } from "../features/ealoader.js";
 import { MediaViewer } from "./media-viewer.js";
 import { renderMarkdown, escapeHtml } from "./chat_markdown.js";
-import { isHiddenTool, isFileMutationTool, isFileReadTool, isToolItemTool, getToolIcon, formatToolName, getToolSummary, getToolInlineSummary, getToolBodyText, _toolStatusHtml, getAgentName, formatAgentLabel, createLucideIcons, saveVideoPlayback, restoreVideoPlayback, flashCopyButton } from "./chat_tool_display.js";
+import { getToolSummary, getToolInlineSummary, getToolBodyText, _toolStatusHtml, getAgentName, formatAgentLabel, createLucideIcons, saveVideoPlayback, restoreVideoPlayback, flashCopyButton } from "./chat_tool_display.js";
 import { buildTimeline, buildRenderKey, buildSubAgentTimeline, selectSubAgentTaskMessages, pickRandomQuote, _fmtTokens, fmtSize } from "./timeline.js";
+import { guardRender, reportUiFault } from "../core/ui_boundary.js";
 import type { TimelineItem, StatusQuote } from "./timeline.js";
 import { ChatScrollIndicator } from "./chat_scroll_indicator.js";
-import { renderSpecCardImpl, renderPlanCardImpl, parsePlanSectionsImpl, renderWorkflowCardImpl } from "./chat_review_cards.js";
-import { renderItemHTMLImpl, renderAIHeaderImpl, renderModeCardImpl, renderUserItemImpl, renderThinkingStripImpl, renderToolCallImpl, renderQuestionCardImpl, renderInfoCardImpl, renderFileCardImpl, renderTerminalCardImpl, renderExpandableStripImpl, renderToolItemSimpleImpl, renderAgentImpl, _agentTaskDividersImpl, renderAssistantTextImpl, renderErrorCardImpl, renderWarningCardImpl, renderBranchSwitcherImpl, renderCompactStartingCardImpl, renderCompactCardImpl, renderSystemMessageImpl } from "./chat_item_render.js";
-import { handleDelegateClickImpl, toggleItemImpl, openActionMenuImpl, closeActionMenuImpl, performRetryImpl, autoScrollImpl, toggleWelcomeImpl, scrollToBottomImpl, scrollToBottomAfterMediaImpl, syncScrollButtonImpl, resetScrollButtonImpl, _updateStatusBarImpl } from "./chat_actions.js";
-import { requestRenderImpl, renderForceImpl, renderImpl, renderSubAgentIntoImpl, computeExpandedImpl, activeThinkingIdImpl, applyAutoExpandImpl, buildTimelineHTMLImpl, fullRenderParallelImpl, fullRenderImpl, incrementalTextUpdateImpl } from "./chat_render_engine.js";
+import { renderSpecCardImpl, renderPlanCardImpl, renderWorkflowCardImpl } from "./chat_review_cards.js";
+import { renderItemHTMLImpl, renderAIHeaderImpl, renderModeCardImpl, renderUserItemImpl, renderThinkingStripImpl, renderToolCallImpl, renderQuestionCardImpl, renderInfoCardImpl, renderFileCardImpl, renderTerminalCardImpl, renderExpandableStripImpl, renderToolItemSimpleImpl, renderAgentImpl, _agentTaskDividersImpl, renderAssistantTextImpl, renderErrorCardImpl, renderWarningCardImpl, renderBranchSwitcherImpl, renderCompactStartingCardImpl, renderCompactCardImpl, renderCompactNoticeImpl, renderModelSwitchNoticeImpl, renderRetryNoticeImpl, renderSystemMessageImpl } from "./chat_item_render.js";
+import { handleDelegateClickImpl, toggleItemImpl, performRetryImpl, autoScrollImpl, toggleWelcomeImpl, scrollToBottomImpl, scrollToBottomAfterMediaImpl, syncScrollButtonImpl, resetScrollButtonImpl, mountStatusBarImpl, syncStatusBarPositionImpl, startStatusBarFollowImpl, _updateStatusBarImpl } from "./chat_actions.js";
+import { requestRenderImpl, renderForceImpl, renderImpl, renderSubAgentIntoImpl, computeExpandedImpl, activeThinkingIdImpl, applyAutoExpandImpl, buildTimelineHTMLImpl, fullRenderParallelImpl, fullRenderImpl, incrementalTextUpdateImpl, appendTimelineTailImpl, patchToolItemImpl, refreshToolCardsImpl, noteBodyScroll, buildDelegatedPromptBubbleImpl } from "./chat_render_engine.js";
 
 export { renderMarkdown } from "./chat_markdown.js";
 export { formatAgentLabel, getAgentName } from "./chat_tool_display.js";
@@ -66,23 +67,72 @@ export class Chat {
   private expandedItems = new Set<string>();
   private userCollapsedItems = new Set<string>();
   private userExpandedItems = new Set<string>();
+  /** Picked-but-not-yet-submitted options per question ask (tcId -> question
+   *  index -> option value). DOM classList dies on re-render; this map is
+   *  what survives a session switch. */
+  private questionSelections = new Map<string, Record<number, string>>();
   private lastAssistantMsgId = "";
+  /** Streaming markdown cache. Re-rendering the whole accumulated answer on
+   *  every animation frame is O(n^2) per turn and re-highlights every code
+   *  block behind it; these fields let the incremental path skip unchanged
+   *  text and cap the re-parse rate while the model is still writing. */
+  private _streamMarkdownId = "";
+  private _streamMarkdownText = "";
+  private _streamMarkdownHtml = "";
+  private _streamMarkdownAt = 0;
+  /** Rendered HTML for finished assistant text blocks, keyed by timeline id.
+   *  A structural re-render (tool result, turn boundary, session reopen) used
+   *  to re-run markdown + highlight.js for every historical message in the
+   *  transcript. Unchanged blocks now reuse their HTML, so only the block
+   *  that actually changed is parsed. Bounded to keep memory flat. */
+  public assistantHtmlCache = new Map<string, {
+    content: string;
+    isStreaming: boolean;
+    hasError: boolean;
+    messageId: string;
+    locale: string;
+    html: string;
+    /** True when `html` is the escaped plain-text fallback, not markdown. */
+    deferred: boolean;
+  }>();
+  /** Render historical assistant blocks as plain text until idle. Set before
+   *  a boot/session render, cleared once the last block has been upgraded. */
+  public deferMarkdown = false;
+  private _markdownUpgradeGen = 0;
+  private _markdownUpgradeStartedAt = 0;
+  /** Scroll sweep: upgrade newly-visible raw blocks as the reader scrolls. */
+  private _mdSweepBound = false;
+  private _mdSweepTimer = 0;
+  /** Per-item signature of the last incremental DOM sync. Unchanged items are
+   *  skipped entirely, so a long transcript costs per-frame work proportional
+   *  to what is actually streaming instead of to its total length. */
+  public incrementalSigs = new Map<string, string>();
   private _lastRunning = false;
+  /** Session id rendered by the last fullRender; detects session switches. */
+  private _lastRenderedSessionId = "";
+  /** One-shot flag: force-pin the next fullRender to the bottom (rollback,
+   *  branch switch, session entry). Consumed by fullRenderImpl. */
+  private _forcePinNextRender = false;
+  private _scrollSig = "";
   private _inRenderForce = false;
-  private rafPending = false;
   private liveLoader: EALoader | null = null;
   private scrollIndicator: ChatScrollIndicator;
-  private _actionMenu: HTMLElement | null = null;
-  private _actionMenuBtn: HTMLElement | null = null;
-  private _actionMenuClose: ((ev: MouseEvent) => void) | null = null;
-  private _actionMenuTurnLeave: { el: HTMLElement; fn: (ev: MouseEvent) => void } | null = null;
-  private _actionMenuEnter: { el: HTMLElement; fn: () => void } | null = null;
-  private _actionMenuLeave: { el: HTMLElement; fn: () => void } | null = null;
-  private _actionMenuCloseTimer: number | null = null;
-  /** Map of file keys to markdown content for plan file rows (avoids attribute length limits). */
-  private _planFileLookup = new Map<string, string>();
+  /** Watches #message-list growth while a turn runs; drives the status bar's
+   *  transform so it follows the latest output without restarting its CSS
+   *  animation. */
+  public statusBarRO: ResizeObserver | null = null;
+  /** Handle of the per-frame re-pin loop that keeps the status bar glued to
+   *  the transcript's last line while a turn runs (0 = not running). */
+  public statusBarRaf = 0;
+  /** Number of timeline items the last fullRender rendered — lets the
+   *  streaming tail-append path know which items are already in the DOM. */
+  public renderedItemCount = 0;
   /** Callback invoked when the user clicks "View Changes" on an artifact file. */
   public onViewChanges: ((path: string) => void) | null = null;
+  /** Callback invoked when the user clicks a file/image the model mentioned: opens the in-app file viewer. */
+  public onOpenFile: ((path: string) => void) | null = null;
+  /** Callback invoked when the user clicks 「继续」 on an interrupted turn. */
+  public onResume: (() => void) | null = null;
 
   /**
    * Constructor: resolves DOM nodes and wires the scroll indicator + bridges.
@@ -100,12 +150,35 @@ export class Chat {
     scrollBtn.className = "chat-scroll-bottom-btn hidden";
     scrollBtn.setAttribute("aria-label", "Scroll to bottom");
     scrollBtn.innerHTML = '<i data-lucide="chevron-down" style="width:18px;height:18px"></i>';
+    // Lucide only swaps `[data-lucide]` placeholders it is explicitly pointed
+    // at.  The button is built here, after index.html's one global pass, so
+    // without this the circle renders with an empty <i> inside.
+    createLucideIcons(scrollBtn);
     this.container.parentElement?.appendChild(scrollBtn);
     scrollBtn.addEventListener("click", () => {
       this.container.scrollTo({ top: this.container.scrollHeight, behavior: "smooth" });
     });
 
     const w = window as any;
+    // Review decisions are bound inline on the card's buttons (same mechanism
+    // as __openSubAgentView). They are NOT in the message-list delegate: the
+    // clicks always fired, but the server silently dropped them because
+    // ClientPlanApprove/Reject (and ClientSteer) had no `from_dict`, so
+    // `parse_client_message` raised and the receive loop answered with a
+    // generic parse_error. See backend/tests/test_client_message_dispatch.py.
+    w.__reviewDecision = (kind: string, reviewId: string) => {
+      const id = (reviewId || "").trim();
+      console.log("[review] decision clicked:", kind, id);
+      if (!id) return;
+      if (kind === "approve") {
+        send({ type: "plan_approve", session_id: getState().sessionId, review_id: id } as any);
+      } else {
+        // No feedback is collected in the card: the loop hands the rejection
+        // back to the model with an instruction to ask the user what has to
+        // change, so the follow-up is a question in the transcript.
+        send({ type: "plan_reject", session_id: getState().sessionId, review_id: id, feedback: "" } as any);
+      }
+    };
     w.__openSubAgentView = (toolCallId: string, taskIndex?: number) => {
       const st = getState();
       const MAX_DEPTH = 4;
@@ -185,6 +258,12 @@ export class Chat {
       const crumb = popSubAgentBreadcrumb();
       w.__pendingSubAgentView = undefined;
       w.__activeSubAgentSessionId = undefined;
+      // Stepping back from a sub-agent must land on the parent's latest turn
+      // (the agent card itself). The userScrolledUp flag is stale here: it
+      // carries whatever the sub-agent transcript's scrolling left it at,
+      // which made the preserved-offset branch position the parent view a
+      // few hundred pixels ABOVE the bottom. Force-pin the next render.
+      this._forcePinNextRender = true;
       // User deliberately stepped back toward the main agent: stop
       // auto-opening freshly spawned sub-agents for the rest of this run.
       if (!crumb) w.__subAgentAutoOpenDismissed = true;
@@ -196,7 +275,8 @@ export class Chat {
       } else {
         this.renderedKey = "";
         this.ml.innerHTML = "";
-        requestAnimationFrame(() => this.render());
+        // Forced paint through the unified scheduler's immediate mode.
+        this.renderForce();
       }
     };
     w.__goToRootView = () => {
@@ -205,6 +285,9 @@ export class Chat {
       // parent view is never mistaken for a sub-agent snapshot.
       w.__activeSubAgentSessionId = undefined;
       w.__pendingSubAgentView = undefined;
+      // Same stale-scroll fix as __closeSubAgentView: the root view must
+      // land on its latest turn, not on the sub-agent's leftover offset.
+      this._forcePinNextRender = true;
       // User explicitly returned to the main agent: suppress auto-open of
       // subsequently spawned sub-agents until they opt back in or a new turn.
       w.__subAgentAutoOpenDismissed = true;
@@ -255,28 +338,110 @@ export class Chat {
       setRequestedSessionId(target.sessionId, requestId);
       send({ type: "resume", session_id: target.sessionId, request_id: requestId });
     };
-    w.__answerQuestion = (event: Event, btn: HTMLElement, cardId: string) => {
+    // Mark a question card as answered: disable every control so the user
+    // gets instant feedback before the backend's tool_result collapses the
+    // card into a plain strip.
+    const __markQuestionSubmitted = (card: HTMLElement) => {
+      card.classList.add("q-answered");
+      card.querySelectorAll<HTMLButtonElement | HTMLInputElement>("button,input").forEach(el => { el.disabled = true; });
+    };
+    // Collect one answer per rendered .q-item (manual input wins over the
+    // selected option) and submit.  A batched ask sends an array — one entry
+    // per question in ask order; a single-question ask sends a plain string.
+    const __submitQuestionAnswers = (event: Event, btn: HTMLElement) => {
       event.stopPropagation();
-      // Resolve the card from the click source first: the same tc-* id can
-      // exist in BOTH the main chat and the automation detail
-      // (renderSubAgentInto reuses the timeline pipeline), so a global
-      // getElementById would hit whichever card came first in the DOM and
-      // answer the WRONG tool call.  closest() guarantees we operate on the
-      // card the user actually clicked.
-      const card = ((btn as HTMLElement).closest('[id^="tc-"]') as HTMLElement | null) ?? document.getElementById(cardId);
-      if (!card) return;
-      // Manual input wins over a previously selected option: clicking an
-      // option fills its value into the input box, so reading the input box
-      // covers both paths and never discards what the user typed by hand.
-      const input = card.querySelector(".q-input") as HTMLInputElement;
-      let answer = input ? input.value.trim() : "";
-      if (!answer) {
-        const selected = card.querySelector(".q-option-card.selected");
-        if (selected) answer = selected.getAttribute("data-value") || "";
+      // Same-card-first resolution as the other __handlers: the automation
+      // detail reuses the timeline pipeline, so closest() guarantees we
+      // operate on the card the user actually clicked.
+      const card = btn.closest('[id^="tc-"]') as HTMLElement | null;
+      if (!card || card.classList.contains("q-answered")) return;
+      const items = Array.from(card.querySelectorAll<HTMLElement>(".q-item"));
+      if (items.length === 0) return;
+      const answers: string[] = [];
+      let firstMissing: HTMLElement | null = null;
+      for (const item of items) {
+        const input = item.querySelector<HTMLInputElement>(".q-input");
+        const selected = item.querySelector<HTMLElement>(".q-option-card.selected");
+        const answer = (input?.value ?? "").trim() || selected?.getAttribute("data-value") || "";
+        if (!answer) {
+          item.classList.add("q-missing");
+          if (!firstMissing) firstMissing = item;
+        }
+        answers.push(answer);
       }
-      if (answer) {
-        send({ type: "respond_question", tool_call_id: cardId.replace("tc-", ""), answers: answer });
+      if (firstMissing) {
+        // Stepped cards show one question at a time — jump to the first
+        // unanswered one before focusing its input, or the user would see no
+        // reaction at all.
+        __qShow(card, items.indexOf(firstMissing));
+        firstMissing.querySelector<HTMLInputElement>(".q-input")?.focus();
+        return;
       }
+      send({ type: "respond_question", tool_call_id: card.id.replace("tc-", ""), answers: answers.length > 1 ? answers : answers[0] });
+      __markQuestionSubmitted(card);
+    };
+    w.__answerQuestion = (event: Event, btn: HTMLElement, _cardId?: string) => {
+      __submitQuestionAnswers(event, btn);
+    };
+    // Option click behavior.  The input row is reserved for hand-typed
+    // answers — clicking an option never fills it.  A single-question card
+    // answers immediately on click; a batched card toggles the option's
+    // selected state (radio behavior within its question) and waits for the
+    // shared submit button.
+    // Stepped navigation for batched question cards.  All .q-item blocks are
+    // rendered up front (answers survive switching back and forth); __qShow
+    // toggles which one is visible and mirrors the position onto the footer
+    // buttons: "previous" hides on the first question, "next" hides on the
+    // last one, and "submit" appears ONLY on the last question.  __qNav moves
+    // relative to the currently visible question (no wrap-around).
+    const __qShow = (card: HTMLElement, index: number) => {
+      const items = Array.from(card.querySelectorAll<HTMLElement>(".q-item"));
+      if (items.length === 0) return;
+      const clamped = Math.min(items.length - 1, Math.max(0, index));
+      const last = items.length - 1;
+      items.forEach((it, i) => { it.hidden = i !== clamped; });
+      const prev = card.querySelector<HTMLElement>('[data-nav="-1"]');
+      const next = card.querySelector<HTMLElement>('[data-nav="1"]');
+      const submit = card.querySelector<HTMLElement>("[data-qsubmit]");
+      if (prev) prev.hidden = clamped === 0;
+      if (next) next.hidden = clamped === last;
+      if (submit) submit.hidden = clamped !== last;
+    };
+    w.__qShow = __qShow;
+    w.__qNav = (btn: HTMLElement, dir: number) => {
+      const card = btn.closest('[id^="tc-"]') as HTMLElement | null;
+      if (!card || card.classList.contains("q-answered")) return;
+      const items = Array.from(card.querySelectorAll<HTMLElement>(".q-item"));
+      const cur = items.findIndex(it => !it.hidden);
+      __qShow(card, (cur < 0 ? 0 : cur) + dir);
+    };
+    w.__selectQuestionOption = (btn: HTMLElement) => {
+      const card = btn.closest('[id^="tc-"]') as HTMLElement | null;
+      if (!card || card.classList.contains("q-answered")) return;
+      const item = btn.closest(".q-item") as HTMLElement | null;
+      if (!item) return;
+      item.classList.remove("q-missing");
+      if (card.dataset.batch !== "1") {
+        const value = btn.getAttribute("data-value") || "";
+        send({ type: "respond_question", tool_call_id: card.id.replace("tc-", ""), answers: value });
+        __markQuestionSubmitted(card);
+        return;
+      }
+      const wasSelected = btn.classList.contains("selected");
+      item.querySelectorAll(".q-option-card.selected").forEach(b => b.classList.remove("selected"));
+      if (!wasSelected) btn.classList.add("selected");
+      // Stepped flow: once this question is answered, jump to the next one.
+      // The arrows stay available for reviewing / changing earlier answers.
+      const items = Array.from(card.querySelectorAll<HTMLElement>(".q-item"));
+      const idx = items.indexOf(item);
+      // Persist the pick on the instance — the DOM class does not survive a
+      // session switch (full re-render), this map does.
+      const tcId = card.id.replace("tc-", "");
+      const selMap = { ...(this.questionSelections.get(tcId) ?? {}) };
+      if (wasSelected) delete selMap[idx];
+      else selMap[idx] = btn.getAttribute("data-value") || "";
+      this.questionSelections.set(tcId, selMap);
+      if (idx >= 0 && idx < items.length - 1) __qShow(card, idx + 1);
     };
     w.__hoverOn = (el: HTMLElement) => {
       const wrap = el.querySelector(".icon-wrap");
@@ -285,13 +450,6 @@ export class Chat {
     w.__hoverOff = (el: HTMLElement) => {
       const wrap = el.querySelector(".icon-wrap");
       if (wrap) wrap.classList.remove("hover");
-    };
-    w.__toggleStatusCard = (el: HTMLElement, id?: string) => {
-      // Same-card-first resolution as __answerQuestion: the automation detail
-      // may render the identical tc-* status card, and a global lookup would
-      // toggle the main chat's copy instead of the one being clicked.
-      const card = ((el as HTMLElement).closest('[id^="tc-"]') as HTMLElement | null) ?? (id ? document.getElementById(id) : null);
-      if (card) card.classList.toggle("expanded");
     };
     w.__viewChanges = (el: HTMLElement) => {
       const card = el.closest(".file-card") as HTMLElement | null;
@@ -413,6 +571,10 @@ export class Chat {
     ro.observe(this.container);
 
     this.ml.addEventListener("click", (e) => this.handleDelegateClick(e));
+    // Card bodies follow their own tail as content streams in. A body the user
+    // scrolled away from is remembered so the next update never yanks it back.
+    // Scroll events do not bubble, so this has to listen in the capture phase.
+    this.ml.addEventListener("scroll", (e) => noteBodyScroll(e.target), true);
     // Track session changes to prevent stale content bleeding
     let _lastSid = getState().sessionId;
     let _lastMsgLen = getState().messages.length;
@@ -428,6 +590,8 @@ export class Chat {
         this.renderedKey = "";
         this.expandedItems.clear();
         this.userCollapsedItems.clear();
+        this.userExpandedItems.clear();
+        _openedHtmlCards.clear();
         if (this.liveLoader) {
           this.liveLoader.destroy();
           this.liveLoader = null;
@@ -440,7 +604,10 @@ export class Chat {
           clearSubAgentBreadcrumb();
         }
         this.ml.innerHTML = "";
-        this.render();
+        // rAF, not a synchronous render: several state writes land in the
+        // same boot tick (session id, messages, settings). Rendering each one
+        // eagerly blocked the UI thread for the whole restored transcript.
+        this.requestRender();
         return;
       }
       if (msgs.length === 0 && _lastMsgLen > 0) {
@@ -448,6 +615,8 @@ export class Chat {
         this.renderedKey = "";
         this.expandedItems.clear();
         this.userCollapsedItems.clear();
+        this.userExpandedItems.clear();
+        _openedHtmlCards.clear();
         if (this.liveLoader) {
           this.liveLoader.destroy();
           this.liveLoader = null;
@@ -463,7 +632,7 @@ export class Chat {
       if (msgs.length > 0 && _lastMsgLen === 0) {
         _lastMsgLen = msgs.length;
         this.renderedKey = "";
-        this.render();
+        this.requestRender();
         return;
       }
       // Re-render when auto_expand setting changes (auto-expanded thinking
@@ -476,8 +645,27 @@ export class Chat {
       }
       _lastMsgLen = msgs.length;
       this.requestRender();
+    }, ["sessionId", "messages", "subAgentView", "subAgentBreadcrumb", "settings"]);
+    // A locale switch must rebuild the transcript: every string in a timeline
+    // item comes from `t()` at render time, and the render key is unchanged,
+    // so a plain render() would keep showing the previous language.
+    onLocaleChange(() => {
+      this.renderedKey = "";
+      this.requestRender();
     });
-    onLocaleChange(() => this.render());
+    // The tool-UI catalog arrives via `plugin_ui_sync`, typically after the
+    // transcript was first painted (a client connecting during plugin warmup
+    // gets an empty catalog first). Every tool card resolves its card shape /
+    // icon / label from that catalog at render time, so a real catalog change
+    // must rebuild the already-rendered items — otherwise plugin tool cards
+    // (e.g. the agent strip) keep their neutral fallback look until an
+    // unrelated view switch happens to force a full render.
+    window.addEventListener("encre-tool-meta-updated", () => {
+      // Only tool cards derive their markup from the catalog; rebuilding the
+      // whole transcript (the old behaviour) made the answer text visibly
+      // refresh when plugin metadata arrived after boot.
+      guardRender("chat", "tool-refresh", () => this.refreshToolCards());
+    });
   }
 
   /** RAF-throttled render — collapses bursts of stream deltas into one
@@ -499,6 +687,152 @@ export class Chat {
 
   renderForce(): void {
     renderForceImpl.call(this);
+  }
+
+  /** Escaped-text render for an assistant block awaiting markdown upgrade. */
+  public renderAssistantTextRaw(item: Extract<TimelineItem, { kind: "assistant_text" }>): string {
+    return renderAssistantTextImpl.call(this, item, true);
+  }
+
+  /** Store one assistant block's rendered HTML, keeping the cache bounded. */
+  public cacheAssistantHtml(
+    id: string,
+    entry: {
+      content: string;
+      isStreaming: boolean;
+      hasError: boolean;
+      messageId: string;
+      locale: string;
+      html: string;
+      deferred: boolean;
+    },
+  ): void {
+    this.assistantHtmlCache.delete(id);
+    this.assistantHtmlCache.set(id, entry);
+    if (this.assistantHtmlCache.size > 600) {
+      const oldest = this.assistantHtmlCache.keys().next().value;
+      if (oldest !== undefined) this.assistantHtmlCache.delete(oldest);
+    }
+  }
+
+  /**
+   * Upgrade deferred assistant blocks to full markdown, newest first, in
+   * idle slices. Each block is patched on its own, so the UI keeps handling
+   * input between blocks and one heavy block cannot hold the rest back.
+   */
+  public beginMarkdownUpgrade(delayMs = 0): void {
+    const gen = ++this._markdownUpgradeGen;
+    this._markdownUpgradeStartedAt = performance.now();
+    if (!this._mdSweepBound) {
+      this._mdSweepBound = true;
+      this.container.addEventListener("scroll", () => {
+        if (!this.deferMarkdown || this._mdSweepTimer) return;
+        // Coalesce scroll storms; only blocks near the viewport get parsed.
+        this._mdSweepTimer = window.setTimeout(() => {
+          this._mdSweepTimer = 0;
+          if (this.deferMarkdown) this.beginMarkdownUpgrade(0);
+        }, 140);
+      }, { passive: true });
+    }
+    const idle = () => {
+      if (gen !== this._markdownUpgradeGen) return;
+      const ric = (window as any).requestIdleCallback as
+        | ((cb: () => void, opts?: { timeout: number }) => number)
+        | undefined;
+      if (ric) ric(() => this._upgradeMarkdownChunk(gen), { timeout: 300 });
+      else window.setTimeout(() => this._upgradeMarkdownChunk(gen), 0);
+    };
+    const waitFrames = () => {
+      // Let the cheap raw render reach the screen before parsing the first
+      // block; a session switch may have superseded this upgrade by then.
+      if (gen !== this._markdownUpgradeGen) return;
+      requestAnimationFrame(() => requestAnimationFrame(idle));
+    };
+    if (delayMs > 0) window.setTimeout(waitFrames, delayMs);
+    else waitFrames();
+  }
+
+  private _upgradeMarkdownChunk(gen: number): void {
+    if (gen !== this._markdownUpgradeGen) return;
+    const nodes = Array.from(this.ml.querySelectorAll(".msg-text--raw")) as HTMLElement[];
+    if (nodes.length === 0) {
+      this.deferMarkdown = false;
+      if (this._markdownUpgradeStartedAt) {
+        console.log(`[perf] markdown upgrade ${Math.round(performance.now() - this._markdownUpgradeStartedAt)}ms`);
+        this._markdownUpgradeStartedAt = 0;
+      }
+      return;
+    }
+    // Only blocks near the viewport are worth parsing. Upgrading the whole
+    // restored transcript at boot made one 200ms+ long task; offscreen raw
+    // text is invisible anyway and is upgraded by the scroll sweep.
+    const containerRect = this.container.getBoundingClientRect();
+    const nearViewport = (el: HTMLElement): boolean => {
+      const r = el.getBoundingClientRect();
+      return r.bottom >= containerRect.top - 600 && r.top <= containerRect.bottom + 600;
+    };
+    const candidates = nodes.filter(nearViewport);
+    if (candidates.length === 0) return;
+    const started = performance.now();
+    const container = this.container;
+    const prevTop = container.scrollTop;
+    const prevHeight = container.scrollHeight;
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      if (performance.now() - started >= 8) break;
+      const contentEl = candidates[i];
+      if (!contentEl.isConnected || !contentEl.classList.contains("msg-text--raw")) continue;
+      const wrapper = contentEl.closest(".assistant-text") as HTMLElement | null;
+      const itemId = wrapper?.getAttribute("data-id") || "";
+      const text = contentEl.textContent || "";
+      const _blockStart = performance.now();
+      let html = "";
+      try {
+        html = renderMarkdown(text);
+      } catch (e) {
+        // One malformed block stays as plain text; the upgrade continues.
+        reportUiFault("markdown", itemId || "block", e);
+        continue;
+      }
+      const _blockMs = performance.now() - _blockStart;
+      if (_blockMs >= 30) {
+        console.warn(`[perf] markdown block ${Math.round(_blockMs)}ms chars=${text.length}`);
+      }
+      contentEl.innerHTML = html;
+      contentEl.classList.remove("msg-text--raw");
+      if (html.includes("data-lucide=")) createLucideIcons(contentEl);
+      guardRender("media", "markdown-upgrade", () => window.__initMediaCards?.(contentEl));
+      if (itemId && wrapper) {
+        const hasError = wrapper.classList.contains("has-error");
+        const messageId = wrapper.getAttribute("data-message-id") || "";
+        this.cacheAssistantHtml(itemId, {
+          content: text,
+          isStreaming: false,
+          hasError,
+          messageId,
+          locale: getLocale(),
+          html: `<div class="assistant-text${hasError ? " has-error" : ""}" data-id="${itemId}" data-message-id="${messageId}"><div class="msg-text">${html}</div></div>`,
+          deferred: false,
+        });
+      }
+    }
+    // Upgrading changes block heights above the viewport. Keep the reader's
+    // visual position (or the bottom pin) stable across the swap.
+    if (this.userScrolledUp) {
+      const delta = container.scrollHeight - prevHeight;
+      if (delta) container.scrollTop = prevTop + delta;
+    } else {
+      this.autoScroll();
+    }
+    // Continue only while raw blocks near the viewport remain; otherwise wait
+    // for the scroll sweep instead of burning idle time on offscreen text.
+    const remaining = (Array.from(this.ml.querySelectorAll(".msg-text--raw")) as HTMLElement[])
+      .filter(nearViewport);
+    if (remaining.length === 0) return;
+    const ric = (window as any).requestIdleCallback as
+      | ((cb: () => void, opts?: { timeout: number }) => number)
+      | undefined;
+    if (ric) ric(() => this._upgradeMarkdownChunk(gen), { timeout: 300 });
+    else window.setTimeout(() => this._upgradeMarkdownChunk(gen), 0);
   }
 
   /** Re-renders the message list from current state (RAF-throttled). */
@@ -629,6 +963,21 @@ export class Chat {
     return renderAgentImpl.call(this, tc, itemId);
   }
 
+  /** Re-render a single tool card in place; false when it cannot be patched. */
+  public patchToolItem(tcId: string): boolean {
+    return patchToolItemImpl.call(this, tcId);
+  }
+
+  /** Re-render tool cards after a tool-UI catalog change (text untouched). */
+  public refreshToolCards(): void {
+    refreshToolCardsImpl.call(this);
+  }
+
+  /** Delegated task prompt as a plain user bubble (sub-agent view). */
+  public buildDelegatedPromptBubble(tc: ToolCallState): string {
+    return buildDelegatedPromptBubbleImpl.call(this, tc);
+  }
+
   private _agentTaskDividers(tc: ToolCallState): Array<{ index: number; name: string; status?: string }> {
     return _agentTaskDividersImpl.call(this, tc);
   }
@@ -645,16 +994,28 @@ export class Chat {
     return renderWarningCardImpl.call(this, item);
   }
 
-  private renderBranchSwitcher(): string {
-    return renderBranchSwitcherImpl.call(this);
+  private renderBranchSwitcher(group?: { ids: string[]; activeIdx: number }): string {
+    return renderBranchSwitcherImpl.call(this, group);
   }
 
   private renderCompactStartingCard(item: Extract<TimelineItem, { kind: "compact_starting" }>): string {
     return renderCompactStartingCardImpl.call(this, item);
   }
 
+  private renderRetryNotice(item: Extract<TimelineItem, { kind: "retry_notice" }>): string {
+    return renderRetryNoticeImpl.call(this, item);
+  }
+
   private renderCompactCard(item: Extract<TimelineItem, { kind: "compact" }>): string {
     return renderCompactCardImpl.call(this, item);
+  }
+
+  private renderCompactNotice(item: Extract<TimelineItem, { kind: "compact_notice" }>): string {
+    return renderCompactNoticeImpl.call(this, item);
+  }
+
+  private renderModelSwitchNotice(item: Extract<TimelineItem, { kind: "model_switch" }>): string {
+    return renderModelSwitchNoticeImpl.call(this, item);
   }
 
   private renderSystemMessage(item: Extract<TimelineItem, { kind: "system_message" }>): string {
@@ -669,10 +1030,6 @@ export class Chat {
     return renderPlanCardImpl(this, item);
   }
 
-  private parsePlanSections(text: string): { plan: string; steps: string; checklist: string } {
-    return parsePlanSectionsImpl(text);
-  }
-
   private renderWorkflowCard(_item: Extract<TimelineItem, { kind: "workflow" }>): string {
     return renderWorkflowCardImpl(this, _item);
   }
@@ -683,20 +1040,6 @@ export class Chat {
 
   private toggleItem(id: string, el: HTMLElement): void {
     toggleItemImpl.call(this, id, el);
-  }
-
-  /** Opens a unified dropdown menu anchored to the given action button.
-   *  Reuses the same visual language as the model selector / @-command
-   *  menus (`.mention-dropdown` / `.mention-dropdown-item`). */
-  private openActionMenu(
-    btn: HTMLElement,
-    items: Array<{ icon: string; label: string; onClick: () => void }>,
-  ): void {
-    openActionMenuImpl.call(this, btn, items);
-  }
-
-  private closeActionMenu(): void {
-    closeActionMenuImpl.call(this);
   }
 
   /** Re-generates the assistant reply starting from the preceding user
@@ -719,9 +1062,10 @@ export class Chat {
   }
 
   /** Scrolls to the bottom and keeps re-pinning until any async media
-   *  (images / videos inside the message list) has finished loading. */
-  private scrollToBottomAfterMedia(): void {
-    scrollToBottomAfterMediaImpl.call(this);
+   *  (images / videos inside the message list) has finished loading.
+   *  When force is set the userScrolledUp guard is bypassed (session entry). */
+  private scrollToBottomAfterMedia(force = false): void {
+    scrollToBottomAfterMediaImpl.call(this, force);
   }
 
   /** Keeps the floating scroll-to-bottom button in sync with the real state
@@ -735,9 +1079,49 @@ export class Chat {
     resetScrollButtonImpl.call(this);
   }
 
+  /** Public reset for the right-edge turn ruler, called by the view-switch
+   *  cleanup so the next render rebuilds it from scratch. Clears the turn
+   *  signature too: without that the incoming render takes the no-rebuild
+   *  `update()` path and the ruler would stay empty. */
+  resetScrollIndicator(): void {
+    this.scrollIndicator.reset();
+    this._scrollSig = "";
+  }
+
+  /** Requests the next full render to pin the view to the bottom regardless
+   *  of the userScrolledUp state. Used after rollback / branch switches:
+   *  the conversation just got truncated, so the pre-event scroll offset is
+   *  meaningless and the user expects to land on the new last turn. */
+  requestPinToBottom(): void {
+    this._forcePinNextRender = true;
+  }
+
   private _currentQuote: StatusQuote | null = null;
 
   private _updateStatusBar(running: boolean): void {
     _updateStatusBarImpl.call(this, running);
+  }
+
+  /** Re-mounts the status bar into #message-list after a fullRender rebuilt it. */
+  mountStatusBar(): void {
+    mountStatusBarImpl.call(this);
+  }
+
+  /** Repositions the status bar under the list's latest output (transform only). */
+  syncStatusBarPosition(): void {
+    syncStatusBarPositionImpl.call(this);
+  }
+
+  /** Starts the per-frame re-pin loop that keeps the status bar glued to the
+   *  transcript's last line while a turn runs (idempotent). */
+  startStatusBarFollow(): void {
+    startStatusBarFollowImpl.call(this);
+  }
+
+  /** Streaming fast path: appends only newly arrived timeline items to the
+   *  DOM instead of rebuilding the whole transcript. Returns false when the
+   *  change is structural and a fullRender is required. */
+  appendTimelineTail(timeline: TimelineItem[], prevCount: number): boolean {
+    return appendTimelineTailImpl.call(this, timeline, prevCount);
   }
 }

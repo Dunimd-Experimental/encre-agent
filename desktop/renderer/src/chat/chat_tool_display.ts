@@ -21,71 +21,20 @@
  */
 
 import type { ToolCallState } from "../core/types.js";
+import { safeCreateIcons } from "../core/ui_boundary.js";
 import { t } from "../features/i18n.js";
-import { renderDiffHtml } from "./diff_render.js";
-import { escapeHtml } from "./chat_markdown.js";
+import { metaFor } from "./tool_meta.js";
+import { renderDiffBody, renderToolBody, isCollapsedPlaceholder } from "./tool_body.js";
 import { TransitionHelper } from "../ui/transition-helper.js";
 
-// === Tool helpers ===================================================================
+// === Tool call text helpers =======================================================
+//
+// No tool is named in this file. Which card a call gets, what it is called and
+// how its result is shown all come from `tool_meta.ts`, which resolves the
+// backend-declared UI (`encre.tools.tool_ui`) against the renderer's six
+// hardcoded file-mutation tools. This file only turns a resolved call into the
+// short strings the cards display.
 
-// === Tool category helpers (match ALL backend tools) ================================
-
-export function isTerminalTool(name: string): boolean {
-  return name === "bash" || name === "bash_output" || name === "bash_kill" || name === "bash_list" ||
-         name === "shell" || name === "terminal" || name === "run_command" || name === "chat.terminal";
-}
-
-export function isFileMutationTool(name: string): boolean {
-  if (
-    name === "write" || name === "file_write" || name === "write_file" ||
-    name === "edit" || name === "file_edit" || name === "edit_file" ||
-    name === "delete_file"
-  ) {
-    return true;
-  }
-  // Fallback for provider/tool-alias variants
-  return /(write|edit|delete)/i.test(name) && /file/i.test(name);
-}
-
-export function isFileReadTool(name: string): boolean {
-  return name === "read" || name === "file_read";
-}
-
-const TERMINAL_TOOLS = new Set([
-  "bash", "bash_output", "bash_kill", "bash_list",
-  "shell", "terminal", "run_command", "chat.terminal",
-]);
-
-const FILE_MUTATION_TOOLS = new Set([
-  "write", "file_write", "edit", "file_edit",
-  "delete_file", "apply_patch",
-]);
-
-const FILE_READ_TOOLS = new Set(["read", "file_read"]);
-
-export function isExpandableStripTool(name: string): boolean {
-  return name === "search" || name === "grep" || name === "glob" || name === "codebase" ||
-         name === "web_search";
-}
-
-export function isToolItemTool(name: string): boolean {
-  return name === "skill" || name === "mcp" || name.startsWith("mcp__") ||
-         name === "memory" || name.startsWith("memory_") ||
-         name === "task" || name.startsWith("task_") ||
-         name === "image" || name === "spreadsheet" || name.startsWith("cron_") || name === "todo" ||
-         name === "find_tool" ||
-         name === "web_fetch" || name === "git" || name === "lsp" || name === "notebook" ||
-         name === "rest_client" || name === "browser" || name === "database" || name === "docker" ||
-         name === "pdf" || name === "deploy" || name === "apply_patch" ||
-         name === "computer" || name === "desktop";
-}
-
-export function isHiddenTool(name: string): boolean {
-  if (name === "task" || name.startsWith("task_")) return true;
-  if (name === "memory" || name.startsWith("memory_")) return true;
-  if (name.startsWith("cron_")) return true;
-  return name === "todo" || name === "find_tool" || name === "lsp";
-}
 
 export function compactText(value: unknown, max = 88): string {
   if (value === undefined || value === null) return "";
@@ -186,188 +135,101 @@ export function firstParam(tc: ToolCallState, keys: string[]): string {
     const value = tc.params[key];
     if (typeof value === "string" && value.trim()) return value;
   }
+  // The parsed object isn't there yet: `tool_call_end` swaps `params` for the
+  // parsed argument object, but every render before it (streaming, and history
+  // replay that never re-sends the event) still sees the raw `arguments`
+  // string. Read the command out of it so the strip summary is never empty.
+  const raw = tc.params?.arguments;
+  if (typeof raw === "string" && raw.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      for (const key of keys) {
+        const value = parsed[key];
+        if (typeof value === "string" && value.trim()) return value;
+      }
+    } catch {
+      // Partial JSON while the arguments are still streaming — ignore.
+    }
+  }
   return "";
 }
 
-export function getToolIcon(name: string, terminal?: string): string {
-  if (isTerminalTool(name)) {
-    // All terminal tools share one glyph (the `>_` prompt, matching the
-    // PowerShell icon). No per-shell differentiation.
-    return "terminal";
-  }
-  if (isFileMutationTool(name)) return "pencil-line";
-  if (isFileReadTool(name)) return "eye";
-  // Web / search / discovery
-  if (name === "web_search" || name === "web_fetch") return "globe";
-  if (name === "search" || name === "grep") return "search";
-  if (name === "codebase" || name.startsWith("codebase")) return "search";
-  if (name === "find_tool") return "compass";
-  if (name === "glob") return "folder-search";
-  // Memory / task / cron (specific match before the prefix fallbacks)
-  if (name === "memory_profile") return "user-circle";
-  if (name === "memory" || name.startsWith("memory_")) return "database";
-  if (name === "task" || name.startsWith("task_")) return "list-checks";
-  if (name.startsWith("cron_")) return "clock-9";
-  // Skills / MCP / agents / orchestration
-  if (name === "skill") return "wand-2";
-  if (name === "mcp" || name.startsWith("mcp__")) return "plug";
-  if (name === "agent") return "zap";
-  if (name === "swarm") return "users";
-  if (name === "workflow") return "workflow";
-  // Compute / automation environments
-  if (name === "browser") return "monitor";
-  if (name === "computer" || name === "computer_use" || name === "vlm_computer_use" || name === "desktop") return "container";
-  if (name === "docker") return "container";
-  if (name === "ssh") return "terminal";
-  // Dev tooling
-  if (name === "notebook") return "notebook-pen";
-  if (name === "git") return "git-branch";
-  if (name === "github") return "github";
-  if (name === "lsp") return "code-2";
-  if (name === "database") return "database";
-  if (name === "diff") return "git-compare";
-  if (name === "json_tool") return "braces";
-  if (name === "lint_format") return "check-check";
-  if (name === "test_run") return "flask-conical";
-  if (name === "env_manager") return "settings-2";
-  if (name === "apply_patch") return "git-pull-request";
-  if (name === "manage") return "settings";
-  // Content / media generation
-  if (name === "pdf" || name === "document") return "file-text";
-  if (name === "presentation") return "presentation";
-  if (name === "spreadsheet") return "table";
-  if (name === "chart") return "bar-chart-3";
-  if (name === "diagram") return "workflow";
-  if (name === "image" || name === "generate_image" || name === "edit_image" || name === "image_variation") return "image";
-  if (name === "qr_code") return "qr-code";
-  if (name === "media") return "film";
-  if (name === "transcribe_audio" || name === "translate_audio") return "mic";
-  if (name === "translation") return "languages";
-  if (name === "archive") return "archive";
-  if (name === "hash_crypto") return "hash";
-  // Cloud / network / provider APIs
-  if (name === "rest_client" || name === "cloud_storage") return "cloud";
-  if (name === "deploy") return "rocket";
-  if (name === "email") return "mail";
-  if (name === "notify") return "bell";
-  if (name === "file_api") return "file";
-  if (name === "batch_api") return "layers";
-  if (name === "fine_tuning_api") return "sliders-horizontal";
-  if (name === "create_embeddings") return "boxes";
-  if (name === "create_moderation") return "shield-check";
-  // Misc known cards
-  if (name === "todo") return "check-circle-2";
-  if (name === "plan") return "file-text";
-  if (name === "question") return "help-circle";
-  if (name === "compact") return "shrink";
-  if (name === "info") return "layout-dashboard";
-  // Fallback: never leave a tool with a blank icon gap — show a neutral
-  // "tool" glyph so unmapped/MCP/provider tools still read as tool calls.
-  return "wrench";
-}
+// === Summary helpers ==============================================================
+//
+// Icon, label, card shape and body are all resolved from the backend-declared
+// tool metadata (see `tool_meta.ts`). This file only keeps the logic that turns
+// a tool call into short human-readable text.
 
-const TERMINAL_LABELS: Record<string, string> = {
-  auto: "Shell",
-  bash: "Bash",
-  cmd: "CMD",
-  powershell: "PowerShell",
-  pwsh: "pwsh",
-  python: "Python",
-  node: "Node.js",
-  irb: "Ruby",
-  julia: "Julia",
-  lua: "Lua",
-  php: "PHP",
-  R: "R",
-};
-
-export function formatToolName(name: string, terminal?: string): string {
-  if (terminal && (name === "bash" || name === "shell" || name === "chat.terminal" || name === "run_command")) {
-    return TERMINAL_LABELS[terminal] || terminal.charAt(0).toUpperCase() + terminal.slice(1);
-  }
-  const labels: Record<string, string> = {
-    "chat.terminal": "Bash",
-    bash: "Bash", bash_output: "Bash Output", bash_kill: "Bash", bash_list: "Bash",
-    shell: "Shell", terminal: "Terminal", run_command: "Bash",
-    web_search: "Web Search", web_fetch: "Web Fetch", find_tool: "Find Tool",
-    read: "Read File", file_read: "Read File", write: "Write File", file_write: "Write File",
-    edit: "Edit File", file_edit: "Edit File", apply_patch: "Apply Patch",
-    mcp: "MCP", lsp: "LSP", git: "Git",
-    memory_create: "Memory", memory_read: "Memory", memory_update: "Memory", memory_delete: "Memory", memory_search: "Memory",
-    task_create: "Task", task_list: "Task", task_get: "Task", task_update: "Task", task_stop: "Task", task_output: "Task",
-    cron_create: "Cron", cron_delete: "Cron", cron_list: "Cron",
-    rest_client: "Rest Client", desktop: "Desktop", computer: "Computer",
-    question: "Question", memory_profile: "Memory Profile",
-    compact: "Compress",
-    info: "Info Card",
-  };
-  if (labels[name]) return labels[name];
-  if (name.startsWith("mcp__")) return "MCP";
-  if (name === "agent") return "Agent";
-  return name.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
+/**
+ * Resolves the page URL a "url"-strategy call targeted (browser family).
+ * Prefers the call's own `url` argument (navigate / new_tab); falls back to a
+ * LABELED url in the result head ("Navigated to …" / "URL: …"). Free-form
+ * result content is never scanned, so a page dump cannot smuggle an arbitrary
+ * link into the summary — and the untrusted-result wrapper is never shown.
+ */
+function toolTargetUrl(tc: ToolCallState): string {
+  const direct = firstParam(tc, ["url", "uri"]);
+  if (direct) return direct;
+  const head = (tc.result || "").slice(0, 400);
+  const m = head.match(/(?:\bNavigated to|\bURL:)\s+(\S+)/);
+  return m ? m[1] : "";
 }
 
 export function getToolSummary(tc: ToolCallState): string {
+  const meta = metaFor(tc.name);
   // For tools with result, show result summary instead of params
   if (tc.result) {
-    // Terminal tools: strip-summary shows the command, body shows result
-    if (TERMINAL_TOOLS.has(tc.name)) {
-      const cmd = firstParam(tc, ["command", "cmd", "input", "shell_command", "script"]);
-      return compactText(cmd, 88);
+    // Backend collapse stub — never leak call ids/previews into the UI.
+    // Command/query-shaped tools still lead with their input; everything
+    // else renders an empty summary rather than the stub text.
+    if (isCollapsedPlaceholder(tc.result)) {
+      return meta.body === "terminal" || meta.body === "web-results"
+        ? compactText(firstParam(tc, meta.keys), 88)
+        : "";
+    }
+    // Question tool: the collapsed strip shows nothing at all — the Q/A
+    // blocks live in the expandable body only.
+    if (tc.name === "question") return "";
+    // URL-strategy tools (browser): the summary is ONLY the page URL. The raw
+    // result is untrusted page content wrapped in delimiters — never dump it.
+    if (meta.result === "url") return compactText(toolTargetUrl(tc), 88);
+    // Terminal + web-search strips always lead with what the model issued
+    // (the command / the query). The stdout or the result list belongs to
+    // the expanded body -- on the collapsed line it reads as if the agent
+    // had *said* that text, and it pushed the actual intent off the edge.
+    if (meta.body === "terminal" || meta.body === "web-results") {
+      return compactText(firstParam(tc, meta.keys), 88);
     }
     // If the backend returned JSON, extract a readable field instead of
     // dumping the raw serialized object into the strip summary.
     const jsonSummary = extractJsonSummary(tc.result);
     if (jsonSummary) return jsonSummary;
-    if (tc.name === "web_search") return compactText(tc.result, 88);
-    if (tc.name === "web_fetch") return compactText(tc.result, 88);
-    if (tc.name === "search" || tc.name === "grep" || tc.name === "codebase") {
+    if (meta.result === "file") {
+      // File tools always show WHICH file was targeted, never the tool result:
+      // file_read returns the file's raw content, so falling back to
+      // `compactText(tc.result)` turned the summary into a dump of its first
+      // lines and hid the file name entirely.
+      return compactPath(toolFilePath(tc), 88);
+    }
+    if (meta.result === "match_count") {
       const match = tc.result.match(/(\d+)\s*match/i);
       return match ? t("chat.toolMatches", { count: parseInt(match[1], 10) }) : compactText(tc.result, 88);
     }
-    if (tc.name === "glob") {
+    if (meta.result === "file_count") {
       const count = tc.result.trim().split("\n").filter((l) => l.trim()).length;
       return t("chat.toolFiles", { count });
     }
-    if (tc.name === "git") return compactText(tc.result, 88);
-    if (tc.name === "find_tool") return t("chat.toolDiscoverTools");
-    if (tc.name === "skill") return compactText(tc.result, 88);
-    if (tc.name === "mcp") return compactText(tc.result, 88);
-    if (tc.name === "memory") return compactText(tc.result, 88);
-    if (tc.name === "task") return compactText(tc.result, 88);
-    if (tc.name === "lsp") return compactText(tc.result, 88);
-    if (tc.name === "notebook") return compactText(tc.result, 88);
-    if (tc.name === "browser") return compactText(tc.result, 88);
-    if (tc.name === "database") return compactText(tc.result, 88);
-    if (tc.name === "docker") return compactText(tc.result, 88);
-    if (tc.name === "pdf") return compactText(tc.result, 88);
-    if (tc.name === "deploy") return compactText(tc.result, 88);
-    // File read/write tools always show WHICH file was targeted, never the
-    // tool result: file_read returns the file's raw content, so falling back
-    // to `compactText(tc.result)` turned the summary into a dump of its first
-    // lines and hid the file name entirely.
-    if (FILE_READ_TOOLS.has(tc.name) || FILE_MUTATION_TOOLS.has(tc.name)) {
-      return compactPath(toolFilePath(tc), 88);
-    }
+    if (meta.result === "discover") return t("chat.toolDiscoverTools");
     return compactText(tc.result, 88);
   }
   // No result yet — show minimal param hint (not full params)
-  if (isTerminalTool(tc.name)) {
-    return compactText(firstParam(tc, ["command", "cmd", "input", "shell_command", "script"]), 96);
+  if (meta.body === "terminal") {
+    return compactText(firstParam(tc, meta.keys), 96);
   }
-  if (tc.name === "web_search") return compactText(firstParam(tc, ["query", "q"]), 88);
-  if (tc.name === "web_fetch") return compactText(firstParam(tc, ["url", "uri"]), 88);
-  if (FILE_READ_TOOLS.has(tc.name) || FILE_MUTATION_TOOLS.has(tc.name)) {
-    return compactPath(toolFilePath(tc), 88);
-  }
-  if (tc.name === "search" || tc.name === "grep" || tc.name === "glob" || tc.name === "codebase") {
-    return compactText(firstParam(tc, ["query", "pattern", "glob", "path"]), 88);
-  }
-  if (tc.name === "skill") return compactText(firstParam(tc, ["name", "skill"]), 88);
-  if (tc.name === "agent") return compactText(firstParam(tc, ["prompt", "description", "agent_name"]), 88);
-  if (tc.name === "mcp" || tc.name.startsWith("mcp__")) return compactText(firstParam(tc, ["tool", "name"]), 88);
-  if (tc.name === "find_tool") return t("chat.toolDiscoverTools");
-  const keys = Object.keys(tc.params).filter(k => k !== "id");
+  if (meta.result === "file") return compactPath(toolFilePath(tc), 88);
+  if (meta.result === "discover") return t("chat.toolDiscoverTools");
+  if (meta.keys.length > 0) return compactText(firstParam(tc, meta.keys), 88);
+  const keys = Object.keys(tc.params).filter((k) => k !== "id");
   if (keys.length > 0) {
     return compactText(tc.params[keys[0]], 88);
   }
@@ -375,27 +237,19 @@ export function getToolSummary(tc: ToolCallState): string {
 }
 
 export function getToolInlineSummary(tc: ToolCallState): string {
-  if (tc.name === "find_tool") return t("chat.toolDiscoverTools");
-  if (tc.name === "mcp" || tc.name.startsWith("mcp__")) {
-    const mcpTool = firstParam(tc, ["tool", "name", "function"]);
-    return compactText(mcpTool || t("general.selectToolCall"), 42);
-  }
-  if (tc.name === "memory" || tc.name.startsWith("memory_")) {
-    const hint = firstParam(tc, ["query", "name", "path"]);
-    return compactText(hint || t("general.memoryAction"), 42);
-  }
-  if (tc.name === "task" || tc.name.startsWith("task_")) {
-    const hint = firstParam(tc, ["id", "title", "task_id"]);
-    return compactText(hint || t("general.taskAction"), 42);
-  }
-  if (tc.name.startsWith("cron_")) {
-    const hint = firstParam(tc, ["schedule", "expression", "name"]);
-    return compactText(hint || t("general.cronAction"), 42);
-  }
+  const meta = metaFor(tc.name);
+  if (meta.result === "discover") return t("chat.toolDiscoverTools");
   // File tools lead with the target file name — same rule as getToolSummary,
   // just narrower, and never shortened in a way that hides the name.
-  if (isFileReadTool(tc.name) || isFileMutationTool(tc.name)) {
+  if (meta.result === "file") {
     return compactPath(toolFilePath(tc), 42) || getToolSummary(tc);
+  }
+  // URL-strategy tools (browser): page URL only, never the result dump.
+  if (meta.result === "url") return compactText(toolTargetUrl(tc), 42);
+  if (meta.keys.length > 0) {
+    const hint = firstParam(tc, meta.keys);
+    if (hint) return compactText(hint, 42);
+    if (meta.hint) return compactText(t(meta.hint), 42);
   }
   const fromParams = firstParam(tc, ["query", "path", "file_path", "url", "name"]);
   return compactText(fromParams || getToolSummary(tc), 42);
@@ -435,181 +289,23 @@ export function parseOption(raw: string): { label: string; desc: string } {
 
 export function getToolBodyText(tc: ToolCallState): string {
   if (!tc.result) return "";
-  if (tc.name === "web_search") return renderWebResults(tc.result);
-  if (tc.name === "web_fetch") return renderWebFetchedContent(tc.result);
-  if (isFileMutationTool(tc.name) && tc.name !== "delete_file") {
-    return renderDiff(tc.result);
+  const meta = metaFor(tc.name);
+  const ctx = { tc, result: tc.result, props: meta.props };
+  // Terminal tools wrap their output in a JSON envelope; when the result is not
+  // JSON the terminal body comes back empty, so show the raw text instead.
+  if (meta.body === "terminal") {
+    return renderToolBody(ctx, "terminal") || renderToolBody(ctx, "pre");
   }
-  // Terminal tools: result is JSON, extract stdout/stderr for display
-  if (TERMINAL_TOOLS.has(tc.name)) {
-    try {
-      const json = JSON.parse(tc.result);
-      const parts: string[] = [];
-      if (json.stdout) parts.push(json.stdout);
-      if (json.stderr) parts.push(json.stderr);
-      const text = parts.join("\n");
-      if (!text.trim()) return `<pre style="font-size:11.5px;color:var(--text-muted);margin:0;padding:0">${escapeHtml("(no output)")}</pre>`;
-      const lines = text.split("\n");
-      const maxLines = 20;
-      const shown = lines.slice(0, maxLines);
-      const hasMore = lines.length > maxLines;
-      let html = `<pre style="font-size:11.5px;color:var(--text-secondary);white-space:pre-wrap;margin:0;line-height:1.5">${escapeHtml(shown.join("\n"))}`;
-      if (hasMore) {
-        html += `\n<span style="color:var(--text-muted)">${t("chat.moreLines", { count: lines.length - maxLines })}</span>`;
-      }
-      html += "</pre>";
-      return html;
-    } catch {
-      // Fallback: not JSON, treat as plain text
-    }
-  }
-  // For most tools, show first few lines as summary, not full raw output
-  const lines = tc.result.trim().split("\n").filter((l) => l.trim());
-  const maxLines = 8;
-  const shown = lines.slice(0, maxLines);
-  const hasMore = lines.length > maxLines;
-  let html = `<pre style="font-size:11.5px;color:var(--text-secondary);white-space:pre-wrap;margin:0;line-height:1.5">${escapeHtml(shown.join("\n"))}`;
-  if (hasMore) {
-    html += `\n<span style="color:var(--text-muted)">${t("chat.moreLines", { count: lines.length - maxLines })}</span>`;
-  }
-  html += "</pre>";
-  return html;
+  return renderToolBody(ctx, meta.body);
 }
 
+/**
+ * Renders a file-mutation result as a diff. The implementation lives in
+ * `renderDiffBody` (./tool_body.js); kept here so existing callers and the
+ * module's public surface stay stable.
+ */
 export function renderDiff(result: string): string {
-  // Extract filename from the first line produced by the file tools:
-  // "Successfully wrote N chars to <path>" or "Applied N edit(s) to <path>."
-  let fileName = "";
-  const firstLine = result.split("\n")[0] || "";
-  const pathMatch = firstLine.match(/(?:to|to:) (.+?)\.?\s*$/);
-  if (pathMatch) fileName = pathMatch[1].trim();
-
-  // Extract the diff body from the ```diff ... ``` fence, then render via the
-  // shared renderer so the chat card and the review panel stay identical.
-  const diffMatch = result.match(/```diff\n([\s\S]*?)```/);
-  if (!diffMatch) return "";
-  return renderDiffHtml(diffMatch[1].trim(), fileName);
-}
-
-export function renderWebResults(result: string): string {
-  const lines = result.trim().split("\n");
-  // Detect format: markdown links "1. [title](url)" or raw text
-  const hasMarkdownLinks = /\[.+?\]\(https?:\/\/.+?\)/.test(result);
-
-  let html = '<div class="web-list">';
-  let num = 1;
-
-  if (hasMarkdownLinks) {
-    // Parse markdown format: "1. [title](url)\n   snippet"
-    const entries = splitMarkdownEntries(result);
-    if (entries.length > 0) {
-      for (const entry of entries) {
-        html += renderWebEntry(num, entry.title, entry.url, entry.snippet);
-        num++;
-      }
-    }
-  } else {
-    // Fallback: try key-value line parsing, or show as clean text
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      // Try "title - url - snippet" pattern
-      const parts = trimmed.split(/\s{2,}-\s{2,}/);
-      if (parts.length >= 2) {
-        const title = parts[0].trim();
-        const rest = parts.slice(1).join(" - ").trim();
-        const urlMatch = rest.match(/^(https?:\/\/\S+)(?:\s+(.+))?$/);
-        const url = urlMatch ? urlMatch[1] : "";
-        const snip = urlMatch && urlMatch[2] ? urlMatch[2] : (url ? "" : rest);
-        html += renderWebEntry(num, title, url, snip);
-        num++;
-      } else {
-        // Catch inline URLs
-        const urlMatch = trimmed.match(/^(.*?)\s*(https?:\/\/\S+)\s*(.*)$/);
-        if (urlMatch) {
-          html += renderWebEntry(num, urlMatch[1] || trimmed, urlMatch[2], urlMatch[3]);
-          num++;
-        } else {
-          html += `<div class="web-item"><span class="web-num">${num}</span><span class="web-snip">${escapeHtml(trimmed)}</span></div>`;
-          num++;
-        }
-      }
-    }
-  }
-
-  if (num === 1) {
-    // No structured entries found, show cleaned text
-    const cleaned = result.replace(/\n{3,}/g, "\n\n").trim();
-    html += `<div class="web-item" style="white-space:pre-wrap;line-height:1.5;font-size:11.5px">${escapeHtml(cleaned)}</div>`;
-  }
-  html += "</div>";
-  return html;
-}
-
-/** Split web_search markdown output into title/url/snippet entries. */
-export function splitMarkdownEntries(text: string): { title: string; url: string; snippet: string }[] {
-  const entries: { title: string; url: string; snippet: string }[] = [];
-  // Match: optional number. [title](url) followed by optional snippet on next line(s)
-  const pattern = /(?:^\d+\.\s*)?\[(.+?)\]\((https?:\/\/[^)]+)\)\s*([\s\S]*?)(?=(?:^\d+\.\s*)?\[.+?\]\(https?:\/\/|$)/gm;
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    entries.push({
-      title: match[1].trim(),
-      url: match[2].trim(),
-      snippet: match[3].trim().replace(/\n+/g, " ").slice(0, 300),
-    });
-  }
-  return entries;
-}
-
-export function renderWebEntry(num: number, title: string, url: string, snippet: string): string {
-  const displayTitle = title || url || "(untitled)";
-  // Clickable title if URL present, otherwise plain text
-  const titleHtml = url
-    ? `<a class="web-title" href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(displayTitle)}</a>`
-    : `<span class="web-title">${escapeHtml(displayTitle)}</span>`;
-  const shortUrl = url ? url.replace(/^https?:\/\//, "").replace(/\/$/, "").slice(0, 50) : "";
-  const urlHtml = shortUrl ? `<span class="web-url">${escapeHtml(shortUrl)}</span>` : "";
-  const snipHtml = snippet ? `<span class="web-snip">${escapeHtml(snippet)}</span>` : "";
-  return `<div class="web-item">
-    <span class="web-num">${num}</span>
-    ${titleHtml}
-    ${urlHtml}
-    ${snipHtml}
-  </div>`;
-}
-
-/** Render web_fetch results: clean scraped text into readable format. */
-export function renderWebFetchedContent(result: string): string {
-  const lines = result.split("\n").map(l => l.trim()).filter(l => l);
-  // Deduplicate consecutive near-identical lines (common in scraped content)
-  const deduped: string[] = [];
-  for (const line of lines) {
-    const prev = deduped[deduped.length - 1];
-    if (prev && _lineSimilarity(prev, line) > 0.85) continue;
-    if (line.length < 3 && deduped.length > 0) continue; // skip single-char noise
-    deduped.push(line);
-  }
-  // Limit display
-  const maxLines = 60;
-  const shown = deduped.slice(0, maxLines);
-  const more = deduped.length > maxLines
-    ? `\n<span style="color:var(--text-muted)">… ${deduped.length - maxLines} more lines</span>`
-    : "";
-  return `<pre class="web-fetched-content">${escapeHtml(shown.join("\n"))}${more}</pre>`;
-}
-
-export function _lineSimilarity(a: string, b: string): number {
-  if (a === b) return 1;
-  const shorter = a.length < b.length ? a : b;
-  const longer = a.length < b.length ? b : a;
-  if (shorter.length === 0) return 0;
-  let matches = 0;
-  const words = new Set(shorter.split(/\s+/));
-  for (const w of longer.split(/\s+/)) {
-    if (words.has(w)) matches++;
-  }
-  return matches / Math.max(words.size, 1);
+  return renderDiffBody(result);
 }
 
 export function _toolStatusHtml(status: string): string {
@@ -624,13 +320,29 @@ export function getThinkingSummary(text: string, elapsed?: number): string {
   return summary || duration;
 }
 
-export function createLucideIcons(root?: HTMLElement): void {
-  if (typeof (window as any).lucide !== "undefined") {
-    (window as any).lucide.createIcons(root ? { root } : undefined);
-  }
+/**
+ * Re-run Lucide inside `root` ONLY.
+ *
+ * `root` is deliberately REQUIRED. `lucide.createIcons()` without a root
+ * defaults to `document`, and for each `[data-lucide]` node it runs
+ * `parentNode.replaceChild(<svg>, <i>)` — it destroys and recreates the node.
+ * A document-wide pass therefore churns every icon in the app: the sidebar,
+ * the toolbar, an open panel, another view entirely.
+ *
+ * That churn is what breaks the UI while the model is streaming. A streamed
+ * token landing between a mousedown and its mouseup swaps the node under the
+ * cursor, so the browser dispatches the resulting `click` on the nearest
+ * common ancestor instead of the real target and the interaction is silently
+ * swallowed. Open UI also loses its hover/expanded state (it "snaps back"),
+ * and the mass replacement forces a synchronous layout that makes scroll
+ * anchoring fight the re-render.
+ *
+ * Always pass the container whose markup was just injected.
+ */
+export function createLucideIcons(root: HTMLElement): void {
+  // Shared boundary: a malformed icon must not abort the surrounding render.
+  safeCreateIcons(root);
 }
-
-const _openedHtmlCards = new Set<string>();
 
 export function saveVideoPlayback(scope?: HTMLElement): Array<{id: string; t: number; p: boolean}> {
   const states: Array<{id: string; t: number; p: boolean}> = [];

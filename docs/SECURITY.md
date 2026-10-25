@@ -21,7 +21,7 @@ The following table lists which Encre Agent release lines currently receive secu
 |---|---|---|---|
 | `0.5.x` (current pre-release) | 🟡 Pre-release | Yes — best-effort, fast turnaround | Until `0.6.0` ships |
 | `0.4.x` | ❌ End-of-life | No | Please upgrade |
-| `< 0.4.3` | ❌ End-of-life | No | Please upgrade |
+| `< 0.5.0` | ❌ End-of-life | No | Please upgrade |
 
 Users are encouraged to track `master` or the latest tagged release. Because Encre Agent is distributed primarily as a single repo (cloned and `pip install -e .`-ed) rather than as a PyPI package, "upgrade" means:
 
@@ -31,7 +31,7 @@ git pull
 pip install -e .
 ```
 
-For the desktop app, follow the auto-update prompt or reinstall from the latest GitHub / Gitee release artifact.
+For the Encre Agent Desktop, follow the auto-update prompt or reinstall from the latest GitHub / Gitee release artifact.
 
 ---
 
@@ -59,7 +59,7 @@ A useful report contains:
 - **Description** — what the vulnerability is, in one paragraph
 - **Impact** — what an attacker can achieve (RCE, data exfiltration, sandbox escape, prompt-injection-mediated action, …)
 - **Affected versions** — which Encre Agent release lines are vulnerable
-- **Affected layer** — Python framework / Rust core / Desktop app / Documentation
+- **Affected layer** — Python gateway / Encre Agent Core / Encre Agent Desktop / Documentation
 - **Steps to reproduce** — numbered, copy-paste runnable
 - **Proof of concept** — script, payload, screenshot, or recording. Especially valuable for: tool injection, prompt injection, sandbox escape, SSRF bypass, credential leakage
 - **Suggested fix** — if you have one (a patch is a bonus, not a requirement)
@@ -72,7 +72,7 @@ A useful report contains:
 **Title:** `<one-line summary>`
 
 **Layer:** Python / Rust / Desktop / Docs
-**Affected versions:** 0.4.3 (commit <hash>)
+**Affected versions:** 0.5.0 (commit <hash>)
 **Severity (your estimate):** Critical / High / Medium / Low
 
 **Description:**
@@ -149,7 +149,20 @@ The default is configurable per-tool via `EncreConfig.permission_settings` (e.g.
 
 ### Layer 2: Dangerous-Command Detection
 
-The Bash tool runs every command through `encre.safety.analyze_bash_command` against patterns from [`dangerous_commands.txt`](../backend/encre/dangerous_commands.txt). Patterns detected by default include `rm -rf /`, raw `dd` against devices, fork-bombs, reverse shells, and known destructive package commands. You can extend the list via `EncreConfig.dangerous_command_patterns`.
+The Bash tool's command text is checked against the blacklist in
+[`dangerous_commands.txt`](../harness/encre/dangerous_commands.txt) inside the Rust
+permission engine (`permission_check_mode`), which is what actually denies or
+prompts a call. The table is sectioned by shell family (`[universal]`, `[linux]`,
+`[windows]`, `[macos]`): the host's own section always applies and the section
+matching the shell named in the tool's `terminal` argument applies too, because
+that argument is model-supplied. `encre.safety.analyze_bash_command` is a separate
+static analyzer used for the network-access flag and for scoring in `auto`
+permission mode -- it is not the enforcement point. Patterns detected by default
+include `rm -rf /`, raw `dd` against devices, fork-bombs, reverse shells, remote
+script piped into an interpreter, and known destructive package commands. You can
+extend the list via `EncreConfig.dangerous_command_patterns`; extra entries are
+appended as `[universal]` rules, so they match under every shell.
+
 
 ### Layer 3: Sandboxed Execution
 
@@ -171,7 +184,7 @@ Both are layered: even if one is bypassed, the other still applies.
 
 ### Layer 5: Encrypted Credential Storage
 
-`encre/crypto.py` provides AES-256-GCM helpers. The desktop app uses them to encrypt browser cookies at rest; the server stores API keys encrypted at rest when configured to. Key files live in the user's data directory (`get_data_dir()`) and are never written to logs.
+`encre/crypto.py` provides AES-256-GCM helpers. The Encre Agent Desktop uses them to encrypt browser cookies at rest; the server stores API keys encrypted at rest when configured to. Key files live in the user's data directory (`get_data_dir()`) and are never written to logs.
 
 ### Layer 6: Multi-Agent Isolation
 
@@ -228,7 +241,7 @@ Before you point Encre Agent at anything that isn't your own laptop, run through
 
 ### Runtime
 
-- [ ] Run as a **non-root user**. The desktop app and the Agent process should never have root.
+- [ ] Run as a **non-root user**. The Encre Agent Desktop and the Agent process should never have root.
 - [ ] Put the host behind a **firewall** that blocks outbound traffic to LLM providers you don't use.
 - [ ] **Log at `INFO`** (not `DEBUG`/`TRACE`) — debug logs include full prompts and tool inputs.
 - [ ] **Monitor** `pre_tool_exec` and `tool_exec_failed` events for unusual patterns.
@@ -334,7 +347,7 @@ We document these so you can make informed decisions about where to deploy Encre
 1. **LLM outputs are non-deterministic.** Even with the same prompt and seed, a model may produce different tool calls. Do not assume idempotency for destructive operations.
 2. **Prompt injection is an unsolved problem.** `EncreAutoSafetyClassifier` mitigates but cannot eliminate it. Treat retrieved content as untrusted; validate tool inputs at the boundary.
 3. **Tool outputs leave the local machine.** When you use a cloud LLM, tool results are sent to the provider. Choose providers whose data-handling policy you have read, or run a local model via the `ollama` / `local` backends.
-4. **The desktop app uses Chromium** (via Electron). It inherits Chromium's CVE cadence. Run `npm audit` regularly.
+4. **The Encre Agent Desktop uses Chromium** (via Electron). It inherits Chromium's CVE cadence. Run `npm audit` regularly.
 5. **Landlock is Linux-only.** On macOS and Windows, the Docker sandbox is the primary isolation mechanism.
 
 ---

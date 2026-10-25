@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,7 +21,9 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-"""Device context cache 鈥?persists collected provider data to disk.
+from __future__ import annotations
+
+"""Device context cache — persists collected provider data to disk.
 
 The cache avoids re-probing hardware at every agent startup.  A TTL
 (default 24h) controls how often the cache is refreshed.
@@ -31,6 +33,11 @@ import json
 import os
 import time
 from typing import Any
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 class DeviceContextCache:
@@ -62,11 +69,11 @@ class DeviceContextCache:
             payload["_timestamp"] = time.time()
             write_json(self._path, payload)
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
     def clear(self) -> None:
         try:
             if os.path.isfile(self._path):
                 os.remove(self._path)
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)

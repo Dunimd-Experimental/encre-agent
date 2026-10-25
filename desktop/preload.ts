@@ -75,8 +75,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   readKeyfile: (): Promise<ArrayBuffer | null> =>
     ipcRenderer.invoke("readKeyfile"),
 
-  readMachineId: (): Promise<string> =>
-    ipcRenderer.invoke("readMachineId"),
+  readKeyWrapMaterial: (): Promise<{ fingerprint: string; appSecret: string }> =>
+    ipcRenderer.invoke("readKeyWrapMaterial"),
+
+  adminFetch: (urlPath: string): Promise<{ ok: boolean; status: number; body?: string; error?: string }> =>
+    ipcRenderer.invoke("adminFetch", urlPath),
 
   // Window controls
   windowMinimize: (): Promise<void> => ipcRenderer.invoke("window-minimize"),
@@ -92,8 +95,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("toggle-devtools"),
 
   // Terminal
-  terminalSpawn: (shell?: string, shellArgs?: string[]): Promise<{ id?: number; error?: string }> =>
-    ipcRenderer.invoke("terminal:spawn", shell, shellArgs),
+  terminalSpawn: (shell?: string, shellArgs?: string[], cwd?: string): Promise<{ id?: number; error?: string }> =>
+    ipcRenderer.invoke("terminal:spawn", shell, shellArgs, cwd),
   terminalWrite: (id: number, data: string): Promise<void> =>
     ipcRenderer.invoke("terminal:write", id, data),
   terminalResize: (id: number, cols: number, rows: number): Promise<void> =>
@@ -159,8 +162,24 @@ contextBridge.exposeInMainWorld("electronAPI", {
   browserLanguageUpdate: (locale: string): void => {
     ipcRenderer.send("browser-language", locale);
   },
+  // In-app browser credential auto-save (passwords & API keys)
+  browserAutosaveUpdate: (enabled: boolean): void => {
+    ipcRenderer.send("browser-autosave", enabled);
+  },
+  // In-app browser switches (Settings -> Assist -> Browser)
+  browserOptionsUpdate: (opts: Record<string, unknown>): void => {
+    ipcRenderer.send("browser-options", opts);
+  },
+  // Wipe cookies and site storage only -- bookmarks and history survive.
+  browserClearSessionData: (): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke("browser:clear-session-data"),
+  browserSaveCredential: (entry: { origin: string; username: string; password: string; kind: string; url?: string; created_at?: number }): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke("browser:save-credential", entry),
   trayThemeUpdate: (themePreference: string): void => {
     ipcRenderer.send("tray-theme", themePreference);
+  },
+  traySkinUpdate: (skin: string): void => {
+    ipcRenderer.send("tray-skin", skin);
   },
   trayPopupAction: (action: string | null, sessionId: string | null): void => {
     ipcRenderer.send("tray-popup-action", { action, sessionId });
@@ -197,9 +216,30 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => { ipcRenderer.removeListener("switch-workspace", handler); };
   },
 
+  // Quit confirmation: main asks the renderer to check running tasks before
+  // quitting; the renderer replies with the user's decision.
+  onQuitRequest: (callback: () => void): (() => void) => {
+    const handler = () => callback();
+    ipcRenderer.on("quit-request", handler);
+    return () => { ipcRenderer.removeListener("quit-request", handler); };
+  },
+  respondQuitConfirm: (allowed: boolean): void => {
+    ipcRenderer.send("quit-confirm-response", allowed);
+  },
+
   // Browser
   browserClearData: (): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke("browser:clear-data"),
+
+  // beforeunload guard: bind will-prevent-unload on a guest webContents and
+  // route the "leave without saving?" decision through the renderer's dialog.
+  browserBindUnloadGuard: (webContentsId: number): Promise<void> =>
+    ipcRenderer.invoke("browser:bind-unload-guard", webContentsId),
+  browserRespondUnload: (webContentsId: number, allow: boolean): Promise<void> =>
+    ipcRenderer.invoke("browser:respond-unload", webContentsId, allow),
+  onBrowserUnloadRequest: (callback: (webContentsId: number) => void): void => {
+    ipcRenderer.on("browser:unload-request", (_e, wcId) => callback(wcId));
+  },
 
   // Browser bookmarks
   getBookmarks: (): Promise<any> =>
@@ -284,6 +324,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => { ipcRenderer.removeListener("browser:new-window", handler); };
   },
 
+  onOpenRoutedUrl: (callback: (url: string) => void): (() => void) => {
+    const handler = (_event: any, url: string) => callback(url);
+    ipcRenderer.on("open-routed-url", handler);
+    return () => { ipcRenderer.removeListener("open-routed-url", handler); };
+  },
+
   openLogs: (): Promise<void> =>
     ipcRenderer.invoke("openLogs"),
 
@@ -326,11 +372,29 @@ contextBridge.exposeInMainWorld("electronAPI", {
   unregisterCdpWebview: (webContentsId: number): Promise<void> =>
     ipcRenderer.invoke("browser:unregister-cdp-webview", webContentsId),
 
+  // Agent control overlay broadcast (shared by browser / computer tools).
+  // While the lock is up every browser view shows the overlay; the
+  // taken-over flag additionally gates the CDP relay in main. `request`
+  // carries a pending control-change request awaiting the user's answer.
+  agentControlUpdate: (active: boolean): void =>
+    ipcRenderer.send("agent-control", active),
+  setAgentTakeover: (taken: boolean): void =>
+    ipcRenderer.send("agent-takeover", taken),
+  respondAgentControlRequest: (granted: boolean): void =>
+    ipcRenderer.send("agent-control-request-respond", granted),
+  onAgentControl: (callback: (state: { active: boolean; webContentsId: number | null; takenOver?: boolean; request?: string | null }) => void): (() => void) => {
+    const handler = (_event: any, state: { active: boolean; webContentsId: number | null; takenOver?: boolean; request?: string | null }) => callback(state);
+    ipcRenderer.on("agent-control-state", handler);
+    return () => { ipcRenderer.removeListener("agent-control-state", handler); };
+  },
+
   // Site info & permissions
   getSiteInfo: (url: string): Promise<{ origin: string; isSecure: boolean; cookieCount: number; permissions: Array<{ name: string; granted: boolean }> }> =>
     ipcRenderer.invoke("browser:get-site-info", url),
   setPermission: (origin: string, permission: string, granted: boolean): Promise<{ success: boolean }> =>
     ipcRenderer.invoke("browser:set-permission", origin, permission, granted),
+  listPermissionGrants: (): Promise<Array<{ origin: string; permission: string; granted: boolean }>> =>
+    ipcRenderer.invoke("browser:list-permissions"),
   getCookiesForOrigin: (url: string): Promise<{ cookies: Array<{ name: string; value: string; domain: string; path: string; secure: boolean; httpOnly: boolean; sameSite: string; expirationDate?: number }> }> =>
     ipcRenderer.invoke("browser:get-cookies-for-origin", url),
 });

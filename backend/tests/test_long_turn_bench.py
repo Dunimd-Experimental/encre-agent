@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,51 +23,50 @@
 
 from __future__ import annotations
 
-"""P1.3 long-turn production benchmark and stateless-request verification.
+"""Long-turn benchmark for the real loop, plus stateless-request verification.
 
-The loop under test is the **real** ``EncreLoop`` driving the real phase
-pipeline (P1.1 registry) over a scripted :class:`~encre.backends.base.BaseBackend`
-subclass -- a real fixture backend, not a mock of loop internals.  The data
-root is redirected to ``tmp_path`` via ``ENCRE_DATA_DIR`` and no network is
-touched.
+The loop under test is the real ``EncreLoop`` driving the real phase pipeline
+(P1.1 registry) over a scripted ``BaseBackend`` subclass -- a genuine fixture
+backend, not a mock of the loop internals. The data root is redirected to
+``tmp_path`` via ``ENCRE_DATA_DIR`` and no network is touched.
 
-Invariants under a 300-iteration tool loop:
+Invariants checked over a 300-iteration tool loop:
 
-1. **Linear prompt assembly** -- per-iteration wall time must not blow up:
-   the median iteration stays within 3x of the first iteration and the
-   mean of the last 100 iterations stays within 3x of the mean of the
-   first 100.  A quadratic prompt rebuild would show a ~20x+ blowup at
-   these transcript sizes (100 -> 600 messages), so these thresholds
-   assert the complexity class, not absolute speed.  The 3x mean bound is
-   calibrated against the measured linear signature under ``tracemalloc``
-   (1.33x without it, 2.35-2.48x with it -- the hook cost scales with the
-   per-iteration allocation count, which itself grows linearly with the
-   transcript because every request must tokenise the full history); GC
-   was ruled out experimentally (ratio identical with gc disabled).
-2. **Bounded memory** -- ``tracemalloc`` current memory sampled at chat
-   call 51 vs chat call 300 must grow by less than 10 MB.  The bench sets
-   ``checkpoint_max_count=1`` (real production config knob): the runner
-   takes a full-transcript deepcopy checkpoint every turn and by default
-   retains 10 of them, which is bounded-by-design retention that scales
-   linearly with the transcript (~49 MB measured at 300 iterations with
-   the default of 10) -- not a leak, but it would swamp this budget.
-   With retention capped at one checkpoint the residual growth is the
-   pipeline's own (ledger, session transcript, working set).
-3. **Message-list correctness** -- every one of the 301 requests carries
-   exactly one system message, the final request carries exactly 300 tool
-   results, and the session transcript ends with the final assistant text.
+1. Linear prompt assembly -- per-iteration wall time must not blow up: the
+   median iteration stays within 3x of the first iteration and the mean of the
+   last 100 iterations stays within 3x of the mean of the first 100. A
+   quadratic prompt rebuild would show a ~20x+ blowup at these transcript
+   sizes (100 -> 600 messages), so these thresholds assert the complexity
+   class rather than absolute speed. The 3x mean bound is calibrated against
+   the measured linear signature under ``tracemalloc`` (1.33x without it,
+   2.35-2.48x with it -- the hook cost scales with the per-iteration
+   allocation count, which grows linearly with the transcript because every
+   request must tokenise the full history). GC was ruled out
+   experimentally: the ratio is identical with gc disabled.
+2. Bounded memory -- ``tracemalloc`` current memory sampled at chat call 51
+   versus chat call 300 must grow by less than 10 MB. The bench sets
+   ``checkpoint_max_count=1`` (a real production config knob): the runner
+   takes a full-transcript deepcopy checkpoint every turn and retains 10 by
+   default, which is bounded-by-design retention that scales linearly with the
+   transcript (~49 MB measured at 300 iterations) -- not a leak, but it would
+   swamp this budget. Capping retention at one checkpoint leaves only the
+   pipeline's own residual (ledger, session transcript, working set).
+3. Message-list correctness -- every one of the 301 requests carries exactly
+   one system message, the final request carries exactly 300 tool results, and
+   the final text-only response is merged into the transcript's last
+   tool-calling assistant message (it never creates a second assistant entry --
+   see ``recovery._phase_post_stream``).
 
-Stateless-request verification (separate tests):
+Stateless-request verification is covered by separate tests:
 
-4. Within one run, every model request sees the *same* system prompt (the
+4. Within one run, every model request sees the same system prompt (the
    run-scoped prompt phase builds it once) and an identical, deduplicated
    tool-definition list.
 5. Across two consecutive runs the static prefix of the system prompt is
-   byte-identical; only the documented turn-scoped suffix blocks (task
-   stage, working set, ``## Prior Turns`` digest and the ``## Context
-   Changes This Turn`` annotation, all appended after the static prefix
-   per the prompt-caching contract in ``loop/phases/prompt.py``) may
-   differ.
+   byte-identical; only the documented turn-scoped suffix blocks (task stage,
+   working set, the ``## Prior Turns`` digest and the ``## Context Changes
+   This Turn`` annotation, all appended after the static prefix per the
+   prompt-caching contract in ``loop/phases/prompt.py``) may differ.
 """
 
 import json
@@ -92,7 +91,7 @@ _TOOL_NAME = "bench_ping"
 _TOOL_ITERATIONS = 300
 
 # Deliberately > 300 chars so the stub-response detector never flags the
-# canned final response.
+# canned final response as a placeholder.
 _FINAL_TEXT = (
     "The benchmark loop has completed all three hundred tool iterations. "
     "Each iteration called the bench_ping tool exactly once with a unique "
@@ -109,7 +108,7 @@ _MEMORY_GROWTH_BUDGET = 10 * 1024 * _KB
 
 
 def _bench_ping(**kwargs: Any) -> str:
-    """Deterministic no-op tool body; unique args per iteration."""
+    """Deterministic no-op tool body; each iteration passes a unique argument."""
     return f"pong {kwargs.get('n')}"
 
 
@@ -124,23 +123,39 @@ def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
 
 
 class _BenchBackend(BaseBackend):
-    """Real ``BaseBackend`` subclass scripting a long tool-calling run.
+    """Real ``BaseBackend`` subclass that scripts a long tool-calling run.
 
-    Per request it records only lightweight metadata (role sequence,
-    system-message content reference, tool names, wall-clock entry time,
-    tracemalloc sample) -- deliberately NOT full message-list copies, so
-    the harness's own bookkeeping cannot distort the memory measurement.
+    Per request it records only lightweight metadata (role sequence, system
+    message content reference, tool names, wall-clock entry time, tracemalloc
+    sample) -- deliberately NOT full message-list copies, so the harness's own
+    bookkeeping cannot distort the memory measurement.
     """
 
-    def __init__(self, tool_iterations: int) -> None:
+    def __init__(self, tool_iterations: int    ) -> None:
+        """Record the scripted iteration count and reset every request-side metric."""
         self.tool_iterations = tool_iterations
         self.chat_calls = 0
+        self.score_calls = 0
         self.call_times: list[float] = []
         self.mem_samples: list[int] = []
         self.request_roles: list[list[str]] = []
         self.request_system_contents: list[Any] = []
         self.request_tool_names: list[list[str]] = []
         self.request_payload_bytes: list[int] = []
+
+    @staticmethod
+    def _is_memory_score(messages: list[dict[str, Any]]) -> bool:
+        """True for the end-of-turn memory gate's scoring request.
+
+        The gate runs on a thinking-disabled ``copy.copy`` of this backend, and
+        a shallow copy shares the accounting LISTS -- so without excluding it,
+        every "one request per turn" invariant below would be measuring the
+        memory gate's traffic as part of the model chain.
+        """
+        first = messages[0] if messages else {}
+        return first.get("role") == "system" and str(first.get("content", "")).startswith(
+            "Rate how much the statement deserves"
+        )
 
     async def chat(
         self,
@@ -153,6 +168,15 @@ class _BenchBackend(BaseBackend):
         enable_caching: bool = False,
         cache_edits_state=None,
     ):
+        """Script one tool call per turn, then a final text-only answer."""
+        if self._is_memory_score(messages):
+            # Answer like the scorer contract demands -- one decimal, nothing
+            # else -- and stay out of the main-chain accounting entirely.
+            self.score_calls += 1
+            yield BackendText(text="0.0")
+            yield BackendFinish(reason="stop", usage={"input_tokens": 8, "output_tokens": 1})
+            return
+
         self.chat_calls += 1
         self.call_times.append(time.perf_counter())
         self.mem_samples.append(
@@ -166,8 +190,8 @@ class _BenchBackend(BaseBackend):
         )
         self.request_tool_names.append(_tool_names(tools))
         # Approximate size of the transcript payload itself, so the memory
-        # assertion can subtract legitimate linear transcript growth from
-        # the traced growth (the transcript is BY DESIGN linear in turns).
+        # assertion can subtract legitimate linear transcript growth from the
+        # traced growth (the transcript is linear in turns by design).
         self.request_payload_bytes.append(
             sum(len(json.dumps(m, default=str)) for m in messages)
         )
@@ -189,19 +213,22 @@ class _BenchBackend(BaseBackend):
             )
 
     def supports_tool_calling(self) -> bool:
+        """Advertise tool calling so the pipeline emits a tool-definition list."""
         return True
 
     # A huge window keeps pre-model compaction inert so every scripted
     # response is consumed by the real turn pipeline.
     def context_window_size(self) -> int:
+        """Report a 1M-token window, which disables pre-model compaction."""
         return 1_000_000
 
     def supports_prompt_caching(self) -> bool:
+        """Report no prompt caching so run-to-run prefix comparison is exact."""
         return False
 
 
 def _make_loop(tmp_path, monkeypatch, backend: _BenchBackend) -> EncreLoop:
-    """Real loop + real session, isolated data root, bench tool registered."""
+    """Build a real loop and real session with an isolated data root and the bench tool."""
     monkeypatch.setenv("ENCRE_DATA_DIR", str(tmp_path / "data"))
     config = EncreConfig(
         model="bench-model",
@@ -212,12 +239,11 @@ def _make_loop(tmp_path, monkeypatch, backend: _BenchBackend) -> EncreLoop:
         log_level="ERROR",
         enable_prompt_caching=False,
         enable_streaming_tool_execution=False,
-        # The runner deep-copies the full transcript into a session
-        # checkpoint every turn and by default retains 10 of them
-        # (bounded-by-design retention, linear in transcript size, ~49MB at
-        # 300 iterations).  Cap retention at one checkpoint -- still
-        # exercising the checkpoint path -- so the <10MB growth assertion
-        # measures the pipeline itself rather than this config knob.
+        # The runner deep-copies the full transcript into a session checkpoint
+        # every turn and retains 10 by default (bounded-by-design retention,
+        # linear in transcript size, ~49MB at 300 iterations). Cap retention at
+        # one checkpoint -- still exercising the checkpoint path -- so the
+        # <10MB growth assertion measures the pipeline itself, not this knob.
         checkpoint_max_count=1,
     )
     session = EncreSession(config)
@@ -245,16 +271,17 @@ def _make_loop(tmp_path, monkeypatch, backend: _BenchBackend) -> EncreLoop:
 
 
 async def test_long_turn_300_iterations_linear_bounded_correct(tmp_path, monkeypatch):
+    """Runs 300 scripted tool turns and asserts linear time, bounded memory, and a correct log."""
     backend = _BenchBackend(_TOOL_ITERATIONS)
     loop = _make_loop(tmp_path, monkeypatch, backend)
 
     tracemalloc.start()
     try:
-        # Retain ONLY what the assertions need.  Keeping every streamed
-        # event would hold a reference to each turn's full sanitized
-        # message snapshot (turn-boundary payloads reference the live
-        # transcript), making the harness itself look like an O(n^2)
-        # retainer and swamping the memory measurement.
+        # Retain only what the assertions need. Keeping every streamed event
+        # would hold a reference to each turn's full sanitized message snapshot
+        # (turn-boundary payloads reference the live transcript), making the
+        # harness itself look like an O(n^2) retainer and swamping the memory
+        # measurement.
         event_total = 0
         finishes: list[Finish] = []
         async for event in loop.run(_PROMPT):
@@ -273,9 +300,9 @@ async def test_long_turn_300_iterations_linear_bounded_correct(tmp_path, monkeyp
     assert [f.reason for f in finishes] == ["stop"]
 
     # -- 1) linear prompt assembly ---------------------------------------
-    # 301 call timestamps -> 300 per-iteration intervals.  Iteration i time
-    # = call_times[i+1] - call_times[i], so interval i covers the prompt
-    # assembly + model + tools + end-of-turn work of iteration i.
+    # 301 call timestamps -> 300 per-iteration intervals. Iteration i time =
+    # call_times[i+1] - call_times[i], so interval i covers the prompt
+    # assembly, model call, tool execution and end-of-turn work of iteration i.
     iter_times = [b - a for a, b in zip(backend.call_times, backend.call_times[1:])]
     assert len(iter_times) == _TOOL_ITERATIONS
     first100_mean = statistics.fmean(iter_times[:100])
@@ -288,10 +315,11 @@ async def test_long_turn_300_iterations_linear_bounded_correct(tmp_path, monkeyp
         f"first={iter_times[0] * 1000:.2f}ms "
         f"(ratio={median_all / iter_times[0]:.2f}x)"
     )
-    # Mean of the last 100 iterations within 3x the mean of the first 100.
-    # Measured linear signature: 1.33x without tracemalloc, 2.35-2.48x with
-    # (the hook multiplies the linear token-count term).  A quadratic prompt
-    # rebuild at these transcript sizes would show ~20x+, far past this bound.
+    # Mean of the last 100 iterations must stay within 3x the mean of the
+    # first 100. Measured linear signature: 1.33x without tracemalloc and
+    # 2.35-2.48x with it (the hook multiplies the linear token-count term).
+    # A quadratic prompt rebuild at these transcript sizes would show ~20x+,
+    # far past this bound.
     assert last100_mean <= 3.0 * first100_mean, (
         f"super-linear growth: last100_mean={last100_mean * 1000:.2f}ms vs "
         f"first100_mean={first100_mean * 1000:.2f}ms "
@@ -299,11 +327,11 @@ async def test_long_turn_300_iterations_linear_bounded_correct(tmp_path, monkeyp
     )
 
     # -- 2) bounded memory ------------------------------------------------
-    # Sample index 50 == chat call 51, index 299 == chat call 300.
-    # The transcript itself grows linearly by design (every turn appends
-    # tool results); subtract that legitimate growth and assert only the
-    # RESIDUAL (ledger revisions, working set, caches, checkpoints) is
-    # bounded -- i.e. no leak beyond what the conversation actually costs.
+    # Sample index 50 == chat call 51, index 299 == chat call 300. The
+    # transcript grows linearly by design (every turn appends tool results);
+    # subtract that legitimate growth and assert only the residual (ledger
+    # revisions, working set, caches, checkpoints) is bounded -- i.e. no leak
+    # beyond what the conversation actually costs.
     raw_growth = backend.mem_samples[299] - backend.mem_samples[50]
     transcript_growth = (
         backend.request_payload_bytes[299] - backend.request_payload_bytes[50]
@@ -326,30 +354,45 @@ async def test_long_turn_300_iterations_linear_bounded_correct(tmp_path, monkeyp
         f"final request carries {final_roles.count('tool')} tool results, "
         f"expected {_TOOL_ITERATIONS}"
     )
-    assert final_roles.count("assistant") == _TOOL_ITERATIONS + 1, (
+    assert final_roles.count("assistant") == _TOOL_ITERATIONS, (
         f"final request carries {final_roles.count('assistant')} assistant "
-        f"messages, expected {_TOOL_ITERATIONS + 1} (300 tool-call turns + "
-        "1 final text turn)"
+        f"messages, expected {_TOOL_ITERATIONS} (the 300 tool-call turns; "
+        "the final text turn's assistant message is only persisted AFTER this "
+        "request returns, and is asserted on the session transcript below)"
     )
     # The run-scoped checkpoint hard-gate may add ONE extra user message for
     # the remainder of the run; the original prompt is always present.
     assert 1 <= final_roles.count("user") <= 2, (
         f"final request carries {final_roles.count('user')} user messages"
     )
-    # Every request of the run: exactly one system message.
+    # Every request of the run must carry exactly one system message.
     bad = [i for i, r in enumerate(backend.request_roles) if r.count("system") != 1]
     assert not bad, f"requests without exactly one system message: {bad[:10]}"
 
     # Session transcript: 1 system + 1 user + 300 assistant(tool_calls)
-    # + 300 tool results + 1 final assistant.
+    # + 300 tool results. The final text-only response does NOT create a
+    # second assistant message: ``recovery._phase_post_stream`` merges a
+    # trailing text-only response into the last assistant message that had
+    # tool_calls (no user message in between means it is the same logical
+    # response), so the transcript ends on the 300th tool result and the
+    # assistant count stays at 300.
     session_roles = [m.get("role", "") for m in loop.session.messages]
     assert session_roles.count("system") == 1
     assert session_roles.count("tool") == _TOOL_ITERATIONS
-    assert session_roles.count("assistant") == _TOOL_ITERATIONS + 1
-    assert session_roles[-1] == "assistant"
-    assert _FINAL_TEXT in str(loop.session.messages[-1].get("content", ""))
+    assert session_roles.count("assistant") == _TOOL_ITERATIONS
+    assert session_roles[-1] == "tool"
+    _tail_assistant = next(
+        m for m in reversed(loop.session.messages) if m.get("role") == "assistant"
+    )
+    # The merge must carry the final text WITHOUT dropping the tool calls -- an
+    # assistant message whose tool_calls vanished would orphan its tool
+    # results and break the next request.
+    assert _tail_assistant.get("tool_calls"), (
+        "merged final assistant message lost its tool_calls"
+    )
+    assert _FINAL_TEXT in str(_tail_assistant.get("content", ""))
 
-    # All 301 requests saw an identical tool-definition list, deduplicated.
+    # All 301 requests saw an identical, deduplicated tool-definition list.
     first_names = backend.request_tool_names[0]
     assert len(first_names) == len(set(first_names)), "duplicate tool definitions"
     changed = [
@@ -365,6 +408,7 @@ async def test_long_turn_300_iterations_linear_bounded_correct(tmp_path, monkeyp
 
 
 async def test_stateless_requests_within_one_run(tmp_path, monkeypatch):
+    """Checks one system message and identical tool lists across requests of a single run."""
     backend = _BenchBackend(tool_iterations=2)
     loop = _make_loop(tmp_path, monkeypatch, backend)
 
@@ -400,13 +444,14 @@ async def test_stateless_requests_within_one_run(tmp_path, monkeypatch):
 
 
 async def test_stateless_requests_across_two_runs(tmp_path, monkeypatch):
+    """Checks that two consecutive runs share a byte-identical system prompt prefix."""
     backend = _BenchBackend(tool_iterations=0)
     loop = _make_loop(tmp_path, monkeypatch, backend)
 
     async for _ in loop.run(_PROMPT):
         pass
-    # A verbatim repeat of the last user message is deduped by design
-    # (prompt.py skips adding a duplicate), so run 2 uses a follow-up prompt.
+    # A verbatim repeat of the last user message is deduped by design (prompt.py
+    # skips adding a duplicate), so run 2 uses a follow-up prompt.
     prompt2 = _PROMPT + " Then summarise the outcome in one sentence."
     async for _ in loop.run(prompt2):
         pass
@@ -420,11 +465,11 @@ async def test_stateless_requests_across_two_runs(tmp_path, monkeypatch):
     sys2 = backend.request_system_contents[1]
     assert sys1 is not None and sys2 is not None
 
-    # The prompt-caching contract (loop/phases/prompt.py): the STATIC prefix
-    # of the system prompt is byte-identical across runs; the turn-scoped
-    # blocks appended after it (task stage / working set / prior turns /
-    # context-change annotation) legitimately differ.  The task-stage block
-    # always renders and always opens with "**Work Phase:**", so split there.
+    # The prompt-caching contract (loop/phases/prompt.py): the STATIC prefix of
+    # the system prompt is byte-identical across runs; the turn-scoped blocks
+    # appended after it (task stage / working set / prior turns / context-change
+    # annotation) legitimately differ. The task-stage block always renders and
+    # always opens with "**Work Phase:**", so split there.
     stage_marker = "\n\n**Work Phase:**"
     prefix1 = sys1.partition(stage_marker)[0]
     prefix2 = sys2.partition(stage_marker)[0]

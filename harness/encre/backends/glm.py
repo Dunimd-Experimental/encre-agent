@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -52,6 +50,9 @@ class GLMBackend(OpenAISSEBackend):
     Supports GLM-4.5, GLM-4.6, and GLM-4.7 via Zhipu AI's OpenAI-compatible
     API.  Thinking/reasoning tokens are extracted from ``reasoning_content``.
     """
+
+    # Zhipu's OpenAI-compatible API supports stream_options.include_usage.
+    _include_stream_usage = True
 
     DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 
@@ -90,6 +91,11 @@ class GLMBackend(OpenAISSEBackend):
         # GLM-4.5+ and GLM-5.x are reasoning-capable.
         # Unknown/older SKUs skip the thinking toggle to avoid a 400.
         if "glm-4.5" in m or "glm-4.6" in m or "glm-4.7" in m or "glm-5" in m:
+            # GLM-5.3 is FORCED thinking: an explicit ``disabled`` envelope
+            # is rejected with an error.  Omit the parameter so the default
+            # (thinking on) applies instead.
+            if "glm-5.3" in m and not self.thinking_enabled:
+                return None
             # GLM-4.5+ and GLM-5.x expose the DeepSeek-style thinking toggle.
             return {
                 "thinking": {

@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 """
-PostRunProcessor -- Self-improving loop for the iClaw daemon.
+PostRunProcessor -- self-improving loop for the iClaw daemon.
 
 Runs after every agent session to:
 1. Analyze the session (tool calls, text output, errors)
@@ -36,6 +36,19 @@ Runs after every agent session to:
 
 This is the core "self-improving" mechanism that makes iClaw
 get better over time without manual intervention.
+
+Position in Encre: this module is the iClaw write-back half.  The Rust agent
+core produces the events, :class:`encre.iclaw.IClawDaemon` runs the process,
+and here those events are distilled into persistent learning state (memory
+files, the soul files under ``data/soul/``, learner observation logs).  Nothing
+in the gateway package touches this code; it is reachable only through the
+iClaw profile.
+
+Public API:
+    * :class:`RunSummary` -- structured digest of one completed run.
+    * :class:`PostRunPipeline` -- the stage runner.
+    * :class:`PostRunOrchestrator` -- gatekeeper that decides whether a run is
+      worth analysing at all.
 """
 
 import asyncio
@@ -57,7 +70,20 @@ logger = get_logger("encre.iclaw.post_run")
 
 @dataclass
 class RunSummary:
-    """Structured summary of a single agent run."""
+    """Structured summary of a single agent run.
+
+    Built once per run by :meth:`PostRunPipeline._build_summary` and handed to
+    every stage.  It is deliberately flat and plain-typed so a stage can consume
+    only the fields it cares about without knowing how they were derived.
+
+    ``tool_calls`` entries carry ``id``, ``name``, and ``success``.  The name is
+    recovered from the tool-call id rather than carried by the event, which is
+    why a run without ids degrades to ``"unknown"`` names instead of failing.
+
+    ``repeated_patterns`` is populated after the call list is complete, by
+    :meth:`PostRunPipeline._detect_patterns`, so it is always ordered by
+    descending frequency.
+    """
 
     prompt: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -93,6 +119,15 @@ class PostRunPipeline:
     analyze_fn : Callable | None
         Optional async callable that performs LLM-powered analysis of the
         run data. If not provided, simple statistical analysis is used.
+
+    Invariant: every subsystem is optional and independently degradable.  A
+    stage whose dependency is ``None`` returns ``{"enabled": False}`` and a
+    stage that raises returns ``{"error": ...}``; the pipeline never lets one
+    missing subsystem abort the others.  That is what lets a partially
+    provisioned daemon still accumulate the learnings it can.
+
+    The pipeline holds no state of its own beyond its dependencies, so one
+    instance may be shared by every run the daemon performs.
     """
 
     def __init__(
@@ -106,6 +141,30 @@ class PostRunPipeline:
         soul_system: EncreSoulSystem | None = None,
         analyze_fn: Callable[[RunSummary], Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
+        """Bind the agent and its optional learning subsystems to the pipeline.
+
+        No subsystem is validated at construction time: a ``None`` entry simply
+        disables the corresponding stage, which is what makes this pipeline
+        usable by a partially provisioned daemon.
+
+        Args:
+            agent: The :class:`encre.agent.EncreAgent` that ran the session.
+                Shared memory, soul, and session state are reached through it.
+            learning_engine: Detects repeated tool-usage patterns and can
+                promote them into skills.
+            evolution_learner: Records success and error observations per run.
+            feedback_learner: Records user corrections detected during a run.
+            consolidator: Performs periodic memory consolidation after the
+                analysis stages finish.
+            soul_system: Applies learned preferences back into ``USER.md``.
+            analyze_fn: Optional async callable taking a
+                :class:`RunSummary` and returning an analysis dict. When
+                omitted, the statistical fallback analysis is used.
+
+        Invariant:
+            The pipeline stores no derived state of its own, so a single
+            instance is safe to reuse across every run of the daemon.
+        """
         self._agent = agent
         self._learning_engine = learning_engine
         self._evolution_learner = evolution_learner
@@ -124,6 +183,28 @@ class PostRunPipeline:
         """Run the full post-processing pipeline on a completed session.
 
         Returns a dict with results from each subsystem stage.
+
+        Args:
+            prompt: The user prompt that started the run.  Stored on the
+                summary and used as the goal text in every learning record, so
+                it is what later stages attribute tool usage to.
+            events: Every agent event streamed during the run, in order.  Only
+                :class:`TextDelta` and :class:`ToolResult` events carry
+                signal; the rest are ignored.
+            duration_seconds: Wall-clock length of the run.  Reported in the
+                result and used by the orchestrator's gate.
+
+        Returns:
+            A dict with ``summary`` (counts), ``analyzed`` (whether LLM
+            analysis ran), ``stages`` (one entry per stage, each either a
+            stage result or ``{"error": ...}``), and ``completed``.
+
+        Note:
+            The four stages run concurrently with ``return_exceptions=True``
+            rather than in a try/except chain.  Stage order in the result dict
+            is fixed by the ``stage_names`` list, so it must stay aligned with
+            the ``gather`` argument order; ``zip`` is strict-disabled so a
+            length mismatch degrades to a shorter loop instead of raising.
         """
         results: dict[str, Any] = {"stages": {}}
 
@@ -171,7 +252,24 @@ class PostRunPipeline:
         events: list[AgentEvent],
         duration_seconds: float,
     ) -> RunSummary:
-        """Aggregate streamed events into a structured :class:`RunSummary`."""
+        """Aggregate streamed events into a structured :class:`RunSummary`.
+
+        Args:
+            prompt: The run's prompt, stored verbatim.
+            events: Events in stream order.  Order matters because pattern
+                detection looks at adjacent tool calls.
+            duration_seconds: Recorded for reporting; not used for any decision
+                inside the pipeline.
+
+        Returns:
+            A populated summary, including detected repeated patterns.
+
+        Note:
+            A tool name is derived from the first ``_``-delimited segment of
+            the tool-call id, which assumes ids are namespaced like
+            ``toolu_<name>_<uuid>``.  A vendor that returns unnamespaced ids
+            gets the whole id as the name, so grouping degrades but never fails.
+        """
         summary = RunSummary(
             prompt=prompt,
             duration_seconds=duration_seconds,
@@ -198,7 +296,17 @@ class PostRunPipeline:
         return summary
 
     def _detect_patterns(self, summary: RunSummary) -> None:
-        """Detect frequently repeated adjacent tool-call pairs in the run."""
+        """Detect frequently repeated adjacent tool-call pairs in the run.
+
+        Mutates ``summary.repeated_patterns`` in place.  A pair is the
+        signature ``"A+B"`` of two consecutive tool calls; a pair occurring at
+        least twice is treated as a habit worth surfacing to the learning
+        engine.
+
+        Args:
+            summary: The summary to annotate.  Must already have its
+                ``tool_calls`` list complete.
+        """
         tool_names = [tc["name"] for tc in summary.tool_calls]
         # Need enough calls to make pattern detection meaningful.
         if len(tool_names) < 3:
@@ -215,7 +323,22 @@ class PostRunPipeline:
             ]
 
     async def _stage_evolution(self, summary: RunSummary) -> dict[str, Any]:
-        """Feed success/error tool observations into the evolution learner."""
+        """Feed success/error tool observations into the evolution learner.
+
+        Args:
+            summary: The run digest whose tool outcomes are recorded.
+
+        Returns:
+            ``{"enabled": False}`` when no learner is wired, otherwise a dict
+            with a ``records`` count and, when there were failures, an
+            ``errors`` list naming the tools involved.
+
+        Note:
+            The failure message is taken from ``tc["error"]``, which
+            :meth:`_build_summary` does not populate, so every recorded error
+            currently reads ``"unknown error"``.  The tool name is still
+            accurate, which is what the learner keys on.
+        """
         if self._evolution_learner is None:
             return {"enabled": False}
         stage: dict[str, Any] = {"enabled": True, "records": 0}
@@ -230,7 +353,21 @@ class PostRunPipeline:
         return stage
 
     async def _stage_learning(self, summary: RunSummary, _enrichments: dict[str, Any]) -> dict[str, Any]:
-        """Run the learning engine's pattern/skill analysis on the run."""
+        """Run the learning engine's pattern/skill analysis on the run.
+
+        Args:
+            summary: The run digest.  Only the tool-call name list and the
+                prompt are passed to the engine; the engine reconstructs its
+                own view from those.
+            _enrichments: Unused by this stage.  Kept in the signature so every
+                stage shares one call shape under :func:`asyncio.gather`.
+
+        Returns:
+            ``{"enabled": False}`` when no engine is wired, otherwise a dict
+            reporting how many tools were analysed.  ``skills_generated`` is
+            reported as zero because generation happens asynchronously inside
+            the engine and is not observable from here.
+        """
         if self._learning_engine is None:
             return {"enabled": False}
         tool_names = [tc["name"] for tc in summary.tool_calls]
@@ -242,7 +379,25 @@ class PostRunPipeline:
         }
 
     async def _stage_memory(self, summary: RunSummary, enrichments: dict[str, Any]) -> dict[str, Any]:
-        """Write a session note to memory and trigger consolidation if able."""
+        """Write a session note to memory and trigger consolidation if able.
+
+        Args:
+            summary: The run digest, used both to build a fallback note and to
+                decide whether consolidation is worth running.
+            enrichments: Optional LLM analysis output.  A ``task_summary`` key
+                wins over the locally rendered note, because the LLM version
+                captures intent rather than tool counts.
+
+        Returns:
+            ``{"enabled": False}`` when the agent has no memory system, a
+            result dict with ``note_added`` and optionally ``consolidated``,
+            or ``{"enabled": True, "error": ...}`` on failure.
+
+        Note:
+            Consolidation only runs when the run actually invoked tools.  A
+            pure-conversation turn cannot contribute new retrieval material, so
+            paying the consolidation cost for it would be wasted work.
+        """
         memory_system = getattr(self._agent, "memory_system", None)
         if memory_system is None:
             return {"enabled": False}
@@ -262,7 +417,24 @@ class PostRunPipeline:
             return {"enabled": True, "error": str(e)}
 
     async def _stage_soul(self, _summary: RunSummary, enrichments: dict[str, Any]) -> dict[str, Any]:
-        """Append discovered user preferences to the soul USER.md."""
+        """Append discovered user preferences to the soul USER.md.
+
+        Args:
+            _summary: Unused by this stage; preferences come only from LLM
+                analysis.  Kept for a uniform stage signature.
+            enrichments: Expected to carry a ``user_preferences`` list of
+                strings.
+
+        Returns:
+            ``{"enabled": False}`` when no soul system is wired, otherwise a
+            dict with the count of notes appended.
+
+        Note:
+            Non-list values are ignored and reported as zero.  Each note must
+            be a string over ten characters, which filters out placeholder
+            entries and empty preferences before they are written to a file
+            that is itself part of the agent's identity.
+        """
         if self._soul_system is None:
             return {"enabled": False}
         user_notes = enrichments.get("user_preferences", [])
@@ -276,7 +448,17 @@ class PostRunPipeline:
         }
 
     def _build_memory_note(self, summary: RunSummary) -> str:
-        """Render a Markdown session-summary note for the memory system."""
+        """Render a Markdown session-summary note for the memory system.
+
+        Args:
+            summary: The run digest to render.
+
+        Returns:
+            A Markdown note, or an empty string when nothing is worth writing.
+            Fields are only emitted when they carry information, so a quiet
+            turn yields a note without tools, errors, or patterns lines rather
+            than lines reading zero.
+        """
         parts: list[str] = []
         parts.append("## Session Summary")
         parts.append(f"**Goal:** {summary.prompt[:300]}")
@@ -300,6 +482,11 @@ class PostRunOrchestrator:
 
     Wraps PostRunPipeline with event collection -- accumulates AgentEvents
     during a streaming run, then feeds them into the pipeline when finished.
+
+    The gate here exists because analysis costs an LLM call.  Running the
+    pipeline for a two-second turn that never invoked a tool would spend that
+    budget on nothing, so trivial runs are rejected before the pipeline sees
+    them and the caller receives a ``skipped`` result instead.
     """
 
     def __init__(
@@ -309,6 +496,25 @@ class PostRunOrchestrator:
         min_tool_calls: int = 1,
         min_duration: float = 1.0,
     ) -> None:
+        """Attach the pipeline and the cheap pre-analysis gates.
+
+        The orchestrator exists to avoid paying for LLM analysis on runs that
+        produced nothing to learn from. Both thresholds are pure configuration;
+        they do not depend on any event data, so they can be fixed at
+        construction and evaluated per run.
+
+        Args:
+            pipeline: The :class:`PostRunPipeline` to feed once a run clears
+                the gates.
+            min_tool_calls: Minimum number of :class:`ToolResult` events before
+                analysis is worth attempting.
+            min_duration: Minimum wall-clock run length, in seconds, before
+                analysis is worth attempting.
+
+        Invariant:
+            Both thresholds are checked with a less-than comparison, so a run
+            that exactly equals a threshold does pass.
+        """
         self._pipeline = pipeline
         self._min_tool_calls = min_tool_calls
         self._min_duration = min_duration
@@ -320,7 +526,23 @@ class PostRunOrchestrator:
         *,
         duration_seconds: float = 0.0,
     ) -> dict[str, Any]:
-        """Collect events from a completed streaming run and process them."""
+        """Collect events from a completed streaming run and process them.
+
+        Args:
+            prompt: The run's prompt, passed through to the pipeline.
+            events: Events accumulated during the run, in stream order.
+            duration_seconds: Wall-clock length of the run.
+
+        Returns:
+            Either a ``{"skipped": True, "reason": ...}`` dict explaining why
+            the run was not analysed, or the pipeline's full result dict.
+
+        Note:
+            Both gates must pass.  The tool-call count is derived by counting
+            :class:`ToolResult` events here rather than trusting a caller
+            count, because the orchestrator is the only component that sees the
+            complete event list.
+        """
         # Count real tool invocations to decide whether analysis is worthwhile.
         tool_call_count = sum(
             1 for e in events if isinstance(e, ToolResult)

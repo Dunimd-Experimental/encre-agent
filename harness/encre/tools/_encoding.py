@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,11 +21,13 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """Encoding-neutral byte handling for subprocess / shell output.
 
 Windows shells (cmd.exe / powershell) and locale-driven external programs
-exchange text in the **system ANSI code page** 鈥?GBK (936) on zh-CN, Shift_JIS
-(932) on ja-JP, EUC-KR (949) on ko-KR, cp1251 (1251) on ru-RU, 鈥?鈥?*not* UTF-8.
+exchange text in the **system ANSI code page** — GBK (936) on zh-CN, Shift_JIS
+(932) on ja-JP, EUC-KR (949) on ko-KR, cp1251 (1251) on ru-RU, … — *not* UTF-8.
 Decoding such output as UTF-8 yields replacement characters the model cannot
 use, and encoding commands as UTF-8 garbles non-ASCII input (often producing
 no output at all).
@@ -35,14 +37,19 @@ instead of ``raw.decode("utf-8", errors="replace")``, and every tool that
 writes text into a shell should use :func:`encode_text`.
 
 Decode strategy (in order):
-1. strict UTF-8 鈥?the modern default (Linux/macOS, ``PYTHONUTF8``-aware tools,
+1. strict UTF-8 — the modern default (Linux/macOS, ``PYTHONUTF8``-aware tools,
    UTF-8 system locales);
-2. the Windows ANSI code page via ``GetACP()`` 鈥?what the child actually wrote;
+2. the Windows ANSI code page via ``GetACP()`` — what the child actually wrote;
 3. a small set of common legacy code pages as a safety net;
 4. lossy UTF-8 so the caller always receives a string.
 """
 
 import sys
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 def get_windows_acp() -> str | None:
@@ -75,14 +82,14 @@ def decode_bytes(raw: bytes) -> str:
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
-        pass
+        logger.debug("exception suppressed", exc_info=True)
     if sys.platform == "win32":
         acp = get_windows_acp()
         if acp:
             try:
                 return raw.decode(acp)
             except (UnicodeDecodeError, LookupError):
-                pass
+                logger.debug("exception suppressed", exc_info=True)
         for enc in _LEGACY_FALLBACKS:
             try:
                 return raw.decode(enc)
@@ -107,7 +114,7 @@ def encode_text(text: str, *, terminal: str | None = None) -> bytes:
             try:
                 return text.encode(acp, errors="replace")
             except LookupError:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
     return text.encode("utf-8", errors="replace")
 
 

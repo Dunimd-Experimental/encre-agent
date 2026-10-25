@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """
 Failover backend -- chains multiple backends with automatic failover.
@@ -40,6 +42,7 @@ Consecutive 529 errors are tracked separately and, once they reach
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -57,6 +60,12 @@ from encre.backends.retry import (
     classify_error,
 )
 from encre.utils.types import BackendError, BackendEvent, BackendFinish
+
+
+from encre.logging_config import get_logger
+
+
+logger = get_logger(__name__)
 
 logger = logging.getLogger("encre.backends.failover")
 
@@ -259,15 +268,21 @@ class FailoverBackend(BaseBackend):
                 async with self._lock:
                     self._active_name = name
 
-                async for event in backend.chat(
-                    messages=messages,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=stream,
-                    enable_caching=enable_caching,
-                ):
+                # Forward the cache-edits state so prompt-cache edits survive
+                # failover.  Skipped when unset (None) so legacy chat()
+                # implementations predating the parameter keep working.
+                _chat_kwargs: dict[str, Any] = {
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": stream,
+                    "enable_caching": enable_caching,
+                }
+                if cache_edits_state is not None:
+                    _chat_kwargs["cache_edits_state"] = cache_edits_state
+                async for event in backend.chat(**_chat_kwargs):
                     if isinstance(event, BackendError):
                         error_msg = event.error
                         failed = True
@@ -340,9 +355,17 @@ class FailoverBackend(BaseBackend):
 
     @staticmethod
     def _is_overloaded_error(error_text: str) -> bool:
-        """Heuristic: does the error text indicate a 529 / overloaded response?"""
+        """Heuristic: does the error text indicate a 529 / overloaded response?
+
+        The status code is matched with a word-boundary regex so substrings
+        like ``"max_tokens 5290"`` do not misfire.
+        """
         lower = error_text.lower()
-        return "529" in lower or "overloaded" in lower or "capacity" in lower
+        return (
+            re.search(r"\b529\b", lower) is not None
+            or "overloaded" in lower
+            or "capacity" in lower
+        )
 
     @staticmethod
     def _is_overloaded_exception(exc: Exception) -> bool:
@@ -350,14 +373,17 @@ class FailoverBackend(BaseBackend):
         try:
             return classify_error(exc) == ErrorClass.OVERLOADED
         except Exception:
-            pass
-
-        text = str(exc).lower()
-        if "529" in text or "overloaded" in text or "capacity" in text:
-            return True
-
+            logger.debug("exception suppressed", exc_info=True)
         if hasattr(exc, "response") and hasattr(exc.response, "status_code"):
             return exc.response.status_code == 529
+
+        text = str(exc).lower()
+        if (
+            re.search(r"\b529\b", text) is not None
+            or "overloaded" in text
+            or "capacity" in text
+        ):
+            return True
 
         return False
 

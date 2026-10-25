@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,8 +20,6 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
-
-from __future__ import annotations
 
 from __future__ import annotations
 
@@ -86,20 +84,18 @@ class XiaomiBackend(OpenAISSEBackend):
     def _thinking_request_param(self) -> dict[str, Any] | None:
         """Return the provider-specific parameter that enables thinking.
 
-        MiMo accepts the DeepSeek-style thinking envelope together with an
-        optional ``reasoning_effort`` (low/medium/high).  We keep the
-        envelope so thinking can be toggled, and add ``reasoning_effort``
-        only when the user selected a level other than the default.
+        MiMo accepts the DeepSeek-style thinking envelope.  ``reasoning_effort``
+        is NOT a documented chat-completions parameter (Responses API only),
+        so it is deliberately not sent here.  MiMo also requires the full
+        ``reasoning_content`` of assistant tool-call messages to be passed
+        back in thinking mode, which the verbatim message pass-through
+        already satisfies.
         """
-        param: dict[str, Any] = {
+        return {
             "thinking": {
                 "type": "enabled" if self.thinking_enabled else "disabled",
             }
         }
-        effort = getattr(self, "reasoning_effort", "") or ""
-        if self.thinking_enabled and effort:
-            param["reasoning_effort"] = effort
-        return param
 
     def context_window_size(self) -> int:
         m = self.model.lower()

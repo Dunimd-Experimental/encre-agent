@@ -3,56 +3,56 @@ import { defineConfig } from 'vitepress'
 const nav_zh = [
   { text: 'Encre Agent Harness', link: '/harness', activeMatch: '^(harness|en/harness)' },
   { text: 'Encre Agent Core', link: '/core', activeMatch: '^(core|en/core)' },
-  { text: 'Encre Agent Desktop', link: '/', activeMatch: '^(?!.*(harness|core)).*$' }
+  { text: 'Encre Agent Desktop', link: '/desktop/', activeMatch: '^(?!.*(harness|core)).*$' }
 ]
 
 const nav_en = [
   { text: 'Encre Agent Harness', link: '/en/harness', activeMatch: '^(harness|en/harness)' },
   { text: 'Encre Agent Core', link: '/en/core', activeMatch: '^(core|en/core)' },
-  { text: 'Encre Agent Desktop', link: '/en/', activeMatch: '^(?!.*(harness|core)).*$' }
+  { text: 'Encre Agent Desktop', link: '/en/desktop/', activeMatch: '^(?!.*(harness|core)).*$' }
 ]
 
 const sidebar_zh = [
   {
     text: '开始使用',
     items: [
-      { text: '介绍', link: '/' },
-      { text: '快速上手', link: '/getting-started' }
+      { text: '介绍', link: '/desktop/' },
+      { text: '快速上手', link: '/desktop/getting-started' }
     ]
   },
   {
     text: '核心功能',
     items: [
-      { text: '三种工作模式', link: '/modes' },
-      { text: '对话与会话', link: '/chat' },
-      { text: '工作区', link: '/workspace' },
-      { text: '自动化任务', link: '/automation' },
-      { text: '全局搜索', link: '/search' },
-      { text: '内置工具面板', link: '/panels' }
+      { text: '三种工作模式', link: '/desktop/modes' },
+      { text: '对话与会话', link: '/desktop/chat' },
+      { text: '工作区', link: '/desktop/workspace' },
+      { text: '自动化任务', link: '/desktop/automation' },
+      { text: '全局搜索', link: '/desktop/search' },
+      { text: '内置工具面板', link: '/desktop/panels' }
     ]
   },
   {
     text: '设置',
     items: [
-      { text: '模型管理', link: '/models' },
-      { text: '智能体', link: '/agents' },
-      { text: '网关接入', link: '/gateway' },
-      { text: '技能与命令', link: '/skills' },
-      { text: 'MCP Server', link: '/mcp' },
-      { text: '规则', link: '/rules' },
-      { text: '记忆', link: '/memory' },
-      { text: '权限与安全', link: '/permissions' },
-      { text: '通用设置', link: '/general' },
-      { text: '存储与数据', link: '/storage' },
-      { text: '用量统计', link: '/usage' }
+      { text: '模型管理', link: '/desktop/models' },
+      { text: '智能体', link: '/desktop/agents' },
+      { text: '网关接入', link: '/desktop/gateway' },
+      { text: '技能与命令', link: '/desktop/skills' },
+      { text: 'MCP Server', link: '/desktop/mcp' },
+      { text: '规则', link: '/desktop/rules' },
+      { text: '记忆', link: '/desktop/memory' },
+      { text: '权限与安全', link: '/desktop/permissions' },
+      { text: '通用设置', link: '/desktop/general' },
+      { text: '存储与数据', link: '/desktop/storage' },
+      { text: '用量统计', link: '/desktop/usage' }
     ]
   },
   {
     text: '更多',
     items: [
-      { text: '快捷键参考', link: '/shortcuts' },
-      { text: '常见问题', link: '/faq' },
-      { text: '关于与更新', link: '/about' }
+      { text: '快捷键参考', link: '/desktop/shortcuts' },
+      { text: '常见问题', link: '/desktop/faq' },
+      { text: '关于与更新', link: '/desktop/about' }
     ]
   }
 ]
@@ -61,43 +61,43 @@ const sidebar_en = [
   {
     text: 'Getting Started',
     items: [
-      { text: 'Introduction', link: '/en/' },
-      { text: 'Quick Start', link: '/en/getting-started' }
+      { text: 'Introduction', link: '/en/desktop/' },
+      { text: 'Quick Start', link: '/en/desktop/getting-started' }
     ]
   },
   {
     text: 'Core Features',
     items: [
-      { text: 'Three Modes', link: '/en/modes' },
-      { text: 'Chat & Sessions', link: '/en/chat' },
-      { text: 'Workspace', link: '/en/workspace' },
-      { text: 'Automation', link: '/en/automation' },
-      { text: 'Search', link: '/en/search' },
-      { text: 'Built-in Panels', link: '/en/panels' }
+      { text: 'Three Modes', link: '/en/desktop/modes' },
+      { text: 'Chat & Sessions', link: '/en/desktop/chat' },
+      { text: 'Workspace', link: '/en/desktop/workspace' },
+      { text: 'Automation', link: '/en/desktop/automation' },
+      { text: 'Search', link: '/en/desktop/search' },
+      { text: 'Built-in Panels', link: '/en/desktop/panels' }
     ]
   },
   {
     text: 'Settings',
     items: [
-      { text: 'Models', link: '/en/models' },
-      { text: 'Agents', link: '/en/agents' },
-      { text: 'Gateway', link: '/en/gateway' },
-      { text: 'Skills & Commands', link: '/en/skills' },
-      { text: 'MCP Server', link: '/en/mcp' },
-      { text: 'Rules', link: '/en/rules' },
-      { text: 'Memory', link: '/en/memory' },
-      { text: 'Permissions', link: '/en/permissions' },
-      { text: 'General', link: '/en/general' },
-      { text: 'Storage', link: '/en/storage' },
-      { text: 'Usage', link: '/en/usage' }
+      { text: 'Models', link: '/en/desktop/models' },
+      { text: 'Agents', link: '/en/desktop/agents' },
+      { text: 'Gateway', link: '/en/desktop/gateway' },
+      { text: 'Skills & Commands', link: '/en/desktop/skills' },
+      { text: 'MCP Server', link: '/en/desktop/mcp' },
+      { text: 'Rules', link: '/en/desktop/rules' },
+      { text: 'Memory', link: '/en/desktop/memory' },
+      { text: 'Permissions', link: '/en/desktop/permissions' },
+      { text: 'General', link: '/en/desktop/general' },
+      { text: 'Storage', link: '/en/desktop/storage' },
+      { text: 'Usage', link: '/en/desktop/usage' }
     ]
   },
   {
     text: 'More',
     items: [
-      { text: 'Shortcuts', link: '/en/shortcuts' },
-      { text: 'FAQ', link: '/en/faq' },
-      { text: 'About', link: '/en/about' }
+      { text: 'Shortcuts', link: '/en/desktop/shortcuts' },
+      { text: 'FAQ', link: '/en/desktop/faq' },
+      { text: 'About', link: '/en/desktop/about' }
     ]
   }
 ]

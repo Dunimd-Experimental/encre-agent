@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,4 +23,9 @@
 
 from __future__ import annotations
 
-"""Test package initializer for the Encre backend test suite."""
+"""Package marker for the Encre backend test suite.
+
+This module exists so that ``backend/tests`` is importable as a package by
+pytest and so shared helpers can be reached through a stable import path.
+It defines no runtime logic of its own.
+"""

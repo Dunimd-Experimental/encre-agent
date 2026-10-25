@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Code Doctor — 诊断报告</title>
+<!--
+  模板占位符（由 scripts/render_report.py 从结构化 JSON 安全填充）：
+    FILE_NAME          被审查的文件名
+    HEALTH_SCORE       健康度评分 0-100
+    SCORE_CLASS        分数颜色等级：low / mid / 空字符串
+    VERDICT            一句话总评
+    AUDIT_DATE         审查日期
+    FINDINGS_HTML      问题清单 HTML（每个问题用 .finding 卡片，见下方结构）
+    OPTIMIZED_CODE     优化后完整代码（已 HTML 转义）
+    DIFF_BEFORE        改动前代码片段（已 HTML 转义）
+    DIFF_AFTER         改动后代码片段（已 HTML 转义）
+    TRADEOFFS_HTML     取舍说明 HTML（<ul><li>...</li></ul>）
+    MODE               审查模式：定点 / 全量自审
+    FINDING_COUNT      问题总数
+    PREREQUISITES_HTML 运行前提（<li>...</li>）；无第三方依赖时写明仅需支持的 Python 版本
+-->
+<style>
+  :root {
+    --bg: #ffffff;
+    --surface: #f7f8fa;
+    --border: #e3e6ea;
+    --text: #1f2328;
+    --muted: #6a737d;
+    --smell: #d85a30;      /* ④ AI 异味 */
+    --perf: #0f6e56;       /* ③ 性能 */
+    --code-bg: #f6f8fa;
+    --code-text: #1f2328;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 40px 20px;
+    line-height: 1.6;
+  }
+  .container { max-width: 920px; margin: 0 auto; }
+  header {
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 24px;
+    margin-bottom: 32px;
+  }
+  h1 { font-size: 22px; margin: 0 0 8px 0; font-weight: 600; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .score-block {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin-top: 20px;
+  }
+  .score {
+    font-size: 48px;
+    font-weight: 600;
+    line-height: 1;
+    color: var(--perf);
+  }
+  .score.low { color: var(--smell); }
+  .score.mid { color: #b5790b; }
+  .verdict { font-size: 15px; color: var(--text); flex: 1; }
+  section { margin-bottom: 36px; }
+  h2 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0 0 16px 0;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .finding {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    margin-bottom: 14px;
+  }
+  .finding-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .tag {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 10px;
+    color: #fff;
+  }
+  .tag.smell { background: var(--smell); }
+  .tag.perf { background: var(--perf); }
+  .sev {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .finding h3 { font-size: 14px; margin: 0; font-weight: 600; }
+  .field { margin-top: 8px; font-size: 13px; }
+  .field-label {
+    color: var(--muted);
+    font-weight: 600;
+    margin-right: 6px;
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    overflow-x: auto;
+    margin: 8px 0;
+  }
+  .diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .diff-col h4 {
+    font-size: 13px;
+    margin: 0 0 6px 0;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .diff-col.before h4 { color: var(--smell); }
+  .diff-col.after h4 { color: var(--perf); }
+  ul.tradeoffs { padding-left: 20px; }
+  ul.tradeoffs li { margin-bottom: 6px; font-size: 13px; }
+  .footer {
+    margin-top: 40px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+  }
+  @media (max-width: 640px) {
+    .diff-grid { grid-template-columns: 1fr; }
+    .score-block { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>AI Code Doctor 诊断报告</h1>
+    <div class="meta">
+      文件：{{FILE_NAME}}　|　模式：{{MODE}}　|　问题数：{{FINDING_COUNT}}　|　日期：{{AUDIT_DATE}}
+    </div>
+    <div class="score-block">
+      <div class="score {{SCORE_CLASS}}">{{HEALTH_SCORE}}</div>
+      <div class="verdict">{{VERDICT}}</div>
+    </div>
+  </header>
+
+  <section>
+    <h2>问题清单（按严重度排序）</h2>
+    <!--
+      每个问题由渲染脚本按如下结构填入 FINDINGS_HTML：
+      <div class="finding">
+        <div class="finding-head">
+          <span class="tag smell">④ 异味</span>  或  <span class="tag perf">③ 性能</span>
+          <span class="sev">严重度：高/中/低</span>
+        </div>
+        <h3>问题标题</h3>
+        <div class="field"><span class="field-label">位置：</span>函数名 + 行号</div>
+        <div class="field"><span class="field-label">问题：</span>描述</div>
+        <div class="field"><span class="field-label">影响：</span>描述</div>
+        <div class="field"><span class="field-label">方案：</span>描述</div>
+        <div class="field"><span class="field-label">收益：</span>实测/预估</div>
+      </div>
+    -->
+    {{FINDINGS_HTML}}
+  </section>
+
+  <section>
+    <h2>运行前提</h2>
+    <ul class="tradeoffs">
+      {{PREREQUISITES_HTML}}
+    </ul>
+  </section>
+
+  <section>
+    <h2>优化后代码</h2>
+    <pre><code>{{OPTIMIZED_CODE}}</code></pre>
+  </section>
+
+  <section>
+    <h2>关键改动对照</h2>
+    <div class="diff-grid">
+      <div class="diff-col before">
+        <h4>改动前</h4>
+        <pre><code>{{DIFF_BEFORE}}</code></pre>
+      </div>
+      <div class="diff-col after">
+        <h4>改动后</h4>
+        <pre><code>{{DIFF_AFTER}}</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>取舍说明</h2>
+    <ul class="tradeoffs">
+      {{TRADEOFFS_HTML}}
+    </ul>
+  </section>
+
+  <div class="footer">
+    本报告由 AI Code Doctor 生成。改动是否应用到原文件需用户确认；安全网依赖 git，未生成 .bak 备份。
+  </div>
+
+</div>
+</body>
+</html>

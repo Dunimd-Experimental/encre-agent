@@ -22,7 +22,52 @@
 
 let monacoReady: Promise<typeof monaco.editor> | null = null;
 let monacoEditor: typeof monaco.editor | null = null;
+let monacoReject: ((err: Error) => void) | null = null;
+let loaderError: Error | null = null;
 const editors = new Set<any>();
+let themesDefined = false;
+
+function defineEncreThemes() {
+  if (themesDefined || !monacoEditor) return;
+  themesDefined = true;
+
+  const selectionColors = {
+    "editor.selectionBackground": "rgba(150, 240, 200, 0.35)",
+    "editor.inactiveSelectionBackground": "rgba(0, 184, 148, 0.12)",
+    "editor.selectionHighlightBackground": "rgba(0, 184, 148, 0.15)",
+  };
+
+  // Scrollbar thumbs sized to the app-wide 4px bar (see editorViewOptions):
+  // subtle --border-like at rest, --text-muted-strength on hover/active.
+  const darkColors = {
+    ...selectionColors,
+    "scrollbar.shadow": "rgba(0, 0, 0, 0)",
+    "scrollbarSlider.background": "rgba(128, 128, 128, 0.28)",
+    "scrollbarSlider.hoverBackground": "rgba(160, 160, 160, 0.45)",
+    "scrollbarSlider.activeBackground": "rgba(160, 160, 160, 0.60)",
+  };
+  const lightColors = {
+    ...selectionColors,
+    "scrollbar.shadow": "rgba(0, 0, 0, 0)",
+    "scrollbarSlider.background": "rgba(100, 100, 100, 0.25)",
+    "scrollbarSlider.hoverBackground": "rgba(100, 100, 100, 0.45)",
+    "scrollbarSlider.activeBackground": "rgba(100, 100, 100, 0.60)",
+  };
+
+  monacoEditor.defineTheme("encre-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [],
+    colors: darkColors,
+  });
+
+  monacoEditor.defineTheme("encre-light", {
+    base: "vs",
+    inherit: true,
+    rules: [],
+    colors: lightColors,
+  });
+}
 
 // True once the Monaco AMD loader script has been injected into the page.
 let loaderInjected = false;
@@ -45,25 +90,43 @@ function ensureMonacoLoader(): void {
       win.require(["vs/editor/editor.main"], () => {});
     }
   };
+  // A silent loader failure used to leave the polling loop below spinning
+  // forever and the code tab a blank rectangle; surface it instead.
+  script.onerror = () => {
+    loaderError = new Error("Failed to load Monaco loader (monaco/vs/loader.js)");
+    console.error("[monaco]", loaderError.message);
+    monacoReject?.(loaderError);
+  };
   document.head.appendChild(script);
 }
 
 export function getMonaco(): Promise<typeof monaco.editor> {
+  if (loaderError) return Promise.reject(loaderError);
   if (monacoReady) return monacoReady;
-  monacoReady = new Promise((resolve) => {
+  monacoReady = new Promise((resolve, reject) => {
+    monacoReject = reject;
     const win = window as any;
+    let waitedMs = 0;
     if (win.monaco && win.monaco.editor) {
       monacoEditor = win.monaco.editor;
+      defineEncreThemes();
       resolve(monacoEditor);
       return;
     }
-    // Start loading Monaco on demand instead of blocking startup.
     ensureMonacoLoader();
     const check = () => {
       if (win.monaco && win.monaco.editor) {
         monacoEditor = win.monaco.editor;
+        defineEncreThemes();
         resolve(monacoEditor);
+      } else if (waitedMs >= 15000) {
+        // The editor bundle was requested but never materialised: give up
+        // rather than polling forever behind a blank panel.
+        const err = new Error("Timed out waiting for the Monaco editor bundle");
+        console.error("[monaco]", err.message);
+        monacoReject?.(err);
       } else {
+        waitedMs += 50;
         setTimeout(check, 50);
       }
     };
@@ -83,7 +146,7 @@ export function unregisterEditor(editor: any) {
 function updateTheme() {
   const isDark = document.documentElement.getAttribute("data-theme") !== "light";
   for (const ed of editors) {
-    ed.updateOptions({ theme: isDark ? "vs-dark" : "vs" });
+    ed.updateOptions({ theme: isDark ? "encre-dark" : "encre-light" });
   }
 }
 

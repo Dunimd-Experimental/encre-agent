@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -25,33 +25,48 @@ from __future__ import annotations
 
 """WebSocket relay transport (production).
 
-The gateway dials **out** to the connector's ``/relay`` WebSocket endpoint,
+The gateway dials out to the connector's ``/relay`` WebSocket endpoint,
 authenticates the upgrade with a per-gateway HMAC bearer token, and exchanges
-newline-delimited JSON frames:
+newline-delimited JSON frames.
 
-  gateway -> connector:
-    hello            {type, gatewayId?}
-    outbound         {type, requestId, action}         (send/edit/typing)
-    follow_up        {type, requestId, action}         (token-less capability)
-    interrupt        {type, session_key, reason?}
-    going_idle       {type}
-    inbound_ack      {type, bufferId}
+Outbound (gateway -> connector)::
 
-  connector -> gateway:
-    descriptor       {type, descriptor}                 (handshake result)
-    inbound          {type, event, bufferId?}
-    outbound_result  {type, requestId, result}
-    interrupt_inbound {type, session_key, chat_id}
-    going_idle_ack   {type}
-    passthrough_forward {type, forward, bufferId?}      (body base64)
+    hello              {type, gatewayId?, identities?}
+    outbound           {type, requestId, action}         (send/edit/typing)
+    follow_up          {type, requestId, action}         (token-less capability)
+    interrupt          {type, session_key, reason?}
+    going_idle         {type}
+    inbound_ack        {type, bufferId}
+
+Inbound (connector -> gateway)::
+
+    descriptor         {type, descriptor}                 (handshake result)
+    inbound            {type, event, bufferId?}
+    outbound_result    {type, requestId, result}
+    interrupt_inbound  {type, session_key, chat_id}
+    going_idle_ack     {type}
+    passthrough_forward {type, forward, bufferId?}       (body base64)
+
+The handshake is a strict two-frame exchange: the gateway sends ``hello`` and
+the connector must answer with exactly one ``descriptor`` frame.  Anything else
+aborts the connection, because the adapter's capabilities -- message length,
+edit support, markdown dialect -- are all derived from that descriptor.
 
 Outbound RPCs (``send``/``edit``/``typing``/``follow_up``/``get_chat_info``)
 block on a per-``requestId`` :class:`asyncio.Future` until the matching
-``outbound_result`` arrives, with a 30s timeout.  A 4401 close AFTER a prior
-successful handshake is a terminal revocation: the transport stops
-reconnecting and surfaces ``was_revoked=True`` so the adapter can mark the
-``relay`` platform as disabled (non-retryable fatal).  A 4401 before any
-successful handshake stays retryable (a cold-start / not-yet-provisioned race).
+``outbound_result`` arrives, with a 30-second timeout.  A timeout yields a
+failure result rather than raising, so the stream consumer can back off
+instead of aborting an agent turn.
+
+A 4401 close after a successful handshake is a terminal revocation: the
+transport stops reconnecting and surfaces ``was_revoked=True`` so the adapter
+can mark the ``relay`` platform as disabled (non-retryable fatal).  A 4401
+before any successful handshake stays retryable -- it is usually a cold-start
+or not-yet-provisioned race rather than a deliberate revocation.
+
+Dial mechanics: the configured URL may be ``http(s)://`` and is rewritten to a
+``ws(s)://host/relay`` target by :func:`_ws_dial_url`, so deployments can write
+a plain HTTPS origin in ``config.yaml``.
 """
 
 import asyncio
@@ -66,7 +81,7 @@ from encre.gateway.relay.descriptor import CapabilityDescriptor
 
 logger = logging.getLogger("encre.gateway.relay.ws_transport")
 
-# A 4401 close after a successful handshake = terminal revocation.
+# A 4401 close after a successful handshake indicates a terminal revocation.
 _RELAY_UNAUTHORIZED_CLOSE_CODE = 4401
 
 RECONNECT_BASE = 1.0
@@ -75,10 +90,25 @@ OUTBOUND_TIMEOUT = 30.0
 
 
 def _ws_dial_url(url: str) -> str:
-    """Normalize a relay URL to a ``ws(s)://host/relay`` dial target.
+    """Normalize a relay URL to a ws(s)://host/relay dial target.
 
-    ``https://`` -> ``wss://``, ``http://`` -> ``ws://``; the path is forced to
-    end with ``/relay`` (the connector's WS endpoint).
+    Converts https:// to wss:// and http:// to ws://; the path is forced to
+    end with /relay (the connector's WebSocket endpoint).
+
+    Args:
+        url: The configured relay URL, typically the value of
+            ``GATEWAY_RELAY_URL``.  Query and fragment are preserved so an
+            operator can pass connector routing hints without a dedicated
+            config key.
+
+    Returns:
+        A dialable ``ws(s)://`` URL whose path ends with ``/relay``.
+
+    Note:
+        An unrecognized scheme falls back to ``ws`` for ``http``-like input and
+        to ``wss`` only for an explicit ``https``.  The fallback exists so a
+        typo in the scheme does not crash at dial time but still dials
+        plaintext-ish and fails visibly.
     """
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
@@ -97,10 +127,54 @@ def _ws_dial_url(url: str) -> str:
 class WebSocketRelayTransport:
     """Production relay transport over an outbound WebSocket.
 
-    Implements the :class:`~encre.gateway.relay.transport.RelayTransport`
-    Protocol.  The gateway dials the connector, authenticates with a per-gateway
+    Implements the :class:`encre.gateway.relay.transport.RelayTransport`
+    Protocol. The gateway dials the connector, authenticates with a per-gateway
     HMAC bearer token, receives a :class:`CapabilityDescriptor` at handshake,
     and then exchanges frames.
+
+    Lifecycle: constructed with a URL and identity -> :meth:`connect` opens the
+    socket, performs the ``hello``/``descriptor`` exchange, and spawns the read
+    loop -> inbound frames are dispatched and outbound RPCs resolved ->
+    :meth:`disconnect` closes the socket and fails any outstanding RPC.
+
+    Concurrency: all state is owned by one event loop.  Outbound RPCs and
+    inbound dispatch interleave freely, and :attr:`_pending` is a plain dict
+    because every read/write of it happens inside a single synchronous block
+    with no ``await`` in between.
+
+    Attributes:
+        _url: The normalized dial target.
+        _platform / _bot_id / _identities: The advertised identity set.  One
+            WebSocket can front N platforms; ``_identities`` is echoed in the
+            hello frame so the connector knows which identities to activate.
+        _connect_timeout: Bounds both the dial and the handshake wait.
+        _outbound_timeout: Bounds a single outbound RPC.
+        _gateway_id / _upgrade_secret: The WS-upgrade credential pair.  When
+            either is missing the transport dials unauthenticated, which the
+            connector may accept or reject.
+        _reconnect / _reconnect_base / _reconnect_max: Backoff knobs.  Retries
+            are driven externally by :class:`encre.gateway.run.GatewayRunner`
+            today, so these are retained here for an internal loop rather than
+            read on every call.
+        _ws: The live ``websockets`` connection, or None when disconnected.
+        _running: The transport intends to be up.  Cleared by :meth:`connect`
+            on failure and by :meth:`disconnect`.
+        _connected: A socket is currently usable.  Cleared by the read loop on
+            any close and by a failed :meth:`_send_raw`.
+        _handshake_done: A ``descriptor`` frame was received at least once.
+            This is the flag that distinguishes a terminal 4401 (after) from a
+            retryable 4401 (before).
+        _was_revoked: Terminal revocation observed.  Once True it is never
+            cleared, because reconnecting against a revoked credential is
+            hostile behaviour.
+        _descriptor: The negotiated capability profile.
+        _pending: request_id -> future awaiting its ``outbound_result``.
+        _going_idle_ack: Future awaiting ``going_idle_ack``.  At most one idle
+            request is in flight at a time.
+        _read_task: The read-loop coroutine.  Cancelled during disconnect; not
+            awaited, since awaiting a cancelled reader would deadlock a shutdown.
+        _read_buf: Leftover bytes between complete lines.  Frames are
+            newline-delimited JSON, so a socket read may split or batch lines.
     """
 
     def __init__(
@@ -118,6 +192,27 @@ class WebSocketRelayTransport:
         reconnect_backoff_s: float = RECONNECT_BASE,
         reconnect_max_backoff_s: float = RECONNECT_MAX,
     ) -> None:
+        """Create a transport bound to *url*.
+
+        Args:
+            url: The connector origin.  Normalized by :func:`_ws_dial_url`.
+            platform: The primary platform this transport fronts.  Used to
+                label the connection; the full identity set is in *identities*.
+            bot_id: The primary bot/identity id on the fronted platform.
+            identities: All identities this gateway fronts, echoed in the hello
+                frame.  Empty list is allowed and means "let the connector
+                decide".
+            connect_timeout_s: Bound on both the dial and the handshake wait.
+            outbound_timeout_s: Bound on a single outbound RPC.
+            gateway_id: The gateway identifier for the upgrade token payload.
+            upgrade_secret: The per-gateway HMAC secret.  Together with
+                *gateway_id* this produces the bearer token; missing either
+                yields an unauthenticated dial.
+            reconnect: Whether an internal reconnect loop is wanted.  Retries
+                are currently owned by the runner.
+            reconnect_backoff_s: Initial backoff for a reconnect loop.
+            reconnect_max_backoff_s: Backoff ceiling.
+        """
         self._url = _ws_dial_url(url)
         self._platform = platform
         self._bot_id = bot_id
@@ -134,13 +229,13 @@ class WebSocketRelayTransport:
         self._running = False
         self._connected = False
         self._handshake_done = False
-        # True once the connector closed with 4401 AFTER a successful handshake
+        # True once the connector closed with 4401 after a successful handshake
         # (terminal revocation -- stop reconnecting).
         self._was_revoked = False
         self._descriptor: CapabilityDescriptor | None = None
-        # requestId -> future awaiting the matching outbound_result.
+        # Maps request IDs to futures awaiting the matching outbound_result.
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
-        # Phase 5 搂5.3: future awaiting the connector's going_idle_ack.
+        # Future awaiting the connector's going_idle_ack response.
         self._going_idle_ack: asyncio.Future[None] | None = None
         self._inbound_handler: Callable[[dict[str, Any]], None] | None = None
         self._passthrough_handler: Callable[[dict[str, Any]], None] | None = None
@@ -148,31 +243,78 @@ class WebSocketRelayTransport:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._read_buf = ""
 
-    # 鈹€鈹€ properties 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ---- properties ----
 
     @property
     def was_revoked(self) -> bool:
+        """Return True if the connector revoked this gateway (4401 after handshake).
+
+        Read by :class:`encre.gateway.relay.adapter.RelayAdapter` to decide
+        whether a failed connect is terminal.  Never resets: a revoked gateway
+        must be re-provisioned, not re-dialed.
+
+        Returns:
+            True once a 4401 close was observed after a successful handshake.
+        """
         return self._was_revoked
 
     @property
     def is_connected(self) -> bool:
+        """Return True when the WebSocket is connected.
+
+        Returns:
+            True while a socket is open and usable.  Cleared immediately on
+            read-loop termination or a failed send, so outbound calls fail fast
+            with a retryable result instead of blocking until their timeout.
+        """
         return self._connected
 
-    # 鈹€鈹€ handler registration 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ---- handler registration ----
 
     def set_inbound_handler(self, handler: Callable[[dict[str, Any]], None]) -> None:
+        """Register the callback invoked when an inbound frame arrives.
+
+        Args:
+            handler: Receives the normalized event dict.  Control frames routed
+                through the inbound path, notably the ``__interrupt__`` tagged
+                ``interrupt_inbound`` event, arrive here too.
+
+        Note:
+            Must be registered before :meth:`connect` completes, otherwise the
+            read loop could be live with no handler attached and frames would be
+            silently dropped.  :meth:`connect` registers nothing itself.
+        """
         self._inbound_handler = handler
 
     def set_passthrough_handler(self, handler: Callable[[dict[str, Any]], None]) -> None:
+        """Register the callback invoked when a passthrough_forward frame arrives.
+
+        Args:
+            handler: Receives the decoded forward envelope
+                (``{platform, botId, method, path, headers, bodyB64}``) whose
+                provider signature the connector already verified.
+        """
         self._passthrough_handler = handler
 
-    # 鈹€鈹€ connect / handshake 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ---- connect / handshake ----
 
     async def connect(self) -> bool:
-        """Open the WS, perform the handshake, start the read loop.
+        """Open the WebSocket, perform the handshake, and start the read loop.
 
-        Returns True on success.  On a terminal 4401 revocation, returns False
-        and sets :attr:`was_revoked`; the caller must NOT retry.
+        Sequence: mint the upgrade token -> dial with a bounded timeout -> send
+        ``hello`` -> require a ``descriptor`` answer -> mark connected -> spawn
+        the read loop.
+
+        Returns:
+            True on success.  False when the dial fails, when the handshake
+            answer is missing, or when the first frame is not a descriptor.
+            On a terminal 4401 revocation the failure is additionally surfaced
+            via :attr:`was_revoked` so the caller must not retry.
+
+        Note:
+            ``_running`` is set before the dial and cleared on every failure
+            path, since the adapter polls transport state after ``connect``
+            returns and must never see a half-open transport reported as live.
         """
         import websockets
 
@@ -198,7 +340,7 @@ class WebSocketRelayTransport:
             self._running = False
             return False
 
-        # Send hello + wait for the descriptor handshake frame.
+        # Send hello frame and wait for the descriptor handshake response.
         hello: dict[str, Any] = {"type": "hello"}
         if self._gateway_id:
             hello["gatewayId"] = self._gateway_id
@@ -231,11 +373,36 @@ class WebSocketRelayTransport:
         return True
 
     async def handshake(self) -> CapabilityDescriptor:
+        """Return the negotiated capability descriptor from the handshake.
+
+        Returns:
+            The :class:`CapabilityDescriptor` parsed from the connector's
+            ``descriptor`` frame.  The adapter derives its ``max_message_length``
+            and ``splits_long_messages`` capabilities from this object, so it is
+            returned rather than re-read from the wire.
+
+        Raises:
+            RuntimeError: When no handshake has completed yet, i.e.
+                :meth:`connect` was never called or failed.
+        """
         if self._descriptor is None:
             raise RuntimeError("handshake not complete -- call connect() first")
         return self._descriptor
 
     async def disconnect(self) -> None:
+        """Close the WebSocket and clean up all pending state.
+
+        Order matters: clear the intent-to-run and connection flags first so a
+        concurrent outbound call sees "not connected" and returns a retryable
+        failure, then cancel the read loop, close the socket, and finally fail
+        every outstanding RPC.  Awaiting the read loop is deliberately avoided,
+        since the loop is blocked on socket reads and would stall a shutdown.
+
+        Note:
+            ``_handshake_done`` and ``_was_revoked`` are preserved, so a
+            revocation observed before shutdown still reports
+            :attr:`was_revoked` as True after teardown.
+        """
         self._running = False
         self._connected = False
         if self._read_task and not self._read_task.done():
@@ -255,7 +422,7 @@ class WebSocketRelayTransport:
             self._going_idle_ack.set_exception(RuntimeError("relay transport closed"))
             self._going_idle_ack = None
 
-    # 鈹€鈹€ outbound RPC 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ---- outbound RPC ----
 
     async def _send_with_request(
         self,
@@ -264,10 +431,30 @@ class WebSocketRelayTransport:
         *,
         platform: str | None = None,
     ) -> dict[str, Any]:
-        """Send an outbound frame and await the matching ``outbound_result``.
+        """Send an outbound frame and await the matching outbound_result.
 
-        Blocks on a per-``requestId`` future with a 30s timeout.  Raises
-        :class:`asyncio.TimeoutError` on timeout.
+        Each request gets a fresh 64-bit random ``requestId`` and a future that
+        the read loop resolves when the connector's matching ``outbound_result``
+        arrives.  Registering the future *before* sending the frame closes the
+        race in which the result would arrive and be dropped for an unknown
+        request id.
+
+        Args:
+            frame_type: The outbound frame kind, e.g. ``outbound`` or
+                ``follow_up``.
+            action: The action payload the connector executes.
+            platform: The originating platform stamp, needed because one
+                WebSocket fronts several platforms.
+
+        Returns:
+            The connector's result dict, or a failure dict when the transport is
+            not connected or the request timed out.  Timeouts and send errors
+            are converted to results rather than raised so the adapter can
+            report a retryable failure to the stream consumer.
+
+        Raises:
+            Exception: Propagated only from a transport error that escapes
+                :meth:`_send_raw`, which normally swallows socket failures.
         """
         if not self._connected:
             return {"success": False, "error": "relay not connected"}
@@ -288,12 +475,49 @@ class WebSocketRelayTransport:
             self._pending.pop(request_id, None)
 
     async def send_outbound(self, action: dict[str, Any], *, platform: str | None = None) -> dict[str, Any]:
+        """Send an outbound action (send/edit/typing) and await the result.
+
+        Args:
+            action: The action payload, carrying an ``op`` discriminator.
+            platform: The originating platform stamp for the connector's egress
+                guard.
+
+        Returns:
+            The connector's ``outbound_result`` payload.
+        """
         return await self._send_with_request("outbound", action, platform=platform)
 
     async def send_follow_up(self, action: dict[str, Any], *, platform: str | None = None) -> dict[str, Any]:
+        """Send a token-less follow_up action and await the result.
+
+        The gateway names the session and capability kind; the connector
+        resolves the real token from its vault, so no capability material ever
+        enters the gateway process.
+
+        Args:
+            action: The follow-up action payload.
+            platform: The originating platform stamp.
+
+        Returns:
+            The connector's ``outbound_result`` payload.
+        """
         return await self._send_with_request("follow_up", action, platform=platform)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        """Fetch chat metadata for the given chat_id via the relay.
+
+        Reuses the generic outbound RPC path with an ``op`` of
+        ``get_chat_info``; the connector answers with a ``chat_info`` object in
+        the result.
+
+        Args:
+            chat_id: The chat to describe.
+
+        Returns:
+            The connector's ``chat_info`` dict when the call succeeds,
+            otherwise a synthetic ``{"name": chat_id, "type": "dm"}`` record so
+            callers that only need a display name never crash.
+        """
         result = await self._send_with_request(
             "outbound", {"op": "get_chat_info", "chat_id": chat_id}
         )
@@ -302,6 +526,17 @@ class WebSocketRelayTransport:
         return {"name": chat_id, "type": "dm"}
 
     async def send_interrupt(self, session_key: str, reason: str | None = None) -> None:
+        """Send an interrupt frame to cancel the given session's current turn.
+
+        Fire-and-forget: unlike the outbound RPCs there is no result frame, so
+        the caller cannot learn whether the interrupt landed.  A disconnected
+        transport is a silent no-op rather than an error, since an interrupt is
+        best-effort.
+
+        Args:
+            session_key: The session whose turn should stop.
+            reason: Optional reason forwarded to the connector for its logs.
+        """
         if not self._connected:
             return
         frame: dict[str, Any] = {"type": "interrupt", "session_key": session_key}
@@ -310,7 +545,26 @@ class WebSocketRelayTransport:
         await self._send_raw(frame)
 
     async def go_idle(self, timeout_s: float = 10.0) -> bool:
-        """Emit ``going_idle`` and await ``going_idle_ack`` (scale-to-zero primitive)."""
+        """Emit going_idle and await going_idle_ack (scale-to-zero primitive).
+
+        The connector buffers inbound platform traffic while the gateway is
+        away and replays it on reconnect, so the acknowledgment is what makes it
+        safe to suspend the process.
+
+        Args:
+            timeout_s: How long to wait for the acknowledgment.
+
+        Returns:
+            True if the connector acknowledged the idle flip.  False when the
+            transport is not connected or the acknowledgment timed out -- a
+            timeout means the connector never confirmed, so the gateway must
+            keep the connection open.
+
+        Note:
+            The future is cleared in ``finally``, so an acknowledgment that
+            arrives after a timeout is dropped rather than leaking into the
+            next idle attempt.
+        """
         if not self._connected:
             return False
         loop = asyncio.get_event_loop()
@@ -325,9 +579,25 @@ class WebSocketRelayTransport:
         finally:
             self._going_idle_ack = None
 
-    # 鈹€鈹€ raw send 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ---- raw send ----
 
     async def _send_raw(self, frame: dict[str, Any]) -> None:
+        """Send a raw JSON frame as a newline-terminated message.
+
+        The trailing newline is part of the wire framing: the read loop on the
+        other end splits on newlines, so a frame sent without one would never
+        be delivered as a complete line.
+
+        Args:
+            frame: The frame dict to send.
+
+        Note:
+            A send failure clears ``_connected`` and logs rather than raising.
+            This is deliberate -- outbound callers convert "not connected" into
+            a retryable result, whereas an exception here would escape through
+            an agent turn.  The tradeoff is that a silently dropped frame is
+            only visible through the warning log.
+        """
         if self._ws is None:
             return
         try:
@@ -336,9 +606,22 @@ class WebSocketRelayTransport:
             logger.warning("[relay] send failed: %s", e)
             self._connected = False
 
-    # 鈹€鈹€ read loop / frame dispatch 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ---- read loop / frame dispatch ----
 
     async def _read_loop(self) -> None:
+        """Continuously read frames from the WebSocket and dispatch them.
+
+        Frames are newline-delimited JSON, and a single socket read may return
+        a partial line or several lines at once.  Reads are therefore
+        accumulated in :attr:`_read_buf`, split on newlines, and the tail kept
+        for the next read.
+
+        Note:
+            A malformed line is logged and skipped rather than fatal, so one
+            corrupted frame cannot take the connection down.  Handler
+            exceptions are likewise caught, because a handler bug must not
+            close the socket.
+        """
         try:
             async for raw in self._ws:
                 if isinstance(raw, bytes):
@@ -357,7 +640,7 @@ class WebSocketRelayTransport:
                     except Exception as e:
                         logger.warning("[relay] frame handler error: %s %s", type(e).__name__, e)
         except Exception as e:
-            # Detect a 4401 close after a successful handshake = revocation.
+            # Detect a 4401 close after a successful handshake as revocation.
             close_code = getattr(getattr(e, "code", None), "value", None) or getattr(e, "code", None)
             if close_code == _RELAY_UNAUTHORIZED_CLOSE_CODE and self._handshake_done:
                 self._was_revoked = True
@@ -373,11 +656,33 @@ class WebSocketRelayTransport:
             self._pending.clear()
 
     async def _handle_frame(self, frame: dict[str, Any]) -> None:
+        """Dispatch a received frame to the appropriate handler based on its type.
+
+        Every frame carries a ``type`` discriminator and is routed as follows:
+
+        - ``inbound``: delivered to the inbound handler, and an ``inbound_ack``
+          is sent back if a ``bufferId`` was present.  The ack is what lets the
+          connector stop buffering a message the gateway has accepted.
+        - ``outbound_result``: resolves the future registered by
+          :meth:`_send_with_request`, keyed by ``requestId``.
+        - ``interrupt_inbound``: re-wrapped as a tagged inbound event so the
+          adapter's single inbound handler can reach ``on_interrupt``.
+        - ``going_idle_ack``: resolves the pending :attr:`_going_idle_ack`.
+        - ``passthrough_forward``: delivered to the passthrough handler.
+        - ``descriptor``: accepted even after the initial handshake, so a
+          re-handshake or a late capability refresh is applied.
+        - anything else: logged at debug and ignored, which is the
+          forward-compatibility path that lets the connector add frame kinds
+          without breaking an older gateway.
+
+        Args:
+            frame: A parsed frame dict.  Unrecognized fields are ignored.
+        """
         ftype = frame.get("type", "")
         if ftype == "inbound":
             if self._inbound_handler:
                 self._inbound_handler(frame.get("event", {}))
-            # Ack buffered delivery if a bufferId was present.
+            # Acknowledge buffered delivery if a bufferId was present.
             buf = frame.get("bufferId")
             if buf:
                 await self._send_raw({"type": "inbound_ack", "bufferId": buf})
@@ -400,7 +705,7 @@ class WebSocketRelayTransport:
             if self._passthrough_handler:
                 self._passthrough_handler(frame.get("forward", {}))
         elif ftype == "descriptor":
-            # A late/re-handshake descriptor -- accept it.
+            # A late or re-handshake descriptor -- accept it.
             self._descriptor = CapabilityDescriptor.from_dict(frame.get("descriptor", {}))
         else:
             logger.debug("[relay] unhandled frame type: %s", ftype)

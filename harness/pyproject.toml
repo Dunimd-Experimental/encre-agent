@@ -24,9 +24,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "encre-harness"
-version = "0.4.3"
+version = "0.5.0"
 description = "Encre Harness — embeddable Python agent harness library"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 license = {text = "Apache-2.0"}
 dependencies = [
     # --- HTTP / networking core ---
@@ -49,6 +49,12 @@ dependencies = [
     # --- Imaging / OCR (desktop + ocr) ---
     "Pillow>=10.0",
     "pytesseract>=0.3",
+    # --- Windows OCR (winrt 3.x splits each namespace into its own
+    #     package; all three projections are required by ocr.py) ---
+    "winrt-runtime>=3.0",
+    "winrt-Windows.Media.Ocr>=1.0",
+    "winrt-Windows.Graphics.Imaging>=1.0",
+    "winrt-Windows.Storage.Streams>=1.0",
     # --- Desktop automation (harness computer module) ---
     "mss>=9.0",
     "pyautogui>=0.9",
@@ -90,7 +96,7 @@ include = ["encre*"]
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.30"]
 ollama = ["ollama>=0.1"]
-native = ["encre-native==0.4.3"]
+native = ["encre-native==0.5.0"]
 aiohttp = ["aiohttp>=3.9"]
 local = ["torch>=2.0", "transformers>=4.36"]
 aws = ["boto3>=1.34"]
@@ -105,8 +111,9 @@ byted = ["ark-sdk>=1.0", "veadk>=1.0", "volcengine-sdk-ark>=1.0", "volcengine-sd
 #   pip install encre-harness[windows]    # Windows
 #   pip install encre-harness[macos]      # macOS
 windows = [
-    "winrt-runtime>=3.0",                 # WinRT runtime
-    "winrt-Windows.Media.Ocr>=1.0",       # WinRT OCR (Win 10+ built-in)
+    # Core OCR winrt projections moved to the main dependency list so any
+    # install path (not only the [windows] extra) gets them.  This extra
+    # now carries the remaining Windows-only niceties.
     "winrt-Windows.Devices.Geolocation>=1.0",  # Native GPS location
     "winrt-Windows.Devices.Sensors>=1.0",      # Accelerometer/gyro/light sensors
     "pywin32>=306",                        # GPU/sensor/display info via WMI
@@ -148,3 +155,29 @@ dev = [
     "pre-commit>=3.7",
     "pyinstaller>=6.0",
 ]
+
+# ── Test configuration ──────────────────────────────────────────────────────
+# Run from harness/: `python -m pytest -q`
+# Run from the repository root: `python -m pytest harness/tests -q`
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+filterwarnings = [
+    "error::DeprecationWarning:encre.*",
+]
+
+# ── Lint configuration ─────────────────────────────────────────────────────
+# The historical tree is not yet ruff-clean; new packages (contracts, kernel,
+# tools, evals, tests) must stay clean:
+#   python -m ruff check encre/contracts encre/kernel tools evals tests
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "RUF", "ARG"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tool classes carry model-facing schema on the class body.
+"evals/**" = ["E501"]

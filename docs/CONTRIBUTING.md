@@ -6,7 +6,7 @@ Encre Agent is a single repository that ships three products on one release line
 
 - a **Python** AI Agent framework (`backend/encre/`)
 - a **Rust** native core that backs it (`native/crates/`)
-- an **Electron + React 19** desktop app (`desktop/`)
+- an **Electron + React 19** Encre Agent Desktop (`desktop/`)
 
 All three share the same version, the same `master` branch, and the same release notes. If you only need to touch one layer, that's fine — the other layers will still build around your change.
 
@@ -76,16 +76,16 @@ Bugs are tracked as [GitHub Issues](https://github.com/mf2023/Encre/issues) (mir
 When you file, include:
 
 - **One-sentence title** that says what is broken, not what you were doing. Good: `EncreAgent.run raises KeyError when tool result is empty`. Bad: `agent broke`.
-- **Layer**: Python framework / Rust core / Desktop app / Documentation. (Pick exactly one — cross-layer bugs usually need two separate issues.)
+- **Layer**: Python gateway / Encre Agent Core / Encre Agent Desktop / Documentation. (Pick exactly one — cross-layer bugs usually need two separate issues.)
 - **Exact steps to reproduce**, copy-paste runnable. Numbered list, no narrative.
 - **Observed vs. expected behavior.** Quote error messages verbatim, including stack traces.
 - **Environment**: OS, Python version, Node version, Rust version (`rustc --version`), Encre Agent commit hash, backend provider + model, permission mode.
-- **Minimal reproducer**: a script or, for the desktop app, a screen recording.
+- **Minimal reproducer**: a script or, for the Encre Agent Desktop, a screen recording.
 
 **Example template:**
 
 ```markdown
-**Layer:** Python framework
+**Layer:** Python gateway
 **Title:** `web_search` returns empty list for queries with non-ASCII characters
 
 **Steps:**
@@ -96,7 +96,7 @@ When you file, include:
 
 **Environment:**
 - OS: Ubuntu 24.04
-- Python: 3.12.3
+- Python: 3.14.0
 - Encre Agent: `0da4040`
 - Backend: openai / gpt-4o
 - Permission mode: default
@@ -185,7 +185,7 @@ Reviewers may request changes. They will not be merged while a review is pending
 
 | Tool | Required version | Why |
 |---|---|---|
-| Python | 3.11 or newer | `backend/encre/` framework |
+| Python | 3.14 or newer | `backend/encre/` framework |
 | Node.js | 18+ (20+ recommended) | `desktop/` Electron build |
 | Rust | 1.65+ (stable) | `native/crates/` native core — only needed if you change Rust code |
 | OS | Linux x64/arm64, macOS x64/arm64, Windows x64 | All three are CI-tested |
@@ -204,7 +204,7 @@ python build.py
 If `build.py` is unavailable in your environment (e.g. you are working on documentation only), the manual equivalent is:
 
 ```bash
-# Python framework (editable install)
+# Python gateway (editable install)
 pip install -e .
 pip install -e ".[dev]"           # adds pytest, ruff, mypy, pre-commit
 
@@ -221,7 +221,7 @@ pip install -e ".[aws]"          # AWS Bedrock
 pip install -e ".[aiohttp]"      # aiohttp-powered HTTP tools
 pip install -e ".[native]"       # Pre-built native extension
 
-# Desktop app
+# Encre Agent Desktop
 cd desktop
 npm install
 cd ..
@@ -260,7 +260,7 @@ cd native
 cargo build --release -p encre-py
 # _native.pyd / _native.so is copied to backend/encre/ automatically on success.
 
-# Desktop app
+# Encre Agent Desktop
 cd desktop
 npm run build       # esbuild → dist/main.js, dist/preload.js, renderer/bundle.js
 npm start           # build + launch Electron
@@ -299,7 +299,7 @@ pytest -m "not network" backend/tests/
 ```bash
 cd native
 cargo test --workspace
-cargo test -p encre-core
+cargo test -p encre --lib
 cargo test -p encre-py
 ```
 
@@ -310,7 +310,7 @@ cd desktop
 npm run typecheck
 ```
 
-The desktop app uses `esbuild` for bundling — there is no separate `npm test` for runtime behaviour unless you add one for your new code.
+The Encre Agent Desktop uses `esbuild` for bundling — there is no separate `npm test` for runtime behaviour unless you add one for your new code.
 
 ### CI parity
 
@@ -431,7 +431,6 @@ encre/
 │   │   ├── gateway/           # Gateway client/server protocol
 │   │   ├── compact/           # Context compaction (9 strategies)
 │   │   ├── lsp/               # LSP client + multi-language server discovery
-│   │   ├── codebase/          # BM25 code indexer + dependency graph
 │   │   ├── computer/          # Desktop & browser automation
 │   │   ├── evolution/         # Meta-cognition, reflex, strategy optimizer
 │   │   ├── feedback/          # Jaccard-based error-correction learner
@@ -466,15 +465,12 @@ encre/
 │       │       ├── landlock.rs    # Linux Landlock enforcement
 │       │       ├── tokenizer.rs   # Heuristic token counter
 │       │       ├── embedding.rs   # Cosine / Jaccard similarity
-│       │       ├── indexer.rs     # BM25 code search index
 │       │       ├── lsp_proto.rs   # LSP JSON-RPC parser
-│       │       ├── ast.rs         # Lightweight AST helpers
-│       │       ├── codebase.rs    # Codebase-wide search
 │       │       └── permission.rs  # Native permission checks
 │       └── encre-py/          # PyO3 bindings → `encre._native`
 │           └── src/lib.rs
 │
-├── desktop/                   # Electron desktop app
+├── desktop/                   # Electron Encre Agent Desktop
 │   ├── main.ts                # Electron main process
 │   ├── preload.ts             # Context bridge (IPC)
 │   ├── build.js               # esbuild config
@@ -549,7 +545,7 @@ We promote contributors to maintainers when all three are true:
 
 1. They have **at least 5 merged PRs** of non-trivial size (excluding typos, docs-only, and CI-only changes).
 2. They have **participated in code review** for at least 3 PRs from other contributors (comments, suggestions, approvals).
-3. They have been **responsive** in issues and PRs on the topics they want to maintain (e.g. the desktop app, a specific backend family).
+3. They have been **responsive** in issues and PRs on the topics they want to maintain (e.g. the Encre Agent Desktop, a specific backend family).
 
 Promotion is by maintainer consensus and is announced in [CHANGELOG.md](CHANGELOG.md). Maintainers retain the right to push to `master`, tag releases, and triage issues. There is no formal demotion process; inactive maintainers are moved to emeritus status after 6 months of inactivity, and can rejoin on request.
 

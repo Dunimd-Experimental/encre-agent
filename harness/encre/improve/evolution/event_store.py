@@ -1,3 +1,46 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
+#
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# DISCLAIMER: Users must comply with applicable AI regulations.
+# Non-compliance may result in service termination or legal liability.
+
+"""Append-only event log for the self-improvement / evolution subsystem.
+
+An :class:`EventStore` is a thin journal of evolution-domain events: every
+:class:`StoredEvent` published into it is written as one JSON object per
+line to a single ``events.jsonl`` file.  Readers use :meth:`replay` to
+reconstruct history (newest first, optionally narrowed by event type or
+session) and :meth:`project` to fold that history into a plain dict.
+
+Publishing is two-phase and order-sensitive: registered in-process handlers
+are invoked synchronously *first*, and only after they return is the event
+appended to disk.  That means a subscriber can observe an event before it
+is durable, which is fine for the current consumers (the reviewer and the
+UI notification path) because they only need eventual visibility, never
+crash-exact durability.
+
+Every filesystem failure is swallowed.  The journal exists to make
+improvement data visible and recoverable; it must not be able to take down
+the agent loop when the data directory is missing, read-only, or full.
+"""
+
 from __future__ import annotations
 
 
@@ -7,6 +50,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+
+
+from encre.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -40,7 +88,7 @@ class EventStore:
             try:
                 handler(event)
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
         self._append_to_file(event)
 
     def register_handler(self, event_type: str, handler: EventHandler) -> None:
@@ -84,7 +132,7 @@ class EventStore:
             try:
                 hook_system.on(et, _handler)
             except Exception:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
 
     def _append_to_file(self, event: StoredEvent) -> None:
         try:
@@ -92,7 +140,7 @@ class EventStore:
 
             append_jsonl(self._path, event.__dict__)
         except (OSError, IOError):
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
     def _iterate(self) -> list[StoredEvent]:
         result: list[StoredEvent] = []
@@ -105,7 +153,7 @@ class EventStore:
                 except (KeyError, TypeError):
                     continue
         except (OSError, IOError):
-            pass
+            logger.debug("exception suppressed", exc_info=True)
         return result
 
     def _ensure_file(self) -> None:
@@ -114,7 +162,7 @@ class EventStore:
                 with open(self._path, "w", encoding="utf-8") as f:
                     f.write("")
             except OSError:
-                pass
+                logger.debug("exception suppressed", exc_info=True)
 
     def _default_path(self) -> str:
         # Keep the event log beside ``evolution/state.json`` instead of in the

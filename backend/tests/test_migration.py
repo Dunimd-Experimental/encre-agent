@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,6 +23,16 @@
 
 from __future__ import annotations
 
+"""Tests for Encre backup migration.
+
+Covers the export/import round-trip of the data directory: secrets are
+written as ciphertext on disk but materialised as plaintext inside the
+archive, and are re-encrypted with the target key on import. Also
+covers exclusion of log artifacts, the manifest that records which files
+were encrypted and in which mode (text vs raw bytes), and rejection of
+archives that do not carry the hidden Encre backup marker.
+"""
+
 import json
 import zipfile
 from pathlib import Path
@@ -33,7 +43,11 @@ from encre.crypto import decrypt, encrypt, encrypt_raw, ensure_keyfile
 
 @pytest.fixture
 def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Isolate the Encre data directory into a temp folder."""
+    """Isolate the Encre data directory into a temp folder.
+
+    Points ENCRE_DATA_DIR at a throwaway path so crypto and migration
+    calls never touch the real data store.
+    """
     d = tmp_path / "data"
     d.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("ENCRE_DATA_DIR", str(d))
@@ -41,17 +55,23 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_export_all_roundtrip(data_dir: Path, tmp_path: Path) -> None:
+    """Export a mixed data directory and import it back into a fresh one.
+
+    The archive must contain decrypted (plaintext) settings plus a manifest
+    that records which files were encrypted and how. On import, secrets are
+    re-encrypted with the target key while plaintext files are copied as-is.
+    """
     ensure_keyfile()
 
-    # An encrypted (base64 "text") settings-style file.
+    # Text-mode encrypted settings file: base64 ciphertext on disk.
     secret = "api_key_that_must_not_leak"
     (data_dir / "settings.json").write_text(encrypt(secret), encoding="utf-8")
-    # An encrypted raw-bytes file.
+    # Raw-byte encrypted file: the payload is binary and must not be decoded.
     raw_secret = b"\x00\x01binary\xff\xfe"
     (data_dir / "browser_key").write_bytes(encrypt_raw(raw_secret))
-    # A plaintext file that must be copied verbatim.
+    # Unencrypted config file that must survive the round-trip byte-for-byte.
     (data_dir / "keybinds.json").write_text('{"k": 1}', encoding="utf-8")
-    # Logs must be excluded from the export.
+    # Log artifacts must be excluded from the export regardless of location.
     (data_dir / "logs").mkdir()
     (data_dir / "logs" / "debug.log").write_text("noise", encoding="utf-8")
     (data_dir / "yimd.log").write_text("noise", encoding="utf-8")
@@ -71,7 +91,7 @@ def test_export_all_roundtrip(data_dir: Path, tmp_path: Path) -> None:
     assert "model/config.toml" in names
 
     with zipfile.ZipFile(zip_path) as zf:
-        # Exported content is PLAINTEXT.
+        # Inside the archive every file is stored as plaintext.
         assert zf.read("settings.json").decode("utf-8") == secret
         assert zf.read("browser_key") == raw_secret
         assert zf.read("keybinds.json").decode("utf-8") == '{"k": 1}'
@@ -96,16 +116,16 @@ def test_export_all_roundtrip(data_dir: Path, tmp_path: Path) -> None:
     assert result["overwritten"] == 0
     assert result["kept"] == 0
 
-    # Re-encrypted: on-disk ciphertext differs from the plaintext secret.
+    # Re-encrypted: the on-disk ciphertext differs from the plaintext secret.
     on_disk = (fresh / "settings.json").read_text(encoding="utf-8").strip()
     assert on_disk != secret
     assert decrypt(on_disk) == secret
-    # Raw re-encrypted file decrypts back to the original bytes.
+    # The raw re-encrypted file must still decrypt back to the original bytes.
     assert (fresh / "browser_key").read_bytes() != raw_secret
     from encre.crypto import decrypt_raw
 
     assert decrypt_raw((fresh / "browser_key").read_bytes()) == raw_secret
-    # Plaintext copied verbatim.
+    # Plaintext files are copied verbatim without re-encryption.
     assert (fresh / "keybinds.json").read_text(encoding="utf-8") == '{"k": 1}'
     assert (fresh / "model" / "config.toml").exists()
 
@@ -113,6 +133,12 @@ def test_export_all_roundtrip(data_dir: Path, tmp_path: Path) -> None:
 
 
 def test_import_all_rejects_invalid_zip(data_dir: Path, tmp_path: Path) -> None:
+    """Reject archives that are not genuine Encre backups.
+
+    A real export carries a hidden marker and imports successfully. A
+    hand-crafted zip without the marker must raise, and must not wipe the
+    target directory even when the caller asks for replace mode.
+    """
     ensure_keyfile()
     (data_dir / "a.json").write_text(encrypt('{"v": "x"}'), encoding="utf-8")
     valid_zip = Path(str(tmp_path / "backup.zip"))
@@ -149,8 +175,14 @@ def test_import_all_rejects_invalid_zip(data_dir: Path, tmp_path: Path) -> None:
 
 
 def test_import_all_modes(data_dir: Path, tmp_path: Path) -> None:
+    """Exercise the skip, replace and overwrite restore modes.
+
+    Each mode is applied against a target directory that already contains a
+    conflicting file plus a local-only file, so we can assert which entries
+    survive the import and which get overwritten by the backup.
+    """
     ensure_keyfile()
-    # Build a backup with two files.
+    # Build a backup with two files: one encrypted, one plaintext.
     (data_dir / "a.json").write_text(encrypt('{"v": "backup"}'), encoding="utf-8")
     (data_dir / "b.json").write_text("plaintext", encoding="utf-8")
     zip_path = Path(str(tmp_path / "backup.zip"))
@@ -159,6 +191,11 @@ def test_import_all_modes(data_dir: Path, tmp_path: Path) -> None:
     export_all(zip_path)
 
     def _setup(target: Path) -> None:
+        """Prepare a target dir with a conflicting backup entry and a local-only file.
+
+        The conflicting entry mirrors the backup's ``a.json`` with different
+        contents so restore modes have something real to keep or overwrite.
+        """
         target.mkdir(parents=True, exist_ok=True)
         # Local "old" file that the backup would overwrite.
         (target / "a.json").write_text(encrypt('{"v": "local"}'), encoding="utf-8")

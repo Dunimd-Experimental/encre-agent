@@ -32,7 +32,7 @@
 
 | Service | Description |
 |---|---|
-| Encre Agent | AI Agent platform: desktop application, Python framework, Rust native core, integrations with 18 chat platforms; local-first |
+| Encre Agent | AI Agent platform: desktop application, Python gateway, Rust native core, integrations with 18 chat platforms; local-first |
 | PiscesLx | LLM hosting |
 | StadionOS | Operating system project |
 | Dunimd Enterprise / Cloud / Studio / Support | Business offerings |

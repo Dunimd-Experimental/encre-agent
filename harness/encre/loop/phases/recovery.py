@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -34,28 +34,33 @@ Plan-Do-Review advancement) and the assistant message materialisation
 The turn tail lives in :mod:`encre.loop.phases.end_of_turn`.
 """
 
-import time
+from __future__ import annotations
+
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from encre.improve.evolution.plan_do_review import ReviewGrade, StepStatus
+from encre.compact.loop_state.transition import TurnTransition
+from encre.features import adapters as _features
 from encre.logging_config import get_logger
 from encre.loop.phase_api import LoopPhase, PhaseContext, PhaseResult
 from encre.loop.phases.end_of_turn import _cleanup_terminal_sessions
 from encre.loop.turn_ctx import TurnContext, TurnExit
 from encre.loop_error import PostStreamAction
-from encre.compact.loop_state.transition import TurnTransition
 from encre.loop_stability import (
+    MAX_DELIBERATION_RETRIES,
+    MAX_STUB_RESPONSE_RETRIES,
     BudgetState,
+    adjudicate_deliberation,
     build_auto_continue_message,
+    build_deliberation_retry_message,
     build_empty_retry_message,
     build_stub_retry_message,
-    build_truncated_retry_message,
     build_tombstone_messages,
+    build_truncated_retry_message,
+    is_deliberation_loop,
     is_empty_response,
     is_stub_response,
     is_truncated_tool_call,
-    MAX_STUB_RESPONSE_RETRIES,
 )
 from encre.recovery_loop import (
     ESCALATED_MAX_TOKENS,
@@ -63,7 +68,7 @@ from encre.recovery_loop import (
     build_max_tokens_recovery_message,
     build_slot_escalation_message,
 )
-from encre.utils.types import create_finish, create_system_message
+from encre.utils.types import create_finish
 
 logger = get_logger(__name__)
 
@@ -71,7 +76,7 @@ logger = get_logger(__name__)
 class PhaseRecoveryMixin:
     """Post-stream recovery and turn finalisation."""
 
-    async def _phase_post_stream(self, t: TurnContext) -> AsyncGenerator[Any, None]:
+    async def _phase_post_stream(self, t: TurnContext) -> AsyncGenerator:
         """Handle the post-stream orchestrator decision and text-only exits.
 
         Args:
@@ -108,15 +113,27 @@ class PhaseRecoveryMixin:
                     )
                 logger.info("[slot] escalating from %d -> %d turn=%d",
                             self.config.default_slot_tokens, self.config.max_tokens, self.session.turn_count)
-                yield create_system_message(build_slot_escalation_message())
+                # Internal loop-control nudge: goes into the session context
+                # (the model must see it) but never onto the wire -- a yielded
+                # SystemMessage renders as a client-facing bubble.
+                self.session.add_message(
+                    "system", build_slot_escalation_message(),
+                    is_synthetic=True,
+                )
             elif "max_tokens" in post_decision.detail:
                 self._max_output_tokens_override = ESCALATED_MAX_TOKENS
                 if t.tool_call_buffers:
-                    _tombstones = build_tombstone_messages(t.tool_call_buffers, "max_tokens truncation")
+                    _tombstones = build_tombstone_messages(
+                        t.tool_call_buffers,
+                        "max_tokens truncation",
+                        reasoning_content="".join(t.thinking_parts),
+                    )
                     for _ts in _tombstones:
                         self.session.add_message(_ts["role"], _ts.get("content", ""),
                             tool_call_id=_ts.get("tool_call_id"), name=_ts.get("name"),
-                            is_error=_ts.get("is_error", False))
+                            is_error=_ts.get("is_error", False),
+                            tool_calls=_ts.get("tool_calls"),
+                            reasoning_content=_ts.get("reasoning_content"))
                     t.tool_call_buffers.clear()
                 if self._state is not None:
                     self._state.transitions.record(
@@ -125,7 +142,12 @@ class PhaseRecoveryMixin:
                         detail=post_decision.detail,
                     )
                 logger.info("[max_tokens] recovery %s turn=%d", post_decision.detail, self.session.turn_count)
-                yield create_system_message(build_max_tokens_recovery_message())
+                # Same as slot escalation: model-context-only nudge, never
+                # rendered in the client timeline.
+                self.session.add_message(
+                    "system", build_max_tokens_recovery_message(),
+                    is_synthetic=True,
+                )
             elif "empty" in post_decision.detail:
                 if self._state is not None:
                     self._state.transitions.record(
@@ -136,7 +158,7 @@ class PhaseRecoveryMixin:
                 logger.warning("[run] empty response, %s turn=%d", post_decision.detail, self.session.turn_count)
                 retry_count = self._error_orch._empty_response_retry_count
                 self.session.add_message(
-                    "user", build_empty_retry_message(retry_count),
+                    "system", build_empty_retry_message(retry_count),
                     is_synthetic=True,
                 )
             elif "truncated" in post_decision.detail:
@@ -153,23 +175,23 @@ class PhaseRecoveryMixin:
                                _tc_name, post_decision.detail, self.session.turn_count)
                 t.tool_call_buffers.clear()
                 self.session.add_message(
-                    "user", build_truncated_retry_message(_tc_name, _args_preview),
+                    "system", build_truncated_retry_message(_tc_name, _args_preview),
                     is_synthetic=True,
                 )
             t.do_continue = True
             return
 
-        if (post_decision.action == PostStreamAction.STOP or
-            (t.slot_finish_reason in ("max_tokens", "length") and
-             not self._error_orch._slot_escalated and
-             self._error_orch._max_output_tokens_recovery_count >= MAX_OUTPUT_TOKENS_RECOVERY_LIMIT)):
+        if ((post_decision.action == PostStreamAction.STOP or
+             (t.slot_finish_reason in ("max_tokens", "length") and
+              not self._error_orch._slot_escalated and
+              self._error_orch._max_output_tokens_recovery_count >= MAX_OUTPUT_TOKENS_RECOVERY_LIMIT)) and
+            is_empty_response(t.text_parts, t.tool_call_buffers, t.thinking_parts)):
             # Empty response exhausted
-            if is_empty_response(t.text_parts, t.tool_call_buffers, t.thinking_parts):
-                logger.warning("[run] empty response retries exhausted turn=%d", self.session.turn_count)
-                self.session.add_message("assistant",
-                    "(No response generated. Please try rephrasing your request.)")
-                yield create_finish("stop")
-                raise TurnExit()
+            logger.warning("[run] empty response retries exhausted turn=%d", self.session.turn_count)
+            self.session.add_message("assistant",
+                "(No response generated. Please try rephrasing your request.)")
+            yield create_finish("stop")
+            raise TurnExit()
 
         # Reset stub counter when the model actually does work (calls tools)
         if t.tool_call_buffers:
@@ -196,6 +218,13 @@ class PhaseRecoveryMixin:
                     if t.thinking_parts:
                         existing_r = m.get("reasoning_content", "") or ""
                         m["reasoning_content"] = existing_r + "".join(t.thinking_parts)
+                    if t.thinking_blocks:
+                        # Keep block signatures replayable across the merge
+                        # (see the block-level note in the commit path).
+                        existing_blocks = list(m.get("reasoning_blocks") or [])
+                        m["reasoning_blocks"] = existing_blocks + [
+                            b for b in t.thinking_blocks if b.get("text") or b.get("signature")
+                        ]
                     if t.backend_usage:
                         m["usage"] = t.backend_usage
                     # Preserve segment ordering
@@ -209,12 +238,17 @@ class PhaseRecoveryMixin:
                         m["segments"] = existing_segs + new_segs
                     self.session.mark_messages_dirty()
                     merged = True
+                    self._clear_pending_stream()
                     break
 
             if not merged and not (t.slash_command_mode in ("spec", "plan") and full_text.strip()):
                 txt_kwargs: dict[str, Any] = {}
                 if t.thinking_parts:
                     txt_kwargs["reasoning_content"] = "".join(t.thinking_parts)
+                if t.thinking_blocks:
+                    txt_kwargs["reasoning_blocks"] = [
+                        b for b in t.thinking_blocks if b.get("text") or b.get("signature")
+                    ]
                 if t.backend_usage:
                     txt_kwargs["usage"] = t.backend_usage
                 segs = []
@@ -225,42 +259,14 @@ class PhaseRecoveryMixin:
                 if segs:
                     txt_kwargs["segments"] = segs
                 self.session.add_message("assistant", full_text, **txt_kwargs)
+                self._clear_pending_stream()
 
             await self.hook_system.emit_session_end()
             await _cleanup_terminal_sessions()
             logger.debug("Agent finished (text-only response, %s chars)", len(full_text))
 
-            # 鈹€鈹€ Save spec/plan output files + emit review events 鈹€鈹€
-            _review_text = full_text
-            if not _review_text.strip() and t.slash_command_mode in ("plan", "spec"):
-                # Model wrote files directly via file_write instead of
-                # outputting text.  Rebuild full_text from the written
-                # files so _save_review_output can create the review card.
-                _file_names = {
-                    "plan": ("PLAN.md", "STEPS.md", "CHECKLIST.md"),
-                    "spec": ("SPEC.md", "STEPS.md", "CHECKLIST.md"),
-                }
-                _names = _file_names.get(t.slash_command_mode, ())
-                _parts = []
-                for fn in _names:
-                    try:
-                        with open(fn, encoding="utf-8") as _f:
-                            _parts.append(_f.read())
-                    except (OSError, IOError):
-                        _parts.append("")
-                if any(_parts):
-                    _header_names = {
-                        "plan": ("## Plan", "## Steps", "## Checklist"),
-                        "spec": ("## Plan", "## Steps", "## Checklist"),
-                    }
-                    _hdrs = _header_names.get(t.slash_command_mode, ())
-                    _review_text = "\n\n".join(
-                        f"{h}\n{p}" for h, p in zip(_hdrs, _parts) if p.strip()
-                    )
-            for _e in self._save_review_output(_review_text, t.slash_command_mode, t.prompt):
-                yield _e
 
-            # 鈹€鈹€ Anti-stub: if the model returned a brief acknowledgment
+            # ── Anti-stub: if the model returned a brief acknowledgment
             # without any tool calls or prior tool work, nudge it to
             # actually act.  This catches the #1 task-delivery failure
             # mode: "I'll help you with that." / "Done!" with no work.
@@ -278,7 +284,7 @@ class PhaseRecoveryMixin:
                 if _stub_count < MAX_STUB_RESPONSE_RETRIES:
                     self._stub_response_retry_count = _stub_count + 1
                     self.session.add_message(
-                        "user", build_stub_retry_message(_stub_count + 1),
+                        "system", build_stub_retry_message(_stub_count + 1),
                         is_synthetic=True,
                     )
                     if self._state is not None:
@@ -298,22 +304,125 @@ class PhaseRecoveryMixin:
                 # next task starts fresh.
                 self._stub_response_retry_count = 0
 
-            # 鈹€鈹€ Auto-continue: when budget remains, nudge the model to
+            # ── Anti-deliberation: the mirror failure of a stub.  The
+            # model produced a very long internal monologue (possibly
+            # thinking-only) that re-decides the same question over and
+            # over, with no tool calls and no committed answer.  Nudge it
+            # to either act or ask one concise question.  Same gating as
+            # the stub check (no merge, no plan/spec mode, no checkpoint).
+            if not _is_stub and not merged and t.slash_command_mode not in ("plan", "spec") and not t.checkpoint_injected_this_run:
+                if is_deliberation_loop(t.text_parts, t.tool_call_buffers, t.thinking_parts):
+                    # Confirm the heuristic with a cheap LLM adjudication
+                    # call so verbose legitimate answers are not nudged.
+                    _adjudicated_loop = await adjudicate_deliberation(
+                        self.backend, t.text_parts, t.thinking_parts,
+                    )
+                    if not _adjudicated_loop:
+                        logger.info(
+                            "[run] deliberation heuristic overruled by LLM adjudication turn=%d",
+                            self.session.turn_count,
+                        )
+                    else:
+                        _dl_count = getattr(self, "_deliberation_retry_count", 0)
+                        if _dl_count < MAX_DELIBERATION_RETRIES:
+                            self._deliberation_retry_count = _dl_count + 1
+                            self.session.add_message(
+                                "system", build_deliberation_retry_message(_dl_count + 1),
+                                is_synthetic=True,
+                            )
+                            if self._state is not None:
+                                self._state.transitions.record(
+                                    TurnTransition.STUB_RESPONSE,
+                                    turn=self.session.turn_count,
+                                    detail=f"deliberation retry={_dl_count + 1}/{MAX_DELIBERATION_RETRIES}",
+                                )
+                            logger.info(
+                                "[run] deliberation loop detected, retrying turn=%d retry=%d/%d",
+                                self.session.turn_count, _dl_count + 1, MAX_DELIBERATION_RETRIES,
+                            )
+                            t.do_continue = True
+                            return
+                else:
+                    # Reset deliberation counter on any committed response.
+                    self._deliberation_retry_count = 0
+
+            # ── Auto-continue: when budget remains, nudge the model to
             # keep going instead of stopping early.  Mirrors Claude Code's
             # token-budget auto-continue (query/tokenBudget.ts).
+            #
+            # Token budget is a *resource* signal; the Plan-Do-Review engine
+            # carries the *task* signal.  Both must agree before the loop
+            # keeps spending: a completed plan never triggers another
+            # auto-continue, and a dead plan (every remaining step
+            # FAILED/BLOCKED) ends the run with a truthful blocked report
+            # instead of burning budget against an unrunnable plan.
+            _pdr_plan_complete = (
+                self._pdr_active and self._pdr.plan.is_complete
+            )
             _auto_continue = False
+            _progress_context = ""
             if (
                 self._profile.auto_continue
                 and self.config.token_budget > 0
                 and not t.tool_call_buffers
                 and not t.checkpoint_injected_this_run
                 and t.backend_usage
+                and not _pdr_plan_complete
             ):
                 self._budget_state.add_usage(
                     t.backend_usage.get("output_tokens", 0)
                     + t.backend_usage.get("input_tokens", 0)
                 )
                 self.session.metadata[BudgetState.META_KEY] = self._budget_state.checkpoint()
+                # Dead-plan gate: with an active plan whose remaining steps
+                # are all FAILED/BLOCKED there is nothing runnable left --
+                # continuing would only re-read the same dead plan.
+                if self._pdr_active:
+                    _plan = self._pdr.plan
+                    _open_steps = [
+                        s for s in _plan.steps
+                        if s.status in (
+                            _features.StepStatus.PENDING,
+                            _features.StepStatus.IN_PROGRESS,
+                        )
+                    ]
+                    if not _open_steps:
+                        _stuck = [
+                            f"{s.id}: {s.description[:120]} ({s.status.name})"
+                            for s in _plan.steps
+                            if s.status in (
+                                _features.StepStatus.FAILED,
+                                _features.StepStatus.BLOCKED,
+                            )
+                        ]
+                        logger.error(
+                            "[run] dead plan (%d stuck step(s)) turn=%d -- blocked finish",
+                            len(_stuck), self.session.turn_count,
+                        )
+                        yield create_finish(
+                            "stop", usage=t.backend_usage, context_usage=t.context_usage,
+                            error=(
+                                "plan_dead: the active plan has no runnable steps "
+                                f"left -- {len(_stuck)} step(s) failed or blocked: "
+                                + "; ".join(_stuck[:5])
+                            ),
+                            error_code="plan_dead",
+                            error_category="plan",
+                        )
+                        raise TurnExit()
+                    _progress_context = self._pdr.get_context()
+                else:
+                    # No active plan: surface the real run state (verification
+                    # ledger + tools that errored this run) so the continuation
+                    # nudge carries facts, not placeholders.
+                    _unverified_n = len(self._verif_ledger.unverified_files())
+                    _error_tools = sorted(self._error_tool_names)
+                    if _unverified_n or _error_tools:
+                        _progress_context = (
+                            f"Run state: {_unverified_n} edited file(s) still lack "
+                            f"passing verification; tools that errored this run: "
+                            f"{', '.join(_error_tools) if _error_tools else 'none'}."
+                        )
                 # Diminishing-returns guard: track consecutive auto-continues
                 # with tiny output.  If the model keeps "continuing" without
                 # producing meaningful output, stop (it is going in circles).
@@ -350,14 +459,32 @@ class PhaseRecoveryMixin:
                         self._budget_state.max_tokens,
                     )
                     self.session.add_message(
-                        "user", build_auto_continue_message(),
+                        "system",
+                        build_auto_continue_message(progress_context=_progress_context),
                         is_synthetic=True,
                     )
                     t.do_continue = True
                     return
+            elif _pdr_plan_complete and self._profile.auto_continue:
+                logger.info(
+                    "[run] plan complete -- auto-continue suppressed turn=%d",
+                    self.session.turn_count,
+                )
+
+            # Plan/spec mode suspends the verification ladder while the
+            # artifacts are still being drafted -- there is nothing to verify
+            # yet.  An approval installs a standing goal, and the
+            # implementation pass that follows is exactly where the ladder
+            # matters, so it is re-enabled for it (see verify_ladder_allowed).
+            _pm = getattr(self, "_plan_mode", None)
+            _verify_ok = (
+                _pm.verify_ladder_allowed(t.slash_command_mode)
+                if _pm is not None
+                else t.slash_command_mode not in ("plan", "spec")
+            )
 
             if not _auto_continue:
-                # 鈹€鈹€ Verify-on-stop (bounded nudge, Hermes port) 鈹€鈹€鈹€鈹€鈹€
+                # ── Verify-on-stop (bounded nudge, Hermes port) ─────
                 # If this turn's text-only finish happened after editing
                 # code that was never verified (or whose verification
                 # failed), nudge the model to verify instead of silently
@@ -368,7 +495,7 @@ class PhaseRecoveryMixin:
                 # deadlock.
                 _unverified = self._verif_ledger.unverified_files()
                 if (
-                    t.slash_command_mode not in ("plan", "spec")
+                    _verify_ok
                     and _unverified
                     and not t.checkpoint_injected_this_run
                     and self._verify_on_stop_nudges < self._profile.verify_on_stop_nudges
@@ -376,7 +503,7 @@ class PhaseRecoveryMixin:
                     self._verify_on_stop_nudges += 1
                     _failed = self._verif_ledger.has_failed_evidence()
                     self.session.add_message(
-                        "user", self._verif_ledger.build_nudge_message(failed=_failed),
+                        "system", self._verif_ledger.build_nudge_message(failed=_failed),
                         is_synthetic=True,
                     )
                     logger.info(
@@ -393,14 +520,14 @@ class PhaseRecoveryMixin:
                     t.do_continue = True
                     return
 
-                # 鈹€鈹€ Forced review escalation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+                # ── Forced review escalation ─────────────────────────
                 # If verify nudges were exhausted but a verification still
                 # failed, do not silently finish: demand a critical review
                 # (code-review skill / critic sub-agent) as the review stage
                 # of the implement -> verify -> review -> fix loop.  Bounded
                 # by _MAX_FORCED_REVIEWS so it can never deadlock.
                 if (
-                    t.slash_command_mode not in ("plan", "spec")
+                    _verify_ok
                     and _unverified
                     and self._verif_ledger.has_failed_evidence()
                     and not t.checkpoint_injected_this_run
@@ -408,7 +535,7 @@ class PhaseRecoveryMixin:
                 ):
                     self._forced_review_count += 1
                     self.session.add_message(
-                        "user",
+                        "system",
                         self._verif_ledger.build_forced_review_message(
                             list(self._verif_ledger.unverified_files())
                         ),
@@ -428,7 +555,7 @@ class PhaseRecoveryMixin:
                     t.do_continue = True
                     return
 
-                # 鈹€鈹€ Hard verification gate 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+                # ── Hard verification gate ────────────────────────────
                 # The final gate before a text-only finish is allowed.
                 # After verify-on-stop nudges and the forced-review stage
                 # are exhausted, unverified code must NOT silently become
@@ -439,14 +566,14 @@ class PhaseRecoveryMixin:
                 # the bound is reached we finish with an explicit
                 # "verification_blocked" error instead of a clean stop.
                 if (
-                    t.slash_command_mode not in ("plan", "spec")
+                    _verify_ok
                     and _unverified
                     and not t.checkpoint_injected_this_run
                     and self._verify_hard_gate_count < self._profile.verify_hard_gate
                 ):
                     self._verify_hard_gate_count += 1
                     self.session.add_message(
-                        "user",
+                        "system",
                         self._verif_ledger.build_hard_gate_message(
                             list(self._verif_ledger.unverified_files()),
                             remaining=self._profile.verify_hard_gate - self._verify_hard_gate_count,
@@ -471,7 +598,7 @@ class PhaseRecoveryMixin:
                 # unverified, do NOT yield a clean stop -- surface it as a
                 # blocked finish so the caller knows delivery is gated.
                 if (
-                    t.slash_command_mode not in ("plan", "spec")
+                    _verify_ok
                     and _unverified
                     and not t.checkpoint_injected_this_run
                     and self._profile.verify_budget_total() > 0
@@ -487,7 +614,7 @@ class PhaseRecoveryMixin:
                         len(_unverified), self._verify_hard_gate_count,
                     )
                     yield create_finish(
-                        "stop", usage=t.backend_usage,
+                        "stop", usage=t.backend_usage, context_usage=t.context_usage,
                         error=(
                             "verification_blocked: changes remain unverified "
                             f"({len(_unverified)} file(s)). Run the project build, "
@@ -503,12 +630,82 @@ class PhaseRecoveryMixin:
                         TurnTransition.TEXT_ONLY,
                         turn=self.session.turn_count,
                     )
+                # ── Standing goal gate (plan/spec) ────────────────────
+                # An approved plan/spec is the session's objective, not a
+                # one-shot approval.  While checklist items remain, a clean
+                # text-only finish is not an ending: the turn is pushed to the
+                # next outstanding item.  The mode is left only when every item
+                # is done, when the drive stalls with no progress left to make,
+                # or when the user exits the mode by hand.
+                _goal = None
+                if _pm is not None and _pm.goal_implementing:
+                    _pm.sync_goal_plan_items(getattr(self.session, "plan_items", None))
+                    _goal = _pm.active_goal
+                    _pending = _pm.pending_goal_items()
+                    _total = _goal.total if _goal is not None else 0
+                    _done = _goal.done_count() if _goal is not None else 0
+
+                    if not _pending:
+                        self.session.add_message(
+                            "system", _pm.goal_complete_message(), is_synthetic=True,
+                        )
+                        _pm.complete_goal()
+                        self.set_mode("")
+                        if self._state is not None:
+                            self._state.transitions.record(
+                                TurnTransition.TEXT_ONLY,
+                                turn=self.session.turn_count,
+                                detail="goal_complete",
+                            )
+                        logger.info(
+                            "[goal] complete (%d/%d) -- leaving mode turn=%d",
+                            _done, _total, self.session.turn_count,
+                        )
+                        yield create_finish("stop", usage=t.backend_usage, context_usage=t.context_usage)
+                        raise TurnExit()
+
+                    if _pm.note_goal_push():
+                        self.session.add_message(
+                            "system", _pm.goal_continue_message(), is_synthetic=True,
+                        )
+                        if self._state is not None:
+                            self._state.transitions.record(
+                                TurnTransition.AUTO_CONTINUE,
+                                turn=self.session.turn_count,
+                                detail="goal_push",
+                            )
+                        logger.info(
+                            "[goal] push (%d/%d done, %d outstanding) turn=%d",
+                            _done, _total, len(_pending), self.session.turn_count,
+                        )
+                        t.do_continue = True
+                        return
+
+                    if self._state is not None:
+                        self._state.transitions.record(
+                            TurnTransition.TEXT_ONLY,
+                            turn=self.session.turn_count,
+                            detail="goal_incomplete",
+                        )
+                    logger.error(
+                        "[goal] stalled with %d item(s) outstanding -- blocked finish turn=%d",
+                        len(_pending), self.session.turn_count,
+                    )
+                    yield create_finish(
+                        "stop", usage=t.backend_usage, context_usage=t.context_usage,
+                        error=_pm.goal_incomplete_message(),
+                        error_code="goal_incomplete",
+                        error_category="goal",
+                    )
+                    raise TurnExit()
+
                 # Plan-Do-Review step advancement (WORKSPACE): when the
                 # turn finished cleanly, mark the current step done (or
                 # failed if verification evidence shows broken state) and
                 # start the next step so the plan makes visible progress
-                # across turns.
-                if self._pdr_active:
+                # across turns.  A standing goal owns this drive when one is
+                # active, so the two never push the same turn.
+                if self._pdr_active and _goal is None:
                     _step_failed = self._verif_ledger.has_failed_evidence()
                     if _step_failed:
                         _failed_files = self._verif_ledger.unverified_files()
@@ -524,21 +721,24 @@ class PhaseRecoveryMixin:
                         # advancing to the next one, closing the loop that
                         # was previously Plan+Do only.
                         _review = self._pdr.lightweight_review()
-                        if _review in (ReviewGrade.FAIL, ReviewGrade.NEEDS_RETRY):
+                        if _review in (
+                            _features.ReviewGrade.FAIL,
+                            _features.ReviewGrade.NEEDS_RETRY,
+                        ):
                             self._pdr.mark_step_failed(error=f"review grade: {_review.name}")
                     # Advance only when the current step actually reached
                     # COMPLETED. mark_step_failed may keep it IN_PROGRESS
                     # (retry budget) -- advancing then would skip the retry.
                     _cur = self._pdr.plan.current_step
-                    if _cur is not None and _cur.status == StepStatus.COMPLETED:
+                    if _cur is not None and _cur.status == _features.StepStatus.COMPLETED:
                         _next = self._pdr.start_next_step()
-                        if _next is not None and _next.status == StepStatus.IN_PROGRESS:
+                        if _next is not None and _next.status == _features.StepStatus.IN_PROGRESS:
                             logger.info(
                                 "[run] Plan-Do-Review step %d/%d completed, advancing to next step",
                                 self._pdr.plan.current_step_index + 1, len(self._pdr.plan.steps),
                             )
                             self.session.add_message(
-                                "user",
+                                "system",
                                 f"[PLAN STEP {self._pdr.plan.current_step_index + 1}] "
                                 f"Continue the plan. Next step: {_next.description} "
                                 f"(success criteria: {_next.success_criteria}).",
@@ -546,7 +746,7 @@ class PhaseRecoveryMixin:
                             )
                             t.do_continue = True
                             return
-                yield create_finish("stop", usage=t.backend_usage)
+                yield create_finish("stop", usage=t.backend_usage, context_usage=t.context_usage)
                 # Main session: text-only ends this run. User sends next message.
                 # Sub-agent: text-only completes the sub-agent task.
                 raise TurnExit()
@@ -560,12 +760,12 @@ class PhaseRecoveryMixin:
         # ``client_id`` (in tool_progress / tool_result events) with
         # the same tc after a session restore.  Without this, restore
         # uses the backend ``id`` (tc["id"]) and streaming updates use
-        # the client_id 鈥?the two halves never meet, so
+        # the client_id — the two halves never meet, so
         # subAgentMessages never lands on the right tc.
         t.assistant_tool_calls = []
         for idx in sorted(t.tool_call_buffers.keys()):
             tc = t.tool_call_buffers[idx]
-            client_id = f"call_{self.session.turn_count}_{idx}"
+            client_id = f"call_{t.tool_id_token}_{idx}"
             protocol_id = tc["id"] or client_id
             tc["id"] = protocol_id
             entry: dict[str, Any] = {
@@ -590,6 +790,15 @@ class PhaseRecoveryMixin:
             msg_kwargs["usage"] = t.backend_usage
         if t.thinking_parts:
             msg_kwargs["reasoning_content"] = "".join(t.thinking_parts)
+        if t.thinking_blocks:
+            # Native-thinking protocols (Anthropic Messages API) replay
+            # thinking blocks with their server-issued signatures; a
+            # mismatched or missing signature is a hard 400.  The plain
+            # ``reasoning_content`` concatenation loses the block
+            # boundaries, so the block list travels alongside it.
+            msg_kwargs["reasoning_blocks"] = [
+                b for b in t.thinking_blocks if b.get("text") or b.get("signature")
+            ]
         # Build segments from streaming order
         segs = []
         if t.thinking_parts:
@@ -601,6 +810,7 @@ class PhaseRecoveryMixin:
         if segs:
             msg_kwargs["segments"] = segs
         self.session.add_message("assistant", t.assistant_content or None, **msg_kwargs)
+        self._clear_pending_stream()
 
 
 class PostStreamPhase(LoopPhase):

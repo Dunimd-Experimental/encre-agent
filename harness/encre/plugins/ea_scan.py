@@ -27,13 +27,19 @@ placed under ``ea_tools/``.  Discovery is fully directory-driven: dropping a
 new package folder (e.g. ``ea-tool-foo/`` or ``ea-skill-bar/``) is enough to
 register it — no hardcoded module lists anywhere.
 
-Two runtime layouts are supported:
+All packages install into exactly ONE directory: ``<data_root>/plugins``
+(``~/.dunimd/encre/plugins`` by default, relocatable via ``ENCRE_DATA_DIR``;
+the application installer's deployment target).  Discovery scans only that
+directory — there are no dev-tree or frozen-bundle fallbacks.  The only
+tools living outside it are the mandatory system tools hardcoded in the
+harness itself.  If a package is not already importable, its directory is
+prepended to ``sys.path`` (no pip install step required).
 
-* **Development**: packages live in ``<harness>/ea_tools/<pkg>/``.  If a
-  package is not already importable, its directory is prepended to
-  ``sys.path`` (no pip install step required).
-* **Frozen (PyInstaller)**: the whole ``ea_tools/`` tree is shipped as data
-  under ``sys._MEIPASS/ea_tools/``; the same scan + ``sys.path`` logic applies.
+Both run modes materialize the shipped packages into the install directory
+before scanning (:func:`_ensure_deployed`): a frozen app carries them as
+PyInstaller data (``<bundle>/ea_tools``), a dev checkout keeps them at
+``<repo>/core/ea_tools``.  Deployment is idempotent (fingerprint stamp) and
+best-effort; the scan itself never leaves the install directory.
 
 Each package's ``pyproject.toml`` is the single source of truth for metadata
 (``name``, ``version``, ``authors``, ``description``) and carries an optional
@@ -46,10 +52,12 @@ Each package's ``pyproject.toml`` is the single source of truth for metadata
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -82,59 +90,240 @@ class EaPackageInfo:
     factory_target: str
     pkg_dir: Path
     skills_dir: Path | None
+    #: Verbatim ``[tool.ea]`` table from pyproject.toml.  Carries the
+    #: ``tier`` plus optional ``transport`` / ``endpoint`` /
+    #: ``resource_limits`` / ``permissions`` / ``activation_events`` that the
+    #: registry mirrors onto the manifest at discovery time.
+    tool_ea: dict[str, Any] = field(default_factory=dict)
 
 
-def _is_frozen() -> bool:
-    return bool(getattr(sys, "frozen", False))
+def packaged_skills(pkg: EaPackageInfo) -> list[str]:
+    """Skill names a package actually ships, read off its own files.
 
-
-def _ea_tools_candidates(here: Path) -> list[Path]:
-    """Return dev-tree candidate locations of the ``ea_tools/`` directory.
-
-    Ordered by preference.  In a source checkout ``ea_scan.py`` lives at
-    ``harness/encre/plugins/ea_scan.py``, so ``parents[2]`` is the harness
-    root and ``parents[3]`` the repository root.  The packages historically
-    sat at ``harness/ea_tools/`` and now live at ``core/ea_tools/`` (the EA
-    extension set belongs to the encre-core distribution).  A bare
-    ``pip install encre-harness`` has none of them — discovery then relies
-    on entry points, which is the intended embedding behaviour.
+    ``[tool.ea] provides_skills`` is optional and the official packages leave
+    it out, yet each one carries ``<module>/skills/<name>/SKILL.md`` on disk.
+    The directory is the evidence, so the registry can state what the plugin
+    provides — and the market can show it — without anybody declaring it twice
+    or guessing.  Empty when the package has no skills directory.
     """
-    harness_root = here.parents[2]          # .../harness
-    repo_root = here.parents[3]             # .../encre (repository root)
-    return [
-        repo_root / "core" / _EA_TOOLS_DIRNAME,   # current: <repo>/core/ea_tools/
-        repo_root / _EA_TOOLS_DIRNAME,            # repo-level: <repo>/ea_tools/
-        harness_root / _EA_TOOLS_DIRNAME,        # legacy: harness/ea_tools/
-    ]
+    if pkg.skills_dir is None:
+        return []
+    try:
+        found = [c.name for c in pkg.skills_dir.iterdir() if c.is_dir() and (c / "SKILL.md").is_file()]
+        # Flat skill documents (``skills/<name>.md``) are first-class skills
+        # too — the tool packages ship their use-instructions that way, and a
+        # package can carry several.  Leaving them out made a multi-skill
+        # package look like it had one skill.
+        found += [
+            f.stem for f in pkg.skills_dir.iterdir()
+            if f.is_file() and f.suffix.lower() == ".md" and f.name != "MEMORY.md"
+        ]
+    except OSError:
+        return []
+    return sorted(set(found))
+
+
+def _plugin_install_root() -> Path:
+    """Return the unique plugin install directory.
+
+    ``<data_root>/plugins`` is the single deployment target: the
+    application installer puts every packaged plugin (``ea-tool-*`` /
+    ``ea-skill-*`` bundles, tool packages, skills) there, and discovery
+    scans only this directory.  The only tools living outside it are the
+    mandatory system tools hardcoded in the harness itself.
+
+    Resolved through :func:`encre.paths.get_data_dir` (the single source
+    of truth for the data tree) so an ``ENCRE_DATA_DIR`` override keeps
+    the WS ``plugin_install`` target and this scan root in lockstep — a
+    hand-rolled ``~/.dunimd/encre`` here used to diverge from the WS
+    handler whenever the env var was set (containers / CI / multi-instance).
+    """
+    from encre.paths import get_data_dir
+
+    return get_data_dir("plugins")
+
+
+def _bundled_source() -> Path | None:
+    """Locate the read-only plugin packages shipped with the application.
+
+    Frozen builds: ``<bundle>/ea_tools`` (PyInstaller data, ``sys._MEIPASS``
+    already points at the ``_internal`` contents directory).  Dev checkouts:
+    ``<repo>/core/ea_tools`` next to the source tree.  A pip-installed
+    library carries no bundle, so ``None`` is returned and discovery falls
+    back to entry points only.
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidate = Path(meipass) / _EA_TOOLS_DIRNAME
+            if candidate.is_dir():
+                return candidate
+        return None
+    repo_root = Path(__file__).resolve().parents[3]
+    candidate = repo_root / "core" / _EA_TOOLS_DIRNAME
+    return candidate if candidate.is_dir() else None
+
+
+def _walk_files(root: Path) -> list[tuple[str, int, int]]:
+    """List ``(relpath, mtime_ns, size)`` for the package tree, cheaply.
+
+    ``Path.rglob`` + ``is_file()`` cost ~10x more than one ``scandir`` sweep
+    on Windows (pathlib globs re-check every match); this runs before every
+    discovery, so the walk itself must not dominate startup.
+    """
+    found: list[tuple[str, int, int]] = []
+    base = str(root)
+    stack = [base]
+    while stack:
+        directory = stack.pop()
+        try:
+            iterator = os.scandir(directory)
+        except OSError:
+            continue
+        with iterator:
+            for entry in iterator:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name in ("__pycache__", "dist") or entry.name.endswith(".egg-info"):
+                            continue
+                        stack.append(entry.path)
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                rel = os.path.relpath(entry.path, base).replace(os.sep, "/")
+                found.append((rel, st.st_mtime_ns, st.st_size))
+    found.sort()
+    return found
+
+
+def _source_fingerprint(source: Path) -> str:
+    """Fingerprint the bundled package tree (names + file mtimes/sizes).
+
+    Frozen bundles take a cheap top-level path: the bundle is immutable for
+    the process lifetime and an application update recreates the directory
+    tree, so the root's own timestamps plus the package-name list detect
+    every realistic change without stat-ing every file.  Dev checkouts keep
+    the deep scan: in-place file edits do not change directory mtimes and
+    dev redeployment must see them.
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            st = source.stat()
+            names = ",".join(sorted(p.name for p in source.iterdir()))
+            return hashlib.sha1(f"frozen:{st.st_mtime_ns}:{st.st_ctime_ns}:{names}".encode()).hexdigest()
+        except OSError:
+            pass  # fall through to the deep scan
+    digest = hashlib.sha1()
+    for rel, mtime_ns, size in _walk_files(source):
+        digest.update(f"{rel}\0{mtime_ns}\0{size}\n".encode())
+    return digest.hexdigest()
+
+
+#: Per-process guard: the deployment check (fingerprint of the bundled
+#: tree) runs once per process.  Discovery calls :func:`ea_tools_root`
+#: (and therefore this) several times per startup; the bundled source is
+#: immutable while the process is alive — a frozen bundle never changes,
+#: and dev-tree edits are only picked up on the next start — so every
+#: re-check re-paid the full stat cost for nothing.
+_DEPLOY_CHECKED = False
+
+
+def _ensure_deployed(root: Path) -> None:
+    """Materialize bundled plugin packages into the install directory.
+
+    This is *deployment*, not discovery: the unique install dir remains the
+    only place the scanner ever looks.  A fingerprint stamp skips the copy
+    when the shipped tree has not changed.  Best-effort — any failure means
+    nothing was deployed, never a crash of the importing application.
+
+    Removal is part of deployment.  The install dir also holds plugins the
+    user installed from the market, so pruning cannot be "delete whatever is
+    not in the bundle" -- it deletes exactly the packages a previous bundle
+    deployed and this bundle no longer ships, tracked in ``.bundled.names``.
+    Without that ledger a package removed from ``ea_tools/`` would stay active
+    forever in every install, shadowing the builtin of the same tool name.
+    """
+    global _DEPLOY_CHECKED
+    if _DEPLOY_CHECKED:
+        return
+    _DEPLOY_CHECKED = True
+    source = _bundled_source()
+    if source is None:
+        return
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = root / ".bundled.stamp"
+        ledger = root / ".bundled.names"
+        fingerprint = _source_fingerprint(source)
+        shipped = {p.name for p in source.iterdir() if p.is_dir()}
+        if stamp.is_file() and stamp.read_text(encoding="utf-8") == fingerprint:
+            return
+        for pkg in source.iterdir():
+            if pkg.is_dir():
+                target = root / pkg.name
+                # Replace, do not merge.  ``copytree(dirs_exist_ok=True)``
+                # leaves files that were deleted or renamed upstream behind
+                # (a stale ``tool-computer_use.md`` next to the current
+                # ``tool-computer.md`` kept being registered as a skill), and
+                # a bundled package is a mirror of the shipped tree, never a
+                # place for local edits.
+                try:
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    shutil.copytree(
+                        pkg, target,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"),
+                    )
+                except Exception as exc:
+                    logger.debug("Could not deploy %s: %s", pkg.name, exc)
+        previous = _read_ledger(ledger)
+        retired = sorted(name for name in previous if name not in shipped)
+        for name in retired:
+            stale = root / name
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
+        ledger.write_text("\n".join(sorted(shipped)), encoding="utf-8")
+        stamp.write_text(fingerprint, encoding="utf-8")
+        if retired:
+            logger.info(
+                "Undeployed %d bundled package(s) no longer shipped: %s",
+                len(retired), ", ".join(retired[:8]) + (" ..." if len(retired) > 8 else ""),
+            )
+        else:
+            logger.info("Deployed bundled plugin packages to %s", root)
+    except Exception as exc:
+        logger.debug("Bundled plugin deployment skipped: %s", exc)
+
+
+def _read_ledger(path: Path) -> set[str]:
+    """Names this function previously deployed; empty on the first run.
+
+    A pre-existing install has no ledger, so its leftovers are unknowns: the
+    first run records what the bundle ships today and prunes only from then on,
+    rather than guessing which directories the user installed themselves.
+    """
+    try:
+        if path.is_file():
+            return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except Exception:
+        logger.debug("Unreadable bundled ledger %s", path, exc_info=True)
+    return set()
 
 
 def ea_tools_root() -> Path:
-    """Return the directory that contains the bundled ``ea-tool-*`` packages.
+    """Return the directory containing installed plugin packages.
 
-    Resolution order:
-
-    1. ``ENCRE_EA_TOOLS_ROOT`` environment variable (explicit override).
-    2. ``sys._MEIPASS/ea_tools`` in frozen (PyInstaller) builds.
-    3. The first existing dev-tree candidate (see
-       :func:`_ea_tools_candidates`).
-
-    Returns a nonexistent path when nothing matches; the scanner treats a
-    missing directory as "no bundled packages" (entry-point discovery only).
+    Always ``<data_root>/plugins`` (``~/.dunimd/encre/plugins`` by default,
+    relocatable via ``ENCRE_DATA_DIR``) — the unique install location.  On
+    the way there, packages shipped with the application (frozen bundle or
+    dev checkout) are deployed into it if needed.  The path is returned
+    even when it does not exist yet; the scanner treats a missing directory
+    as "nothing installed" (entry-point discovery only).
     """
-    # 1. Explicit override wins.
-    env_root = os.environ.get("ENCRE_EA_TOOLS_ROOT")
-    if env_root:
-        return Path(env_root)
-    if _is_frozen():
-        meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
-        return meipass / _EA_TOOLS_DIRNAME
-    here = Path(__file__).resolve()
-    for candidate in _ea_tools_candidates(here):
-        if candidate.is_dir():
-            return candidate
-    # Nothing found: return the legacy path so callers see a consistent
-    # (missing) location instead of an odd half-composed one.
-    return _ea_tools_candidates(here)[0]
+    root = _plugin_install_root()
+    _ensure_deployed(root)
+    return root
 
 
 def _parse_pyproject(path: Path) -> dict[str, Any]:
@@ -151,10 +340,16 @@ def _parse_pyproject(path: Path) -> dict[str, Any]:
     return data
 
 
+def _extract_tool_ea(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the verbatim ``[tool.ea]`` table (empty dict when absent)."""
+    tool_ea = data.get("tool", {}).get("ea", {})
+    return tool_ea if isinstance(tool_ea, dict) else {}
+
+
 def _extract_tier(data: dict[str, Any]) -> str:
     """Read ``[tool.ea] tier``; bundled packages default to system-default."""
-    tool_ea = data.get("tool", {}).get("ea", {})
-    if isinstance(tool_ea, dict) and tool_ea.get("tier") in (TIER_MANDATORY, TIER_SYSTEM_DEFAULT, TIER_USER):
+    tool_ea = _extract_tool_ea(data)
+    if tool_ea.get("tier") in (TIER_MANDATORY, TIER_SYSTEM_DEFAULT, TIER_USER):
         return tool_ea["tier"]
     return TIER_SYSTEM_DEFAULT
 
@@ -187,16 +382,20 @@ def _derive_module_name(pkg_dir: Path, data: dict[str, Any]) -> str | None:
 def _ensure_importable(module_name: str, pkg_dir: Path) -> bool:
     """Make sure *module_name* resolves from *pkg_dir*.
 
-    ``pkg_dir`` is prepended to ``sys.path`` so the top-level package it
-    contains (``pkg_dir/<module_name>/``) becomes importable.  Existence is
-    verified with a single filesystem probe rather than
-    ``importlib.util.find_spec`` — the latter walks every ``sys.path`` entry
-    (~170 ``stat`` calls per package), which dominated discovery time across
-    hundreds of packages.
+    ``pkg_dir`` is appended to ``sys.path`` so the top-level package it
+    contains (``pkg_dir/<module_name>/``) becomes importable.  Appending —
+    not prepending — is deliberate: a plugin-controlled directory at
+    ``sys.path[0]`` could shadow stdlib or core modules (a stray
+    ``logging.py`` would hijack the whole process) for every later import.
+    Module names are unique ``ea_*`` identifiers, so tail placement never
+    mis-resolves them.  Existence is verified with a single filesystem
+    probe rather than ``importlib.util.find_spec`` — the latter walks every
+    ``sys.path`` entry (~170 ``stat`` calls per package), which dominated
+    discovery time across hundreds of packages.
     """
     pkg_dir_str = str(pkg_dir)
     if pkg_dir_str not in sys.path:
-        sys.path.insert(0, pkg_dir_str)
+        sys.path.append(pkg_dir_str)
     return (pkg_dir / module_name).is_dir() or (pkg_dir / f"{module_name}.py").is_file()
 
 
@@ -214,7 +413,11 @@ def iter_ea_packages() -> Iterator[EaPackageInfo]:
         return
 
     for pkg_dir in sorted(root.iterdir()):
-        if not pkg_dir.is_dir() or not pkg_dir.name.startswith(("ea-tool-", "ea-skill-")):
+        # ea-tool-/ea-skill-: bundled or zip-installed packages;
+        # ea-plugin-: central-repository wheels unpacked by the market
+        # installer (encre.market_catalog), laid out like any EA package.
+        if not pkg_dir.is_dir() or not pkg_dir.name.startswith(
+                ("ea-tool-", "ea-skill-", "ea-plugin-", "ea-connector-")):
             continue
         data = _parse_pyproject(pkg_dir / "pyproject.toml")
         module_name = _derive_module_name(pkg_dir, data)
@@ -254,4 +457,5 @@ def iter_ea_packages() -> Iterator[EaPackageInfo]:
             factory_target=factory_target or f"{module_name}:create_plugin",
             pkg_dir=pkg_dir,
             skills_dir=skills_dir if skills_dir.is_dir() else None,
+            tool_ea=_extract_tool_ea(data),
         )

@@ -1,13 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -20,6 +20,8 @@
 #
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
+
+from __future__ import annotations
 
 """Autonomous, goal-driven agent execution for Encre.
 
@@ -164,13 +166,18 @@ class EncreGoalRunner:
         """
         provider = goal.evaluator_provider or self.config.backend_type
         model = goal.evaluator_model or self.config.model
+        _sampling = self.config.active_model_sampling_overrides()
+        # A stale sampling copy persisted inside backend_kwargs must not
+        # shadow the explicit values.
+        _bk = {k: v for k, v in self.config.backend_kwargs.items() if k not in self.config._SAMPLING_KEYS}
         if goal.evaluator_provider:
             return create_backend(
                 provider,
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
                 model=model,
-                **self.config.backend_kwargs,
+                **_sampling,
+                **_bk,
             )
         # Use a fast/cheap model for evaluation when possible
         eval_model = model
@@ -185,7 +192,8 @@ class EncreGoalRunner:
             api_key=self.config.api_key,
             base_url=self.config.base_url,
             model=eval_model,
-            **self.config.backend_kwargs,
+            **_sampling,
+            **_bk,
         )
 
     async def run(

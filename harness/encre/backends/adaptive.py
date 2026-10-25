@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,22 +23,28 @@
 
 from __future__ import annotations
 
-"""调用前能力降级规划（capability matrix adaptive routing）。
+"""Pre-call capability degradation planning (capability-matrix adaptive routing).
 
-内核 loop 不再假设每个模型都支持工具调用、图像输入、提示缓存与流式响应。
-本模块以 :class:`~encre.backends.registry.ModelInfo` 为主判据，并结合 backend
-自身暴露的 ``supports_*`` 能力方法（作为**更严格的**补充约束，两者取"与"，
-任一为假即降级），在真正调用 backend 之前算出一份 :class:`CapabilityPlan`：
+The kernel loop no longer assumes that every model supports tool calling, image
+input, prompt caching, and streaming responses.  This module takes
+:class:`~encre.backends.registry.ModelInfo` as its primary signal, and layers
+the backend's own ``supports_*`` capability methods on top as a **stricter**
+secondary constraint (the two are AND-combined: if either says no, the
+capability is degraded).  Before a backend is actually called, a
+:class:`CapabilityPlan` is computed that decides, per dimension:
 
-- ``use_tools``：为假时不向 backend 传 tools schema，改为把工具清单压缩成
-  纯文本指令注入 system prompt（见 :func:`tool_intent_fallback`）。
-- ``use_vision``：为假时剥离消息中的图片引用并替换为文本描述
-  （见 :func:`apply_to_messages`）。
-- ``use_caching``：为假时不注入缓存边界。
-- ``use_streaming``：为假时以非流式方式请求。
+- ``use_tools``: when False, no tools schema is sent to the backend.  The tool
+  catalogue is instead compressed into a plain-text instruction and injected
+  into the system prompt (see :func:`tool_intent_fallback`).
+- ``use_vision``: when False, image references in messages are stripped and
+  replaced with a text description (see :func:`apply_to_messages`).
+- ``use_caching``: when False, no caching boundary is injected.
+- ``use_streaming``: when False, the request is made non-streamingly.
 
-设计约束：本模块**绝不抛异常**。任何畸形/缺失输入都必须退化为保守方案，并把
-降级原因记录在 :attr:`CapabilityPlan.reasons` 中，以便审计与排障。
+Design constraint: this module **never raises**.  Any malformed or missing
+input must degrade to a conservative plan, and every degraded dimension must
+record its reason in :attr:`CapabilityPlan.reasons` so audits and debugging can
+see exactly what was turned off and why.
 """
 
 from dataclasses import dataclass, field
@@ -47,14 +53,14 @@ from typing import Any
 from encre.backends.registry import ModelInfo
 
 
-# 图片类内容块的类型标识：OpenAI 风格 ``image_url``、Anthropic 风格
-# ``image``、OpenAI Responses API 风格 ``input_image``。
+# Type markers for image-bearing content parts: OpenAI-style ``image_url``,
+# Anthropic-style ``image``, and the OpenAI Responses API's ``input_image``.
 _IMAGE_PART_TYPES: frozenset[str] = frozenset({"image_url", "image", "input_image"})
 
-# 图片被剥离后写入消息的占位文本。
+# Placeholder text written into a message when an image part has been stripped.
 _IMAGE_OMITTED_TEXT = "[图片已省略：当前模型不支持图像输入]"
 
-# 注入 system prompt 的工具意图说明标题。
+# Heading for the tool-intent block injected into the system prompt.
 _TOOL_INTENT_HEADER = (
     "[工具意图说明] 当前模型不支持原生工具调用。若需要调用下列工具，"
     "请用文本明确表达意图，格式为："
@@ -64,14 +70,15 @@ _TOOL_INTENT_HEADER = (
 
 @dataclass
 class CapabilityPlan:
-    """调用前算出的四维降级方案。
+    """Four-axis degradation plan computed before a backend call.
 
     Attributes:
-        use_tools: 是否向 backend 传 tools schema。
-        use_vision: 是否允许消息携带图片引用。
-        use_caching: 是否允许注入提示缓存边界。
-        use_streaming: 是否以流式方式请求。
-        reasons: 每个被降级维度的原因（维度名 -> 说明），用于审计/排障。
+        use_tools: whether to send the tools schema to the backend.
+        use_vision: whether messages are allowed to carry image references.
+        use_caching: whether prompt-caching boundaries may be injected.
+        use_streaming: whether the request should stream.
+        reasons: per-degraded-dimension reason (dimension name -> explanation),
+            retained for audit and troubleshooting.
     """
 
     use_tools: bool = True
@@ -82,20 +89,23 @@ class CapabilityPlan:
 
     @property
     def degraded(self) -> bool:
-        """是否有任一维度被降级。"""
+        """Whether any dimension has been turned down."""
         return bool(self.reasons)
 
 
 def _call_backend_flag(backend: Any, method_name: str) -> bool | None:
-    """安全地询问 backend 的能力方法。
+    """Safely ask a backend for one of its capability flags.
 
     Args:
-        backend: 具体 backend 实例；``None`` 表示不可用。
-        method_name: 形如 ``supports_tool_calling`` 的能力方法名。
+        backend: the concrete backend instance; ``None`` means unavailable.
+        method_name: a capability method name such as
+            ``supports_tool_calling``.
 
     Returns:
-        方法存在且可调用时返回其布尔结果；方法缺失或调用抛异常时返回
-        ``None``（视为"无额外约束"，以 ModelInfo 的判定为准）。
+        The boolean result when the method exists and is callable.
+        ``None`` when the method is missing or the call raises -- treated as
+        "no extra constraint", so that the ModelInfo-based decision stands on
+        its own.
     """
     if backend is None:
         return None
@@ -114,32 +124,38 @@ def compute_plan(
     backend: Any = None,
     config: Any = None,
 ) -> CapabilityPlan:
-    """按模型能力矩阵计算调用前的降级方案。
+    """Compute the pre-call degradation plan from the model capability matrix.
 
-    判定规则：
+    Decision rules:
 
-    1. 以 ``ModelInfo`` 为主判据（``supports_tools`` / ``supports_images`` /
-       ``supports_prompt_caching`` / ``supports_streaming``）。
-    2. backend 的能力方法（``supports_tool_calling`` / ``supports_vision_input`` /
-       ``supports_prompt_caching``）作为更严格的补充约束，与主判据取"与"。
-    3. ``model_info`` 为 ``None`` 时不得盲目乐观：tools / vision / caching 一律
-       保守降级，streaming 保留（现有 backend 均支持流式）。
+    1. ``ModelInfo`` is the primary signal (``supports_tools`` /
+       ``supports_images`` / ``supports_prompt_caching`` /
+       ``supports_streaming``).
+    2. The backend's capability methods (``supports_tool_calling`` /
+       ``supports_vision_input`` / ``supports_prompt_caching``) act as a
+       stricter secondary constraint, AND-combined with the primary signal.
+    3. When ``model_info`` is ``None`` we must not be blindly optimistic:
+       tools / vision / caching are all degraded conservatively; streaming is
+       kept (every current backend supports it).
 
     Args:
-        model_info: 当前模型元数据；未知时传 ``None``。
-        backend: 可选的 backend 实例，用于叠加更严格的能力约束。
-        config: 可选配置对象；显式关闭提示缓存时同样降级 caching。
+        model_info: current model metadata; pass ``None`` when unknown.
+        backend: optional backend instance used to layer stricter capability
+            constraints.
+        config: optional configuration object; explicitly disabling prompt
+            caching degrades the caching dimension as well.
 
     Returns:
-        一份 :class:`CapabilityPlan`。本函数绝不抛异常。
+        A :class:`CapabilityPlan`. This function never raises.
     """
     reasons: dict[str, str] = {}
 
     if model_info is None:
-        # 未知模型 -> 保守默认：不传 tools、不发图片、不注入缓存边界。
-        reasons["tools"] = "unknown model → conservative default"
-        reasons["vision"] = "unknown model → conservative default"
-        reasons["caching"] = "unknown model → conservative default"
+        # Unknown model -> conservative defaults: no tools, no images, and no
+        # caching boundary. Streaming stays on (see rule 3 above).
+        reasons["tools"] = "unknown model -> conservative default"
+        reasons["vision"] = "unknown model -> conservative default"
+        reasons["caching"] = "unknown model -> conservative default"
         plan = CapabilityPlan(
             use_tools=False,
             use_vision=False,
@@ -169,7 +185,9 @@ def compute_plan(
             reasons=reasons,
         )
 
-    # backend 能力方法：更严格的补充约束（取"与"）。已降级的维度保留原有原因。
+    # Backend capability methods: a stricter secondary constraint (AND). A
+    # dimension already degraded above keeps its original reason -- these
+    # branches only fire while the plan still had the capability enabled.
     if _call_backend_flag(backend, "supports_tool_calling") is False and plan.use_tools:
         plan.use_tools = False
         plan.reasons["tools"] = "backend does not support tool calling"
@@ -180,7 +198,8 @@ def compute_plan(
         plan.use_caching = False
         plan.reasons["caching"] = "backend does not support prompt caching"
 
-    # config 覆盖：显式关闭提示缓存时同样降级。
+    # Config override: an explicit "disable prompt caching" setting degrades
+    # the caching dimension too.
     if config is not None and not bool(getattr(config, "enable_prompt_caching", True)):
         if plan.use_caching:
             plan.use_caching = False
@@ -193,9 +212,10 @@ def apply_to_tools(
     tools: list[dict[str, Any]] | None,
     plan: CapabilityPlan,
 ) -> list[dict[str, Any]] | None:
-    """按降级方案裁剪 tools schema。
+    """Trim the tools schema according to the plan.
 
-    ``plan.use_tools`` 为假时返回 ``None``，即不向 backend 传任何 tools schema。
+    When ``plan.use_tools`` is False, returns ``None`` so that no tools schema
+    reaches the backend at all.
     """
     if not plan.use_tools:
         return None
@@ -206,12 +226,13 @@ def apply_to_messages(
     messages: list[dict[str, Any]],
     plan: CapabilityPlan,
 ) -> list[dict[str, Any]]:
-    """按降级方案剥离消息中的图片引用。
+    """Strip image references from messages according to the plan.
 
-    ``plan.use_vision`` 为假时，把 OpenAI 风格 ``{"type": "image_url", ...}``
-    与 Anthropic 风格 ``{"type": "image", "source": {...}}`` 等图片内容块替换
-    为文本描述（保留 alt / text / filename 等元信息）。返回新的消息结构，**不**
-    就地修改入参。
+    When ``plan.use_vision`` is False, OpenAI-style
+    ``{"type": "image_url", ...}`` and Anthropic-style
+    ``{"type": "image", "source": {...}}`` image parts are replaced with a
+    text description (preserving alt / text / filename metadata). Returns a
+    new message structure; does **not** mutate the input in place.
     """
     if plan.use_vision or not messages:
         return messages
@@ -238,18 +259,22 @@ def apply_to_messages(
 
 
 def tool_intent_fallback(tool_payload: list[dict[str, Any]] | None) -> str:
-    """把工具清单压缩成一段纯文本指令，供注入 system prompt。
+    """Compress the tool catalogue into a plain-text instruction for the system prompt.
 
-    当 tools 被降级关闭时，模型仍需要知道有哪些工具可用、如何用文本表达调用
-    意图。这里复用 ``discovery.get_active_tools_payload(...)`` 的返回结构
-    （OpenAI 风格 ``{"type": "function", "function": {...}}`` 或 Anthropic 风格
-    ``{"name": ..., "description": ...}``），逐条渲染"工具名 + 一句话用途"。
+    When the tools dimension has been degraded off, the model still needs to
+    know which tools exist and how to express a call as text. This reuses the
+    shape returned by ``discovery.get_active_tools_payload(...)``
+    (OpenAI-style ``{"type": "function", "function": {...}}`` or
+    Anthropic-style ``{"name": ..., "description": ...}``) and renders each
+    tool as "name + one-sentence purpose".
 
     Args:
-        tool_payload: 活跃工具清单；为空时返回空字符串。
+        tool_payload: the active tool list; returns the empty string when
+            empty.
 
     Returns:
-        可追加到 system prompt 末尾的纯文本指令；无可用工具时返回 ``""``。
+        A plain-text instruction block to append to the end of the system
+        prompt; ``""`` when there are no usable tools.
     """
     if not tool_payload:
         return ""
@@ -268,10 +293,10 @@ def tool_intent_fallback(tool_payload: list[dict[str, Any]] | None) -> str:
 
 
 def _is_image_part(part: dict[str, Any]) -> bool:
-    """判断一个内容块是否为图片引用。"""
+    """Whether a content part is an image reference."""
     if part.get("type") in _IMAGE_PART_TYPES:
         return True
-    # 兜底：部分 provider 只给出 image_url/source 字段而未带 type。
+    # Fallback: some providers emit an image_url/source field without a type.
     if isinstance(part.get("image_url"), dict):
         return True
     source = part.get("source")
@@ -280,8 +305,117 @@ def _is_image_part(part: dict[str, Any]) -> bool:
     return False
 
 
+def expand_tool_images(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Project the ``images`` side-key on tool messages into image content parts.
+
+    :meth:`encre.session.Session.add_tool_result` stores screenshots produced by
+    tools under the message's ``images`` side-key (``content`` stays a plain
+    string, so frontend rendering, persistence, and compaction need no
+    changes). When the backend request is being built, this function unfolds
+    those side-keys into OpenAI-style ``image_url`` parts appended to the
+    matching tool message's content. Vision degradation is applied afterwards
+    by :func:`apply_to_messages`.
+
+    Non-mutating: messages without an ``images`` side-key are returned as-is;
+    messages with images produce a new dict.
+    """
+    if not messages:
+        return messages
+    out: list[Any] = []
+    changed = False
+    for message in messages:
+        if not (isinstance(message, dict) and message.get("images")):
+            out.append(message)
+            continue
+        content = message.get("content")
+        blocks: list[Any] = []
+        if isinstance(content, list):
+            blocks.extend(content)
+        elif content:
+            blocks.append({"type": "text", "text": str(content)})
+        for img in message.get("images") or []:
+            if not isinstance(img, dict) or not img.get("data"):
+                continue
+            media = str(img.get("media_type") or "image/png")
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{media};base64,{img['data']}"},
+            })
+        new_message = dict(message)
+        new_message["content"] = blocks if blocks else content
+        new_message.pop("images", None)
+        out.append(new_message)
+        changed = True
+    return out if changed else messages
+
+
+def relocate_tool_images(
+    messages: list[dict[str, Any]] | None,
+    keep_in_place: bool = False,
+) -> list[dict[str, Any]] | None:
+    """Re-home image parts inside tool messages per provider rules.
+
+    When ``keep_in_place`` is True (Anthropic family) the messages are returned
+    as-is. Otherwise image parts are moved into a synthetic user message placed
+    **after the run of tool messages that produced them** -- multiple tool
+    results within the same turn stay contiguous (which OpenAI requires for
+    tool_call_id response ordering), while images sit immediately next to the
+    tool result that produced them.
+
+    Non-mutating: returns the input unchanged when there are no images,
+    otherwise returns a new list.
+    """
+    if keep_in_place or not messages:
+        return messages
+
+    def _split_images(content: Any) -> tuple[list[Any], list[Any]]:
+        images: list[Any] = []
+        rest: list[Any] = []
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and _is_image_part(part):
+                    images.append(part)
+                else:
+                    rest.append(part)
+        return images, rest
+
+    out: list[Any] = []
+    changed = False
+    pending: list[Any] = []
+
+    def _flush() -> None:
+        nonlocal pending, changed
+        if pending:
+            out.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Screenshot attached to the tool result above]"},
+                    *pending,
+                ],
+            })
+            pending = []
+            changed = True
+
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            images, rest = _split_images(message.get("content"))
+            if images:
+                new_message = dict(message)
+                new_message["content"] = rest if rest else ""
+                out.append(new_message)
+                pending.extend(images)
+                changed = True
+            else:
+                out.append(message)
+            continue
+        _flush()
+        out.append(message)
+    _flush()
+    return out if changed else messages
+
+
 def _describe_image_part(part: dict[str, Any]) -> str:
-    """把被剥离的图片内容块渲染成保留元信息的文本描述。"""
+    """Render a stripped image part as a text description that keeps its metadata."""
     meta: list[str] = []
     for key in ("alt", "text", "filename", "name", "title"):
         value = part.get(key)
@@ -303,7 +437,7 @@ def _describe_image_part(part: dict[str, Any]) -> str:
 
 
 def _describe_url(url: str) -> str:
-    """把图片 URL 压缩成可读的短描述（避免内联 base64 污染 prompt）。"""
+    """Compress an image URL into a short description, avoiding inline base64."""
     if url.startswith("data:"):
         header = url.split(",", 1)[0]
         return f"内联图片数据（{header}）"
@@ -313,7 +447,7 @@ def _describe_url(url: str) -> str:
 
 
 def _tool_name_and_description(item: Any) -> tuple[str, str]:
-    """从 OpenAI 或 Anthropic 风格的工具定义中取出名称与描述。"""
+    """Extract the name and description from an OpenAI- or Anthropic-style tool definition."""
     if not isinstance(item, dict):
         return "", ""
     function = item.get("function")
@@ -323,7 +457,7 @@ def _tool_name_and_description(item: Any) -> tuple[str, str]:
 
 
 def _first_sentence(text: str, limit: int = 120) -> str:
-    """把工具描述压缩成一句话，避免污染 system prompt。"""
+    """Compress a tool description to one sentence so it does not bloat the prompt."""
     text = " ".join(str(text).split())
     if not text:
         return ""

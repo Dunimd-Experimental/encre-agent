@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -29,19 +29,25 @@ ladder, telemetry, evolution reflection, turn-end hooks, rollback commit
 and terminal cleanup.
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextlib
+import re
 import time
 from collections import Counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from encre.capabilities.process import TerminalSessionManager
+from encre.compact.loop_state.transition import TurnTransition
 from encre.events.lifecycle import TurnEnded
+from encre.features import adapters as _features
 from encre.logging_config import get_logger
 from encre.loop.phase_api import LoopPhase, PhaseContext, PhaseResult
 from encre.loop.turn_ctx import TurnContext
-from encre.memdir.judgment import Experience, SignificanceJudge
-from encre.compact.loop_state.transition import TurnTransition
 from encre.loop_stability import BudgetState, build_grace_message
-from encre.capabilities.process import TerminalSessionManager
+from encre.prompts.loader import PromptLoader
+from encre.utils.backend_clone import thinking_off_clone as _thinking_off_clone
 from encre.utils.loop_helpers import (
     _GUARDRAIL_BLOCK_AFTER,
     _GUARDRAIL_HALT_AFTER,
@@ -55,16 +61,142 @@ from encre.utils.loop_helpers import (
     _summarize_verify_result,
 )
 from encre.utils.tokens import estimate_tokens
+from encre.utils.verification_ledger import (
+    _extract_exit_code,
+    classify_verification_outcome,
+)
+
+if TYPE_CHECKING:
+    # Annotation-only: ``Experience`` is resolved at runtime through
+    # :mod:`encre.features.adapters`, the declared feature seam.
+    from encre.memdir.judgment import Experience
 
 logger = get_logger(__name__)
+
+# Cap for the guardrail counters: both are consecutive-turn signals, so
+# entries for signatures that stopped repeating are dead weight in a long
+# session.  When a counter exceeds this many entries, the oldest (least
+# recently touched) entries are evicted.
+_GUARDRAIL_COUNT_MAX_ENTRIES = 128
+
+# Model-assisted memory gate.  The significance judge's math threshold is a
+# cheap pre-filter; this prompt is the final arbiter.  The model MUST answer
+# with a single worth score and nothing else -- thinking is force-disabled on
+# the scorer backend clone and the prompt forbids any explanation.
+# Language-neutral: it names content CATEGORIES, never vocabulary.
+# Text lives in ``prompts/memdir/memory_scorer.prompt`` so prompt copy is never
+# hardcoded in Python, like every other prompt in the system.
+_MEMORY_SCORER_PROMPT = PromptLoader().load("memory_scorer", category="memdir")
+
+#: Minimum worth score (0.0-1.0) for a math-approved candidate to be kept.
+_MEMORY_SCORE_KEEP_THRESHOLD = 0.5
+
+
+def _parse_memory_score(text: str) -> float:
+    """Extract the model's worth score from its answer.
+
+    Tolerates 0-10 and 0-100 answer scales by normalising down to 0.0-1.0.
+    An unparsable answer returns 0.0: the model gate is mandatory, so an
+    answer without any score is an unverified candidate and must not be
+    written -- a silent fail-open here is exactly how junk memories flood
+    the graph.
+
+    Args:
+        text: The raw model answer (expected to be just a number).
+
+    Returns:
+        The clamped worth score in ``[0.0, 1.0]``.
+    """
+    match = re.search(r"\d+(?:\.\d+)?", text or "")
+    if not match:
+        return 0.0
+    value = float(match.group())
+    if value > 1.0:
+        value /= 10.0 if value <= 10.0 else 100.0
+    return min(1.0, max(0.0, value))
+
+
+def _make_memory_verifier(backend: Any):
+    """Build the model-assisted verifier injected into the significance judge.
+
+    EVERY candidate that cleared the math threshold gets its own bounded,
+    non-streaming call to the currently active model (a thinking-disabled
+    clone of the loop's backend), and the model answers with exactly one
+    worth score: higher = more worth remembering, lower = less.  Candidates
+    scoring below :data:`_MEMORY_SCORE_KEEP_THRESHOLD` are dropped; anything
+    else passes through unchanged.
+
+    The gate is fail-closed -- verification is mandatory, never advisory.
+    A missing scorer, a failed score call or an unparsable answer all drop
+    the candidate: a fail-open degradation here is how raw tool output and
+    conversation noise flood the memory graph with worthless nodes.  The
+    math pre-filter stays cheap and offline; the model is the arbiter of
+    what actually persists.
+    """
+    scorer = _thinking_off_clone(backend)
+
+    async def verify(candidates: list[Any]) -> list[Any]:
+        if not candidates:
+            return candidates
+        if scorer is None:
+            logger.warning(
+                "[end_of_turn] memory verifier unavailable; dropping %d candidate(s)",
+                len(candidates),
+            )
+            return []
+        from encre.utils.types import BackendFinish, BackendText
+
+        out: list[Any] = []
+        for candidate in candidates:
+            try:
+                messages = [
+                    {"role": "system", "content": _MEMORY_SCORER_PROMPT},
+                    {"role": "user", "content": str(candidate.content or "")[:500]},
+                ]
+                full_text = ""
+                async for event in scorer.chat(messages=messages, max_tokens=16, stream=False):
+                    if isinstance(event, BackendText):
+                        full_text += event.text
+                    elif isinstance(event, BackendFinish):
+                        break
+                score = _parse_memory_score(full_text)
+            except Exception:
+                logger.warning(
+                    "[end_of_turn] memory score call failed; dropping candidate content={!r}",
+                    str(candidate.content or "")[:80],
+                    exc_info=True,
+                )
+                score = 0.0
+            if score >= _MEMORY_SCORE_KEEP_THRESHOLD:
+                out.append(candidate)
+            else:
+                logger.debug(
+                    "[end_of_turn] memory candidate dropped by model score={:.2f} content={!r}",
+                    score,
+                    str(candidate.content or "")[:80],
+                )
+        return out
+
+    return verify
+
+
+def _prune_recent_entries(counts: dict[str, int], max_entries: int = _GUARDRAIL_COUNT_MAX_ENTRIES) -> None:
+    """Evict the oldest entries when ``counts`` exceeds ``max_entries``.
+
+    Callers pop-and-reinsert on every update, so dict insertion order
+    reflects recency; dropping from the front evicts stale entries first.
+    """
+    excess = len(counts) - max_entries
+    if excess <= 0:
+        return
+    for key in list(counts.keys())[:excess]:
+        counts.pop(key, None)
 
 
 async def _cleanup_terminal_sessions() -> None:
     """Kill all persistent terminal sessions from the finished turn."""
-    try:
+    with contextlib.suppress(Exception):
         await TerminalSessionManager.instance().cleanup_all()
-    except Exception:
-        pass
 
 
 class PhaseEndOfTurnMixin:
@@ -80,7 +212,7 @@ class PhaseEndOfTurnMixin:
             None.  Sets ``t.do_break`` when the guardrail ladder halts the
             session (mirrors the original ``break`` statement).
         """
-        # 鈹€鈹€ Budget grace call 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # ── Budget grace call ─────────────────────────────────────
         # When the token budget is exhausted, give the model one final
         # call to wrap up.  Mirrors Hermes agent's budget grace call.
         if t.backend_usage:
@@ -107,9 +239,13 @@ class PhaseEndOfTurnMixin:
         # follow-ups) stays in one assistant message on both session and UI.
 
         self.session.turn_count += 1
+        # The turn is over: hand the next (independent) turn its own tool-call
+        # id namespace.  Retry paths that skip this phase (END_TURN/EXIT) keep
+        # the current token on purpose so a re-issued call reuses its card.
+        t.rotate_tool_id_token()
         turn_latency = (time.time() - t.turn_start) * 1000
 
-        # 鈹€鈹€ Repetitive tool-call loop detection + guardrail ladder 鈹€鈹€
+        # ── Repetitive tool-call loop detection + guardrail ladder ──
         # Detect when the model is genuinely stuck: same tool+args across
         # consecutive turns.  Different queries with the same tool name
         # (e.g. web_search with different queries) are fine.
@@ -137,10 +273,18 @@ class PhaseEndOfTurnMixin:
             _turn_sigs_set.add(sig)
             _turn_sig_names[sig] = name
             if sig in self._guardrail_prev_sigs:
-                self._guardrail_call_counts[sig] = self._guardrail_call_counts.get(sig, 1) + 1
+                _prev = self._guardrail_call_counts.get(sig, 1)
+                # pop+reinsert marks the signature as recently touched so
+                # the prune below never evicts an active repeat streak.
+                self._guardrail_call_counts.pop(sig, None)
+                self._guardrail_call_counts[sig] = _prev + 1
             else:
+                self._guardrail_call_counts.pop(sig, None)
                 self._guardrail_call_counts[sig] = 1
         self._guardrail_prev_sigs = _turn_sigs_set
+        # Bound the counter: entries for signatures that stopped repeating
+        # would otherwise accumulate unboundedly across a long session.
+        _prune_recent_entries(self._guardrail_call_counts)
         if turn_sigs:
             self._recent_tool_names.append(tuple(turn_sigs))
             if len(self._recent_tool_names) > 20:
@@ -152,13 +296,25 @@ class PhaseEndOfTurnMixin:
             # differ cosmetically.
             for p in t.prepared:
                 pname = p.get("name", "")
-                # A successful verify/lint/test tool records passing evidence
-                # in the verification ledger (the change has been checked).
+                # A verification tool's evidence is judged from its *real*
+                # outcome signal (exit code / failure count / ok flag), never
+                # from "the command executed without a tool error": a pytest
+                # run reporting 50 failures exits cleanly as far as the tool
+                # layer is concerned and must be recorded as FAILED evidence.
+                # Unparseable results fail closed (recorded as not passed).
                 if pname in _VERIFY_TOOL_NAMES and not p.get("skip"):
-                    _vpassed = not p.get("is_error", False)
+                    _vresult = str(p.get("result", ""))
+                    _voutcome = classify_verification_outcome(pname, _vresult)
+                    _vexit = _extract_exit_code(_vresult)
+                    if _voutcome is None:
+                        _vpassed, _vdetail = False, "unparseable result"
+                    else:
+                        _vpassed, _vdetail = _voutcome
                     self._verif_ledger.record_verification(
                         pname, _vpassed,
-                        summary=_summarize_verify_result(pname, str(p.get("result", "")), _vpassed),
+                        summary=_summarize_verify_result(pname, _vresult, _vpassed),
+                        exit_code=_vexit,
+                        detail=_vdetail,
                     )
                 # Plan-Do-Review (WORKSPACE): record the tool call against
                 # the current step so lightweight review can judge step
@@ -175,9 +331,12 @@ class PhaseEndOfTurnMixin:
                     pdigest = _result_digest(str(p.get("result", "")))
                     _dkey = f"{pname}:{pdigest}"
                     if self._guardrail_no_progress_digests.get(pname) == pdigest:
-                        self._guardrail_no_progress_counts[_dkey] = \
-                            self._guardrail_no_progress_counts.get(_dkey, 0) + 1
+                        _prev_np = self._guardrail_no_progress_counts.get(_dkey, 0)
+                        # pop+reinsert keeps recency ordering for the prune.
+                        self._guardrail_no_progress_counts.pop(_dkey, None)
+                        self._guardrail_no_progress_counts[_dkey] = _prev_np + 1
                     else:
+                        self._guardrail_no_progress_counts.pop(_dkey, None)
                         self._guardrail_no_progress_counts[_dkey] = 1
                     self._guardrail_no_progress_digests[pname] = pdigest
                     if self._guardrail_no_progress_counts.get(_dkey, 0) >= _NO_PROGRESS_AFTER:
@@ -193,19 +352,25 @@ class PhaseEndOfTurnMixin:
                             "Stop re-reading the same data and choose a different action."
                         )
 
+            # Bound the no-progress counter the same way as the call counter.
+            _prune_recent_entries(self._guardrail_no_progress_counts)
+
             # Detect repetitive tool-loops even when tools are failing:
             # a model stuck re-invoking the same tool+args (often the
             # exact failing call) is the most common runaway scenario,
             # and _record_stuck_event only injects guidance -- it never
             # aborts -- so firing on error turns is safe and desirable.
             if len(self._recent_tool_names) >= _STUCK_LOOP_THRESHOLD:
+                # Light-tier models settle into identical-call loops faster
+                # and dig deeper per lap, so trip them earlier.
+                _thr = 4 if self._model_profile().is_light else _STUCK_LOOP_THRESHOLD
                 # Count each distinct signature across the window so that an
                 # alternating pattern (A,B,A,B,...) is caught as stuck, not
                 # just a strictly-consecutive repeat.
-                recent = self._recent_tool_names[-_STUCK_LOOP_THRESHOLD:]
+                recent = self._recent_tool_names[-_thr:]
                 _counts = Counter(recent)
                 _repeated_sig, _repeated_count = _counts.most_common(1)[0]
-                if _repeated_count >= _STUCK_LOOP_THRESHOLD:
+                if _repeated_count >= _thr:
                     logger.warning(
                         "[run] repetitive tool-loop: %s x%d turn=%d",
                         _repeated_sig, _repeated_count, self.session.turn_count,
@@ -220,15 +385,26 @@ class PhaseEndOfTurnMixin:
                     self._guardrail_call_counts.items(), key=lambda kv: kv[1],
                 )
                 if _top_count >= _GUARDRAIL_HALT_AFTER and not self._guardrail_halt:
-                    self._guardrail_halt = True
-                    logger.error(
-                        "[run] guardrail HALT: %s called %dx -- stopping turn %d",
-                        _top_sig, _top_count, self.session.turn_count,
-                    )
-                    self._record_stuck_event((_top_sig,))
-                    self._set_task_stage("discover", reason="guardrail halt")
-                    t.do_break = True
-                    return
+                    # Last resort for a stuck light-tier model before killing
+                    # the turn: escalate to a stronger model the user already
+                    # configured (one-shot per session; the escalation clears
+                    # the detection windows so the new model starts clean).
+                    if self._try_tier_escalation(
+                        f"guardrail halt: {_top_sig} x{_top_count}"
+                    ):
+                        logger.warning(
+                            "[run] guardrail HALT bypassed via tier escalation, turn continues"
+                        )
+                    else:
+                        self._guardrail_halt = True
+                        logger.error(
+                            "[run] guardrail HALT: %s called %dx -- stopping turn %d",
+                            _top_sig, _top_count, self.session.turn_count,
+                        )
+                        self._record_stuck_event((_top_sig,))
+                        self._set_task_stage("discover", reason="guardrail halt")
+                        t.do_break = True
+                        return
                 if _top_count >= _GUARDRAIL_BLOCK_AFTER:
                     # Feed a synthetic block result so the model sees the call
                     # was refused rather than silently looping again.
@@ -268,7 +444,7 @@ class PhaseEndOfTurnMixin:
         tool_outcomes: list[dict[str, Any]] = [
             {
                 "tool_name": p.get("name", ""),
-                "is_error": bool(p.get("is_error") or p.get("skip") and p.get("error")),
+                "is_error": bool(p.get("is_error") or (p.get("skip") and p.get("error"))),
                 "semantic_type": p.get("semantics", {}).get("semantic_type", ""),
             }
             for p in t.prepared
@@ -291,7 +467,7 @@ class PhaseEndOfTurnMixin:
         ))
         # Trigger background review every N turns (fire-and-forget)
         if self.reviewer is not None:
-            asyncio.create_task(self.reviewer.on_turn_end(self))
+            self._turn_end_reviewer_task = asyncio.create_task(self.reviewer.on_turn_end(self))
         # Significance judgment -- the ONLY path into memory.  This phase
         # never writes memory itself: it collects this turn's experiences,
         # hands them to the judge as a background task, and lets the judge
@@ -302,7 +478,12 @@ class PhaseEndOfTurnMixin:
         # call sites (execute / tools / tool executor); this single turn-tail
         # hook covers all of them without touching any of those sites.
         self._dispatch_safety_reflow()
-        self.rollback.commit(self.session, f"turn_{self.session.turn_count}")
+        # Commit BEFORE the significance judge runs: the judge persists memory
+        # nodes asynchronously, and those must belong to the turn they were
+        # judged from -- not to whatever turn happens to be in flight when the
+        # task finally executes.
+        _commit_turn = self.session.turn_count
+        self.rollback.commit(self.session, f"turn_{_commit_turn}")
 
         # Clean up persistent terminal sessions from this turn.
         await _cleanup_terminal_sessions()
@@ -352,11 +533,14 @@ class PhaseEndOfTurnMixin:
         # second turn and falsely clear the significance threshold.
         if t.prompt and t.prompt != getattr(self, "_last_judged_prompt", None):
             self._last_judged_prompt = t.prompt
-            experiences.append(Experience(
+            experiences.append(_features.Experience(
                 kind="user_message",
                 content=t.prompt,
                 session_id=session_id,
-                metadata={"source": "turn_prompt"},
+                # Turn attribution: rollback paths archive memories recorded
+                # by discarded turns, so every experience must carry the
+                # turn number it was produced in.
+                metadata={"source": "turn_prompt", "turn": self.session.turn_count},
                 ts=t.turn_start or time.time(),
             ))
         for p in t.prepared:
@@ -368,7 +552,7 @@ class PhaseEndOfTurnMixin:
                     p.get("tool_call_id") or p.get("id") or ""
                 ) if r
             ]
-            experiences.append(Experience(
+            experiences.append(_features.Experience(
                 kind="tool_result",
                 content=result,
                 session_id=session_id,
@@ -377,6 +561,7 @@ class PhaseEndOfTurnMixin:
                     "tool_name": str(p.get("name", "") or ""),
                     "is_error": bool(p.get("is_error", False)),
                     "source": "tool_result",
+                    "turn": self.session.turn_count,
                 },
             ))
         return experiences
@@ -403,9 +588,13 @@ class PhaseEndOfTurnMixin:
             # The ``strong_association`` signal reads existing memory through
             # the single retrieval path (associative recall over the layer
             # store).  When the memory subsystem is unavailable the engine is
-            # ``None`` and the signal stays inactive.
-            judge = SignificanceJudge(
+            # ``None`` and the signal stays inactive.  The model verifier is
+            # the final gate after the math threshold: it drops tool noise
+            # and markup junk and extracts subject keywords that feed the
+            # assisted lexicon (so recurring names become entity hubs).
+            judge = _features.SignificanceJudge(
                 recall_engine=getattr(self, "recall_engine", None),
+                verifier=_make_memory_verifier(getattr(self, "backend", None)),
             )
             self._significance_judge = judge
         experiences = self._collect_turn_experiences(t)
@@ -435,7 +624,9 @@ class PhaseEndOfTurnMixin:
         correction into a real authorization decision.
 
         A failure here must never affect turn teardown, so everything is caught
-        and logged.  The record count is advanced only after a successful
+        and logged -- but logged loudly: a policy that did not reach disk is
+        lost on restart, so the error names the storage path instead of hiding
+        at debug level.  The record count is advanced only after a successful
         reflow, so a transient fault is retried on the next turn.
 
         Returns:
@@ -453,8 +644,11 @@ class PhaseEndOfTurnMixin:
         try:
             reflow.apply(session_id=getattr(self.session, "id", "") or "")
         except Exception:
-            logger.debug(
-                "[end_of_turn] safety-policy reflow failed", exc_info=True,
+            logger.error(
+                "[end_of_turn] learned safety policies were NOT saved to %s "
+                "(they will be lost on restart); retrying next turn",
+                getattr(reflow, "storage_path", "<unknown>"),
+                exc_info=True,
             )
             return
         self._last_reflow_record_count = count
@@ -477,6 +671,8 @@ class EndOfTurnPhase(LoopPhase):
     async def run(self, ctx: PhaseContext) -> PhaseResult:
         t = ctx.turn
         await self._loop._phase_end_of_turn(t)
+        # Lazy plugins may listen for turn boundaries (``turn_end``).
+        self._loop._emit_plugin_event("turn_end")
         if t.do_break:
             t.do_break = False
             return PhaseResult.end_run("end-of-turn guardrail halted the session")

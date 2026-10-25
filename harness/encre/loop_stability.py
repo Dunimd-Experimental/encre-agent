@@ -3,11 +3,11 @@
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# You may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -21,13 +21,75 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 import logging
 import re
 from typing import Any
 
+from encre.errors import WithheldError  # noqa: F401
 from encre.prompts.loader import PromptLoader
+from encre.utils.types import BackendText
 
-logger = logging.getLogger(__name__)
+from encre.logging_config import get_logger
+
+
+async def adjudicate_deliberation(
+    backend: Any,
+    text_parts: list[str],
+    thinking_parts: list[str],
+) -> bool:
+    """Confirm the deliberation-loop heuristic with a cheap LLM verdict.
+
+    The heuristic casts a wide net; this one-shot call (tiny output budget,
+    no tools, no conversation history) asks the model itself to classify
+    the flagged monologue, so verbose but legitimate answers are never
+    interrupted by a nudge.  Returns True to proceed with the nudge.
+
+    Any adjudication failure falls back to the heuristic verdict (True):
+    availability problems must not change loop behaviour.
+    """
+    if backend is None:
+        return True
+    text = "".join(text_parts).strip()
+    thinking = "".join(thinking_parts).strip()
+    monologue = text if len(text) >= len(thinking) else thinking
+    if len(monologue) > 4000:
+        monologue = monologue[:2000] + "\n[...]\n" + monologue[-2000:]
+    try:
+        chunks: list[str] = []
+        gen = backend.chat(
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "You are a strict output classifier reviewing the LAST "
+                        "response of an AI coding agent.\n\nRESPONSE:\n"
+                        f"{monologue}\n\nClassify the response:\n"
+                        "- DELIVERABLE: it concretely answers the user's request, "
+                        "or presents a committed result, summary, or question as "
+                        "this turn's answer.\n"
+                        "- LOOP: it is an uncommitted internal deliberation "
+                        "monologue -- repeatedly re-deciding and hedging without "
+                        "acting or answering.\n\n"
+                        "Reply with exactly one word: DELIVERABLE or LOOP."
+                    ),
+                }
+            ],
+            tools=None,
+            max_tokens=8,
+            stream=False,
+        )
+        async for event in gen:
+            if isinstance(event, BackendText):
+                chunks.append(event.text)
+        verdict = "".join(chunks).strip().upper()
+        return "LOOP" in verdict or "DELIVERABLE" not in verdict
+    except Exception:
+        return True
+
+
+logger = get_logger(__name__)
 
 # Prompt copy for runtime-injected messages (grace calls, auto-continue,
 # delegation guidance, steer injections, thinking prefills, standing-orders
@@ -73,22 +135,25 @@ def _load_runtime_meta(name: str) -> dict[str, Any]:
         logger.warning("[runtime_prompt] meta '%s' failed: %s", name, exc)
         return {}
 
-# 鈹€鈹€ Limits 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+# ── Limits ────────────────────────────────────────────────────────────
 MAX_EMPTY_RESPONSE_RETRIES = 2
 MAX_TRUNCATED_TOOL_CALL_RETRIES = 2
 MAX_STUB_RESPONSE_RETRIES = 2
+MAX_DELIBERATION_RETRIES = 2
 MAX_MESSAGE_REPAIR_DEPTH = 50
 PRE_API_COMPACT_THRESHOLD_RATIO = 0.85
 POST_TOOL_COMPACT_THRESHOLD_RATIO = 0.80
 MAX_STEER_MESSAGES = 5
 
-# 鈹€鈹€ Surrogate / control character patterns 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Surrogate / control character patterns ────────────────────────────
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WHITESPACE_RE = re.compile(r"\n{4,}")
 
 
-# 鈹€鈹€ 1. Message Repair 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 1. Message Repair ─────────────────────────────────────────────────
+
 
 def repair_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Repair message list before sending to the API.
@@ -130,8 +195,7 @@ def repair_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     tc["function"]["arguments"] = args
 
         # Skip completely empty messages (no content, no tool_calls, no tool_call_id)
-        if (not content and not msg.get("tool_calls")
-                and not msg.get("tool_call_id")):
+        if not content and not msg.get("tool_calls") and not msg.get("tool_call_id"):
             continue
 
         # Pad empty assistant content when it has tool_calls (API requires content)
@@ -184,6 +248,19 @@ def _fix_role_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                 prev_tc = list(prev.get("tool_calls") or [])
                 prev_tc.extend(msg["tool_calls"])
                 prev["tool_calls"] = prev_tc
+            # Preserve ``reasoning_content`` across the merge.  The merged
+            # assistant now owns both tool_call sets, and DeepSeek's
+            # thinking mode (plus GLM interleaved / Kimi preserved thinking)
+            # rejects the follow-up request with HTTP 400 when a tool-call
+            # assistant lacks its ``reasoning_content`` -- dropping the
+            # merged-away side's reasoning would reintroduce exactly that.
+            if role == "assistant":
+                prev_r = str(prev.get("reasoning_content") or "")
+                cur_r = str(msg.get("reasoning_content") or "")
+                if prev_r and cur_r:
+                    prev["reasoning_content"] = prev_r + "\n" + cur_r
+                elif cur_r:
+                    prev["reasoning_content"] = cur_r
             # Preserve compact-layering markers from the merged message so a
             # real user instruction merged into a summary doesn't erase the
             # summary/archive/hint boundary the compact engine set.  Without
@@ -206,15 +283,19 @@ def _fix_role_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]
     if result and result[0].get("role") == "system":
         first_idx = 1
     if first_idx < len(result) and result[first_idx].get("role") == "assistant":
-        result.insert(first_idx, {
-            "role": "user",
-            "content": "(continue)",
-        })
+        result.insert(
+            first_idx,
+            {
+                "role": "user",
+                "content": "(continue)",
+            },
+        )
 
     return result
 
 
-# 鈹€鈹€ 2. Empty Response Detection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 2. Empty Response Detection ───────────────────────────────────────
+
 
 def is_empty_response(
     text_parts: list[str],
@@ -235,50 +316,91 @@ def build_empty_retry_message(retry_count: int) -> str:
             "Your previous response was empty. Please provide a response. "
             "If you need to use a tool, do so. If you're done, say so explicitly."
         )
-    return (
-        "Your response was empty again. You must respond with text or a tool call. "
-        "Do not return an empty response."
-    )
+    return "Your response was empty again. You must respond with text or a tool call. Do not return an empty response."
 
 
-# 鈹€鈹€ 2b. Stub Response Detection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 2b. Stub Response Detection ──────────────────────────────────────
 # A stub is a response that has *some* text (so is_empty_response is False)
-# but is too brief to be a real deliverable 鈥?e.g. "I'll help you with that."
-# or "Done!" 鈥?without any tool calls to back it up.
+# but is too brief to be a real deliverable — e.g. "I'll help you with that."
+# or "Done!" — without any tool calls to back it up.
 #
 # This catches the #1 task-delivery failure mode: the model acknowledges the
 # request but never actually starts working, and the auto-continue mechanism
 # doesn't fire because token_budget is 0 or exhausted.
 
 _STUB_PATTERNS: tuple[str, ...] = (
-    "i'll help", "i will help", "let me help", "i can help",
-    "i'll do", "i will do", "let me do",
-    "i'll start", "i will start", "let me start",
-    "i'll begin", "i will begin", "let me begin",
-    "i'll look", "i will look", "let me look",
-    "i'll check", "i will check", "let me check",
-    "i'll try", "i will try", "let me try",
-    "i'll see", "i will see", "let me see",
-    "i'll work", "i will work", "let me work",
-    "i'll get", "i will get", "let me get",
-    "sure!", "of course!", "absolutely!", "no problem!",
-    "i'll take", "i will take", "let me take",
-    "i'll handle", "i will handle", "let me handle",
+    "i'll help",
+    "i will help",
+    "let me help",
+    "i can help",
+    "i'll do",
+    "i will do",
+    "let me do",
+    "i'll start",
+    "i will start",
+    "let me start",
+    "i'll begin",
+    "i will begin",
+    "let me begin",
+    "i'll look",
+    "i will look",
+    "let me look",
+    "i'll check",
+    "i will check",
+    "let me check",
+    "i'll try",
+    "i will try",
+    "let me try",
+    "i'll see",
+    "i will see",
+    "let me see",
+    "i'll work",
+    "i will work",
+    "let me work",
+    "i'll get",
+    "i will get",
+    "let me get",
+    "sure!",
+    "of course!",
+    "absolutely!",
+    "no problem!",
+    "i'll take",
+    "i will take",
+    "let me take",
+    "i'll handle",
+    "i will handle",
+    "let me handle",
 )
 
 _STUB_COMPLETED_PATTERNS: tuple[str, ...] = (
-    "done!", "finished!", "complete!", "all done", "all set",
-    "that's it", "thats it", "here you go", "there you go",
+    "done!",
+    "finished!",
+    "complete!",
+    "all done",
+    "all set",
+    "that's it",
+    "thats it",
+    "here you go",
+    "there you go",
 )
 
-# Responses with these markers are NOT stubs 鈥?they contain real deliverable
+# Responses with these markers are NOT stubs — they contain real deliverable
 # content (code, file paths, structured output).
 _REAL_CONTENT_MARKERS: tuple[str, ...] = (
     "```",  # code block
     "file:///",  # file reference
-    ".py", ".js", ".ts", ".rs", ".go", ".java",  # file extensions
-    "def ", "class ", "function ", "import ",  # code keywords
-    "http://", "https://",  # URLs
+    ".py",
+    ".js",
+    ".ts",
+    ".rs",
+    ".go",
+    ".java",  # file extensions
+    "def ",
+    "class ",
+    "function ",
+    "import ",  # code keywords
+    "http://",
+    "https://",  # URLs
 )
 
 
@@ -291,7 +413,7 @@ def is_stub_response(
     """Return True if the model returned a suspiciously brief text-only response.
 
     A stub has:
-    - Some text (not empty 鈥?empty is handled by :func:`is_empty_response`)
+    - Some text (not empty — empty is handled by :func:`is_empty_response`)
     - NO tool calls (a response with tools is never a stub)
     - Brief text (< 300 chars) that looks like an acknowledgment without action
 
@@ -300,19 +422,19 @@ def is_stub_response(
     mechanism only fires when ``token_budget > 0``, so without this check a
     stub slips through to ``finish("stop")`` and the user gets nothing.
 
-    Conservative by design 鈥?false negatives (missing a stub) are harmless,
+    Conservative by design — false negatives (missing a stub) are harmless,
     false positives (flagging a real response) waste one retry turn.
     """
     if tool_call_buffers:
-        return False  # Has tool calls 鈥?not a stub
+        return False  # Has tool calls — not a stub
     text = "".join(text_parts).strip()
     if not text:
-        return False  # Empty 鈥?handled by is_empty_response
+        return False  # Empty — handled by is_empty_response
     if len(text) > 300:
-        return False  # Substantial text 鈥?probably a real response
+        return False  # Substantial text — probably a real response
 
     # If the model produced substantial thinking content, it may be
-    # reasoning before acting 鈥?don't flag as stub.
+    # reasoning before acting — don't flag as stub.
     thinking = "".join(thinking_parts).strip()
     if len(thinking) > 200:
         return False
@@ -352,7 +474,7 @@ def build_stub_retry_message(retry_count: int) -> str:
     if retry_count == 1:
         return (
             "[Your previous response was too brief to be a real deliverable. "
-            "Do not just acknowledge the request 鈥?actually DO the work now. "
+            "Do not just acknowledge the request — actually DO the work now. "
             "Use the appropriate tools to gather context, execute the task, "
             "and verify the result. A short text acknowledgment is NOT a "
             "deliverable. Act.]"
@@ -360,11 +482,117 @@ def build_stub_retry_message(retry_count: int) -> str:
     return (
         "[Your response is still too brief. You MUST take action NOW: "
         "call the appropriate tools, execute the task, and deliver a "
-        "complete result. Do not stop with just text 鈥?act.]"
+        "complete result. Do not stop with just text — act.]"
     )
 
 
-# 鈹€鈹€ 3. Truncated Tool Call Detection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 2c. Deliberation Loop Detection ───────────────────────────────────────────────────────────────
+# The mirror image of a stub: instead of a too-brief acknowledgment, the model
+# produces a very LONG stream of internal monologue ("let me...", "OK, final
+# decision...", "wait, let me reconsider...") that re-decides the same thing
+# over and over, never emits a tool call, and never commits to an answer.
+# Such a turn burns the entire token budget with zero delivery.
+
+_DELIBERATION_MARKERS: tuple[str, ...] = (
+    "let me",
+    "i'll",
+    "i will",
+    "hmm",
+    "wait,",
+    "ok,",
+    "okay,",
+    "final decision",
+    "reconsider",
+    "should i",
+    "maybe i",
+    "on second thought",
+    "alternatively",
+    "i think i'll",
+    "let me just",
+    "let me reconsider",
+    "actually,",
+    "i'm torn",
+    "ugh",
+    "circular",
+    "let me think",
+)
+
+_DELIBERATION_MIN_TOTAL_CHARS = 1500
+# Classic loop: thinking-only monologue (visible text near-empty).
+_DELIBERATION_MIN_MARKERS = 8
+# Text-heavy monologue: verbose prose answers are the main false-positive
+# risk, so require a much denser hedge pattern before flagging.
+_DELIBERATION_MIN_MARKERS_TEXT_HEAVY = 12
+
+
+def is_deliberation_loop(
+    text_parts: list[str],
+    tool_call_buffers: dict[int, dict[str, Any]],
+    thinking_parts: list[str],
+) -> bool:
+    """Return True if the response is a long uncommitted deliberation monologue.
+
+    A deliberation loop has:
+    - NO tool calls (a response with tools made progress by definition)
+    - A large combined volume of text and/or thinking (>= 1500 chars)
+    - Heavy density of hedging/re-planning markers (tiered threshold)
+    - No real deliverable content (no code blocks, file references, URLs)
+    - No trailing question to the user (asking IS a legitimate exit)
+
+    Thinking-only responses (empty visible text, long reasoning) are the
+    classic case: the model re-decides the same question dozens of times,
+    then the turn ends without acting or answering.  Conservative by design:
+    false negatives are harmless, false positives waste one retry turn.
+    """
+    if tool_call_buffers:
+        return False  # Has tool calls -- not stuck
+    text = "".join(text_parts).strip()
+    thinking = "".join(thinking_parts).strip()
+    combined = f"{text}\n{thinking}".strip()
+    if len(combined) < _DELIBERATION_MIN_TOTAL_CHARS:
+        return False
+    # Real deliverable content (code, files, links) is never a deliberation
+    # loop, even when it is verbose.
+    lowered = combined.lower()
+    for marker in _REAL_CONTENT_MARKERS:
+        if marker in lowered:
+            return False
+    # A response that ends by asking the user a question already took the
+    # legitimate exit -- asking IS a deliverable, never nudge it.
+    if text.rstrip().endswith("?"):
+        return False
+    marker_hits = sum(lowered.count(marker) for marker in _DELIBERATION_MARKERS)
+    threshold = _DELIBERATION_MIN_MARKERS if len(text) < 300 else _DELIBERATION_MIN_MARKERS_TEXT_HEAVY
+    return marker_hits >= threshold
+
+
+def build_deliberation_retry_message(retry_count: int) -> str:
+    """Build a nudge that forces the model out of a deliberation loop.
+
+    The failure being corrected is endless internal re-planning: the model
+    keeps re-deciding instead of acting OR asking.  The nudge explicitly
+    authorizes the two -- and only two -- acceptable exits.
+    """
+    if retry_count == 1:
+        return (
+            "[Your previous response was hundreds of words of internal "
+            "deliberation with no action and no answer. STOP deliberating. "
+            "You must do exactly ONE of the following now: (a) act -- call "
+            "the appropriate tools and execute the task, or (b) if a stored "
+            "rule genuinely conflicts with the request, reply to the user "
+            "with ONE short sentence stating the conflict and asking for "
+            "confirmation. Long internal monologue is NOT a deliverable.]"
+        )
+    return (
+        "[You are still deliberating instead of delivering. Decide NOW: "
+        "either call the tools to do the work, or reply with ONE concise "
+        "clarifying question to the user. Do not output any further "
+        "re-planning or internal monologue.]"
+    )
+
+
+# ── 3. Truncated Tool Call Detection ──────────────────────────────────
+
 
 def is_truncated_tool_call(tool_call_buffers: dict[int, dict[str, Any]]) -> bool:
     """Return True if any tool call has truncated/invalid JSON arguments."""
@@ -383,6 +611,7 @@ def is_truncated_tool_call(tool_call_buffers: dict[int, dict[str, Any]]) -> bool
                 return True
             # Try to parse
             import json
+
             try:
                 json.loads(stripped)
             except json.JSONDecodeError:
@@ -401,7 +630,8 @@ def build_truncated_retry_message(tool_name: str, args_preview: str) -> str:
     )
 
 
-# 鈹€鈹€ 4. Pre-API Token Pressure Check 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 4. Pre-API Token Pressure Check ──────────────────────────────────
+
 
 def check_token_pressure(
     messages: list[dict[str, Any]],
@@ -422,14 +652,11 @@ def check_token_pressure(
     """
     try:
         from encre.utils.tokens import count_message_tokens
+
         input_tokens = count_message_tokens(messages)
     except Exception:
         # Fallback: rough estimate (4 chars per token)
-        total_chars = sum(
-            len(str(m.get("content", "")))
-            + len(str(m.get("tool_calls", "")))
-            for m in messages
-        )
+        total_chars = sum(len(str(m.get("content", ""))) + len(str(m.get("tool_calls", ""))) for m in messages)
         input_tokens = total_chars // 4
     input_tokens += max(0, extra_tokens)
 
@@ -439,7 +666,8 @@ def check_token_pressure(
     return input_tokens / available
 
 
-# 鈹€鈹€ 5. Post-Tool Compression Check 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 5. Post-Tool Compression Check ────────────────────────────────────
+
 
 def should_post_tool_compact(
     messages: list[dict[str, Any]],
@@ -449,12 +677,16 @@ def should_post_tool_compact(
 ) -> bool:
     """Return True if context should be compressed after tool execution."""
     ratio = check_token_pressure(
-        messages, context_window, max_tokens, extra_tokens=extra_tokens,
+        messages,
+        context_window,
+        max_tokens,
+        extra_tokens=extra_tokens,
     )
     return ratio > POST_TOOL_COMPACT_THRESHOLD_RATIO
 
 
-# 鈹€鈹€ 6. Interrupt / Abort Check 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 6. Interrupt / Abort Check ────────────────────────────────────────
+
 
 class InterruptSignal:
     """Lightweight interrupt signal that can be checked cheaply."""
@@ -484,7 +716,7 @@ def check_interrupt(loop: Any) -> bool:
         try:
             return bool(cancelled())
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
     # Check for abort event
     cancel_event = getattr(loop, "_cancel_event", None)
@@ -492,22 +724,41 @@ def check_interrupt(loop: Any) -> bool:
         try:
             return cancel_event.is_set()
         except Exception:
-            pass
+            logger.debug("exception suppressed", exc_info=True)
 
     return False
 
 
-# 鈹€鈹€ Requirement change detection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── Requirement change detection ──────────────────────────────────────
 
 _REQUIREMENT_CHANGE_KEYWORDS: tuple[str, ...] = (
-    "actually", "instead", "change", "forget", "ignore",
-    "different", "new plan", "instead of", "rethink",
-    "reconsider", "new approach", "scrap", "abandon",
-    "never mind", "on second thought", "let me rephrase",
-    "let me clarify", "change of plan", "actually, don't",
-    "actually, do", "forget what i said", "disregard",
-    "start over", "from scratch", "different direction",
-    "new requirement", "changed my mind",
+    "actually",
+    "instead",
+    "change",
+    "forget",
+    "ignore",
+    "different",
+    "new plan",
+    "instead of",
+    "rethink",
+    "reconsider",
+    "new approach",
+    "scrap",
+    "abandon",
+    "never mind",
+    "on second thought",
+    "let me rephrase",
+    "let me clarify",
+    "change of plan",
+    "actually, don't",
+    "actually, do",
+    "forget what i said",
+    "disregard",
+    "start over",
+    "from scratch",
+    "different direction",
+    "new requirement",
+    "changed my mind",
 )
 
 
@@ -532,11 +783,13 @@ def _detect_requirement_change(prompt: str) -> str:
     return ""
 
 
-# 鈹€鈹€ 7. Tombstone Generation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 7. Tombstone Generation ───────────────────────────────────────────
+
 
 def build_tombstone_messages(
     tool_call_buffers: dict[int, dict[str, Any]],
     reason: str,
+    reasoning_content: str = "",
 ) -> list[dict[str, Any]]:
     """Build tombstone messages for orphaned tool calls.
 
@@ -546,65 +799,65 @@ def build_tombstone_messages(
 
     Unlike the simple orphan cleanup in recovery_loop.py, tombstones
     also include a placeholder assistant message so the conversation
-    history clearly shows where the interruption happened.
+    history clearly shows where the interruption happened.  That
+    placeholder carries the orphaned ``tool_calls`` (each tool result
+    must have an owning assistant message or the OpenAI-protocol
+    endpoints reject the request) and the reasoning captured before the
+    interruption: DeepSeek's thinking mode requires the
+    ``reasoning_content`` of every tool-call assistant to be passed back
+    in all subsequent requests (HTTP 400 "must be passed back"
+    otherwise).
 
     Mirrors Claude Code's tombstone pattern in query.ts.
     """
     tombstones: list[dict[str, Any]] = []
 
+    # Rebuild the orphaned tool_calls the interrupted attempt emitted so
+    # the tombstone assistant owns the tool results that follow.
+    orphaned_calls: list[dict[str, Any]] = []
+    for tc in tool_call_buffers.values():
+        tc_id = tc.get("id", "") or tc.get("_client_id", "")
+        if not tc_id:
+            continue
+        orphaned_calls.append(
+            {
+                "id": tc_id,
+                "type": "function",
+                "function": {
+                    "name": str(tc.get("name", "")),
+                    "arguments": str(tc.get("arguments", "") or "{}"),
+                },
+            }
+        )
+
     # Add a placeholder assistant message marking the interruption
     if tool_call_buffers:
-        tombstones.append({
+        placeholder: dict[str, Any] = {
             "role": "assistant",
             "content": f"[Response interrupted: {reason}]",
-        })
+        }
+        if orphaned_calls:
+            placeholder["tool_calls"] = orphaned_calls
+            if reasoning_content:
+                placeholder["reasoning_content"] = reasoning_content
+        tombstones.append(placeholder)
 
     # Add tool_result blocks for each orphaned tool call
     for tc in tool_call_buffers.values():
         tc_id = tc.get("id", "") or tc.get("_client_id", "")
         if not tc_id:
             continue
-        tombstones.append({
-            "role": "tool",
-            "tool_call_id": tc_id,
-            "name": tc.get("name", ""),
-            "content": f"[Tool execution was interrupted: {reason}]",
-            "is_error": True,
-        })
+        tombstones.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "name": tc.get("name", ""),
+                "content": f"[Tool execution was interrupted: {reason}]",
+                "is_error": True,
+            }
+        )
 
     return tombstones
-
-
-# 鈹€鈹€ 8. Withheld Error Pattern 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-class WithheldError:
-    """Wraps an error that should be withheld from the user until
-    recovery has been attempted.
-
-    If recovery succeeds, the error is silently consumed.
-    If recovery fails, the error is released and shown to the user.
-
-    Mirrors Claude Code's withheld error pattern in query.ts.
-    """
-
-    def __init__(self, error: Exception, *, kind: str = "unknown") -> None:
-        self.error = error
-        self.kind = kind
-        self._released = False
-
-    @property
-    def should_withhold(self) -> bool:
-        """Return True if the error should be withheld (not yet released)."""
-        return not self._released
-
-    def release(self) -> Exception:
-        """Release the error so it will be shown to the user."""
-        self._released = True
-        return self.error
-
-    def consume(self) -> None:
-        """Silently consume the error (recovery succeeded)."""
-        self._released = True
 
 
 def classify_error(exc: Exception) -> str:
@@ -628,24 +881,36 @@ def classify_error(exc: Exception) -> str:
 
 def is_rate_limit_or_overload_msg(msg: str) -> bool:
     patterns = [
-        "rate limit", "too many requests", "overloaded",
-        "capacity", "throttl", "429", "503",
-        "service unavailable", "high demand",
+        "rate limit",
+        "too many requests",
+        "overloaded",
+        "capacity",
+        "throttl",
+        "429",
+        "503",
+        "service unavailable",
+        "high demand",
     ]
     return any(p in msg for p in patterns)
 
 
 def is_context_overflow_msg(msg: str) -> bool:
     patterns = [
-        "prompt is too long", "context length exceeded",
-        "input length exceeds", "input is too long",
-        "maximum context length", "reduce the length",
-        "too many tokens", "413", "request too large",
+        "prompt is too long",
+        "context length exceeded",
+        "input length exceeds",
+        "input is too long",
+        "maximum context length",
+        "reduce the length",
+        "too many tokens",
+        "413",
+        "request too large",
     ]
     return any(p in msg for p in patterns)
 
 
-# 鈹€鈹€ 9. Thinking Prefill 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 9. Thinking Prefill ───────────────────────────────────────────────
+
 
 def build_thinking_prefill(
     prompt: str,
@@ -667,19 +932,17 @@ def build_thinking_prefill(
     # in prompts/runtime/ (category "runtime"), never hardcoded in Python.
     if not hint:
         if "?" in prompt:
-            hint = _load_runtime_text("thinking_prefill_question") \
-                or "Let me analyze this question step by step."
+            hint = _load_runtime_text("thinking_prefill_question") or "Let me analyze this question step by step."
         elif "error" in prompt.lower() or "bug" in prompt.lower():
-            hint = _load_runtime_text("thinking_prefill_bug") \
-                or "Let me investigate this issue systematically."
+            hint = _load_runtime_text("thinking_prefill_bug") or "Let me investigate this issue systematically."
         else:
-            hint = _load_runtime_text("thinking_prefill_default") \
-                or "Let me think about the best approach."
+            hint = _load_runtime_text("thinking_prefill_default") or "Let me think about the best approach."
 
     return hint
 
 
-# 鈹€鈹€ 10. Budget Grace Call 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 10. Budget Grace Call ─────────────────────────────────────────────
+
 
 class BudgetState:
     """Tracks token budget and whether a grace call has been used.
@@ -725,7 +988,7 @@ class BudgetState:
         }
 
     @classmethod
-    def restore(cls, snapshot: dict | None, *, fallback_max: int = 0) -> "BudgetState":
+    def restore(cls, snapshot: dict | None, *, fallback_max: int = 0) -> BudgetState:
         """Rebuild a BudgetState from a checkpointed snapshot.
 
         When *snapshot* is missing or malformed, returns a fresh state with
@@ -759,18 +1022,29 @@ def build_grace_message(remaining_work: str = "") -> str:
     return msg.strip()
 
 
-def build_auto_continue_message() -> str:
+def build_auto_continue_message(progress_context: str = "") -> str:
     """Build a message that nudges the model to continue where it left off.
 
     Mirrors Claude Code's token budget auto-continue
     (query/tokenBudget.ts:checkTokenBudget): when the model stops early but
     still has budget, inject a concise nudge so it keeps going rather than
     forcing the user to say "continue".
+
+    Args:
+        progress_context: Optional real progress state (Plan-Do-Review step
+            graph, or verification-ledger / error-tool run state).  Appended
+            verbatim after the nudge so the continuation decision is grounded
+            in facts; empty means the plain nudge, unchanged.
+
+    Returns:
+        The synthetic continuation nudge message.
     """
-    return _load_runtime_text("auto_continue_message") or (
-        "[Continue from where you left off. Do NOT repeat work already done. "
-        "Keep going with the next task or step.]"
+    msg = _load_runtime_text("auto_continue_message") or (
+        "[Continue from where you left off. Do NOT repeat work already done. Keep going with the next task or step.]"
     )
+    if progress_context:
+        msg = f"{msg}\n\n{progress_context}"
+    return msg
 
 
 def build_delegation_guidance() -> str:
@@ -805,7 +1079,8 @@ def build_delegation_guidance() -> str:
     )
 
 
-# 鈹€鈹€ 11. /steer Injection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 11. /steer Injection ──────────────────────────────────────────────
+
 
 class SteerQueue:
     """Queue for user mid-conversation instruction injections.
@@ -881,20 +1156,58 @@ def build_steer_injection(steer_messages: list[str]) -> str:
     if not steer_messages:
         return ""
     if len(steer_messages) == 1:
-        return _load_runtime_text("steer_single", message=steer_messages[0]) or \
-            f"[User instruction mid-conversation]\n{steer_messages[0]}"
+        return _load_runtime_text("steer_single", message=steer_messages[0]) or f"[User instruction mid-conversation]\n{steer_messages[0]}"
     parts = "\n".join(f"- {m}" for m in steer_messages)
-    return _load_runtime_text("steer_multi", items=parts) or \
-        f"[User instructions mid-conversation]\n{parts}"
+    return _load_runtime_text("steer_multi", items=parts) or f"[User instructions mid-conversation]\n{parts}"
 
 
-# 鈹€鈹€ 12. Standing Orders Reminder 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── 12. Standing Orders Reminder ──────────────────────────────────────
 # A per-turn reminder of the binding pre-action governance constraints
 # (recall memory first, clarify ambiguity, checkpoint long chains, disclose
 # assumptions, honour authority precedence).  Merged into the LAST user
 # message on fresh user turns so the model re-arms its constraints right
 # before it starts responding -- mirroring the existing guidance-merge
 # pattern used for evolution feedback and advisor notes.
+
+
+def build_live_register_text(register: str, prefix: str = "") -> str:
+    """Render the per-turn ``Live Register`` declaration.
+
+    The system prompt deliberately carries ALL register sections so its prefix
+    never changes shape mid-session (provider prompt cache survives).  This
+    short block is what makes that safe to read: it names the register
+    governing the current turn and lists the sections that are inert right
+    now.  The context compiler content-hashes it, so a stable register costs
+    one message for the whole session and only a transition adds another.
+
+    ``prefix`` is the built system prompt.  When supplied, the inert list is
+    filtered to sections actually present in it: the activation table is
+    directory-wide, while the prefix carries exactly one specialty, one
+    tool-execution variant (full or slim), and no skill catalogue at all -- and
+    naming an absent section as inert would be its own small lie.
+
+    Returns an empty string when the prompt file cannot be loaded so the loop
+    degrades to the pre-register behaviour instead of failing.
+    """
+    try:
+        from encre.prompts.system import REGISTER_TITLES, inactive_section_titles
+
+        resolved = register if register in REGISTER_TITLES else "work"
+        inert = inactive_section_titles(resolved)
+        if prefix:
+            inert = [title for title in inert if f"## {title}" in prefix]
+        lines = [f"- {title}" for title in inert] or ["- (none)"]
+        return _get_runtime_loader().load_with_context(
+            "live_register",
+            category="runtime",
+            register=resolved,
+            title=REGISTER_TITLES[resolved],
+            inactive="\n".join(lines),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("[register] live declaration load failed: %s", exc)
+        return ""
+
 
 def build_standing_orders_reminder() -> str:
     """Build the standing-orders reminder injected on fresh user turns.
@@ -911,9 +1224,7 @@ def build_standing_orders_reminder() -> str:
         return ""
 
 
-def append_to_last_user_message(
-    messages: list[dict[str, Any]], suffix: str
-) -> None:
+def append_to_last_user_message(messages: list[dict[str, Any]], suffix: str) -> None:
     """Append *suffix* to the last ``user`` message in *messages* in place.
 
     Uses a shallow copy of the target dict so the original session messages
@@ -931,19 +1242,42 @@ def append_to_last_user_message(
             return
 
 
-# 鈹€鈹€ 13. Checkpoint Hard-Gate 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# Code-level enforcement of the mandatory checkpoint gate (Gate 4): after a
-# bounded run of consecutive tool-call steps with no fresh user message, the
-# loop injects a checkpoint user message that hands control back to the user.
-# The prompt copy lives in prompts/runtime/checkpoint_message.prompt.  The
-# threshold auto-relaxes when the user has explicitly authorised a hands-off
-# run (matched against patterns in prompts/runtime/
-# autonomous_authorization_patterns.prompt).
+# ── 13. Checkpoint Hard-Gate ─────────────────────────────────────────
+# THE single authority on when a long autonomous chain pauses.  The prompt
+# copies of this rule (mandatory_constraints Gate 4, task_completion's
+# "Boundary of Keep Going", standing-orders rule 3) are gone: a pause
+# instruction stated in the system prompt competes with -- and historically
+# beat -- the instruction to finish the job.  The model now hears about
+# pausing only when this gate actually fires, via
+# prompts/runtime/checkpoint_message.prompt.
+#
+# The gate is register-scoped.  ``chat`` and ``answer`` turns are not
+# autonomous work chains at all, so no threshold applies; ``work`` gets a
+# budget high enough to finish a real job (reading a project, wiring a change,
+# verifying it) in one pass instead of being truncated at step five.
 
-# Consecutive tool-call steps (assistant turns that invoked tools) allowed
-# before the loop forces a checkpoint.  Mirrors the "about 5 tool-call steps"
-# wording in mandatory_constraints.prompt and standing_orders_reminder.prompt.
-CHECKPOINT_TOOL_STEP_THRESHOLD = 5
+#: Consecutive tool-call steps allowed in the ``work`` register before the loop
+#: forces a checkpoint.  Kept as a module-level constant because tests and
+#: diagnostics probe it; ``checkpoint_threshold_for`` is what the loop uses.
+CHECKPOINT_TOOL_STEP_THRESHOLD = 12
+
+#: Per-register pause budget.  ``0`` means the gate is disabled for that
+#: register -- no pause message is ever injected on chat or answer turns.
+_CHECKPOINT_THRESHOLDS: dict[str, int] = {
+    "chat": 0,
+    "answer": 0,
+    "work": CHECKPOINT_TOOL_STEP_THRESHOLD,
+}
+
+
+def checkpoint_threshold_for(register: str) -> int:
+    """Return the pause budget for *register*; ``0`` disables the gate.
+
+    An unknown register falls back to the ``work`` budget: pausing too rarely
+    is recoverable, but treating an unclassified turn as "never pause" would
+    let an unattended chain run without a checkpoint.
+    """
+    return _CHECKPOINT_THRESHOLDS.get(register or "work", CHECKPOINT_TOOL_STEP_THRESHOLD)
 
 
 def build_checkpoint_message(steps: int) -> str:
@@ -956,7 +1290,9 @@ def build_checkpoint_message(steps: int) -> str:
     """
     try:
         return _get_runtime_loader().load_with_context(
-            "checkpoint_message", category="runtime", steps=str(steps),
+            "checkpoint_message",
+            category="runtime",
+            steps=str(steps),
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("[checkpoint] message load failed: %s", exc)
@@ -972,20 +1308,54 @@ def _checkpoint_authorization_patterns() -> list[str]:
     return []
 
 
-def checkpoint_gate_relaxed(latest_user_prompt: str) -> bool:
+def recent_user_texts(messages: list[dict[str, Any]], limit: int = 4) -> list[str]:
+    """Return the most recent genuine user texts in *messages* (newest last).
+
+    Used by :func:`checkpoint_gate_relaxed` so an authorisation granted a turn
+    ago still counts.  Synthetic injections are filtered out -- the
+    ``[CONTEXT UPDATE]`` delta entries, the checkpoint message itself, and the
+    steering blocks -- because those are runtime chatter, not user speech.
+    """
+    texts: list[str] = []
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = str(msg.get("content") or "").strip()
+        if not content or content.startswith(
+            ("[CONTEXT UPDATE]", "[User instruction", "[User instructions", "## Checkpoint", "=== Standing Orders")
+        ):
+            continue
+        if "Checkpoint — Pause and Hand Back" in content or "Checkpoint \u2014 Pause" in content:
+            continue
+        texts.append(content)
+        if len(texts) >= limit:
+            break
+    texts.reverse()
+    return texts
+
+
+def checkpoint_gate_relaxed(
+    latest_user_prompt: str,
+    recent_user_prompts: list[str] | None = None,
+) -> bool:
     """Return True when the user has explicitly authorised a hands-off run.
 
-    Matches the latest user instruction (lowercased) against the phrases in
-    ``prompts/runtime/autonomous_authorization_patterns.prompt``.  A match
-    means the checkpoint threshold auto-relaxes: the user asked the agent to
-    work unattended, so pausing every ~5 steps would fight their explicit
-    intent.  The match is deliberately conservative (specific phrases only)
-    so ordinary instructions do not accidentally disable the gate.
+    Matches the user's instruction(s) (lowercased) against the phrases in
+    ``prompts/runtime/autonomous_authorization_patterns.prompt``.  A match means
+    the user asked the agent to work unattended, so pausing mid-chain would
+    fight their explicit intent.
+
+    ``recent_user_prompts`` is scanned as well as the current message: an
+    authorisation given one turn earlier ("just run it all yourself, I'm going
+    out") is still standing for the task it was given for, and requiring the
+    user to re-authorise every turn made the gate effectively permanent.
     """
-    if not latest_user_prompt:
+    texts = [latest_user_prompt or ""]
+    texts.extend(recent_user_prompts or [])
+    combined = "\n".join(texts).lower()
+    if not combined.strip():
         return False
-    lowered = latest_user_prompt.lower()
-    return any(p in lowered for p in _checkpoint_authorization_patterns())
+    return any(pattern in combined for pattern in _checkpoint_authorization_patterns())
 
 
 def count_consecutive_tool_steps(messages: list[dict[str, Any]]) -> int:
